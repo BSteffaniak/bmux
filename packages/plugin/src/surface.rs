@@ -46,6 +46,8 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+pub mod embedded;
+
 /// Stable namespaced identity for an independently composed surface.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -89,6 +91,11 @@ pub enum PluginSurfaceTarget {
         surface: Uuid,
         depth: bmux_presentation_scene::scene::PaneDepth,
     },
+    /// The box an embedding host allocates, such as a panel of an application that
+    /// shows plugin output inside its own layout. Coordinates are local to that box.
+    /// Only embedding hosts show these (see [`embedded`]); the attach client rejects
+    /// them.
+    Embedded,
 }
 
 /// Stable namespaced identity for one input region.
@@ -140,6 +147,29 @@ pub struct PluginSurfaceRegion {
     pub endpoint: Option<crate::AttachInputEndpoint>,
     /// Typed identity for input routing, resolved by the producer's hit table.
     pub key: Option<bmux_presentation_scene::scene::HitKey>,
+    /// The full interaction a `bmux_tui` frame declared for the region, when it was
+    /// captured from one. Embedding hosts replay it exactly; without it they derive
+    /// the interaction from `focusable` and `cursor`.
+    #[serde(default)]
+    pub interaction: Option<PluginSurfaceRegionInteraction>,
+}
+
+/// How a region behaves under the pointer and keyboard, as a `bmux_tui` hit region
+/// declares it. Identity and geometry stay on the region itself.
+#[allow(clippy::struct_excessive_bools)] // Independent interaction policies of one region.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PluginSurfaceRegionInteraction {
+    pub layer: i16,
+    pub role: bmux_tui::hit::HitRole,
+    pub pointer_intent: bmux_tui::pointer::PointerIntent,
+    pub visible: bool,
+    pub pointer_events: bool,
+    pub hoverable: bool,
+    pub focusable: bool,
+    pub enabled: bool,
+    pub tab_order: i32,
+    /// Owner-local id of the focus scope the region belongs to.
+    pub focus_scope: Option<String>,
 }
 
 /// Optional caller-owned scene descriptions in surface-local cell geometry.
@@ -298,7 +328,53 @@ impl PluginSurfaceRegion {
             cursor,
             endpoint: None,
             key: None,
+            interaction: Some(PluginSurfaceRegionInteraction {
+                layer: region.layer,
+                role: region.role,
+                pointer_intent: region.pointer_intent,
+                visible: region.visible,
+                pointer_events: region.pointer_events,
+                hoverable: region.hoverable,
+                focusable: region.focusable,
+                enabled: region.enabled,
+                tab_order: region.tab_order,
+                focus_scope: region
+                    .focus_scope
+                    .as_ref()
+                    .map(|scope| scope.as_str().to_owned()),
+            }),
         }
+    }
+
+    /// The `bmux_tui` hit region this region declares, under `id` and with any focus
+    /// scope renamed by `scope`, at `rect` in the painting frame's coordinates.
+    #[must_use]
+    pub fn to_tui(
+        &self,
+        id: bmux_tui::hit::HitId,
+        area: bmux_tui::geometry::Rect,
+        scope: impl Fn(&str) -> bmux_tui::hit::HitId,
+    ) -> bmux_tui::hit::HitRegion {
+        let mut region = bmux_tui::hit::HitRegion::new(id, area);
+        if let Some(interaction) = &self.interaction {
+            region.layer = interaction.layer;
+            region.role = interaction.role;
+            region.pointer_intent = interaction.pointer_intent;
+            region.visible = interaction.visible;
+            region.pointer_events = interaction.pointer_events;
+            region.hoverable = interaction.hoverable;
+            region.focusable = interaction.focusable;
+            region.enabled = interaction.enabled;
+            region.tab_order = interaction.tab_order;
+            region.focus_scope = interaction.focus_scope.as_deref().map(scope);
+        } else {
+            region.focusable = self.focusable;
+            if let PluginSurfaceCursor::Tui { intent, role } = self.cursor {
+                region.role = role;
+                region.pointer_intent = intent;
+            }
+        }
+        region
     }
 
     #[must_use]
@@ -310,6 +386,7 @@ impl PluginSurfaceRegion {
             cursor: PluginSurfaceCursor::Default,
             endpoint: None,
             key: None,
+            interaction: None,
         }
     }
 
@@ -452,6 +529,15 @@ pub enum PluginSurfacePublishError {
     GraphicsNeedPaneTarget {
         id: PluginSurfaceId,
     },
+    /// A surface for an embedding host's box published where the attach client
+    /// would place it.
+    EmbeddedTargetOnScreen {
+        id: PluginSurfaceId,
+    },
+    /// A surface given to an embedding host that targets the attach client's screen.
+    NotEmbedded {
+        id: PluginSurfaceId,
+    },
 }
 
 impl std::fmt::Display for PluginSurfacePublishError {
@@ -546,6 +632,12 @@ impl std::fmt::Display for PluginSurfacePublishError {
                 "{} draws terminal graphics but is not attached to a pane",
                 id.local_id
             ),
+            Self::EmbeddedTargetOnScreen { id } => {
+                write!(formatter, "{} targets an embedding host's box", id.local_id)
+            }
+            Self::NotEmbedded { id } => {
+                write!(formatter, "{} targets the attach screen", id.local_id)
+            }
             Self::ConflictingRevision => {
                 formatter.write_str("surface revision conflicts with retained owner state")
             }
@@ -872,7 +964,35 @@ impl PluginSurfaceRegistry {
     }
 }
 
+/// Which host a snapshot is validated for: the attach client's screen, or an
+/// embedding host's box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceHost {
+    Screen,
+    Embedded,
+}
+
 fn validate_snapshot(
+    owner_plugin_id: &str,
+    snapshot: &PluginSurfaceSnapshot,
+    maximum_surfaces_per_owner: usize,
+    maximum_retained_items_per_surface: usize,
+    maximum_text_bytes: usize,
+    maximum_snapshot_bytes: usize,
+) -> Result<(), PluginSurfacePublishError> {
+    validate_snapshot_for(
+        SurfaceHost::Screen,
+        owner_plugin_id,
+        snapshot,
+        maximum_surfaces_per_owner,
+        maximum_retained_items_per_surface,
+        maximum_text_bytes,
+        maximum_snapshot_bytes,
+    )
+}
+
+pub(crate) fn validate_snapshot_for(
+    host: SurfaceHost,
     owner_plugin_id: &str,
     snapshot: &PluginSurfaceSnapshot,
     maximum_surfaces_per_owner: usize,
@@ -974,7 +1094,7 @@ fn validate_snapshot(
                 id: surface.id.clone(),
             });
         }
-        validate_surface_target(owner_plugin_id, snapshot, surface)?;
+        validate_surface_target(host, owner_plugin_id, snapshot, surface)?;
     }
     Ok(())
 }
@@ -1035,10 +1155,25 @@ fn validate_surface_items(
 /// Layouts must be the owner's own; attachments must name a surface of the
 /// same snapshot.
 fn validate_surface_target(
+    host: SurfaceHost,
     owner_plugin_id: &str,
     snapshot: &PluginSurfaceSnapshot,
     surface: &PluginSurface,
 ) -> Result<(), PluginSurfacePublishError> {
+    let embedded = matches!(surface.target, PluginSurfaceTarget::Embedded);
+    match host {
+        SurfaceHost::Screen if embedded => {
+            return Err(PluginSurfacePublishError::EmbeddedTargetOnScreen {
+                id: surface.id.clone(),
+            });
+        }
+        SurfaceHost::Embedded if !embedded => {
+            return Err(PluginSurfacePublishError::NotEmbedded {
+                id: surface.id.clone(),
+            });
+        }
+        SurfaceHost::Screen | SurfaceHost::Embedded => {}
+    }
     match &surface.target {
         PluginSurfaceTarget::Layout(layout_id) if layout_id.owner_plugin_id != owner_plugin_id => {
             Err(PluginSurfacePublishError::ForeignLayoutTarget {
@@ -1636,6 +1771,7 @@ mod tests {
         duplicate.interactive_regions = vec![
             PluginSurfaceRegion {
                 key: None,
+                interaction: None,
                 local_id: "same".to_owned(),
                 rect: ExtensionRect::new(0, 0, 1, 1),
                 focusable: false,
@@ -1644,6 +1780,7 @@ mod tests {
             },
             PluginSurfaceRegion {
                 key: None,
+                interaction: None,
                 local_id: "same".to_owned(),
                 rect: ExtensionRect::new(1, 0, 1, 1),
                 focusable: false,
@@ -1666,6 +1803,7 @@ mod tests {
         let mut disabled = surface("owner", "disabled", retained_id);
         disabled.interactive_regions = vec![PluginSurfaceRegion {
             key: None,
+            interaction: None,
             local_id: "region".to_owned(),
             rect: ExtensionRect::new(0, 0, 1, 1),
             focusable: false,

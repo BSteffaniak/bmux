@@ -47,9 +47,9 @@ Four paths draw non-pane UI in the attach client today.
 - Path A paint clips to `surface.rect` and ignores `clip_rect`. Fixed in phase 2.
 - `retained_surface_metadata_equal` ignores `modal`.
 - Path B never reaches the native terminal, and its hits are never routed back.
-  Removed from the attach client in phase 8 (it had no producers); the inert
-  `bmux_tui::presentation::portable` wire contract stays because the external
-  `bcode` plugin SDK references its contract id.
+  Removed from the attach client in phase 8 (it had no producers in the attach
+  client). Embedding hosts, which did use it, now receive plugin surfaces instead:
+  see "Embedding hosts" below.
 - Tab-bar menus and toasts recompute absolute rects from the viewport themselves.
   Fixed in phase 3.
 - Every producer parses string hook ids (`strip_prefix("bmux.sidebar:sidebar:tab:")`).
@@ -245,14 +245,47 @@ Each phase lands with the parity harness and the targeted tests green.
    proves the chain to a streaming client and into the registries. Process
    plugins publish by writing `Publish` frames before an invocation's response
    (declared kinds only); the Python process example proves it in a real server.
-   Frontend portable presentations (path B) had no producers and were removed in
-   phase 8.
+   Frontend portable presentations (path B) had no producers in the attach client
+   and were removed in phase 8; embedding hosts use plugin surfaces instead (see
+   "Embedding hosts").
 7. **Host overlays and components.** Prompts and help publish scenes; stock
    components (list, tab strip, menu, toast stack, text input) replace the
    sidebar's and tab bar's hand-written measuring, hover and scrolling.
 8. **Remaining special cases.** Committed-frame subscription and attach context
    snapshot as generic primitives; broadcast and pane-runtime commands move onto
    presentation commands; the old paths and adapters are deleted.
+
+## Embedding hosts
+
+An application can show plugin output inside its own layout instead of on the
+attach client's screen: Bcode draws its dynamically loaded plugins' interfaces in
+panels of its own TUI. Such an embedding host is a second consumer of the same
+contract, `PluginSurface`, so plugin output has one shape whichever host shows it.
+
+- **Target.** `PluginSurfaceTarget::Embedded` is the box the embedding host
+  allocates; coordinates are local to it. The attach client's registry rejects it
+  (`EmbeddedTargetOnScreen`), and embedding hosts reject every other target
+  (`NotEmbedded`). Both validate through the same snapshot rules.
+- **Frame state.** `bmux_plugin::surface::embedded::EmbeddedSurface` wraps the
+  surface with its size and the state a `bmux_tui` frame carries beyond cells,
+  regions and selection: images and their occlusions, the terminal cursor, focus
+  and modal scopes, and metadata availability. Regions keep the full `bmux_tui` hit
+  interaction (`PluginSurfaceRegion::interaction`), so capture is lossless.
+- **Capture.** `EmbeddedSurface::from_prepared` and `from_frame` capture what a
+  producer painted: cells become one `CellBlock` (graphemes, wide symbols, every
+  style attribute including concealed text).
+- **One lowering.** `bmux_plugin::render_paint` paints `RenderOp`s into a
+  `bmux_tui` frame for both hosts. The attach client paints with terminal
+  semantics (`CellComposition::Replace`); embedding hosts overlay
+  (`CellComposition::Overlay`), so style a producer leaves unset keeps the host's
+  panel beneath it.
+- **Lifecycle.** `EmbeddedSurfaceHost` (one per producer activation) and its
+  producer handle `EmbeddedSurfacePort` keep published revisions apart from the
+  displayed one: the host acknowledges a revision only after its output reached
+  the terminal, and admits input only against that revision. Every region,
+  selection, semantic, image and focus identity is scoped to its resource, so
+  producers cannot collide or address each other. The wire contract id is
+  `bmux.surface.embedded.v1`.
 
 ## Producer models: push and pull
 

@@ -280,8 +280,9 @@ pub fn resolve_plugin_surface_rects(
                 pending.push(index);
                 None
             }
-            // Pane-attached content is painted in the pane's own stages.
-            PluginSurfaceTarget::Pane { .. } => None,
+            // Pane-attached content is painted in the pane's own stages; embedded
+            // surfaces never reach the attach client (publishing rejects them).
+            PluginSurfaceTarget::Pane { .. } | PluginSurfaceTarget::Embedded => None,
         };
         if let Some(rect) = rect {
             resolved.insert(index, rect);
@@ -2833,6 +2834,7 @@ mod tests {
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 key: None,
+                interaction: None,
                 local_id: "link".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: false,
@@ -2900,6 +2902,7 @@ mod tests {
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 key: None,
+                interaction: None,
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
@@ -2994,6 +2997,7 @@ mod tests {
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 key: None,
+                interaction: None,
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
@@ -3688,6 +3692,7 @@ mod tests {
             interactive_regions: vec![
                 bmux_plugin::surface::PluginSurfaceRegion {
                     key: None,
+                    interaction: None,
                     local_id: "whole".to_owned(),
                     rect: ExtensionRect::new(0, 0, 8, 4),
                     focusable: false,
@@ -3696,6 +3701,7 @@ mod tests {
                 },
                 bmux_plugin::surface::PluginSurfaceRegion {
                     key: None,
+                    interaction: None,
                     local_id: "inner".to_owned(),
                     rect: ExtensionRect::new(3, 1, 2, 1),
                     focusable: false,
