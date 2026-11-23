@@ -162,12 +162,8 @@ fn mutate(profile: &Profile, draws: &mut Draws) -> Profile {
                     5 => faults.kill = rate * 5.0,
                     6 => faults.signal_delay = rate * 5.0,
                     7 => faults.startup_query = rate * 5.0,
-                    8 if crate::profile::THREAD_SPAWN_FAULTS => {
-                        faults.thread_spawn = rate / 10.0;
-                    }
-                    8 => {}
-                    _ if crate::profile::WALL_CLOCK_JUMPS => faults.wall_clock = rate / 20.0,
-                    _ => {}
+                    8 => faults.thread_spawn = rate / 10.0,
+                    _ => faults.wall_clock = rate / 20.0,
                 }
             }
             4 => {

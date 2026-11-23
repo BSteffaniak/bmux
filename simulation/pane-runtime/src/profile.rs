@@ -72,25 +72,6 @@ impl Kind {
     }
 }
 
-/// Whether profiles turn thread spawn failures on (drawn, or by a guided mutation).
-///
-/// Off for now: `switchy_async`'s simulator expects the spawns of its own threads to succeed
-/// (`spawn_blocking`'s thread, and its executor workers), so a failing one panics the run there
-/// before the pane runtime's own failure paths matter. The draws stay, so turning it on shifts
-/// nothing. A profile with `threadspawn=` (or `SIMULATOR_THREAD_SPAWN_FAILURES`) still forces
-/// it.
-pub const THREAD_SPAWN_FAULTS: bool = false;
-
-/// Whether profiles turn wall clock jumps on (drawn, or by a guided mutation).
-///
-/// Off for now: simvar's harness measures each run's elapsed time on the simulated wall clock
-/// (`switchy::time::now()`, then `duration_since(..).unwrap()`) after the run, outside its
-/// panic catching, so a run whose clock ends behind where it started panics the fleet worker:
-/// the run disappears and the runs it cut short fail determinism checks. The draws stay, so
-/// turning it on shifts nothing. A profile with `clockjump=` (or `SIMULATOR_WALL_CLOCK_JUMPS`)
-/// still forces it.
-pub const WALL_CLOCK_JUMPS: bool = false;
-
 /// Rates of the simulated kernel's faults (see `switchy_pty::simulator::Faults`), and how
 /// often process ids are reused.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -232,15 +213,11 @@ impl Profile {
         // regression seeds without a profile keep theirs).
         if draw(5) == 0 {
             let rate = [0.005, 0.02][usize::try_from(draw(2)).unwrap_or(0)];
-            if THREAD_SPAWN_FAULTS {
-                profile.faults.thread_spawn = rate;
-            }
+            profile.faults.thread_spawn = rate;
         }
         if draw(4) == 0 {
             let rate = [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
-            if WALL_CLOCK_JUMPS {
-                profile.faults.wall_clock = rate;
-            }
+            profile.faults.wall_clock = rate;
         }
         profile
     }
@@ -442,8 +419,7 @@ mod tests {
             let parsed: Profile = profile.to_string().parse().unwrap();
             assert_eq!(parsed, profile, "seed {seed}");
         }
-        assert_eq!(spawns > 0, THREAD_SPAWN_FAULTS, "{spawns}");
-        assert_eq!(jumps > 0, WALL_CLOCK_JUMPS, "{jumps}");
+        assert!(spawns > 0 && jumps > 0, "{spawns} {jumps}");
         let forced: Profile = "threadspawn=0.01 clockjump=0.001".parse().unwrap();
         assert!(forced.faults.thread_spawn > 0.0 && forced.faults.wall_clock > 0.0);
         assert_eq!(forced.to_string().parse::<Profile>().unwrap(), forced);
