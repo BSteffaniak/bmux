@@ -38,13 +38,12 @@ use crate::{
     telemetry::Board,
 };
 
-mod kernel;
 mod ledger;
 mod panes;
 mod server;
 
 pub use ledger::Stats;
-use kernel::live_threads;
+use sim_support::kernel::live_threads;
 use ledger::State;
 
 /// The shell panes run.

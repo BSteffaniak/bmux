@@ -37,7 +37,7 @@ use sim_support::invariants::checked;
 use simvar::{Sim, SimBootstrap, SimConfig};
 use switchy_pty::{
     Signal,
-    simulator::{self, Config, Faults, Personality, ProcessState},
+    simulator::{self, Config, Faults, Personality},
 };
 use switchy_thread::{
     sync::{Arc, Mutex, mpsc},
@@ -744,12 +744,8 @@ fn check_group_ended(pid: u32, serial: Option<u64>, violation: &impl Fn(Invarian
     };
     checked(Invariant::GroupEnds);
     thread::sleep(Duration::from_secs(1));
-    let survivors: Vec<String> = simulator::snapshot()
-        .processes
-        .into_iter()
-        .filter(|p| {
-            p.session_serial == serial && p.group == pid && p.state == ProcessState::Running
-        })
+    let survivors: Vec<String> = sim_support::kernel::running()
+        .filter(|p| p.session_serial == serial && p.group == pid)
         .map(|p| format!("{} ({}, received {:?})", p.pid, p.program, p.signals))
         .collect();
     if !survivors.is_empty() {

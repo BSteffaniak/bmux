@@ -5,18 +5,16 @@ use std::sync::{Arc, atomic::Ordering};
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;
-use sim_support::invariants::checked;
-use switchy_pty::simulator;
-
-use super::{
-    Opening, Shared, draw, event,
+use sim_support::{
+    invariants::checked,
     kernel::{
-        alive, answered, killed_by_fault, leader_of, running_in, session_of, terminal_of,
+        killed_by_fault, running_in, running_process, session_of, session_serial_of, terminal_of,
         terminal_state,
     },
-    ledger::Opened,
-    random_size,
 };
+use switchy_pty::simulator;
+
+use super::{Opening, Shared, draw, event, ledger::Opened, random_size};
 use crate::{
     invariants::Invariant,
     telemetry::{Board, PaneView},
@@ -35,7 +33,7 @@ impl Shared {
         pid: u32,
         serial: u64,
     ) -> Option<String> {
-        match leader_of(serial) {
+        match session_of(serial) {
             Some(session) if session == pid => None,
             Some(session) => Some(format!("it is in session {session}")),
             None if killed_by_fault(serial) => None,
@@ -303,7 +301,7 @@ impl Shared {
                 let Some(serial) = current() else {
                     return true;
                 };
-                let Some((_, _, Some(terminal))) = alive(serial) else {
+                let Some(terminal) = running_process(serial).and_then(|p| p.terminal) else {
                     return true;
                 };
                 simulator::snapshot()
@@ -312,7 +310,7 @@ impl Shared {
                     .any(|t| t.name == terminal && (t.size.rows, t.size.cols) == (rows, cols))
             })
             .await;
-        if !sized && current().is_some_and(|serial| alive(serial).is_some()) {
+        if !sized && current().is_some_and(|serial| running_process(serial).is_some()) {
             let pid = panes.pid(pane).unwrap_or(0);
             self.violated(
                 Invariant::RequestedSize,
@@ -349,7 +347,7 @@ impl Shared {
         checked(Invariant::TypedInOrder);
         let pid = opened.pid;
         let reached = self
-            .settle(|| answered(pid, &opened.typed) || alive(opened.serial).is_none())
+            .settle(|| answered(pid, &opened.typed) || running_process(opened.serial).is_none())
             .await;
         if !reached {
             self.violated(
@@ -364,7 +362,7 @@ impl Shared {
             );
         }
         // 10. A pane whose program ended says so.
-        if alive(opened.serial).is_none() {
+        if running_process(opened.serial).is_none() {
             checked(Invariant::EndedSaysSo);
             if !self
                 .settle(|| panes.exited(pane) || panes.pid(pane) != Some(pid))
@@ -380,7 +378,7 @@ impl Shared {
                 );
             }
         }
-        let session = session_of(opened.serial);
+        let session = session_serial_of(opened.serial);
         // 11. Closing a pane leaves its siblings (its session's other panes) alone.
         let siblings = self.siblings_of(panes, pane);
         let signalled_before: usize = simulator::signal_log().len();
@@ -520,7 +518,7 @@ impl Shared {
             let Some(opened) = state.open.get_mut(&pane) else {
                 break 'begin Err((pane, panes));
             };
-            let Some(old_session) = session_of(opened.serial) else {
+            let Some(old_session) = session_serial_of(opened.serial) else {
                 return;
             };
             // Lines typed from now on go to the new program.
@@ -616,4 +614,24 @@ impl Shared {
             );
         }
     }
+}
+
+/// Whether `pid`'s terminal shows each of `lines` answered, in order.
+fn answered(pid: u32, lines: &[String]) -> bool {
+    let Some(terminal) = simulator::process_io(pid).and_then(|io| io.terminal) else {
+        return lines.is_empty();
+    };
+    // An interrupt typed while a program reads raw input (a querier waiting for its answers)
+    // is an ordinary byte, so it joins the next line.
+    let written =
+        String::from_utf8_lossy(&simulator::terminal_written(&terminal).unwrap_or_default())
+            .replace('\x03', "");
+    let mut rest = written.as_str();
+    lines.iter().all(|line| {
+        let answer = format!("got:{line}\r\n");
+        rest.find(&answer).is_some_and(|at| {
+            rest = &rest[at + answer.len()..];
+            true
+        })
+    })
 }

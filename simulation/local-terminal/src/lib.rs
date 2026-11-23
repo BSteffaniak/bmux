@@ -26,7 +26,7 @@ use sim_support::invariants::{checked, violated};
 use simvar::{Sim, SimBootstrap, SimConfig};
 use switchy_pty::{
     PtySize,
-    simulator::{self, Config, Faults, Personality, Process, ProcessState},
+    simulator::{self, Config, Faults, Personality, Process},
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 
@@ -175,10 +175,8 @@ async fn read_frames(client: &mut DuplexStream, seen: &mut Seen, stop: impl Fn(&
 
 /// The shell's terminal, while it runs.
 fn shell_terminal() -> Option<String> {
-    simulator::snapshot()
-        .processes
-        .into_iter()
-        .find(|p| p.program == "sh" && p.state == ProcessState::Running)
+    sim_support::kernel::running()
+        .find(|p| p.program == "sh")
         .and_then(|p| p.terminal)
 }
 
@@ -262,12 +260,7 @@ fn final_checks(
             "the shell's slot is not empty after it exited",
         );
     }
-    let running: Vec<u32> = simulator::snapshot()
-        .processes
-        .into_iter()
-        .filter(|p| p.state == ProcessState::Running)
-        .map(|p| p.pid)
-        .collect();
+    let running: Vec<u32> = sim_support::kernel::running().map(|p| p.pid).collect();
     if !running.is_empty() {
         fail(
             violations,

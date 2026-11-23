@@ -9,12 +9,14 @@ use std::{
 
 use bmux_pane_runtime_plugin::simulation::Panes;
 use bmux_simvar_tui::Tone;
-use sim_support::invariants::checked;
+use sim_support::{
+    invariants::checked,
+    kernel::{detached, killed_by_fault, live_threads, running_in, running_process},
+};
 use switchy_pty::simulator::{self, ProcessState};
 
 use super::{
     SHELL, Shared, draw, event,
-    kernel::{alive, detached, killed_by_fault, live_threads, running_in},
     ledger::{State, Witness},
 };
 use crate::{invariants::Invariant, telemetry::Board};
@@ -90,7 +92,7 @@ impl Shared {
             .open
             .keys()
             .filter_map(|pane| panes.program_serial(*pane))
-            .filter(|serial| alive(*serial).is_some())
+            .filter(|serial| running_process(*serial).is_some())
             .collect();
         let before = simulator::signal_log().len();
         let bystander = Panes::recovering(SHELL, &self.records);

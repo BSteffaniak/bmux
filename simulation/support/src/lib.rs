@@ -42,6 +42,7 @@ const INTERVAL: Duration = Duration::from_millis(100);
 const PULSE: Duration = Duration::from_millis(250);
 
 pub mod invariants;
+pub mod kernel;
 
 static INTEREST: OnceLock<Arc<Interest>> = OnceLock::new();
 
