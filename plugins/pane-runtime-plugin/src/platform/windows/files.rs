@@ -9,6 +9,23 @@ pub(crate) use super::native::{
     current_executable, executable_sha256, process_id, retain_executable,
 };
 
+/// `path`'s identity: size, attributes, and last-write and creation times.
+pub(crate) fn file_identity(path: &Path) -> Option<super::FileIdentity> {
+    use std::os::windows::fs::MetadataExt as _;
+    // simulation-safe: native Windows backend only; simulated targets track no identity
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    Some(super::FileIdentity([
+        metadata.file_size(),
+        u64::from(metadata.file_attributes()),
+        metadata.last_write_time(),
+        metadata.creation_time(),
+        0,
+        0,
+        0,
+        0,
+    ]))
+}
+
 /// Windows executables are identified by a digest their launcher attests.
 pub(crate) const EXECUTABLE_MAPPED: bool = false;
 

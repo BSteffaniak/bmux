@@ -10794,6 +10794,8 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 
 struct ManagerLockHolder {
     operation: &'static str,
+    /// The call that took the lock.
+    site: &'static std::panic::Location<'static>,
     started: switchy_time::Instant,
 }
 
@@ -10975,18 +10977,21 @@ impl ServerSessionRuntimeAdapter {
         PinReservation::acquire(&self.retained_pin_bytes, 2 * RESPONSE_OUTPUT_BUDGET)
     }
 
-    fn current_holder_snapshot(&self) -> Option<(&'static str, u128)> {
+    fn current_holder_snapshot(
+        &self,
+    ) -> Option<(&'static str, &'static std::panic::Location<'static>, u128)> {
         self.current_holder.lock().ok().and_then(|holder| {
             holder
                 .as_ref()
-                .map(|h| (h.operation, h.started.elapsed().as_millis()))
+                .map(|h| (h.operation, h.site, h.started.elapsed().as_millis()))
         })
     }
 
-    fn mark_holder_start(&self, operation: &'static str) {
+    fn mark_holder_start(&self, operation: &'static str, site: &'static std::panic::Location<'static>) {
         if let Ok(mut holder) = self.current_holder.lock() {
             *holder = Some(ManagerLockHolder {
                 operation,
+                site,
                 started: switchy_time::Instant::now(),
             });
         }
@@ -10998,15 +11003,19 @@ impl ServerSessionRuntimeAdapter {
         }
     }
 
+    // Warnings name the calling site, so every holder is identifiable.
+    #[track_caller]
     fn with_lock<R>(&self, f: impl FnOnce(&mut SessionRuntimeManager) -> R) -> Option<R> {
         self.with_lock_named("unknown", f)
     }
 
+    #[track_caller]
     fn with_lock_named<R>(
         &self,
         operation: &'static str,
         f: impl FnOnce(&mut SessionRuntimeManager) -> R,
     ) -> Option<R> {
+        let site = std::panic::Location::caller();
         let wait_started = switchy_time::Instant::now();
         let mut guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
@@ -11014,13 +11023,15 @@ impl ServerSessionRuntimeAdapter {
             let holder = self.current_holder_snapshot();
             warn!(
                 operation,
+                %site,
                 wait_ms = wait.as_millis(),
-                holder_operation = holder.map(|(op, _)| op),
-                holder_ms = holder.map(|(_, ms)| ms),
+                holder_operation = holder.map(|(op, ..)| op),
+                holder_site = holder.map(|(_, site, _)| site.to_string()),
+                holder_ms = holder.map(|(.., ms)| ms),
                 "pane runtime manager lock wait exceeded hot-path budget"
             );
         }
-        self.mark_holder_start(operation);
+        self.mark_holder_start(operation, site);
         let hold_started = switchy_time::Instant::now();
         let result = f(&mut guard);
         let revisions = std::mem::take(&mut guard.pending_layout_revisions);
@@ -11031,6 +11042,7 @@ impl ServerSessionRuntimeAdapter {
         if hold > Duration::from_millis(10) {
             warn!(
                 operation,
+                %site,
                 hold_ms = hold.as_millis(),
                 "pane runtime manager lock hold exceeded hot-path budget"
             );
@@ -11038,15 +11050,18 @@ impl ServerSessionRuntimeAdapter {
         Some(result)
     }
 
+    #[track_caller]
     fn with_lock_read<R>(&self, f: impl FnOnce(&SessionRuntimeManager) -> R) -> Option<R> {
         self.with_lock_read_named("unknown", f)
     }
 
+    #[track_caller]
     fn with_lock_read_named<R>(
         &self,
         operation: &'static str,
         f: impl FnOnce(&SessionRuntimeManager) -> R,
     ) -> Option<R> {
+        let site = std::panic::Location::caller();
         let wait_started = switchy_time::Instant::now();
         let guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
@@ -11054,13 +11069,15 @@ impl ServerSessionRuntimeAdapter {
             let holder = self.current_holder_snapshot();
             warn!(
                 operation,
+                %site,
                 wait_ms = wait.as_millis(),
-                holder_operation = holder.map(|(op, _)| op),
-                holder_ms = holder.map(|(_, ms)| ms),
+                holder_operation = holder.map(|(op, ..)| op),
+                holder_site = holder.map(|(_, site, _)| site.to_string()),
+                holder_ms = holder.map(|(.., ms)| ms),
                 "pane runtime manager read lock wait exceeded hot-path budget"
             );
         }
-        self.mark_holder_start(operation);
+        self.mark_holder_start(operation, site);
         let hold_started = switchy_time::Instant::now();
         let result = f(&guard);
         let hold = hold_started.elapsed();
@@ -11068,6 +11085,7 @@ impl ServerSessionRuntimeAdapter {
         if hold > Duration::from_millis(10) {
             warn!(
                 operation,
+                %site,
                 hold_ms = hold.as_millis(),
                 "pane runtime manager read lock hold exceeded hot-path budget"
             );

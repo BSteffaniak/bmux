@@ -62,6 +62,12 @@ pub(crate) use target::{
     bounded_probe_output, parse_ps_process_entry, send_process_signal_command,
 };
 
+/// A file as the operating system identifies it (its device, inode, size, mode and change
+/// times where it has them): any rewrite or replacement changes it. `None` where it cannot be
+/// read, or where a target does not track it (simulated), which callers treat as changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity(pub(crate) [u64; 8]);
+
 /// When a process started, as the operating system records it: with its pid, an identity no
 /// later process shares (a reused pid has a different start).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

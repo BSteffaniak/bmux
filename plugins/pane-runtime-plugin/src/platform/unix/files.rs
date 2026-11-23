@@ -6,6 +6,25 @@ pub(crate) use super::native::{
     current_executable, executable_sha256, process_id, retain_executable,
 };
 
+/// `path`'s identity: device, inode, size, mode, and modification and status-change times
+/// (which no unprivileged process can set back).
+pub(crate) fn file_identity(path: &Path) -> Option<super::FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    // simulation-safe: native Unix backend only; simulated targets track no identity
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let signed = |value: i64| value.cast_unsigned();
+    Some(super::FileIdentity([
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        u64::from(metadata.mode()),
+        signed(metadata.mtime()),
+        signed(metadata.mtime_nsec()),
+        signed(metadata.ctime()),
+        signed(metadata.ctime_nsec()),
+    ]))
+}
+
 /// Whether this process's executable is identified by its mapped image (Linux), rather than by
 /// a digest its launcher attests.
 pub(crate) const EXECUTABLE_MAPPED: bool = cfg!(target_os = "linux");

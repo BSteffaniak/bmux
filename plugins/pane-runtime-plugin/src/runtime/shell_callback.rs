@@ -10,9 +10,7 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     // images.
     enum Images {}
     let images = crate::run_shared::run_shared::<Images, _>(|| {
-        switchy_thread::sync::Mutex::new(
-            std::collections::BTreeMap::<PathBuf, (PathBuf, String)>::new(),
-        )
+        switchy_thread::sync::Mutex::new(std::collections::BTreeMap::<PathBuf, Image>::new())
     });
     let mut images = images
         .lock()
@@ -20,11 +18,28 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     switchy_fs::sync::create_dir_all(root)?;
     let root = switchy_fs::sync::canonicalize(root)?;
     let directory = root.join("callback-images");
-    if let Some((path, hash)) = images.get(&root) {
+    if let Some(image) = images.get_mut(&root) {
+        // Every pane spawns with the manager held, so re-hashing a large
+        // executable per pane stalls everything else. The verified file,
+        // unchanged since (same identity), needs no fresh digest.
+        if image
+            .identity
+            .is_some_and(|identity| crate::platform::files::file_identity(&image.path) == Some(identity))
+        {
+            return Ok(image.path.clone());
+        }
         // Reuse the expected identity, not a fresh digest of possibly corrupt
         // cached bytes. This also works after the original executable is gone.
-        return crate::platform::files::retain_executable(path, &directory, "shell-callback", hash)
-            .map_err(anyhow::Error::msg);
+        let path = crate::platform::files::retain_executable(
+            &image.path,
+            &directory,
+            "shell-callback",
+            &image.hash,
+        )
+        .map_err(anyhow::Error::msg)?;
+        image.identity = crate::platform::files::file_identity(&path);
+        image.path.clone_from(&path);
+        return Ok(path);
     }
     let source = switchy_fs::sync::canonicalize(
         crate::platform::files::current_executable().context("locate shell callback executable")?,
@@ -46,13 +61,48 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
             .map_err(anyhow::Error::msg)?;
     // Images outlive this manager: nested shells and recovery can still need
     // them. Pruning is deliberately not part of pane teardown.
-    images.insert(root, (path.clone(), hash));
+    let identity = crate::platform::files::file_identity(&path);
+    images.insert(
+        root,
+        Image {
+            path: path.clone(),
+            hash,
+            identity,
+        },
+    );
     Ok(path)
+}
+
+/// A retained callback image: where it is, its expected digest, and its file
+/// identity when its contents were last verified.
+struct Image {
+    path: PathBuf,
+    hash: String,
+    identity: Option<crate::platform::FileIdentity>,
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// A verified image is reused while its file is unchanged, and any change
+    /// to it is caught again (here, rewriting it with bytes of the same length).
+    #[test]
+    fn prepared_images_are_reused_until_their_file_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let first = super::prepare(&root).unwrap();
+        let identity = crate::platform::files::file_identity(&first);
+        assert!(identity.is_some());
+        assert_eq!(super::prepare(&root).unwrap(), first);
+        assert_eq!(crate::platform::files::file_identity(&first), identity);
+
+        let length = usize::try_from(std::fs::metadata(&first).unwrap().len()).unwrap();
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&first, vec![b'x'; length]).unwrap();
+        assert_ne!(crate::platform::files::file_identity(&first), identity);
+        assert!(super::prepare(&root).is_err());
+    }
 
     #[test]
     fn cached_callback_survives_source_removal_and_rejects_corruption() {

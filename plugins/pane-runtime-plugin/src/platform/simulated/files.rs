@@ -7,6 +7,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use switchy_fs::sync::{File, OpenOptions, Permissions};
 
+/// Simulated files track no identity, so every retained image is verified again, exactly as
+/// before identities were kept.
+pub(crate) const fn file_identity(_path: &Path) -> Option<super::FileIdentity> {
+    None
+}
+
 /// Where the stand-in for this process's executable lives in the run's file system.
 const EXECUTABLE: &str = "/opt/bmux/bin/bmux";
 
