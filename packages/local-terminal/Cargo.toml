@@ -17,7 +17,6 @@ switchy_async = { workspace = true, features = ["macros", "time"] }
 tokio         = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
 switchy_async = { workspace = true, features = [
     "macros",
     "rt-multi-thread",

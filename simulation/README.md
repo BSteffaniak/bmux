@@ -26,10 +26,14 @@ cargo sim pane-runtime --tui                       # the dashboard: run continuo
 cargo sim pane-runtime --tui 42                    # ... with the run of seed 42 open
 cargo sim pane-runtime --fleet                     # continuously, printing findings
 cargo sim pty --regression                         # its pinned seeds
+cargo sim pane-runtime --check                     # is everything it links deterministic?
 ```
 
 `cargo sim NAME [ARGS]` (an alias for `cargo xtask sim`) builds and runs member
-`NAME` in release mode. Runs are configured through simvar's environment:
+`NAME` in release mode. `--check` instead runs `sim-check` (`check/`), which checks
+everything `NAME` links with `switchy_cargo`: each local crate scanned by the rules in
+its manifest's `[package.metadata.switchy.simulation]`, and every other crate on the
+audit list in `determinism.toml`. Runs are configured through simvar's environment:
 
 | Variable | Meaning |
 | --- | --- |

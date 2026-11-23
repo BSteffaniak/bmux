@@ -242,12 +242,21 @@ fn simulate(args: &[String]) -> Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| error("xtask has no parent directory"))?;
-    let status = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let mut command = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
         .args(["run", "--release", "--manifest-path"])
-        .arg(root.join("simulation").join("Cargo.toml"))
-        .args(["--package", name, "--"])
-        // `cargo sim pty -- --tui` and `cargo sim pty --tui` mean the same.
-        .args(args[1..].iter().skip_while(|arg| *arg == "--"))
+        .arg(root.join("simulation").join("Cargo.toml"));
+    if args[1..].iter().any(|arg| arg == "--check") {
+        // `cargo sim NAME --check`: check what NAME links is deterministic (sim-check), rather
+        // than running it.
+        command.args(["--package", "sim-check", "--", name]);
+    } else {
+        command
+            .args(["--package", name, "--"])
+            // `cargo sim pty -- --tui` and `cargo sim pty --tui` mean the same.
+            .args(args[1..].iter().skip_while(|arg| *arg == "--"));
+    }
+    let status = command
         .status()
         .map_err(|e| error(format!("cannot run cargo: {e}")))?;
     if status.success() {

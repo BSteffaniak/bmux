@@ -19,7 +19,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering}, // simulation-safe: the run's own server generation
     },
     time::Duration,
 };
@@ -131,7 +131,7 @@ impl Stats {
         ] {
             simvar::record(value);
         }
-        if std::env::var_os("PANE_RUNTIME_SIM_STATS").is_some() {
+        if crate::host_set("PANE_RUNTIME_SIM_STATS") {
             eprintln!("pane-runtime stats: {self:?}");
         }
     }
@@ -209,7 +209,7 @@ pub struct Shared {
 /// Record an event on the run's timeline (and print it with `PANE_RUNTIME_SIM_EVENTS`).
 fn event(kind: &str, label: impl Into<String>, tone: Tone) {
     let label = label.into();
-    if std::env::var_os("PANE_RUNTIME_SIM_EVENTS").is_some() {
+    if crate::host_set("PANE_RUNTIME_SIM_EVENTS") {
         eprintln!("[{:?}] {kind}: {label}", switchy_time::Instant::now());
     }
     sim_support::event(kind, label, tone);
@@ -220,7 +220,7 @@ fn event(kind: &str, label: impl Into<String>, tone: Tone) {
 /// failures (which may pause here).
 fn violated(violations: &mut Vec<String>, message: String) {
     Board::failed(&message);
-    if std::env::var_os("PANE_RUNTIME_SIM_EVENTS").is_some() {
+    if crate::host_set("PANE_RUNTIME_SIM_EVENTS") {
         eprintln!("[{:?}] VIOLATION: {message}", switchy_time::Instant::now());
     }
     sim_support::failure(&message);
@@ -492,12 +492,12 @@ impl Shared {
                 switchy_async::time::sleep(Duration::from_millis(1)).await;
                 continue;
             };
-            if std::env::var_os("PANE_RUNTIME_SIM_TRACE").is_some() {
+            if crate::host_set("PANE_RUNTIME_SIM_TRACE") {
                 eprintln!("driver {driver} chose {}", kind.name());
             }
             // Debugging replays that part: a draw from the run's generator (taken, so the
             // probed run differs from an unprobed one, but alike in every probed replay).
-            if std::env::var_os("PANE_RUNTIME_SIM_RNG_PROBE").is_some() {
+            if crate::host_set("PANE_RUNTIME_SIM_RNG_PROBE") {
                 eprintln!(
                     "probe driver {driver} {} rng {}",
                     kind.name(),

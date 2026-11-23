@@ -245,3 +245,41 @@ exemption.
 
   Nothing else differed in 1000 pane runtime runs (guided ones too), and 300 each of pty
   and local terminal.
+
+### 20.2 (MoosicBox `f28ef693f`)
+
+- **The check.** `switchy_cargo` resolves a simulation's graph with `cargo metadata`:
+  normal dependencies for the host, not entering proc macros. `cargo sim NAME --check` runs
+  it through `simulation/check` (`sim-check`), a separate member, so the check's own
+  dependencies stay out of the simulations' graphs. CI runs it for the three simulations.
+- **Local crates** are scanned by the rules bmux's per-crate scan had grown, now shared in
+  `switchy_cargo`. Two changes:
+  - Files loaded only by `#[cfg(test)] mod` declarations are skipped.
+  - Lines several patterns match are reported once.
+
+  Rules moved from the twelve `tests/primitives.rs` files into the crates' manifests, and
+  `bmux_sim_primitives_check` is gone. Rules naming missing files are errors.
+- **What was found.** Run over the whole graph, the rules reported about 700 lines in 18
+  crates never scanned before. An instrumented build of the pane runtime simulation (800
+  runs, standard and guided) settled which of them run: in 16 of the crates not one line ran.
+  - Eight run only around runs (the dashboard and TUI stack, the client, terminal I/O,
+    benchmarks, install manifests).
+  - Six are linked by code the simulations run, but not exercised by it: configuration,
+    IPC models, the plugin SDK, performance telemetry, presentation facts. Each says to drop
+    its `runs = false` before a simulation runs it.
+  - `bmux_color`'s one finding is a constant table (marked safe). `bmux_cell_geometry`'s
+    are in a test-only module, which the scanner fix above now skips.
+  - The simulations' own crates (the workload, `sim_support`) state what of them is
+    harness. The pane runtime simulation's host switches go through one annotated helper.
+- **External crates.** `simulation/determinism.toml` lists all 256 the simulations link.
+  - 26 `controlled`: switchy and simvar.
+  - 19 `restricted`: `uuid`, `rand`, `getrandom`, `tokio`, the hashers, `tempfile` and
+    others, whose non-deterministic entry points the rules forbid.
+  - 59 `pure`.
+  - 148 `unaudited`: a baseline of 2026-11-22, pinned to exact versions.
+- **Not yet.**
+  - The scan is still line-based (the `syn`-based scan with path resolution is still to
+    come).
+  - `runs = false` is a claim nothing checks at run time yet (20.4, or a nightly coverage
+    run).
+  - The 148 baseline crates are still to be audited.

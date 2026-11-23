@@ -26,3 +26,10 @@ tokio                    = { workspace = true, features = ["sync"] }
 default = []
 
 fail-on-warnings = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# The harness around runs: switches read before any run (main.rs), the explorer (which starts
+# and compares processes), the guide (which steers a fleet across runs by design: each run's
+# profile is in its replay command) and dashboard telemetry (which never changes a run).
+exempt = ["main.rs", "explore.rs", "guide.rs", "telemetry.rs"]

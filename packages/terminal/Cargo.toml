@@ -31,3 +31,8 @@ windows-sys = { workspace = true, features = [
 [features]
 default          = []
 fail-on-warnings = ["bmux_keyboard/fail-on-warnings"]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "Terminal control of the user's own terminal, client side; never inside a run."

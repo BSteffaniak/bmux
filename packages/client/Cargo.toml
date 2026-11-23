@@ -54,3 +54,8 @@ serde = ["bmux_codec/serde", "bmux_keyboard/serde"]
 
 [package.metadata.cargo-machete]
 ignored = ["bmux_server"] # dev-dependency used in integration tests
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "The client; simulations drive the pane runtime in-process, without one."

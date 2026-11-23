@@ -58,6 +58,7 @@ pub const fn xterm_256(index: u8) -> Rgb {
 /// matching against their defaults would produce unpredictable output.
 #[must_use]
 pub fn nearest_256(color: Rgb) -> u8 {
+    // simulation-safe: a constant table, computed once the same way in every run.
     static EXTENDED: OnceLock<[Oklab; 240]> = OnceLock::new();
     let palette = EXTENDED.get_or_init(|| {
         std::array::from_fn(|offset| {

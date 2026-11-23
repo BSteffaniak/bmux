@@ -79,7 +79,6 @@ members = [
     "packages/server",
     "packages/session-state",
     "packages/session/models",
-    "packages/sim-primitives-check",
     "packages/snapshot-protocol",
     "packages/snapshot-runtime",
     "packages/sandbox-harness",
@@ -318,7 +317,6 @@ bmux_scene_protocol_render = { version = "0.0.1-alpha.4", default-features = fal
 bmux_server = { version = "0.0.1-alpha.4", default-features = false, path = "packages/server" }
 bmux_session_models = { version = "0.0.1-alpha.4", default-features = false, path = "packages/session/models" }
 bmux_session_state = { version = "0.0.1-alpha.4", default-features = false, path = "packages/session-state" }
-bmux_sim_primitives_check = { version = "0.0.1-alpha.4", default-features = false, path = "packages/sim-primitives-check" }
 bmux_simvar_tui = { version = "0.0.1-alpha.4", default-features = false, path = "packages/simvar-tui" }
 bmux_slots = { version = "0.0.1-alpha.4", default-features = false, path = "packages/slots" }
 bmux_snapshot_protocol = { version = "0.0.1-alpha.4", default-features = false, path = "packages/snapshot-protocol" }

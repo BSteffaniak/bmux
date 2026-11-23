@@ -20,3 +20,9 @@ switchy_thread      = { workspace = true, features = ["simulator"] }
 default = []
 
 fail-on-warnings = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# The harness around runs: the dashboard and its telemetry (which never changes a run, so it
+# may keep real time), fleets, and the regression runner (which starts processes).
+exempt = ["lib.rs"]

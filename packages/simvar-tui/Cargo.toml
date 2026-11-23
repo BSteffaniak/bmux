@@ -34,3 +34,8 @@ fail-on-warnings = [
     "bmux_tui_components/fail-on-warnings",
     "simvar_observer/fail-on-warnings",
 ]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "The simulation dashboard: it watches runs from outside them."

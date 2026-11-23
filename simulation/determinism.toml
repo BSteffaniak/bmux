@@ -1,0 +1,1529 @@
+# What `cargo sim NAME --check` (switchy_cargo) holds every simulation to, beyond its own rules.
+# Each crate a simulation links says what of it runs in simulations in its manifest's
+# [package.metadata.switchy.simulation]; see AGENTS.md.
+
+# Forbidden in every crate a simulation runs, on top of switchy_cargo's list.
+forbid = [
+    # This process's executable goes through the pane runtime's platform layer.
+    "bmux_plugin::retain_executable",
+    "bmux_plugin::executable_sha256",
+]
+
+# Every crate the simulations link from a registry or git repository, as with `cargo vet`: a
+# crate (or version) not covered here fails the check until it is audited.
+#
+# Verdicts: `controlled` (the simulators), `pure` (deterministic in itself), `restricted` (its
+# non-deterministic entry points are forbidden by the rules; the reason names them), and
+# `unaudited` (accepted as it was on the baseline's date, pinned to that version).
+
+[[audit]]
+name = "adler2"
+version = "^2"
+verdict = "pure"
+reason = "Adler-32."
+
+[[audit]]
+name = "ahash"
+version = "^0.8"
+verdict = "restricted"
+reason = "A randomly seeded hasher; reached only through hash maps, which scanned crates may not use."
+
+[[audit]]
+name = "aho-corasick"
+version = "^1"
+verdict = "pure"
+reason = "String searching."
+
+[[audit]]
+name = "anyhow"
+version = "^1"
+verdict = "pure"
+reason = "Error values (backtraces only when RUST_BACKTRACE asks)."
+
+[[audit]]
+name = "atomic-waker"
+version = "=1.1.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "base64"
+version = "^0.22"
+verdict = "pure"
+reason = "Base64 encoding."
+
+[[audit]]
+name = "base64"
+version = "^0.23"
+verdict = "pure"
+reason = "Base64 encoding."
+
+[[audit]]
+name = "bitflags"
+version = "^2"
+verdict = "pure"
+reason = "Flag types."
+
+[[audit]]
+name = "block-buffer"
+version = "^0.12"
+verdict = "pure"
+reason = "Hash block buffering."
+
+[[audit]]
+name = "block2"
+version = "=0.6.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "btparse"
+version = "=0.2.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "bytes"
+version = "^1"
+verdict = "pure"
+reason = "Byte buffers."
+
+[[audit]]
+name = "cfg-if"
+version = "^1"
+verdict = "pure"
+reason = "Conditional compilation macro."
+
+[[audit]]
+name = "chrono"
+version = "=0.4.45"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "color-backtrace"
+version = "=0.7.4"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "colored"
+version = "=3.1.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "core-foundation"
+version = "=0.10.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "core-foundation-sys"
+version = "=0.8.7"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "cpufeatures"
+version = "^0.3"
+verdict = "pure"
+reason = "CPU feature detection (fixed per host)."
+
+[[audit]]
+name = "crc32fast"
+version = "^1"
+verdict = "pure"
+reason = "CRC-32."
+
+[[audit]]
+name = "crossbeam-channel"
+version = "=0.5.17"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "crossbeam-utils"
+version = "=0.8.23"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "crypto-common"
+version = "^0.2"
+verdict = "pure"
+reason = "Cryptography traits."
+
+[[audit]]
+name = "ctrlc"
+version = "=3.5.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "deranged"
+version = "=0.5.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "digest"
+version = "^0.11"
+verdict = "pure"
+reason = "Hash function traits."
+
+[[audit]]
+name = "dispatch2"
+version = "=0.3.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "either"
+version = "^1"
+verdict = "pure"
+reason = "A sum type."
+
+[[audit]]
+name = "equivalent"
+version = "^1"
+verdict = "pure"
+reason = "Comparison traits."
+
+[[audit]]
+name = "errno"
+version = "=0.3.15"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "fallible-iterator"
+version = "^0.3"
+verdict = "pure"
+reason = "Iterator traits."
+
+[[audit]]
+name = "fallible-streaming-iterator"
+version = "^0.1"
+verdict = "pure"
+reason = "Iterator traits."
+
+[[audit]]
+name = "fastrand"
+version = "^2"
+verdict = "restricted"
+reason = "Thread-local generator seeded from the OS. No scanned crate may call it (rand-like entry points are forbidden); reached only inside other dependencies."
+
+[[audit]]
+name = "fdeflate"
+version = "=0.3.7"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "flate2"
+version = "=1.1.11"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "flume"
+version = "=0.12.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "fnv"
+version = "=1.0.7"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "foldhash"
+version = "^0.2"
+verdict = "restricted"
+reason = "A randomly seeded hasher; reached only through hash maps, which scanned crates may not use."
+
+[[audit]]
+name = "form_urlencoded"
+version = "^1"
+verdict = "pure"
+reason = "Form encoding."
+
+[[audit]]
+name = "futures"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-channel"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-core"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-executor"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-io"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-sink"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-task"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "futures-util"
+version = "=0.3.34"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "genawaiter"
+version = "=0.99.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "genawaiter-macro"
+version = "=0.99.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "getrandom"
+version = "^0.2"
+verdict = "restricted"
+reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+
+[[audit]]
+name = "getrandom"
+version = "^0.3"
+verdict = "restricted"
+reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+
+[[audit]]
+name = "getrandom"
+version = "^0.4"
+verdict = "restricted"
+reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+
+[[audit]]
+name = "h2"
+version = "=0.4.20"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hashbrown"
+version = "^0.14"
+verdict = "restricted"
+reason = "Iteration order follows a random seed; HashMap and HashSet are forbidden in scanned crates (BTreeMap instead)."
+
+[[audit]]
+name = "hashbrown"
+version = "^0.17"
+verdict = "restricted"
+reason = "Iteration order follows a random seed; HashMap and HashSet are forbidden in scanned crates (BTreeMap instead)."
+
+[[audit]]
+name = "hashlink"
+version = "=0.9.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hostname"
+version = "=0.4.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "http"
+version = "=1.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "http-body"
+version = "=1.1.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "http-body-util"
+version = "=0.1.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "httparse"
+version = "=1.10.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "httpdate"
+version = "=1.0.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hybrid-array"
+version = "^0.4"
+verdict = "pure"
+reason = "Fixed-size arrays."
+
+[[audit]]
+name = "hyper"
+version = "=1.12.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hyper-rustls"
+version = "=0.27.10"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hyper-timeout"
+version = "=0.5.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hyper-util"
+version = "=0.1.21"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "hyperchad_docs_config"
+version = "=0.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "iana-time-zone"
+version = "=0.1.65"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_collections"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_locale_core"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_normalizer"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_normalizer_data"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_properties"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_properties_data"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "icu_provider"
+version = "=2.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "idna"
+version = "=1.1.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "idna_adapter"
+version = "=1.2.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "if-addrs"
+version = "=0.13.4"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "if-addrs"
+version = "=0.15.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "indexmap"
+version = "^2"
+verdict = "restricted"
+reason = "Insertion-ordered, but its default hasher is randomly seeded; HashMap-style use is forbidden in scanned crates."
+
+[[audit]]
+name = "ipnet"
+version = "=2.12.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "itertools"
+version = "=0.15.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "itoa"
+version = "^1"
+verdict = "pure"
+reason = "Integer formatting."
+
+[[audit]]
+name = "lazy_static"
+version = "=1.5.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "lexical"
+version = "^7"
+verdict = "pure"
+reason = "Number parsing and formatting."
+
+[[audit]]
+name = "lexical-core"
+version = "^1"
+verdict = "pure"
+reason = "Number parsing and formatting."
+
+[[audit]]
+name = "lexical-parse-float"
+version = "^1"
+verdict = "pure"
+reason = "Number parsing."
+
+[[audit]]
+name = "lexical-parse-integer"
+version = "^1"
+verdict = "pure"
+reason = "Number parsing."
+
+[[audit]]
+name = "lexical-util"
+version = "^1"
+verdict = "pure"
+reason = "Number parsing helpers."
+
+[[audit]]
+name = "lexical-write-float"
+version = "^1"
+verdict = "pure"
+reason = "Number formatting."
+
+[[audit]]
+name = "lexical-write-integer"
+version = "^1"
+verdict = "pure"
+reason = "Number formatting."
+
+[[audit]]
+name = "libc"
+version = "=0.2.191"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "libloading"
+version = "=0.9.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "libsqlite3-sys"
+version = "=0.30.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "litemap"
+version = "=0.8.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "lock_api"
+version = "=0.4.14"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "log"
+version = "=0.4.35"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "matchers"
+version = "=0.2.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "mdns-sd"
+version = "=0.21.7"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "memchr"
+version = "^2"
+verdict = "pure"
+reason = "Byte searching."
+
+[[audit]]
+name = "miniz_oxide"
+version = "=0.8.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "miniz_oxide"
+version = "=0.9.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "mio"
+version = "=1.2.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "moosicbox_assert"
+version = "=0.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "moosicbox_env_utils"
+version = "=0.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "moosicbox_log_runtime"
+version = "=0.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "moosicbox_profiles"
+version = "=0.5.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "nix"
+version = "=0.32.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "nu-ansi-term"
+version = "=0.50.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "num-conv"
+version = "=0.2.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "num-traits"
+version = "^0.2"
+verdict = "pure"
+reason = "Numeric traits."
+
+[[audit]]
+name = "objc2"
+version = "=0.6.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "objc2-encode"
+version = "=4.1.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "once_cell"
+version = "=1.21.4"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "opentelemetry"
+version = "=0.33.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "opentelemetry-http"
+version = "=0.33.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "opentelemetry-otlp"
+version = "=0.33.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "opentelemetry-proto"
+version = "=0.33.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "opentelemetry_sdk"
+version = "=0.33.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "percent-encoding"
+version = "^2"
+verdict = "pure"
+reason = "URL percent-encoding."
+
+[[audit]]
+name = "pin-project"
+version = "^1"
+verdict = "pure"
+reason = "Pin projection macros."
+
+[[audit]]
+name = "pin-project-lite"
+version = "^0.2"
+verdict = "pure"
+reason = "Pin projection macros."
+
+[[audit]]
+name = "pin-utils"
+version = "^0.1"
+verdict = "pure"
+reason = "Pin helpers."
+
+[[audit]]
+name = "png"
+version = "=0.18.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "potential_utf"
+version = "=0.1.6"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "powerfmt"
+version = "=0.2.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "ppv-lite86"
+version = "=0.2.21"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "prost"
+version = "=0.14.6"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "prost-types"
+version = "=0.14.6"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rand"
+version = "^0.8"
+verdict = "restricted"
+reason = "rand:: is forbidden by the shared rules; randomness comes from switchy_random."
+
+[[audit]]
+name = "rand"
+version = "^0.9"
+verdict = "restricted"
+reason = "rand:: is forbidden by the shared rules; randomness comes from switchy_random."
+
+[[audit]]
+name = "rand_chacha"
+version = "^0.3"
+verdict = "restricted"
+reason = "Reached only through rand, which the shared rules forbid."
+
+[[audit]]
+name = "rand_chacha"
+version = "^0.9"
+verdict = "restricted"
+reason = "Reached only through rand, which the shared rules forbid."
+
+[[audit]]
+name = "rand_core"
+version = "^0.10"
+verdict = "restricted"
+reason = "Reached only through rand, which the shared rules forbid."
+
+[[audit]]
+name = "rand_core"
+version = "^0.6"
+verdict = "restricted"
+reason = "Reached only through rand, which the shared rules forbid."
+
+[[audit]]
+name = "rand_core"
+version = "^0.9"
+verdict = "restricted"
+reason = "Reached only through rand, which the shared rules forbid."
+
+[[audit]]
+name = "regex"
+version = "^1"
+verdict = "pure"
+reason = "Regular expressions (its caches are per regex, not seeded or ordered by time)."
+
+[[audit]]
+name = "regex-automata"
+version = "^0.4"
+verdict = "pure"
+reason = "Regular expression engine."
+
+[[audit]]
+name = "regex-syntax"
+version = "^0.8"
+verdict = "pure"
+reason = "Regular expression parsing."
+
+[[audit]]
+name = "reqwest"
+version = "=0.13.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "ring"
+version = "=0.17.14"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "roxmltree"
+version = "=0.20.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "roxmltree"
+version = "=0.21.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rupnp"
+version = "=3.0.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rusqlite"
+version = "=0.32.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustc-demangle"
+version = "=0.1.28"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustix"
+version = "=1.1.6"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustls"
+version = "=0.23.46"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustls-pki-types"
+version = "=1.16.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustls-platform-verifier"
+version = "=0.7.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "rustls-webpki"
+version = "=0.103.17"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "scoped-tls"
+version = "=1.0.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "scopeguard"
+version = "^1"
+verdict = "pure"
+reason = "Scope guards."
+
+[[audit]]
+name = "security-framework"
+version = "=3.7.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "security-framework-sys"
+version = "=2.17.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "serde"
+version = "^1"
+verdict = "pure"
+reason = "Serialization framework: no I/O, clocks, randomness or threads."
+
+[[audit]]
+name = "serde-querystring"
+version = "=0.3.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "serde_core"
+version = "^1"
+verdict = "pure"
+reason = "Serialization framework core."
+
+[[audit]]
+name = "serde_json"
+version = "^1"
+verdict = "pure"
+reason = "JSON encoding and decoding only."
+
+[[audit]]
+name = "serde_spanned"
+version = "^1"
+verdict = "pure"
+reason = "Span-carrying values for serde."
+
+[[audit]]
+name = "sha2"
+version = "^0.11"
+verdict = "pure"
+reason = "SHA-2 hashing."
+
+[[audit]]
+name = "sharded-slab"
+version = "=0.1.7"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "shell-words"
+version = "^1"
+verdict = "pure"
+reason = "Shell word splitting."
+
+[[audit]]
+name = "signal-hook-registry"
+version = "=1.4.8"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "simd-adler32"
+version = "^0.3"
+verdict = "pure"
+reason = "Adler-32."
+
+[[audit]]
+name = "simvar"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "simvar_explore"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "simvar_harness"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "simvar_observer"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "simvar_utils"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "slab"
+version = "=0.4.12"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "smallvec"
+version = "^1"
+verdict = "pure"
+reason = "Inline vectors."
+
+[[audit]]
+name = "socket-pktinfo"
+version = "=0.4.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "socket2"
+version = "=0.6.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "spin"
+version = "=0.9.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "ssdp-client"
+version = "=2.1.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "stable_deref_trait"
+version = "^1"
+verdict = "pure"
+reason = "A marker trait."
+
+[[audit]]
+name = "strum"
+version = "^0.28"
+verdict = "pure"
+reason = "Enum string derives."
+
+[[audit]]
+name = "subtle"
+version = "^2"
+verdict = "pure"
+reason = "Constant-time comparisons."
+
+[[audit]]
+name = "switchy"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_async"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_database"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_database_connection"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_env"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_fs"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_http"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_http_models"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_mdns"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_network"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_pty"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_random"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_simulation"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_tcp"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_telemetry"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_thread"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_time"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_upnp"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_uuid"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_web_server"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "switchy_web_server_core"
+version = "*"
+verdict = "controlled"
+reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
+
+[[audit]]
+name = "symlink"
+version = "=0.1.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "sync_wrapper"
+version = "=1.0.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tempfile"
+version = "^3"
+verdict = "restricted"
+reason = "Creates host files; tempfile:: is forbidden by the shared rules (switchy_fs::tempdir instead)."
+
+[[audit]]
+name = "termcolor"
+version = "=1.4.1"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "thiserror"
+version = "^2"
+verdict = "pure"
+reason = "Error derive support."
+
+[[audit]]
+name = "thread_local"
+version = "=1.1.10"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "time"
+version = "=0.3.55"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "time-core"
+version = "=0.1.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tinystr"
+version = "=0.8.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tokio"
+version = "^1"
+verdict = "restricted"
+reason = "The simulator re-exports parts of it; its runtime, spawn, time, task, select! and watch are forbidden by the shared rules (switchy_async instead)."
+
+[[audit]]
+name = "tokio-rustls"
+version = "=0.26.6"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tokio-stream"
+version = "=0.1.19"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tokio-util"
+version = "=0.7.20"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "toml"
+version = "^1"
+verdict = "pure"
+reason = "TOML encoding and decoding."
+
+[[audit]]
+name = "toml_datetime"
+version = "^1"
+verdict = "pure"
+reason = "TOML dates as values (never reads a clock)."
+
+[[audit]]
+name = "toml_edit"
+version = "^0.25"
+verdict = "pure"
+reason = "TOML editing."
+
+[[audit]]
+name = "toml_parser"
+version = "^1"
+verdict = "pure"
+reason = "TOML parsing."
+
+[[audit]]
+name = "toml_writer"
+version = "^1"
+verdict = "pure"
+reason = "TOML writing."
+
+[[audit]]
+name = "tonic"
+version = "=0.14.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tonic-prost"
+version = "=0.14.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tonic-types"
+version = "=0.14.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tower"
+version = "=0.5.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tower-http"
+version = "=0.6.11"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tower-layer"
+version = "=0.3.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tower-service"
+version = "=0.3.3"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing"
+version = "=0.1.44"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing-appender"
+version = "=0.2.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing-core"
+version = "=0.1.36"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing-log"
+version = "=0.2.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing-opentelemetry"
+version = "=0.34.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "tracing-subscriber"
+version = "=0.3.23"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "try-lock"
+version = "=0.2.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "typenum"
+version = "^1"
+verdict = "pure"
+reason = "Type-level numbers."
+
+[[audit]]
+name = "untrusted"
+version = "=0.9.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "url"
+version = "=2.5.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "urlencoding"
+version = "^2"
+verdict = "pure"
+reason = "URL encoding."
+
+[[audit]]
+name = "utf8_iter"
+version = "^1"
+verdict = "pure"
+reason = "UTF-8 iteration."
+
+[[audit]]
+name = "utf_types"
+version = "=1.0.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "uuid"
+version = "^1"
+verdict = "restricted"
+reason = "Uuid::new_v4 reads OS randomness; the shared rules forbid new_v4 (ids come from switchy_uuid or a crate's seeded ids module)."
+
+[[audit]]
+name = "want"
+version = "=0.3.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "winnow"
+version = "^1"
+verdict = "pure"
+reason = "Parser combinators."
+
+[[audit]]
+name = "writeable"
+version = "=0.6.4"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "xml"
+version = "=1.4.0"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "yoke"
+version = "=0.8.4"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zerocopy"
+version = "=0.8.64"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zerofrom"
+version = "=0.1.8"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zeroize"
+version = "=1.9.2"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zerotrie"
+version = "=0.2.5"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zerovec"
+version = "=0.11.9"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zlib-rs"
+version = "=0.6.8"
+verdict = "unaudited"
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+
+[[audit]]
+name = "zmij"
+version = "^1"
+verdict = "pure"
+reason = "Float formatting."

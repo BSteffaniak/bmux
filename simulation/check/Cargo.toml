@@ -1,0 +1,16 @@
+[package]
+name                 = "sim-check"
+description          = "Checks that everything a simulation links runs deterministically under it"
+edition.workspace    = true
+license.workspace    = true
+publish.workspace    = true
+repository.workspace = true
+version.workspace    = true
+
+[dependencies]
+switchy_cargo = { workspace = true }
+
+[features]
+default = []
+
+fail-on-warnings = []

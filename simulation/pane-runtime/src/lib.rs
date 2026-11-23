@@ -81,7 +81,7 @@ impl SimBootstrap for PaneRuntimeBootstrap {
     /// A guided run's profile is its input (see [`guide`]): reported as the run's
     /// `PANE_RUNTIME_SIM_PROFILE`, so its replay command carries it.
     fn props(&self) -> Vec<(String, String)> {
-        if std::env::var_os("PANE_RUNTIME_SIM_PROFILE").is_some() {
+        if host_set("PANE_RUNTIME_SIM_PROFILE") {
             return Vec::new();
         }
         guide::profile_for(simvar::switchy::random::simulator::seed())
@@ -112,15 +112,13 @@ impl SimBootstrap for PaneRuntimeBootstrap {
 /// With `PANE_RUNTIME_SIM_TRACE`, print every scheduling decision (to find where two runs of a
 /// seed part).
 fn trace_decisions() {
-    if std::env::var_os("PANE_RUNTIME_SIM_TRACE").is_none() {
+    if !host_set("PANE_RUNTIME_SIM_TRACE") {
         return;
     }
     // With `PANE_RUNTIME_SIM_BACKTRACE_AT=N`, where the stopping thread was at decision N.
-    let backtrace_at: Option<u64> = std::env::var("PANE_RUNTIME_SIM_BACKTRACE_AT")
-        .ok()
+    let backtrace_at: Option<u64> = host_var("PANE_RUNTIME_SIM_BACKTRACE_AT")
         .and_then(|value| value.parse().ok());
-    let threads_at: Option<u64> = std::env::var("PANE_RUNTIME_SIM_THREADS_AT")
-        .ok()
+    let threads_at: Option<u64> = host_var("PANE_RUNTIME_SIM_THREADS_AT")
         .and_then(|value| value.parse().ok());
     switchy_thread::simulator::set_decision_hook(Some(Arc::new(
         move |decision: &switchy_thread::simulator::Decision,
@@ -148,6 +146,18 @@ fn trace_decisions() {
     )));
 }
 
+/// Whether the host's environment sets `name`: a debugging switch, or (`PANE_RUNTIME_SIM_PROFILE`,
+/// `SIMULATOR_PTY_PERSONALITY`) a run's input, which its replay command carries. Read from the
+/// host, not the run's sealed environment, on purpose.
+pub(crate) fn host_set(name: &str) -> bool {
+    std::env::var_os(name).is_some() // simulation-safe: a switch or input from the host, as above
+}
+
+/// The value of `name` in the host's environment, as [`host_set`] reads it.
+pub(crate) fn host_var(name: &str) -> Option<String> {
+    std::env::var(name).ok() // simulation-safe: a switch or input from the host, as above
+}
+
 /// The run's profile: `PANE_RUNTIME_SIM_PROFILE` when set, else the guide's (see [`guide`]),
 /// else drawn from the seed.
 ///
@@ -156,7 +166,7 @@ fn trace_decisions() {
 /// * If `PANE_RUNTIME_SIM_PROFILE` is not a profile
 #[must_use]
 pub fn run_profile() -> Profile {
-    if let Ok(text) = std::env::var("PANE_RUNTIME_SIM_PROFILE") {
+    if let Some(text) = host_var("PANE_RUNTIME_SIM_PROFILE") {
         return text
             .parse()
             .unwrap_or_else(|error| panic!("PANE_RUNTIME_SIM_PROFILE: {error}"));
@@ -222,7 +232,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
 /// * If no temporary directory can be created for the session records
 #[allow(clippy::too_many_lines)]
 pub async fn run(profile: Profile, scenario: Option<&explore::Scenario>) -> Result<(), Vec<String>> {
-    if std::env::var_os("PANE_RUNTIME_SIM_TRACE").is_some() {
+    if host_set("PANE_RUNTIME_SIM_TRACE") {
         eprintln!("profile {profile}");
     }
     switchy_time::simulator::set_step_multiplier(profile.clock);
@@ -245,7 +255,7 @@ pub async fn run(profile: Profile, scenario: Option<&explore::Scenario>) -> Resu
     );
     let faults = profile.faults;
     let personality = match scenario {
-        Some(scenario) if std::env::var_os("SIMULATOR_PTY_PERSONALITY").is_none() => {
+        Some(scenario) if !host_set("SIMULATOR_PTY_PERSONALITY") => {
             scenario.personality
         }
         _ => Config::from_env().personality,

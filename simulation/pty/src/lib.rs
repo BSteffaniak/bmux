@@ -94,9 +94,14 @@ impl Invariant {
     }
 }
 
+/// One of the run's named random streams, as `switchy_simulation::stream` hands it out.
+// simulation-safe: switchy_simulation's own type for a run's stream.
+type Stream = std::sync::Mutex<switchy_simulation::Rng>;
+
 /// Each invariant's checks and failures in the current run. A std mutex is never a switch
 /// point, so keeping count never changes the run.
 #[derive(Default)]
+// simulation-safe: the run's own invariant bookkeeping, locked briefly with no switch point.
 struct Checks(std::sync::Mutex<BTreeMap<Invariant, (u64, Vec<String>)>>);
 
 fn with_checks<R>(f: impl FnOnce(&mut BTreeMap<Invariant, (u64, Vec<String>)>) -> R) -> R {
@@ -171,18 +176,18 @@ fn lock<T>(mutex: &Mutex<T>) -> switchy_thread::sync::MutexGuard<'_, T> {
 }
 
 /// The run's draws for the workload as a whole.
-fn rng() -> Arc<std::sync::Mutex<switchy_simulation::Rng>> {
+fn rng() -> Arc<Stream> {
     switchy_simulation::stream("bmux_pty_workload")
 }
 
-fn draw(stream: &std::sync::Mutex<switchy_simulation::Rng>, bound: u64) -> u64 {
+fn draw(stream: &Stream, bound: u64) -> u64 {
     stream
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .below(bound.max(1))
 }
 
-fn chance(stream: &std::sync::Mutex<switchy_simulation::Rng>, p: f64) -> bool {
+fn chance(stream: &Stream, p: f64) -> bool {
     stream
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -193,6 +198,7 @@ fn chance(stream: &std::sync::Mutex<switchy_simulation::Rng>, p: f64) -> bool {
 fn kernel_config() -> Config {
     let from_env = Config::from_env();
     let stream = rng();
+    // simulation-safe: a run input its replay command carries.
     let personality = if std::env::var("SIMULATOR_PTY_PERSONALITY").is_ok() {
         from_env.personality
     } else if chance(&stream, 0.5) {
@@ -200,6 +206,7 @@ fn kernel_config() -> Config {
     } else {
         Personality::MacOs
     };
+    // simulation-safe: a run input its replay command carries.
     let faults = if std::env::var("SIMULATOR_PTY_FAULTS").is_ok() {
         from_env.faults
     } else if chance(&stream, 0.3) {
@@ -378,7 +385,7 @@ struct Scenario {
     captured: bool,
 }
 
-fn scenario(stream: &std::sync::Mutex<switchy_simulation::Rng>) -> Scenario {
+fn scenario(stream: &Stream) -> Scenario {
     let mut typing = false;
     let mut reports_resizes = false;
     let (name, args): (&str, Vec<String>) = match draw(stream, 11) {
@@ -432,7 +439,7 @@ fn scenario(stream: &std::sync::Mutex<switchy_simulation::Rng>) -> Scenario {
     }
 }
 
-fn random_size(stream: &std::sync::Mutex<switchy_simulation::Rng>) -> PtySize {
+fn random_size(stream: &Stream) -> PtySize {
     PtySize::new(
         u16::try_from(20 + draw(stream, 200)).unwrap_or(80),
         u16::try_from(5 + draw(stream, 60)).unwrap_or(24),
@@ -453,7 +460,7 @@ enum Action {
     Drop,
 }
 
-fn action(stream: &std::sync::Mutex<switchy_simulation::Rng>) -> Action {
+fn action(stream: &Stream) -> Action {
     let millis = |bound| Duration::from_millis(draw(stream, bound));
     match draw(stream, 100) {
         0..=34 => Action::Next(millis(100)),

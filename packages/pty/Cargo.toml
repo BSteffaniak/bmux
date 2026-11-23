@@ -32,9 +32,6 @@ windows-sys = { workspace = true, features = [
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }
 
-[dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
-
 [features]
 default = ["native"]
 
@@ -53,3 +50,12 @@ simulator = [
     "switchy_thread/simulator",
     "switchy_time/simulator",
 ]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# The Windows pseudo-console runner is native-only as a whole.
+native = ["conpty.rs"]
+# This crate is a platform layer: it chooses each system's backend.
+os-named-in = ["lib.rs"]
+# Stricter here than the shared rules: no std threads, std sync groups or std instants at all.
+forbid = ["std::thread::", "std::sync::{", "Instant::now"]

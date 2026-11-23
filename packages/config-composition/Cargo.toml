@@ -24,3 +24,10 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# Linked by code the simulations run, but not exercised by them yet: before a simulation runs
+# it, remove this table so the check scans it.
+runs = false
+reason = "Configuration capture and composition; the simulations never load configuration in a run: no line of it ran in 800 instrumented pane runtime runs, standard and guided (2026-11-22)."

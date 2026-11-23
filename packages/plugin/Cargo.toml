@@ -45,7 +45,6 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
 serial_test = { workspace = true }
 tokio = { workspace = true, features = [
     "sync",
@@ -73,3 +72,8 @@ fail-on-warnings = [
     "bmux_perf_telemetry/fail-on-warnings",
     "bmux_presentation_scene/fail-on-warnings",
 ]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# The pane runtime simulation runs only the plugin state registry.
+only = ["plugin_state.rs"]

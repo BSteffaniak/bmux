@@ -155,6 +155,8 @@ touches `simulation/**`, `packages/pty/**`, `packages/local-terminal/**`,
 
 - `cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings`
 - `cargo test --manifest-path simulation/Cargo.toml -p pane-runtime --test platform`
+- `cargo sim pane-runtime --check`, `cargo sim pty --check` and `cargo sim local-terminal --check`
+  (also after changing any crate the simulations link, or the dependencies of one)
 - `cargo sim pty --regression`
 - `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=process cargo sim pty`
 - `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=process cargo sim pane-runtime`
@@ -164,14 +166,28 @@ Code the pane runtime simulation runs must stay deterministic: tasks, timers and
 `select!` through `switchy_async`, threads and locks through `switchy_thread`, clocks
 through `switchy_time`, environment reads through `switchy_env`, identifiers through
 the plugin's `ids` module, directory listings through `dir_order`, this process's own id
-through the platform layer's `files`, and process-wide state through `run_shared`. The
-`SIMULATOR_VERIFY_DETERMINISM=process` checks above replay each run alone in a fresh,
+through the platform layer's `files`, and process-wide state through `run_shared`.
+`cargo sim NAME --check` (`switchy_cargo`) enforces this over everything simulation NAME
+links, found from its dependency graph:
+
+- Each local crate is scanned line by line, by the rules in its manifest's
+  `[package.metadata.switchy.simulation]`: which files run (`only`), native backends
+  (`native`), the controlled versions themselves (`exempt`), where an operating system may be
+  named (`os-named-in`), extra `forbid` patterns, or `runs = false` with a `reason` for a
+  crate simulations link but never run inside a run. A crate without the table is scanned
+  whole. A line using a std primitive on purpose says why: `// simulation-safe: <reason>`.
+- Every crate from a registry or git must be on `simulation/determinism.toml`'s audit list,
+  with a verdict and a reason; a new crate or version fails the check until it is audited.
+  Patterns forbidden everywhere are listed there too.
+
+Before a simulation starts running a crate marked `runs = false`, remove its table so the
+check scans it. A std lock must never be held across a switch point: simulations poll tasks
+on several workers.
+
+The `SIMULATOR_VERIFY_DETERMINISM=process` checks above replay each run alone in a fresh,
 perturbed process and compare everything it observed (schedule, processes and terminal
-output, file tree, random draws, clock); a failure names the first observation that
-differs, with the text around it. Each crate on the simulated path enforces this in its
-`tests/primitives.rs` (the shared `bmux_sim_primitives_check` scan), stating its exemptions;
-a crate the simulation starts running gets one too. A std lock must never be held across a
-switch point: simulations poll tasks on several workers.
+output, file tree, random draws, clock); a failure names the first observation that differs,
+with the text around it.
 
 A fix for a bug a simulation found (a fleet, guided or explored run, or a determinism
 check) says so in its commit message's trailers, so these fixes can be listed with

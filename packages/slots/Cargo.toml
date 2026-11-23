@@ -21,3 +21,8 @@ tempfile = { workspace = true }
 
 [features]
 fail-on-warnings = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "Install manifests for multi-version installs; nothing of it is even linked into a simulation binary."

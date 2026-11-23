@@ -44,3 +44,10 @@ fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_perf_telemetry/fail-on-warnings",
 ]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# Linked by code the simulations run, but not exercised by them yet: before a simulation runs
+# it, remove this table so the check scans it.
+runs = false
+reason = "Plugin SDK types the pane runtime plugin is written against; the simulations do not exercise its code: no line of it ran in 800 instrumented pane runtime runs, standard and guided (2026-11-22)."

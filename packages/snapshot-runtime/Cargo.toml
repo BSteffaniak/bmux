@@ -19,7 +19,6 @@ switchy_time   = { workspace = true, features = ["std"] }
 thiserror      = { workspace = true }
 
 [dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
 tokio                     = { workspace = true, features = ["macros", "rt"] }
 
 [features]

@@ -28,3 +28,8 @@ default          = []
 fail-on-warnings = ["bmux_keyboard?/fail-on-warnings"]
 keyboard         = ["dep:bmux_keyboard"]
 serde            = ["dep:serde", "bmux_keyboard?/serde"]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "Text editing for terminal UIs (the dashboard, the client); never inside a run."

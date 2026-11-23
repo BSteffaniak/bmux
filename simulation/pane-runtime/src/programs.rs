@@ -7,6 +7,7 @@
 //! Every kind but [`Kind::Instant`] and [`Kind::Orphaner`] ends up answering each line it reads
 //! with `got:<line>`, as the shell does, after its own antics.
 
+// simulation-safe: see `Programs`.
 use std::{
     collections::BTreeMap,
     sync::{Mutex, PoisonError},
@@ -73,6 +74,7 @@ impl Kind {
 
 /// The run's programs: the mix to draw from, and what each pane's program turned out to be.
 #[derive(Debug, Default)]
+// simulation-safe: the run's own program mix, locked briefly with no switch point inside.
 pub struct Programs(Mutex<State>);
 
 #[derive(Debug, Default)]

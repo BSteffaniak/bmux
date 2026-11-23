@@ -19,8 +19,12 @@ tracing    = { workspace = true, features = ["std"] }
 uuid       = { workspace = true, features = ["serde", "std", "v4"] }
 
 [dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
 tokio                     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# The pane runtime simulation runs only the shutdown progress tracker.
+only = ["shutdown_progress.rs"]

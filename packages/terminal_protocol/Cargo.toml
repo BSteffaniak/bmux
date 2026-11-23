@@ -15,10 +15,12 @@ serde = { workspace = true, features = ["derive", "std"] }
 # The clock a simulation controls (std's natively).
 switchy_time = { workspace = true, features = ["std"] }
 
-[dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
-
 [features]
 default          = ["kitty-keyboard"]
 fail-on-warnings = []
 kitty-keyboard   = []
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# Pointer-shape output to the user's own terminal: client side, never in a pane runtime.
+exempt = ["pointer_output.rs"]

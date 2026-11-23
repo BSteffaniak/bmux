@@ -68,7 +68,6 @@ tracing   = { workspace = true, features = ["std"] }
 uuid      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-bmux_sim_primitives_check = { workspace = true }
 switchy_async_cargo       = { workspace = true }
 tempfile                 = { workspace = true }
 
@@ -139,3 +138,19 @@ windows-sys = { workspace = true, features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+# Native backends: each talks to one operating system and never runs in simulation.
+native = ["platform/unix/", "platform/windows/", "platform/native.rs"]
+# The controlled versions themselves, and code that only tests build.
+exempt = ["ids.rs", "dir_order.rs", "run_shared.rs", "runtime/ingest_bench.rs"]
+os-named-in = ["platform/"]
+# The session models' own random identifiers: name sessions and clients through `ids`.
+forbid = [
+    "Session::new(",
+    "SessionId::new(",
+    "ClientId::new(",
+    "SessionId::default(",
+    "ClientId::default(",
+]

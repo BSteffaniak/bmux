@@ -210,3 +210,8 @@ navigation = [
 ]
 overlays = ["dialog", "modal-frame", "picker-frame", "toast-stack"]
 text-editing = ["text-input", "text-input-box", "text-view"]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "Terminal UI components for the dashboard and the client; never inside a run."

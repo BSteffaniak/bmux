@@ -36,3 +36,8 @@ fail-on-warnings = [
     "bmux_tui?/fail-on-warnings",
 ]
 internal = ["dep:bmux_terminal_grid", "dep:bmux_tui"]
+
+# What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
+[package.metadata.switchy.simulation]
+runs = false
+reason = "Benchmark support, used only by the pane runtime's ingest benchmark, which only tests build."
