@@ -183,7 +183,8 @@ Simulation-replay: SIMULATOR_SEED=... SIMULATOR_EPOCH_OFFSET=... PANE_RUNTIME_SI
 ```
 
 Give the simulation's name, and the replay variables that reproduced it on the build it was
-found with. Add the seed to that simulation's `regression-seeds`, with a note.
+found with. Add the seed to that simulation's `regression-seeds`, with a note. Fixes from
+before this convention are listed in `docs/development/simulation-found-fixes.md`.
 
 The pane runtime plugin names an operating system only in `src/platform/` (native
 Unix, native Windows and simulated targets, plus the host's files). Core logic
