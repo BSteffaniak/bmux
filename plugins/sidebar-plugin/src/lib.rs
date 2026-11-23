@@ -11,6 +11,7 @@ pub mod declaration {
 }
 
 mod activity;
+mod view;
 
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
@@ -19,8 +20,8 @@ use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,
 };
 use bmux_plugin::{
-    AttachInputEvent, AttachInputResult, ExtensionRect, RenderColor, RenderNamedColor, RenderOp,
-    RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
+    AttachInputEvent, AttachInputResult, ExtensionRect, RenderColor, RenderNamedColor, RenderStyle,
+    ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{TypedServiceEndpoint as _, prelude::*};
@@ -29,7 +30,7 @@ use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
 };
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
-use bmux_tabs_plugin_api::{tabs_commands, tabs_list, tabs_status};
+use bmux_tabs_plugin_api::{tabs_list, tabs_status};
 use bmux_tui_components::virtual_list::{CursorInput, CursorOutcome, ItemCursor};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -259,16 +260,6 @@ fn parse_organization(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct MeasuredSidebarItem {
-    title: String,
-    description: String,
-    status: String,
-    width: usize,
-    fields: Vec<bmux_tui::composition::TextBlock>,
-    layout: bmux_tui::component::LayoutNode,
-}
-
 /// Where a presentation reads semantic facts from.
 enum FactSource {
     /// A registry shared explicitly with this runtime's producers.
@@ -334,8 +325,8 @@ struct CompanionState {
     groups_memory: Option<std::path::PathBuf>,
     /// What each tab is doing, from the tabs plugin's `tabs-status`.
     activity: activity::ActivityView,
-    scroll: bmux_tui_components::scroll_view::ScrollViewState,
-    measured_items: std::cell::RefCell<std::collections::BTreeMap<SidebarHit, MeasuredSidebarItem>>,
+    /// The rows' measurements and scroll position.
+    list: std::cell::RefCell<bmux_tui_components::virtual_list::VirtualListState<SidebarHit>>,
     /// What each published revision's region keys mean.
     hits: std::cell::RefCell<HitTables<SidebarHit>>,
     /// The width the sidebar asks for, within its minimum and maximum.
@@ -393,6 +384,12 @@ impl SidebarRow {
             Self::Group { id, .. } => SidebarHit::Group(*id),
             Self::Tab(index) => SidebarHit::Tab(tabs[*index].id),
         }
+    }
+}
+
+impl std::fmt::Display for SidebarHit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&item_region_id(*self))
     }
 }
 
@@ -497,8 +494,9 @@ impl CompanionState {
             },
             cursor: ItemCursor::new(),
             activity,
-            scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
-            measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            list: std::cell::RefCell::new(
+                bmux_tui_components::virtual_list::VirtualListState::new(0),
+            ),
         }
     }
 
@@ -549,15 +547,7 @@ impl CompanionState {
             return false;
         }
         self.allocation = Some(rect);
-        let layout = self.scroll_layout();
-        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
-            &layout,
-            &mut self.scroll,
-            0,
-        );
-        if let Some(row) = self.active_row() {
-            self.reveal(row);
-        }
+        self.settle_scroll(true);
         true
     }
 
@@ -578,86 +568,6 @@ impl CompanionState {
         Ok(())
     }
 
-    fn measure_item(
-        &self,
-        id: SidebarHit,
-        title: String,
-        description: String,
-        status: String,
-        width: usize,
-    ) -> std::cell::Ref<'_, MeasuredSidebarItem> {
-        let stale = self.measured_items.borrow().get(&id).is_none_or(|item| {
-            item.title != title
-                || item.description != description
-                || item.status != status
-                || item.width != width
-        });
-        if stale {
-            use bmux_tui::component::{Component, Constraints, LayoutCx};
-            use bmux_tui::composition::{Column, TextBlock};
-            use bmux_tui::text::{Line, Text};
-            let description_lines = if description.trim().is_empty() || width <= 1 {
-                Vec::new()
-            } else {
-                bmux_tui::text::wrap_text(
-                    description.trim(),
-                    bmux_tui::text::TextWrapGeometry::uniform(width.saturating_sub(2).max(1)),
-                    bmux_tui::text::TextWrap::Word,
-                )
-                .into_iter()
-                .take(2)
-                .collect::<Vec<_>>()
-            };
-            let mut fields = vec![
-                TextBlock::new(Text::from_lines(vec![Line::raw(truncate_to_width(
-                    &title, width,
-                ))]))
-                .id("title"),
-            ];
-            if !description_lines.is_empty() {
-                fields.push(
-                    TextBlock::new(Text::from_lines(
-                        description_lines
-                            .iter()
-                            .map(|line| Line::raw(format!("  {line}")))
-                            .collect::<Vec<_>>(),
-                    ))
-                    .id("description"),
-                );
-            }
-            if !status.is_empty() {
-                fields.push(
-                    TextBlock::new(Text::from_lines(vec![Line::raw(format!(
-                        "  {}",
-                        truncate_to_width(&status, width.saturating_sub(2))
-                    ))]))
-                    .id("status"),
-                );
-            }
-            let content = fields
-                .iter()
-                .fold(Column::new().id(item_region_id(id)), |column, field| {
-                    column.child(field.clone())
-                });
-            let layout = content.layout(
-                Constraints::for_width(u64::from(u16::try_from(width).unwrap_or(u16::MAX))),
-                &mut LayoutCx::new(),
-            );
-            self.measured_items.borrow_mut().insert(
-                id,
-                MeasuredSidebarItem {
-                    title,
-                    description,
-                    status,
-                    width,
-                    fields,
-                    layout,
-                },
-            );
-        }
-        std::cell::Ref::map(self.measured_items.borrow(), |items| &items[&id])
-    }
-
     fn tab_fact(&self, tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
         self.facts
             .as_ref()
@@ -665,8 +575,46 @@ impl CompanionState {
             .flatten()
     }
 
-    fn measured_tab(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
-        let tab = &self.snapshot.tabs[index];
+    /// Every listed row as a component, keyed by what it shows.
+    fn row_views(&self, revision: u64) -> Vec<(SidebarHit, view::RowView)> {
+        let palette = SidebarPalette::default();
+        self.rows()
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let item = row.item(&self.snapshot.tabs);
+                let hovered = self.cursor.hovered() == Some(&item);
+                let row = match row {
+                    SidebarRow::Tab(tab) => {
+                        view::RowView::Card(self.card(*tab, index, hovered, revision, &palette))
+                    }
+                    SidebarRow::Group {
+                        name,
+                        tabs,
+                        collapsed,
+                        ..
+                    } => view::RowView::Header(
+                        self.header(name, tabs, *collapsed, hovered, &palette),
+                    ),
+                };
+                (item, row)
+            })
+            .collect()
+    }
+
+    /// A tab's card: its title (the state glyph in its state's color when the
+    /// title starts with it) with the state summary at the right, its
+    /// description and status, tinted when shown or hovered.
+    fn card(
+        &self,
+        tab_index: usize,
+        row: usize,
+        hovered: bool,
+        revision: u64,
+        palette: &SidebarPalette,
+    ) -> view::CardRow {
+        use bmux_plugin::render_paint::tui_style;
+        let tab = &self.snapshot.tabs[tab_index];
         let fact = self.tab_fact(tab);
         let width = usize::from(self.allocated_width().saturating_sub(4));
         let activity = self
@@ -677,74 +625,214 @@ impl CompanionState {
             render_template(
                 template,
                 tab,
-                index,
+                tab_index,
                 self.settings.show_index,
                 fact.as_ref(),
                 activity.as_ref(),
             )
         };
-        // The first line leaves room for the summary painted at its right.
-        let summary = activity
-            .as_ref()
-            .and_then(|activity| activity.summary.as_deref())
-            .map_or(0, |summary| bmux_cell_geometry::display_width(summary) + 1);
-        let title = if summary > 0 && summary + 4 <= width {
-            truncate_to_width(&render(&self.settings.title_template), width - summary)
+        let card = if tab.active {
+            Some(palette.active_card)
+        } else if hovered {
+            Some(palette.hover_card)
         } else {
-            render(&self.settings.title_template)
+            None
         };
-        self.measure_item(
-            SidebarHit::Tab(tab.id),
-            title,
-            render(&self.settings.description_template),
-            render(&self.settings.status_template),
-            width,
-        )
-    }
-
-    fn scroll_layout(&self) -> bmux_tui::component::LayoutNode {
-        use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
-        let mut content = LayoutNode::leaf(
-            LayoutId::new("sidebar.items"),
-            LogicalSize::new(u64::from(self.width), 0),
+        let title_style = fact.as_ref().map_or_else(
+            || {
+                if tab.active {
+                    palette.active_title
+                } else {
+                    palette.title
+                }
+            },
+            |fact| fact_style(fact.role, palette.title),
         );
-        for row in self.rows() {
-            let item = self.measured_row(&row);
-            let y = content.size.height;
-            content.size.height = y.saturating_add(item.layout.size.height);
-            content
-                .children
-                .push(ChildLayout::new(0, y, item.layout.clone()));
+        let title = render(&self.settings.title_template);
+        let (glyph, color) = state_glyph(activity.as_ref());
+        let mut spans = Vec::new();
+        let rest = match (&activity, title.strip_prefix(glyph)) {
+            (Some(_), Some(rest)) => {
+                spans.push(bmux_tui::text::Span::styled(
+                    glyph.to_string(),
+                    tui_style(RenderStyle::new().foreground(color)),
+                ));
+                rest.to_string()
+            }
+            _ => title,
+        };
+        spans.push(bmux_tui::text::Span::styled(rest, tui_style(title_style)));
+        let trailing = activity.as_ref().and_then(|activity| {
+            let style = match activity.state {
+                activity::TabState::Idle => palette.muted,
+                state => RenderStyle::new().foreground(state.color()),
+            };
+            activity
+                .summary
+                .clone()
+                .map(|summary| view::styled(summary, tui_style(style)))
+        });
+        let field = |name: &str| view::FieldId {
+            id: selection_id(row, name),
+            revision,
+        };
+        view::CardRow {
+            title: bmux_tui::text::Line::from_spans(spans),
+            trailing,
+            description: render(&self.settings.description_template),
+            status: render(&self.settings.status_template),
+            muted: tui_style(palette.muted),
+            chrome: view::RowChrome {
+                card: card.map(tui_style),
+                accent: tab.active.then(|| tui_style(palette.accent)),
+                base: tui_style(palette.base),
+            },
+            fields: [field("title"), field("description"), field("status")],
         }
-        let viewport_height = content
-            .children
-            .iter()
-            .take(self.settings.maximum_visible_items)
-            .map(|child| child.node.size.height)
-            .sum();
-        bmux_tui_components::scroll_view::ScrollViewComponent::viewport_layout(
-            LayoutId::new("sidebar.viewport"),
-            LogicalSize::new(
-                u64::from(self.allocated_width()),
-                self.allocation.map_or(viewport_height, |rect| {
-                    u64::try_from(usize::from(rect.h.saturating_sub(2))).unwrap_or(u64::MAX)
-                }),
-            ),
-            content,
+    }
+
+    /// A workspace's header: its marker and name, and at the right what its
+    /// tabs are doing, most pressing first, or how many it holds. A collapsed
+    /// header that hides the shown tab is marked as the shown row.
+    fn header(
+        &self,
+        name: &str,
+        tabs: &[usize],
+        collapsed: bool,
+        hovered: bool,
+        palette: &SidebarPalette,
+    ) -> view::HeaderRow {
+        use bmux_plugin::render_paint::{tui_color, tui_style};
+        let holds_active = collapsed && tabs.iter().any(|index| self.snapshot.tabs[*index].active);
+        let card = if holds_active {
+            Some(palette.active_card)
+        } else if hovered {
+            Some(palette.hover_card)
+        } else {
+            None
+        };
+        let marker = if collapsed { '▸' } else { '▾' };
+        let title = format!("{marker} {name}");
+        // The title keeps at least a few cells; the counts take the rest, the
+        // least pressing dropped first when they do not fit.
+        let title_room = bmux_cell_geometry::display_width(&title).min(8);
+        let room =
+            usize::from(self.allocated_width().saturating_sub(4)).saturating_sub(title_room + 1);
+        let mut spans = Vec::new();
+        for (index, (text, color)) in group_summary(self, tabs, room).into_iter().enumerate() {
+            if index > 0 {
+                spans.push(bmux_tui::text::Span::raw(" "));
+            }
+            let style = color.map_or_else(
+                || tui_style(palette.muted),
+                |color| bmux_tui::style::Style::new().fg(tui_color(color)),
+            );
+            spans.push(bmux_tui::text::Span::styled(text, style));
+        }
+        view::HeaderRow {
+            title: view::styled(title, tui_style(palette.heading)),
+            trailing: bmux_tui::text::Line::from_spans(spans),
+            chrome: view::RowChrome {
+                card: card.map(tui_style),
+                accent: holds_active.then(|| tui_style(palette.accent)),
+                base: tui_style(palette.base),
+            },
+        }
+    }
+
+    /// The rows as a list, measured at the current width. Measurements are
+    /// kept per row and content, so this is cheap when little changed.
+    fn synced_list<'a>(
+        &self,
+        rows: &'a [(SidebarHit, view::RowView)],
+    ) -> bmux_tui_components::virtual_list::VirtualList<'a, SidebarHit> {
+        let list = view::list(rows);
+        list.sync(
+            u64::from(self.allocated_width()),
+            &mut self.list.borrow_mut(),
+            &mut bmux_tui::component::LayoutCx::new(),
+        );
+        list
+    }
+
+    /// Rows the list may use below the heading: the allocation's, or the
+    /// first `maximum_visible_items` rows' when nothing is allocated yet.
+    fn list_height(&self, keys: &[SidebarHit]) -> u16 {
+        self.allocation.map_or_else(
+            || {
+                let state = self.list.borrow();
+                let rows = keys
+                    .iter()
+                    .take(self.settings.maximum_visible_items)
+                    .filter_map(|key| state.item_height(key))
+                    .sum::<u64>();
+                u16::try_from(rows).unwrap_or(u16::MAX)
+            },
+            |rect| rect.h.saturating_sub(2),
         )
     }
 
-    fn reveal(&mut self, index: usize) {
-        let layout = self.scroll_layout();
-        let Some(item) = layout.children[0].node.children.get(index) else {
-            return;
-        };
-        bmux_tui_components::scroll_view::ScrollView::new().ensure_visible(
-            &layout,
-            &mut self.scroll,
-            item.y,
-            item.node.size.height,
-        );
+    /// Keep the scroll position within the rows and, when `reveal_active`,
+    /// on the row showing this client's tab.
+    fn settle_scroll(&self, reveal_active: bool) {
+        let rows = self.row_views(self.revision);
+        let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let _list = self.synced_list(&rows);
+        let height = u64::from(self.list_height(&keys));
+        let active = reveal_active.then(|| self.active_item()).flatten();
+        let mut state = self.list.borrow_mut();
+        state.clamp_scroll(height);
+        if let Some(key) = active {
+            state.ensure_key_visible(&key, height);
+        }
+    }
+
+    /// Scroll so `item`'s row is visible.
+    fn reveal_item(&self, item: SidebarHit) {
+        let rows = self.row_views(self.revision);
+        let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let _list = self.synced_list(&rows);
+        let height = u64::from(self.list_height(&keys));
+        self.list.borrow_mut().ensure_key_visible(&item, height);
+    }
+
+    /// Scroll by `rows`; returns whether the position moved.
+    fn scroll_rows(&self, rows: i64) -> bool {
+        let views = self.row_views(self.revision);
+        let keys = views.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let _list = self.synced_list(&views);
+        let height = u64::from(self.list_height(&keys));
+        self.list.borrow_mut().scroll_by(rows, height)
+    }
+
+    /// The first listed row's offset into the list.
+    #[cfg(test)]
+    fn scroll_offset(&self) -> u64 {
+        self.list.borrow().scroll.vertical_offset()
+    }
+
+    /// Tabs in scope, including those under collapsed headers.
+    fn tabs_in_scope(&self) -> usize {
+        self.rows()
+            .iter()
+            .map(|row| match row {
+                SidebarRow::Tab(_) => 1,
+                SidebarRow::Group {
+                    tabs, collapsed, ..
+                } => {
+                    if *collapsed {
+                        tabs.len()
+                    } else {
+                        0
+                    }
+                }
+            })
+            .sum()
+    }
+
+    /// The row showing this client's tab.
+    fn active_item(&self) -> Option<SidebarHit> {
+        self.active_row().map(|row| self.item_keys()[row])
     }
 
     /// The listed rows: every tab in scope, under its workspace's header when
@@ -806,29 +894,6 @@ impl CompanionState {
             .collect()
     }
 
-    /// A row's measured card: a tab's, or a workspace header's single line.
-    fn measured_row(&self, row: &SidebarRow) -> std::cell::Ref<'_, MeasuredSidebarItem> {
-        match row {
-            SidebarRow::Tab(index) => self.measured_tab(*index),
-            SidebarRow::Group {
-                id,
-                name,
-                collapsed,
-                ..
-            } => {
-                let width = usize::from(self.allocated_width().saturating_sub(4));
-                let marker = if *collapsed { '▸' } else { '▾' };
-                self.measure_item(
-                    SidebarHit::Group(*id),
-                    format!("{marker} {name}"),
-                    String::new(),
-                    String::new(),
-                    width,
-                )
-            }
-        }
-    }
-
     /// Collapse or expand `workspace`'s group and remember it. Returns a
     /// description of a failure to remember it.
     fn toggle_group(&mut self, workspace: Uuid) -> Option<String> {
@@ -836,12 +901,7 @@ impl CompanionState {
             self.collapsed.insert(workspace);
         }
         self.revision = self.revision.saturating_add(1).max(1);
-        let layout = self.scroll_layout();
-        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
-            &layout,
-            &mut self.scroll,
-            0,
-        );
+        self.settle_scroll(false);
         let keys = self.item_keys();
         self.cursor.retain(&keys);
         self.remember_groups().err()
@@ -892,30 +952,17 @@ impl CompanionState {
             self.snapshot = snapshot;
             let keys = self.item_keys();
             self.cursor.retain(&keys);
-            self.measured_items
-                .get_mut()
-                .retain(|item, _| keys.contains(item));
-            let layout = self.scroll_layout();
-            bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
-                &layout,
-                &mut self.scroll,
-                0,
-            );
-            if let Some(row) = self.active_row() {
-                self.reveal(row);
-            }
+            self.settle_scroll(true);
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
 
-    /// Fact and status text affect wrapping, row geometry and hit regions,
-    /// so drop measurements and republish; optionally reveal the active tab.
+    /// Fact and status text can change rows' geometry; the list measures
+    /// rows whose text changed when it next syncs. Republish, and optionally
+    /// keep the active tab in view.
     fn remeasure(&mut self, reveal_active: bool) {
-        self.measured_items.get_mut().clear();
         self.revision = self.revision.saturating_add(1).max(1);
-        if reveal_active && let Some(row) = self.active_row() {
-            self.reveal(row);
-        }
+        self.settle_scroll(reveal_active);
     }
 
     fn select(&mut self, context_id: Option<Uuid>) {
@@ -1477,20 +1524,6 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     Ok(())
 }
 
-fn truncate_to_width(value: &str, maximum: usize) -> String {
-    let mut result = String::new();
-    let mut width = 0_usize;
-    for grapheme in bmux_unicode_segmentation::graphemes(value) {
-        let cell_width = bmux_cell_geometry::grapheme_width(grapheme);
-        if width.saturating_add(cell_width) > maximum {
-            break;
-        }
-        result.push_str(grapheme);
-        width = width.saturating_add(cell_width);
-    }
-    result
-}
-
 fn tab_fact(
     tab: &tabs_list::TabListEntry,
     facts: &bmux_presentation_state::PresentationFactRegistry,
@@ -1599,148 +1632,6 @@ fn render_template(
         )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}")
-}
-
-#[cfg(test)]
-fn push_wrapped_text(
-    ops: &mut Vec<RenderOp>,
-    text: &str,
-    x: u16,
-    start_row: u16,
-    width: usize,
-    maximum_rows: u16,
-    style: RenderStyle,
-) -> u16 {
-    if text.is_empty() || width == 0 || maximum_rows == 0 {
-        return 0;
-    }
-    let lines = bmux_tui::text::wrap_text(
-        text.trim(),
-        bmux_tui::text::TextWrapGeometry::uniform(width),
-        bmux_tui::text::TextWrap::Word,
-    );
-    let mut rows = 0_u16;
-    for line in lines.iter().take(usize::from(maximum_rows)) {
-        ops.push(RenderOp::text_run(
-            x,
-            start_row.saturating_add(rows),
-            line,
-            style,
-        ));
-        rows = rows.saturating_add(1);
-    }
-    rows
-}
-
-#[allow(clippy::too_many_lines)] // Scene construction is one ordered retained projection; splitting obscures row accounting.
-// The surface wire format uses text runs; let the component painter resolve
-// clipping and grapheme cells before adapting its plain field to that format.
-fn paint_sidebar_field(
-    field: &bmux_tui::composition::TextBlock,
-    child: &bmux_tui::component::ChildLayout,
-    placement: &(u64, std::ops::Range<u64>),
-    style: RenderStyle,
-    ops: &mut Vec<RenderOp>,
-    metadata: (
-        &mut bmux_plugin::surface::PluginSurfaceMetadata,
-        String,
-        u64,
-    ),
-) {
-    use bmux_tui::buffer::Buffer;
-    use bmux_tui::component::Component;
-    use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
-    use bmux_tui::paint::PaintCx;
-
-    let width = u16::try_from(child.node.size.width).unwrap_or(u16::MAX);
-    if width == 0 {
-        return;
-    }
-    let start = placement.0.saturating_add(child.y);
-    let end = start.saturating_add(child.node.size.height);
-    let visible_start = start.max(placement.1.start);
-    let visible_end = end.min(placement.1.end);
-    if visible_start >= visible_end {
-        return;
-    }
-    let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
-    let offset = i64::try_from(visible_start - start).unwrap_or(i64::MAX);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    let mut frame = Frame::new(&mut buffer);
-    PaintCx::new(&mut frame).with_child(
-        0,
-        -offset,
-        bmux_tui::paint::LocalRect::new(0, offset, width, height),
-        |cx| {
-            field.paint(&child.node, cx);
-            field.register_selection(
-                &child.node,
-                cx,
-                metadata.1.clone(),
-                metadata.1.clone(),
-                0,
-                metadata.2,
-            );
-        },
-    );
-    let origin_x = 2_u16.saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX));
-    let origin_y =
-        u16::try_from(visible_start.saturating_sub(placement.1.start) + 1).unwrap_or(u16::MAX);
-    let area = Rect::new(origin_x, origin_y, width, height);
-    let selection = metadata
-        .0
-        .selection
-        .as_mut()
-        .expect("producer selection scene");
-    selection.push_scope(
-        bmux_tui::selection::SelectionScope::new(metadata.1.clone(), area).revision(metadata.2),
-    );
-    for fragment in frame.selection().fragments() {
-        let mut fragment = fragment.clone();
-        fragment.area.x = fragment.area.x.saturating_add(origin_x);
-        fragment.area.y = fragment.area.y.saturating_add(origin_y);
-        selection.push_fragment(fragment);
-    }
-    metadata.0.text.insert(
-        metadata.1.clone().into(),
-        field
-            .text()
-            .lines
-            .iter()
-            .map(bmux_tui::text::Line::plain_text)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    metadata
-        .0
-        .semantics
-        .as_mut()
-        .expect("producer semantic scene")
-        .push(bmux_tui::semantic::SemanticRegion::new(
-            metadata.1, area, "label",
-        ));
-    drop(frame);
-    for (offset, cells) in buffer.cells().chunks(usize::from(width)).enumerate() {
-        let text = cells
-            .iter()
-            .filter(|cell| !cell.is_wide_continuation())
-            .map(|cell| cell.symbol.as_str())
-            .collect::<String>();
-        let logical_row = visible_start.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
-        let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
-            &placement.1,
-            logical_row..logical_row.saturating_add(1),
-        ) else {
-            continue;
-        };
-        ops.push(RenderOp::text_run(
-            2_u16.saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
-            u16::try_from(projected.start + 1).unwrap_or(u16::MAX),
-            text.trim_end(),
-            style,
-        ));
-    }
 }
 
 /// A tab's state glyph and color. They show only what the tab is doing; the
@@ -1858,324 +1749,174 @@ fn group_summary(
     }
     parts
 }
-
-fn sidebar_region(
-    item: SidebarHit,
-    width: u16,
-    row: u16,
-    height: u16,
-    hits: &mut HitTable<SidebarHit>,
-) -> PluginSurfaceRegion {
-    PluginSurfaceRegion::new(
-        item_region_id(item),
-        ExtensionRect::new(1, row, width.saturating_sub(2), height.max(1)),
-    )
-    .endpoint(input_endpoint())
-    .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
-    .key(hits.key(item))
-}
-
-/// Paint a workspace's header row: its marker and name, and at the right
-/// what its tabs are doing: how many need input, failed, are working and
-/// have stopped, most pressing first, or else how many tabs it holds. A
-/// collapsed header is marked when it hides this client's tab.
-fn paint_group_header(
-    state: &CompanionState,
-    palette: &SidebarPalette,
-    ops: &mut Vec<RenderOp>,
-    (width, start_row, end_row): (u16, u16, u16),
-    (tabs, collapsed, hovered): (&[usize], bool, bool),
-    title: &str,
-) {
-    let holds_active = collapsed && tabs.iter().any(|index| state.snapshot.tabs[*index].active);
-    let card = if holds_active {
-        palette.active_card
-    } else if hovered {
-        palette.hover_card
-    } else {
-        palette.base
-    };
-    if holds_active || hovered {
-        ops.push(RenderOp::fill_rect(
-            ExtensionRect::new(0, start_row, width, end_row.saturating_sub(start_row)),
-            ' ',
-            card,
-        ));
-    }
-    // The title keeps at least a few cells; the counts take the rest, the
-    // least pressing dropped first when they do not fit.
-    let title_room = bmux_cell_geometry::display_width(title).min(8);
-    let room = usize::from(width.saturating_sub(4)).saturating_sub(title_room + 1);
-    let parts = group_summary(state, tabs, room);
-    let summary_width = parts
-        .iter()
-        .map(|(text, _)| bmux_cell_geometry::display_width(text))
-        .sum::<usize>()
-        + parts.len().saturating_sub(1);
-    let summary_x = width
-        .saturating_sub(1)
-        .saturating_sub(u16::try_from(summary_width).unwrap_or(u16::MAX));
-    ops.push(RenderOp::text_run(
-        2,
-        start_row,
-        truncate_to_width(title, usize::from(summary_x.saturating_sub(3))),
-        palette.heading.background_of(card),
-    ));
-    let mut x = summary_x;
-    for (text, color) in parts {
-        let style = color.map_or(palette.muted, |color| RenderStyle::new().foreground(color));
-        let cells = u16::try_from(bmux_cell_geometry::display_width(&text)).unwrap_or(u16::MAX);
-        ops.push(RenderOp::text_run(
-            x,
-            start_row,
-            text,
-            style.background_of(card),
-        ));
-        x = x.saturating_add(cells).saturating_add(1);
-    }
-    if holds_active {
-        for bar_row in start_row..end_row {
-            ops.push(RenderOp::text_run(
-                0,
-                bar_row,
-                "▎",
-                palette.accent.background_of(card),
-            ));
-        }
-    }
-}
-
 #[cfg(test)]
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     build_surface_with_hits(state, revision).0
 }
 
 // Paint and logical descriptions share the same measured scroll projection.
-#[allow(clippy::too_many_lines)]
+
+/// The sidebar's interactive regions from the regions its components
+/// painted: a region per visible row (keyed in `hits`, and recorded in
+/// `placed`) and the resize edge.
+fn sidebar_regions(
+    painted: Vec<PluginSurfaceRegion>,
+    hits: &mut HitTable<SidebarHit>,
+    placed: &mut std::collections::BTreeSet<SidebarHit>,
+) -> Vec<PluginSurfaceRegion> {
+    let mut regions = Vec::new();
+    for hit in painted {
+        // The list registers each row for keyboard focus too, under the same
+        // id; the pointer regions are the interactive ones.
+        if hit
+            .interaction
+            .as_ref()
+            .is_some_and(|interaction| !interaction.pointer_events)
+        {
+            continue;
+        }
+        let item = if hit.local_id == view::RESIZE_EDGE {
+            Some(SidebarHit::ResizeEdge)
+        } else {
+            hit.local_id
+                .strip_prefix(view::LIST_ID)
+                .and_then(|rest| rest.strip_prefix(".item."))
+                .and_then(region_item)
+        };
+        let Some(item) = item.filter(|item| placed.insert(*item)) else {
+            continue;
+        };
+        let cursor = if item == SidebarHit::ResizeEdge {
+            bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal
+        } else {
+            bmux_plugin::surface::PluginSurfaceCursor::Pointer
+        };
+        regions.push(
+            PluginSurfaceRegion::new(item_region_id(item), hit.rect)
+                .endpoint(input_endpoint())
+                .focusable(cursor)
+                .key(hits.key(item)),
+        );
+    }
+    regions
+}
+
+/// The plain text of the fields on screen, by selection scope: exactly the
+/// text each painted field's selection indexes into.
+fn visible_field_text(
+    rows: &[(SidebarHit, view::RowView)],
+    placed: &std::collections::BTreeSet<SidebarHit>,
+    width: u16,
+) -> std::collections::BTreeMap<bmux_tui::selection::SelectionContentId, String> {
+    let mut text = std::collections::BTreeMap::new();
+    for (key, row) in rows {
+        let view::RowView::Card(card) = row else {
+            continue;
+        };
+        if !placed.contains(key) {
+            continue;
+        }
+        for (field, value) in card.fields.iter().zip(card.field_texts(u64::from(width))) {
+            if !value.trim().is_empty() {
+                text.insert(field.id.clone().into(), value);
+            }
+        }
+    }
+    text
+}
+
+/// The sidebar's surface and what its regions' keys mean: the heading, the
+/// rows (painted, clipped and given hit regions by the list component), and
+/// the resize edge.
 fn build_surface_with_hits(
     state: &CompanionState,
     revision: u64,
 ) -> (PluginSurface, HitTable<SidebarHit>) {
+    use bmux_plugin::render_paint::tui_style;
     let mut hits = HitTable::new();
     let width = state.allocated_width();
     let palette = SidebarPalette::default();
-    // Content-sized surfaces are finalized from the emitted item geometry below.
-    let height = u16::MAX;
-    let heading = state.settings.heading.to_uppercase();
-    let rows = state.rows();
-    // Tabs in scope, including those under collapsed headers.
-    let count = rows
-        .iter()
-        .map(|row| match row {
-            SidebarRow::Tab(_) => 1,
-            SidebarRow::Group {
-                tabs, collapsed, ..
-            } => {
-                if *collapsed {
-                    tabs.len()
-                } else {
-                    0
-                }
-            }
-        })
-        .sum::<usize>()
-        .to_string();
-    let count_x = width
-        .saturating_sub(1)
-        .saturating_sub(u16::try_from(count.len()).unwrap_or(u16::MAX));
-    let mut ops = vec![
-        RenderOp::fill_rect(ExtensionRect::new(0, 0, width, height), ' ', palette.base),
-        RenderOp::text_run(1, 0, heading, palette.heading),
-        RenderOp::text_run(count_x, 0, count, palette.muted),
-    ];
-    let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
-        selection: Some(bmux_tui::selection::SelectionScene::new()),
-        semantics: Some(bmux_tui::semantic::SemanticScene::new()),
-        text: std::collections::BTreeMap::new(),
+    let rows = state.row_views(revision);
+    let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let list = state.synced_list(&rows);
+    let list_height = state.list_height(&keys);
+    let shown_rows = {
+        let list_state = state.list.borrow();
+        u16::try_from(
+            list_state
+                .total_height()
+                .saturating_sub(list_state.scroll.vertical_offset())
+                .min(u64::from(list_height)),
+        )
+        .unwrap_or(u16::MAX)
     };
-    let mut regions = Vec::with_capacity(rows.len());
-    let layout = state.scroll_layout();
-    let visible = state.scroll.vertical_offset()
-        ..state
-            .scroll
-            .vertical_offset()
-            .saturating_add(layout.size.height);
-    let mut row = 1_u16;
-    for (index, listed) in rows.iter().enumerate() {
-        let item = &layout.children[0].node.children[index];
-        let item_end = item.y.saturating_add(item.node.size.height);
-        let Some(projected) =
-            bmux_tui_components::scroll_view::ScrollView::project_rows(&visible, item.y..item_end)
-        else {
-            continue;
-        };
-        let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
-        let end_row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
-        let tab_index = match listed {
-            SidebarRow::Tab(tab_index) => *tab_index,
-            SidebarRow::Group {
-                id,
-                tabs,
-                collapsed,
-                ..
-            } => {
-                let hovered = state.cursor.hovered() == Some(&SidebarHit::Group(*id));
-                paint_group_header(
-                    state,
-                    &palette,
-                    &mut ops,
-                    (width, start_row, end_row),
-                    (tabs, *collapsed, hovered),
-                    &state.measured_row(listed).title,
-                );
-                row = end_row;
-                regions.push(sidebar_region(
-                    SidebarHit::Group(*id),
-                    width,
-                    start_row,
-                    row.saturating_sub(start_row),
-                    &mut hits,
-                ));
-                continue;
-            }
-        };
-        let tab = &state.snapshot.tabs[tab_index];
-        let fact = state.tab_fact(tab);
-        let activity = state.activity.activity(tab.id, tab.active);
-        let hovered = state.cursor.hovered() == Some(&SidebarHit::Tab(tab.id));
-        // The card's background: tinted when active or hovered.
-        let card = if tab.active {
-            palette.active_card
-        } else if hovered {
-            palette.hover_card
-        } else {
-            palette.base
-        };
-        if tab.active || hovered {
-            ops.push(RenderOp::fill_rect(
-                ExtensionRect::new(0, start_row, width, end_row.saturating_sub(start_row)),
-                ' ',
-                card,
-            ));
-        }
-        let title_style = fact.as_ref().map_or_else(
-            || {
-                if tab.active {
-                    palette.active_title.background_of(card)
-                } else {
-                    palette.title.background_of(card)
-                }
-            },
-            |fact| fact_style(fact.role, palette.title).background_of(card),
-        );
-        let measured = state.measured_tab(tab_index);
-        let title_text = measured.title.clone();
-        for (field, child) in measured.fields.iter().zip(&measured.layout.children) {
-            let style = match child.node.id.as_str() {
-                "title" => title_style,
-                _ => palette.muted.background_of(card),
-            };
-            paint_sidebar_field(
-                field,
-                child,
-                &(item.y, visible.clone()),
-                style,
-                &mut ops,
-                (
-                    &mut metadata,
-                    selection_id(index, child.node.id.as_str()),
-                    revision,
-                ),
-            );
-        }
-        drop(measured);
-        // The first line, when it is on screen: the state glyph in its color
-        // and the summary at the right.
-        if projected.start == item.y
-            && let Some(activity) = &activity
-        {
-            let (glyph, color) = state_glyph(Some(activity));
-            if title_text.starts_with(glyph) {
-                ops.push(RenderOp::text_run(
-                    2,
-                    start_row,
-                    glyph.to_string(),
-                    RenderStyle::new().foreground(color).background_of(card),
-                ));
-            }
-            if let Some(summary) = &activity.summary {
-                let summary_width =
-                    u16::try_from(bmux_cell_geometry::display_width(summary)).unwrap_or(u16::MAX);
-                let x = width.saturating_sub(1).saturating_sub(summary_width);
-                if x > 3 {
-                    let style = match activity.state {
-                        activity::TabState::Idle => palette.muted,
-                        state => RenderStyle::new().foreground(state.color()),
-                    };
-                    ops.push(RenderOp::text_run(
-                        x,
-                        start_row,
-                        summary.clone(),
-                        style.background_of(card),
-                    ));
-                }
-            }
-        }
-        if tab.active {
-            for bar_row in start_row..end_row {
-                ops.push(RenderOp::text_run(
-                    0,
-                    bar_row,
-                    "▎",
-                    palette.accent.background_of(card),
-                ));
-            }
-        }
-        row = end_row;
-        regions.push(sidebar_region(
-            SidebarHit::Tab(tab.id),
-            width,
-            start_row,
-            row.saturating_sub(start_row),
-            &mut hits,
-        ));
+    let height = if state.settings.content_height {
+        shown_rows.saturating_add(2)
+    } else {
+        state
+            .allocation
+            .map_or_else(|| list_height.saturating_add(2), |rect| rect.h)
     }
-    if state.settings.content_height {
-        let rect = ExtensionRect::new(0, 0, width, row.saturating_add(1));
-        ops[0] = RenderOp::fill_rect(rect, ' ', palette.base);
-    }
-    if let Some(edge) = resize_edge(state, row) {
-        // Drawn while the pointer is on it or dragging it, so it is found
-        // where the resize cursor appears.
-        if state.edge_hovered || state.resize.is_some() {
-            for edge_row in edge.y..edge.y.saturating_add(edge.h) {
-                ops.push(RenderOp::text_run(
-                    edge.x,
-                    edge_row,
-                    "│",
-                    palette.accent.background_of(palette.base),
-                ));
-            }
-        }
-        // Last, so the edge wins over any card beneath it.
-        regions.push(
-            PluginSurfaceRegion::new(RESIZE_EDGE_REGION, edge)
-                .endpoint(input_endpoint())
-                .focusable(bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal)
-                .key(hits.key(SidebarHit::ResizeEdge)),
-        );
-    }
+    .max(1);
+    let count = state.tabs_in_scope();
+    let edge = resize_edge(state, shown_rows).map(|edge| view::Edge {
+        x: edge.x,
+        height: edge.h.min(height),
+        highlighted: state.edge_hovered || state.resize.is_some(),
+        style: tui_style(palette.accent.background_of(palette.base)),
+    });
+    let component = view::SidebarView {
+        size: (width, height),
+        base: tui_style(palette.base),
+        heading: view::styled(
+            state.settings.heading.to_uppercase(),
+            tui_style(palette.heading),
+        ),
+        count: view::styled(count.to_string(), tui_style(palette.muted)),
+        list,
+        state: &state.list,
+        list_height,
+        edge,
+    };
+    let size = bmux_tui::geometry::Size::new(width, height);
+    let layout = bmux_tui::component::Component::layout(
+        &component,
+        bmux_tui::component::Constraints::tight(size),
+        &mut bmux_tui::component::LayoutCx::new(),
+    );
+    let painted = bmux_plugin::component_viewport::ComponentViewport::new(
+        layout,
+        bmux_tui::geometry::Rect::new(0, 0, width, height),
+        bmux_tui::geometry::Point::new(0, 0),
+    )
+    .map(|viewport| viewport.paint(&component));
+    let Some(painted) = painted else {
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
+            revision,
+            PluginLayoutId::new(OWNER, LAYOUT_ID),
+            Vec::new(),
+        )
+        .opaque(true);
+        return (surface, hits);
+    };
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
         revision,
         PluginLayoutId::new(OWNER, LAYOUT_ID),
-        ops,
+        bmux_plugin::component_render::buffer_render_ops(&painted.buffer),
     )
     .opaque(true);
-    surface.metadata = Some(metadata);
-    for region in regions {
+    let mut placed = std::collections::BTreeSet::new();
+    for region in sidebar_regions(painted.hits, &mut hits, &mut placed) {
         surface = surface.interactive_region(region);
     }
+    let text = visible_field_text(&rows, &placed, width);
+    surface.metadata = Some(bmux_plugin::surface::PluginSurfaceMetadata {
+        selection: Some(painted.selection),
+        semantics: Some(painted.semantics),
+        text,
+    });
     (surface, hits)
 }
 
@@ -2373,20 +2114,13 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let previous_scroll = companion.scroll;
-    let previous = companion.scroll.vertical_offset();
-    let layout = companion.scroll_layout();
-    bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
-        &layout,
-        &mut companion.scroll,
-        if event.wheel_delta > 0 { -1 } else { 1 },
-    );
-    if previous == companion.scroll.vertical_offset() {
+    let previous_scroll = companion.list.borrow().scroll;
+    if !companion.scroll_rows(if event.wheel_delta > 0 { -1 } else { 1 }) {
         return true;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
     if publish_companion(companion).is_err() {
-        companion.scroll = previous_scroll;
+        companion.list.borrow_mut().scroll = previous_scroll;
         return false;
     }
     true
@@ -2427,16 +2161,14 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
         }
         _ => return None,
     };
-    let previous_scroll = companion.scroll;
+    let previous_scroll = companion.list.borrow().scroll;
     let previous_cursor = companion.cursor.clone();
     // The keyboard moves from the focused row; the highlight follows it.
     let keys = companion.item_keys();
     companion.cursor.set_cursor(Some(target));
     if let CursorOutcome::Moved(next) = companion.cursor.apply(&keys, input) {
-        if let Some(index) = keys.iter().position(|id| *id == next) {
-            companion.reveal(index);
-        }
         companion.cursor.set_hovered(Some(next));
+        companion.reveal_item(next);
     } else {
         companion.cursor.set_hovered(Some(target));
     }
@@ -2445,7 +2177,7 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
         if publish_companion(companion).is_ok() {
             true
         } else {
-            companion.scroll = previous_scroll;
+            companion.list.borrow_mut().scroll = previous_scroll;
             companion.cursor = previous_cursor;
             false
         }
@@ -2459,7 +2191,7 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
 }
 
 /// A left press or Enter on a tab's card switches to that tab: answered here,
-/// as a `switch-tab` invocation the attach client runs, because a handled
+/// as an `activate-tab` invocation the attach client runs, because a handled
 /// endpoint never reaches the plugin's service.
 fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
     if !is_activation(event) {
@@ -2472,7 +2204,7 @@ fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<Att
             drop(guard);
             Some(AttachInputResult {
                 consumed: true,
-                service_invocation: switch_tab_invocation(target),
+                service_invocation: activate_tab_invocation(target),
                 ..AttachInputResult::default()
             })
         }
@@ -2503,13 +2235,15 @@ fn is_activation(event: &AttachInputEvent) -> bool {
     key || pointer
 }
 
-/// The tabs plugin's `switch-tab` command for `tab`, for the client to run.
-fn switch_tab_invocation(tab: Uuid) -> Option<bmux_plugin::AttachInputServiceInvocation> {
-    use tabs_commands::client::{SwitchTabEndpoint as Endpoint, SwitchTabRequest};
-    let payload = bmux_plugin_sdk::encode_service_message(&SwitchTabRequest {
-        target: tab.to_string(),
-    })
-    .ok()?;
+/// The workspaces plugin's `activate-tab` command for `tab`, for the client
+/// to run: it shows that exact tab, switching to its workspace when it is in
+/// another one.
+fn activate_tab_invocation(tab: Uuid) -> Option<bmux_plugin::AttachInputServiceInvocation> {
+    use bmux_workspaces_plugin_api::workspaces_activation_v1::client::{
+        ActivateTabEndpoint as Endpoint, ActivateTabRequest,
+    };
+    let payload =
+        bmux_plugin_sdk::encode_service_message(&ActivateTabRequest { context_id: tab }).ok()?;
     let payload = bmux_plugin_sdk::service_contract::encode(
         Endpoint::INTERFACE_ID.as_str(),
         Endpoint::SERVICE_CONTRACT,
@@ -2586,10 +2320,12 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
         return AttachInputResult::default();
     };
     let mut client = ServiceCallerDispatchClient::new(context);
-    match block_on_typed_dispatch(tabs_commands::client::switch_tab(
-        &mut client,
-        target.to_string(),
-    )) {
+    match block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_activation_v1::client::activate_tab(
+            &mut client,
+            target,
+        ),
+    ) {
         Ok(Ok(_)) => AttachInputResult {
             consumed: true,
             dirty: true,
@@ -2694,31 +2430,8 @@ mod tests {
         drop(second);
     }
 
-    #[test]
-    fn field_paints_visible_rows_beyond_terminal_coordinate_limit() {
-        use bmux_tui::component::{ChildLayout, Component, Constraints, LayoutCx};
-        let text = format!("{}deep", "row\n".repeat(70_000));
-        let field = bmux_tui::composition::TextBlock::new(text.as_str());
-        let layout = field.layout(Constraints::for_width(4), &mut LayoutCx::new());
-        let child = ChildLayout::new(0, 0, layout);
-        let mut ops = Vec::new();
-        let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
-            selection: Some(bmux_tui::selection::SelectionScene::new()),
-            semantics: Some(bmux_tui::semantic::SemanticScene::new()),
-            text: std::collections::BTreeMap::new(),
-        };
-        super::paint_sidebar_field(
-            &field,
-            &child,
-            &(0, 70_000..70_001),
-            super::RenderStyle::new(),
-            &mut ops,
-            (&mut metadata, "deep-field".to_owned(), 1),
-        );
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], super::RenderOp::TextRun { text, .. } if text == "deep"));
-    }
     use super::*;
+    use bmux_plugin::RenderOp;
 
     /// Most tests exercise a shown sidebar; the shipped default is hidden.
     fn shown_toml() -> toml::Value {
@@ -3067,16 +2780,6 @@ mod tests {
     }
 
     #[test]
-    fn truncation_preserves_combining_graphemes() {
-        assert_eq!(truncate_to_width("e\u{301}x", 1), "e\u{301}");
-    }
-
-    #[test]
-    fn truncation_is_unicode_cell_safe() {
-        assert_eq!(truncate_to_width("ab界cd", 4), "ab界");
-    }
-
-    #[test]
     fn templates_escape_braces_and_expand_stable_tab_fields() {
         let tab = tabs_list::TabListEntry {
             id: Uuid::from_u128(10),
@@ -3136,14 +2839,6 @@ mod tests {
     }
 
     #[test]
-    fn descriptions_wrap_on_unicode_cell_boundaries() {
-        let mut ops = Vec::new();
-        let rows = push_wrapped_text(&mut ops, "alpha 界 beta", 0, 0, 7, 3, RenderStyle::new());
-        assert_eq!(rows, 2);
-        assert_eq!(ops.len(), 2);
-    }
-
-    #[test]
     fn hover_style_changes_only_the_target_card_title() {
         let mut state = CompanionState::new(shown_settings(), None);
         let first = Uuid::from_u128(11);
@@ -3170,8 +2865,10 @@ mod tests {
         let before = build_surface(&state, 1);
         state.cursor.set_hovered(Some(SidebarHit::Tab(second)));
         let after = build_surface(&state, 2);
-        assert_eq!(before.ops[3], after.ops[3]);
-        assert_ne!(before.ops[4], after.ops[4]);
+        // The first card's row is untouched; the hovered card's is restyled.
+        assert_eq!(painted_row(&before, 1), painted_row(&after, 1));
+        assert_ne!(painted_row(&before, 2), painted_row(&after, 2));
+        assert_eq!(surface_text(&before, 32, 3), surface_text(&after, 32, 3));
     }
 
     #[tokio::test]
@@ -3420,10 +3117,10 @@ mod tests {
                 .is_err()
         );
         assert!(state.allocation_publication_pending);
-        state.scroll.set_vertical_offset(1);
+        state.list.borrow_mut().scroll.set_vertical_offset(1);
         state
             .publish_allocation(rect, |current| {
-                assert_eq!(current.scroll.vertical_offset(), 1);
+                assert_eq!(current.scroll_offset(), 1);
                 Ok(())
             })
             .unwrap();
@@ -3757,6 +3454,154 @@ mod tests {
         assert!(header.contains("bmux"), "{header:?}");
     }
 
+    /// Six working agents, each a two-row card (title and directory), in a
+    /// sidebar with room for six rows of them.
+    fn working_cards() -> CompanionState {
+        use bmux_tabs_plugin_api::tabs_status::{
+            AgentActivity, TabAgent, TabStatus, TabStatusSnapshot,
+        };
+        let mut state = CompanionState::new(shown_settings(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 8));
+        let now = 600_000;
+        state.activity.replace(TabStatusSnapshot {
+            tabs: (1..=6_u128)
+                .map(|index| TabStatus {
+                    tab_id: Uuid::from_u128(index),
+                    panes: 1,
+                    running_command: Some("claude".into()),
+                    cwd: Some(format!("/work/repo-{index}")),
+                    title: None,
+                    git: None,
+                    last_exit: None,
+                    output_at_ms: None,
+                    attention_at_ms: None,
+                    attention: None,
+                    agent: Some(TabAgent {
+                        name: "claude".into(),
+                        activity: AgentActivity::Working,
+                        message: None,
+                        changed_at_ms: now - 1_000,
+                        finished_at_ms: None,
+                    }),
+                })
+                .collect(),
+            now_ms: now,
+            revision: 1,
+        });
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (1..=6_u128)
+                .map(|index| tabs_list::TabListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("tab-{index}"),
+                    active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        state
+    }
+
+    /// Scrolled to any offset, even partway into a card, every card whose
+    /// title is on screen shows its state glyph in its state's color and its
+    /// summary at the right of that title row.
+    #[test]
+    fn scrolled_cards_keep_their_state_glyph_and_summary() {
+        let green = Some(RenderColor::Named(RenderNamedColor::Green));
+        for offset in 0..=6_i64 {
+            let state = working_cards();
+            state.scroll_rows(offset);
+            assert_eq!(state.scroll_offset(), u64::try_from(offset).unwrap());
+            let surface = build_surface(&state, 1);
+            let text = surface_text(&surface, 32, 8);
+            let titles = (1..8_u16)
+                .filter(|row| text[usize::from(*row)].contains("tab-"))
+                .collect::<Vec<_>>();
+            assert!(titles.len() >= 2, "offset {offset}: {text:?}");
+            for row in titles {
+                let line = &text[usize::from(row)];
+                assert!(
+                    line.ends_with("working"),
+                    "offset {offset}, row {row}: {line:?}"
+                );
+                let runs = painted_row(&surface, row);
+                let glyph = runs
+                    .iter()
+                    .find(|(x, text, _)| *x == 2 && text.starts_with('◉'));
+                assert_eq!(
+                    glyph.map(|(_, _, style)| style.fg),
+                    Some(green),
+                    "offset {offset}, row {row}: {runs:?}"
+                );
+                let summary = runs.iter().find(|(_, text, _)| text.contains("working"));
+                assert_eq!(
+                    summary.map(|(_, _, style)| style.fg),
+                    Some(green),
+                    "offset {offset}, row {row}: {runs:?}"
+                );
+            }
+        }
+    }
+
+    /// After scrolling, each card's hit region covers exactly the rows its
+    /// card paints, inside the list: none overlap, none are off screen, and
+    /// every card with a visible title can be clicked there.
+    #[test]
+    fn hit_regions_match_painted_cards_after_scrolling() {
+        for offset in 0..=6_i64 {
+            let state = working_cards();
+            state.scroll_rows(offset);
+            let surface = build_surface(&state, 1);
+            let text = surface_text(&surface, 32, 8);
+            let mut covered = std::collections::BTreeSet::new();
+            for region in tab_regions(&surface) {
+                let id = region_tab_id(&region.local_id).unwrap();
+                let name = format!("tab-{}", id.as_u128());
+                assert!(
+                    region.rect.y >= 1 && region.rect.y + region.rect.h <= 7,
+                    "{region:?}"
+                );
+                for row in region.rect.y..region.rect.y + region.rect.h {
+                    assert!(covered.insert(row), "offset {offset}: row {row} twice");
+                    let line = &text[usize::from(row)];
+                    let card_row =
+                        line.contains(&name) || line.contains(&format!("repo-{}", id.as_u128()));
+                    assert!(card_row, "offset {offset}: {name} region on {line:?}");
+                }
+            }
+            for (row, line) in text.iter().enumerate().skip(1) {
+                if let Some(start) = line.find("tab-") {
+                    let name = line[start..].split_whitespace().next().unwrap();
+                    let row = u16::try_from(row).unwrap();
+                    assert!(
+                        tab_regions(&surface).iter().any(|region| {
+                            region_tab_id(&region.local_id)
+                                .is_some_and(|id| format!("tab-{}", id.as_u128()) == name)
+                                && (region.rect.y..region.rect.y + region.rect.h).contains(&row)
+                        }),
+                        "offset {offset}: no region for {name} on row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clicking, or pressing Enter on, a tab in another workspace shows that
+    /// tab: the click asks the workspaces plugin to activate it.
+    #[test]
+    fn clicking_a_tab_in_another_workspace_activates_it() {
+        let owner =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(grouped_state(grouped(), None))));
+        let other = Uuid::from_u128(4);
+        let region = tab_region_id(other);
+        for event in [press(&region), key(&region, "enter")] {
+            let result = super::handle_local_input(&owner, &event).unwrap();
+            assert!(result.consumed);
+            assert_activates(&result.service_invocation.unwrap(), other);
+        }
+    }
+
     /// A sidebar installed like an attach client's, shown at `placement`
     /// and allocated `rect`, remembering its width in `state_dir`.
     struct Installed {
@@ -3956,6 +3801,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `invocation` is the workspaces plugin's `activate-tab` for `tab`.
+    fn assert_activates(invocation: &bmux_plugin::AttachInputServiceInvocation, tab: Uuid) {
+        use bmux_plugin_sdk::TypedServiceEndpoint as _;
+        use bmux_workspaces_plugin_api::workspaces_activation_v1::{
+            self as activation, client::ActivateTabEndpoint,
+        };
+        assert_eq!(
+            invocation.endpoint.operation,
+            ActivateTabEndpoint::OPERATION.to_string()
+        );
+        assert_eq!(
+            invocation.endpoint.interface_id,
+            ActivateTabEndpoint::INTERFACE_ID.to_string()
+        );
+        let payload = bmux_plugin_sdk::service_contract::decode_for(
+            &invocation.endpoint.interface_id,
+            activation::SERVICE_CONTRACT,
+            &invocation.payload,
+        )
+        .unwrap();
+        let request: activation::client::ActivateTabRequest =
+            bmux_plugin_sdk::decode_service_message(payload).unwrap();
+        assert_eq!(request.context_id, tab);
+    }
+
     /// Clicking a tab's card, or pressing Enter on it, switches to that tab
     /// when the input arrives the way the attach client routes it: through
     /// the presentation's registered endpoint.
@@ -4002,20 +3872,10 @@ mod tests {
                 panic!("{} {} was not handled", event.event_kind, event.phase);
             };
             assert!(result.consumed);
-            let invocation = result.service_invocation.expect("a switch-tab invocation");
-            assert_eq!(
-                invocation.endpoint.operation,
-                tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string()
-            );
-            let payload = bmux_plugin_sdk::service_contract::decode_for(
-                &invocation.endpoint.interface_id,
-                tabs_commands::SERVICE_CONTRACT,
-                &invocation.payload,
-            )
-            .unwrap();
-            let request: tabs_commands::client::SwitchTabRequest =
-                bmux_plugin_sdk::decode_service_message(payload).unwrap();
-            assert_eq!(request.target, second.to_string());
+            let invocation = result
+                .service_invocation
+                .expect("an activate-tab invocation");
+            assert_activates(&invocation, second);
         }
         // Other buttons and phases do not switch tabs.
         for event in [
@@ -4078,6 +3938,23 @@ mod tests {
             .interactive_regions
             .iter()
             .filter(|region| region.local_id.starts_with("tab:"))
+            .collect()
+    }
+
+    /// What a surface paints on row `y`: each run's column, text and style.
+    fn painted_row(surface: &PluginSurface, y: u16) -> Vec<(u16, String, RenderStyle)> {
+        surface
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RenderOp::TextRun {
+                    x,
+                    y: row,
+                    text,
+                    style,
+                } if *row == y => Some((*x, text.clone(), *style)),
+                _ => None,
+            })
             .collect()
     }
 
@@ -4177,9 +4054,23 @@ mod tests {
             revision: 1,
         });
         let surface = build_surface(&state, 1);
-        // Metadata may hold no more than 16 bytes here; the ops are tiny.
-        let registry =
-            bmux_plugin::surface::PluginSurfaceRegistry::with_limits(4, 4_096, 16, 1 << 20);
+        // Every painted run fits the text limit here; the selection metadata,
+        // which holds every field's text, does not.
+        let longest_run = surface
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RenderOp::TextRun { text, .. } => Some(text.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        let registry = bmux_plugin::surface::PluginSurfaceRegistry::with_limits(
+            4,
+            4_096,
+            longest_run,
+            1 << 20,
+        );
         publish_surfaces(&registry, 1, vec![surface]).unwrap();
         let published = registry.owner_snapshot(OWNER).unwrap();
         assert!(published.surfaces[0].metadata.is_none());
@@ -4515,16 +4406,7 @@ mod tests {
         event.phase = "wheel".to_string();
         event.wheel_delta = -1;
         assert!(!update_scroll(&owner, &event));
-        assert_eq!(
-            owner
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .scroll
-                .vertical_offset(),
-            0
-        );
+        assert_eq!(owner.lock().unwrap().as_ref().unwrap().scroll_offset(), 0);
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("down".to_string());
@@ -4532,7 +4414,7 @@ mod tests {
         {
             let mut guard = owner.lock().unwrap();
             let state = guard.as_mut().unwrap();
-            assert_eq!(state.scroll.vertical_offset(), 0);
+            assert_eq!(state.scroll_offset(), 0);
             assert_eq!(state.cursor.hovered(), None);
             state.surfaces = Some(std::sync::Arc::new(
                 bmux_plugin::surface::PluginSurfaceRegistry::new(1),
@@ -4547,7 +4429,7 @@ mod tests {
             state.cursor.hovered(),
             Some(&SidebarHit::Tab(Uuid::from_u128(2)))
         );
-        assert!(state.scroll.vertical_offset() > 0);
+        assert!(state.scroll_offset() > 0);
         drop(guard);
     }
 
@@ -4573,41 +4455,38 @@ mod tests {
                 .collect(),
             revision: 1,
         });
-        let layout = state.scroll_layout();
-        assert_eq!(layout.size.height, 2);
-        assert_eq!(layout.children[0].node.size.height, 6);
-        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
-            &layout,
-            &mut state.scroll,
-            1,
-        );
+        // One card (a title and its description) fits; three are listed.
+        assert!(state.scroll_rows(1));
+        assert_eq!(state.list_height(&state.item_keys()), 2);
+        assert_eq!(state.list.borrow().total_height(), 6);
         let surface = build_surface(&state, 1);
         assert_eq!(tab_regions(&surface).len(), 2);
         assert_eq!(
             tab_regions(&surface)[0].rect,
-            ExtensionRect::new(1, 1, state.settings.width - 2, 1)
+            ExtensionRect::new(0, 1, state.settings.width, 1)
         );
         assert_eq!(
             tab_regions(&surface)[1].rect,
-            ExtensionRect::new(1, 2, state.settings.width - 2, 1)
+            ExtensionRect::new(0, 2, state.settings.width, 1)
         );
         assert!(
             surface
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    RenderOp::TextRun { y, .. } => Some(*y),
+                    RenderOp::TextRun { y, text, .. } if !text.trim().is_empty() => Some(*y),
                     _ => None,
                 })
                 .all(|y| y <= 2)
         );
-        state.reveal(2);
-        assert_eq!(state.scroll.vertical_offset(), 4);
+        state.reveal_item(SidebarHit::Tab(Uuid::from_u128(2)));
+        assert_eq!(state.scroll_offset(), 4);
         assert_eq!(tab_regions(&build_surface(&state, 2)).len(), 1);
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 5)));
-        assert_eq!(state.scroll_layout().size.height, 3);
+        assert_eq!(state.list_height(&state.item_keys()), 3);
         assert_eq!(state.allocated_width(), 12);
-        assert_eq!(state.scroll.vertical_offset(), 4);
+        // Narrower, the descriptions wrap to two rows: the offset still fits.
+        assert_eq!(state.scroll_offset(), 4);
         assert!(!state.resize(ExtensionRect::new(0, 0, 12, 5)));
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 1)));
         assert_eq!(
@@ -4635,7 +4514,7 @@ mod tests {
                 .collect(),
             revision: 1,
         });
-        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert_eq!(state.scroll_offset(), 3);
         let surface = build_surface(&state, 1);
         assert_eq!(tab_regions(&surface).len(), 2);
         assert_eq!(
@@ -4690,8 +4569,9 @@ mod tests {
             )
             .unwrap();
         let after = build_surface(&state, 2);
-        assert_eq!(before.ops[3], after.ops[3]);
-        assert_ne!(before.ops[4], after.ops[4]);
+        // Only the card the fact is about changes.
+        assert_eq!(painted_row(&before, 1), painted_row(&after, 1));
+        assert_ne!(painted_row(&before, 2), painted_row(&after, 2));
         assert!(facts.remove_producer(&producer));
     }
 
@@ -4760,7 +4640,7 @@ mod tests {
         });
         let surface = build_surface(&state, 2);
         assert_eq!(tab_regions(&surface).len(), 32);
-        assert_eq!(state.scroll.vertical_offset(), 1_968);
+        assert_eq!(state.scroll_offset(), 1_968);
     }
 
     #[test]
@@ -4791,13 +4671,17 @@ mod tests {
         assert_ne!(metadata.selection.as_ref().unwrap().fragments(), []);
         assert!(metadata.text.values().any(|text| text.contains("one")));
         assert_ne!(metadata.semantics.as_ref().unwrap().regions(), []);
-        assert!(matches!(
-            surface.ops[0],
-            RenderOp::FillRect {
-                rect: ExtensionRect { h: 3, .. },
-                ..
-            }
-        ));
+        // The heading, the one card and a spacer: the background covers
+        // exactly those rows.
+        let rows = surface
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RenderOp::TextRun { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(rows, std::collections::BTreeSet::from([0, 1, 2]));
     }
 
     #[test]

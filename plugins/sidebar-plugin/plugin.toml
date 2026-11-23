@@ -11,6 +11,11 @@ version           = "0.0.1-alpha.0"
 plugin_id   = "bmux.tabs"
 version_req = ">=0.0.1-alpha.0"
 
+# Clicking a tab shows it, in whichever workspace it is.
+[[dependencies]]
+plugin_id   = "bmux.workspaces"
+version_req = ">=0.0.1-alpha.0"
+
 # Visibility commands are answered by the sidebar presentation inside each
 # attach client, so they change only what that client shows.
 [[commands]]

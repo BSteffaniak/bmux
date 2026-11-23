@@ -95,6 +95,9 @@ Show or hide it in one attach client with `plugin:bmux.sidebar:toggle`
 (`ctrl+alt+s` by default), `plugin:bmux.sidebar:show` or
 `plugin:bmux.sidebar:hide`. See `docs/tab-presentations.md` for details.
 
+Click a tab, or press Enter on it, to show it, in whichever workspace it is
+(through the workspaces plugin's `activate-tab`).
+
 With `grouping = "workspace"`, each workspace's tabs sit under a header that
 sums up what they are doing: how many need input (`◆`), failed (`▲`), are
 working (`◉`) and have stopped (`■`), most pressing first, or how many tabs it
