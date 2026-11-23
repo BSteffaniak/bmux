@@ -96,6 +96,50 @@ struct Record {
     version: u32,
     sid: i32,
     leader_start: Option<(u64, u64)>,
+    /// The server incarnation that recorded the session (see [`Owner`]).
+    #[serde(default)]
+    owner: Option<u64>,
+}
+
+/// The servers of a run: the next incarnation, and those still running.
+#[derive(Default)]
+struct Incarnations {
+    next: AtomicU64,
+    running: switchy_thread::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+fn incarnations() -> switchy_thread::sync::Arc<Incarnations> {
+    crate::run_shared::run_shared::<Incarnations, _>(Incarnations::default)
+}
+
+/// The server records name. Every activation in a simulated run shares one process, so a
+/// server is its activation's incarnation, running until it crashes ([`Self::end`], as
+/// `abandon` models) the way a native server runs until its process dies.
+#[derive(Debug)]
+pub(crate) struct Owner(u64);
+
+impl Owner {
+    pub(crate) fn new() -> Self {
+        let incarnations = incarnations();
+        let incarnation = incarnations.next.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut running) = incarnations.running.lock() {
+            running.insert(incarnation);
+        }
+        Self(incarnation)
+    }
+
+    pub(crate) fn end(&self) {
+        if let Ok(mut running) = incarnations().running.lock() {
+            running.remove(&self.0);
+        }
+    }
+
+    fn running(incarnation: u64) -> bool {
+        incarnations()
+            .running
+            .lock()
+            .is_ok_and(|running| running.contains(&incarnation))
+    }
 }
 
 /// The session `pid` belongs to, while it runs.
@@ -212,6 +256,7 @@ impl Session {
         &self,
         root: &Path,
         token: uuid::Uuid,
+        owner: &Owner,
     ) -> anyhow::Result<Option<PathBuf>> {
         // The job's kill-on-close covers a crashed server on Windows; nothing to record.
         if self.job.is_some() {
@@ -225,6 +270,7 @@ impl Session {
                 version: RECORD_VERSION,
                 sid: i32::try_from(self.sid)?,
                 leader_start: self.start.map(|start| (start.0, start.1)),
+                owner: Some(owner.0),
             },
         )?;
         Ok(Some(path))
@@ -314,9 +360,8 @@ pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
     sweep_session(leader)
 }
 
-/// The simulated server has no process of its own to name (a crash is modelled by
-/// [`crate::runtime::session_control::SessionAuthority::abandon`] in the same process), so its
-/// records are swept whenever their session is still theirs.
+/// Sweep a recorded session whose server crashed; a running server's is left alone (see
+/// [`Owner`]).
 pub(crate) fn recover_record(path: &Path) -> anyhow::Result<crate::platform::RecordRecovery> {
     let record: Record = serde_json::from_slice(&switchy_fs::sync::read(path)?)?;
     anyhow::ensure!(
@@ -329,6 +374,9 @@ pub(crate) fn recover_record(path: &Path) -> anyhow::Result<crate::platform::Rec
     let recorded = record
         .leader_start
         .map(|(serial, fraction)| crate::platform::ProcessStartIdentity(serial, fraction));
+    if record.owner.is_some_and(Owner::running) {
+        return Ok(crate::platform::RecordRecovery::Owned);
+    }
     if still_ours(leader, recorded) {
         sweep_session(leader)?;
     }

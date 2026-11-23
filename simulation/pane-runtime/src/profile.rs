@@ -37,11 +37,19 @@ pub enum Kind {
     /// Lose power: every process dies, and the file system keeps only what was made durable
     /// (and a random part of the rest), then a new server recovers.
     PowerLoss,
+    /// Activate a second pane runtime on the running server's runtime directory, as a
+    /// command run in a client (or the CLI) does.
+    Bystander,
 }
 
 impl Kind {
+    /// Kinds whose weights a drawn profile draws after every other field, in this order.
+    /// Kinds added once profiles were in use belong here: drawn last, they leave every earlier
+    /// field (and so every regression seed's profile) as it was.
+    const DRAWN_LAST: [Self; 1] = [Self::Bystander];
+
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -52,6 +60,7 @@ impl Kind {
         Self::PowerLoss,
         Self::Split,
         Self::Interrupt,
+        Self::Bystander,
     ];
 
     /// Its name in a profile.
@@ -68,6 +77,7 @@ impl Kind {
             Self::PowerLoss => "power",
             Self::Split => "split",
             Self::Interrupt => "interrupt",
+            Self::Bystander => "bystander",
         }
     }
 }
@@ -133,7 +143,7 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()
@@ -148,10 +158,13 @@ impl Profile {
     /// Draw a profile with `draw(bound)`, which returns a number below `bound`.
     pub fn draw(mut draw: impl FnMut(u64) -> u64) -> Self {
         let mut weights = [0; Kind::ALL.len()];
-        for (index, weight) in weights.iter_mut().enumerate() {
+        for (kind, weight) in Kind::ALL.iter().zip(weights.iter_mut()) {
+            if Kind::DRAWN_LAST.contains(kind) {
+                continue;
+            }
             // Opening and waiting are always on: without panes nothing else happens, and
             // without waits nothing has time to.
-            let always = matches!(Kind::ALL[index], Kind::Open | Kind::Wait);
+            let always = matches!(kind, Kind::Open | Kind::Wait);
             if always || draw(2) == 0 {
                 *weight = 1 + draw(8);
             }
@@ -219,7 +232,19 @@ impl Profile {
             let rate = [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
             profile.faults.wall_clock = rate;
         }
+        for kind in Kind::DRAWN_LAST {
+            if draw(3) == 0 {
+                profile.set_weight(kind, 1 + draw(4));
+            }
+        }
         profile
+    }
+
+    /// Set `kind`'s weight.
+    fn set_weight(&mut self, kind: Kind, weight: u64) {
+        if let Some(index) = Kind::ALL.iter().position(|k| *k == kind) {
+            self.weights[index] = weight;
+        }
     }
 
     /// `kind`'s weight.
@@ -426,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_faults_are_drawn_after_every_other_field() {
+    fn the_new_faults_and_kinds_are_drawn_after_every_other_field() {
         // So every other field draws as before they existed.
         for seed in 0..50_u64 {
             let mut state = seed;
@@ -438,6 +463,16 @@ mod tests {
                 value
             });
             let mut at = draws.len();
+            // Kinds drawn last, in reverse: on (then a weight, of four) or not.
+            for _ in Kind::DRAWN_LAST {
+                if draws[at - 1].0 == 4 && draws[at - 2] == (3, 0) {
+                    at -= 2;
+                } else {
+                    at -= 1;
+                    assert_eq!(draws[at].0, 3, "seed {seed}: {draws:?}");
+                    assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
+                }
+            }
             // The wall clock: on (then a rate, of three) or not.
             if draws[at - 1].0 == 3 && draws[at - 2] == (4, 0) {
                 at -= 2;

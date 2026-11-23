@@ -35,6 +35,8 @@
 //!    those started outside the runtime, no session record.
 //! 10. A pane whose program ended says so.
 //! 11. Closing a pane leaves its siblings (its session's other panes, from splits) alone.
+//! 12. A pane runtime activated on the server's runtime directory while it runs (as a command
+//!     run in a client does) kills nothing the server runs.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood

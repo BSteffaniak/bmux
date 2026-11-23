@@ -511,7 +511,7 @@ impl Shared {
     /// Count `kind` under way (unless it crashes the server), with the server generation it
     /// acts on, which a crash ends.
     fn begin(&self, state: &mut State, kind: Kind) -> u64 {
-        if !matches!(kind, Kind::Crash | Kind::PowerLoss) {
+        if !matches!(kind, Kind::Crash | Kind::PowerLoss | Kind::Bystander) {
             state.busy += 1;
         }
         self.generation.load(Ordering::SeqCst)
@@ -522,6 +522,8 @@ impl Shared {
     async fn take(&self, driver: u64, kind: Kind, generation: u64) {
         if kind == Kind::Crash || kind == Kind::PowerLoss {
             self.crash(driver, kind == Kind::PowerLoss).await;
+        } else if kind == Kind::Bystander {
+            self.bystander(driver).await;
         } else {
             self.cancellable(driver, kind, generation).await;
         }
@@ -583,7 +585,7 @@ impl Shared {
             Kind::Resize => self.resize(driver).await,
             Kind::Close => self.close_one(driver).await,
             Kind::Restart => self.restart(driver).await,
-            Kind::Crash | Kind::PowerLoss => {}
+            Kind::Crash | Kind::PowerLoss | Kind::Bystander => {}
             Kind::Split => self.split(driver).await,
             Kind::Interrupt => self.interrupt(driver),
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
@@ -1147,6 +1149,58 @@ impl Shared {
                 running_in(&[old_session])
             ));
         }
+    }
+
+    /// Activate a second pane runtime on the server's runtime directory while the server runs
+    /// (as a command run in a client does), checking invariant 12: it kills nothing the server
+    /// runs. Drivers pause meanwhile, so no close or restart of theirs kills a program.
+    async fn bystander(&self, driver: u64) {
+        let _one_at_a_time = self.crash.lock().await;
+        let panes = {
+            let mut state = self.lock();
+            if state.open.is_empty() {
+                return;
+            }
+            state.crashing = true;
+            Arc::clone(&state.panes)
+        };
+        while self.lock().busy > 0 {
+            switchy_async::time::sleep(Duration::from_millis(1)).await;
+        }
+        let message = format!("d{driver}: a command activated the pane runtime beside the server");
+        event("bystander", message, Tone::Info);
+        // The programs of the server's live panes.
+        let programs: Vec<u64> = self
+            .lock()
+            .open
+            .keys()
+            .filter_map(|pane| panes.program_serial(*pane))
+            .filter(|serial| alive(*serial).is_some())
+            .collect();
+        let before = simulator::signal_log().len();
+        let bystander = Panes::recovering(SHELL, &self.records);
+        bystander.shut_down();
+        drop(bystander);
+        // 12. It killed none of them (the kill fault aside).
+        Board::checked(12);
+        let killed: Vec<u64> = simulator::signal_log()
+            .get(before..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|record| {
+                record.signal == switchy_pty::Signal::Kill
+                    && !record.by_fault
+                    && programs.contains(&record.serial)
+            })
+            .map(|record| record.serial)
+            .collect();
+        if !killed.is_empty() {
+            self.violated(format!(
+                "12. a pane runtime activated beside the running server killed its panes' \
+                 programs {killed:?}"
+            ));
+        }
+        self.lock().crashing = false;
     }
 
     /// Crash the server, start processes it never owned, then start a new server on the same

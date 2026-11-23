@@ -152,6 +152,7 @@ impl Session {
         &self,
         _root: &Path,
         _token: uuid::Uuid,
+        _owner: &Owner,
     ) -> anyhow::Result<Option<PathBuf>> {
         Ok(None)
     }
@@ -216,6 +217,16 @@ impl Session {
         if let Ok(mut job) = self.job.lock() {
             job.take();
         }
+    }
+}
+
+/// Windows keeps no records, so they name no server.
+#[derive(Debug)]
+pub(crate) struct Owner;
+
+impl Owner {
+    pub(crate) const fn new() -> Self {
+        Self
     }
 }
 

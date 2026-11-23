@@ -24,6 +24,8 @@ const RECORDS: &str = "pane-sessions";
 #[derive(Debug)]
 pub(crate) struct SessionAuthority {
     records: Mutex<Option<PathBuf>>,
+    /// Who this activation's records name as their server; see [`recover`].
+    owner: backend::Owner,
     sweep_on_exit: AtomicBool,
     /// Shared with each session's control (see [`Self::abandon`]).
     abandoned: Arc<AtomicBool>,
@@ -33,6 +35,7 @@ impl Default for SessionAuthority {
     fn default() -> Self {
         Self {
             records: Mutex::new(None),
+            owner: backend::Owner::new(),
             sweep_on_exit: AtomicBool::new(true),
             abandoned: Arc::new(AtomicBool::new(false)),
         }
@@ -71,6 +74,8 @@ impl SessionAuthority {
     #[cfg(feature = "simulator")]
     pub(crate) fn abandon(&self) {
         self.abandoned.store(true, Ordering::SeqCst);
+        // A dead server's records name no running server any more.
+        self.owner.end();
     }
 }
 
@@ -229,7 +234,7 @@ impl SessionControl {
     ) -> anyhow::Result<Self> {
         let backend = backend::Session::adopt(preparation, leader, master)?;
         let record = match host.sessions().records() {
-            Some(root) => backend.commit_record(&root, token)?,
+            Some(root) => backend.commit_record(&root, token, &host.sessions().owner)?,
             None => None,
         };
         Ok(Self {

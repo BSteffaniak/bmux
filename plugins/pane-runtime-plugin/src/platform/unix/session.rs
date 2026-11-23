@@ -60,6 +60,17 @@ fn this_process() -> Option<(u32, (u64, u64))> {
     crate::platform::process_start_identity(pid).map(|start| (pid, (start.0, start.1)))
 }
 
+/// The server records name: natively, this process (by pid and start identity), which is
+/// running for as long as anything can ask.
+#[derive(Debug)]
+pub(crate) struct Owner(Option<(u32, (u64, u64))>);
+
+impl Owner {
+    pub(crate) fn new() -> Self {
+        Self(this_process())
+    }
+}
+
 impl Session {
     pub(crate) fn adopt(
         _preparation: Preparation,
@@ -86,6 +97,7 @@ impl Session {
         &self,
         root: &Path,
         token: uuid::Uuid,
+        owner: &Owner,
     ) -> anyhow::Result<Option<PathBuf>> {
         std::fs::create_dir_all(root)?;
         let path = root.join(format!("{token}.json"));
@@ -95,7 +107,7 @@ impl Session {
                 version: RECORD_VERSION,
                 sid: self.sid,
                 leader_start: self.start.map(|start| (start.0, start.1)),
-                owner: this_process(),
+                owner: owner.0,
             },
         )?;
         Ok(Some(path))
