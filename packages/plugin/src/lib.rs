@@ -41,6 +41,8 @@ mod plugin_state;
 pub mod prompt;
 mod registry;
 pub mod render;
+#[cfg(feature = "tui")]
+pub mod render_paint;
 mod service_location;
 mod startup_gate;
 mod static_definition_registry;

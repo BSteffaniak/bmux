@@ -13,12 +13,13 @@ use bmux_appearance::{
 };
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::TerminalGraphicFill;
+use bmux_plugin::render_paint::clip_extension_rect;
 use bmux_plugin::{
     AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
     AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
     RenderOp, RenderStyle, RenderTextSpan, RenderUnderCell, TerminalGraphicOverlay,
-    TerminalRenderCapabilities, clip_render_text_run_to_rect, render_text_width_u16,
+    TerminalRenderCapabilities,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{
@@ -133,42 +134,12 @@ fn coalesce_render_damage(
     }
 }
 
-fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<ExtensionRect> {
-    let x1 = rect.x.max(bounds.x);
-    let y1 = rect.y.max(bounds.y);
-    let x2 = rect.right().min(bounds.right());
-    let y2 = rect.bottom().min(bounds.bottom());
-    if x1 >= x2 || y1 >= y2 {
-        None
-    } else {
-        Some(ExtensionRect {
-            x: x1,
-            y: y1,
-            w: x2.saturating_sub(x1),
-            h: y2.saturating_sub(y1),
-        })
-    }
-}
-
 fn render_damage_trace_shape(damage: &RenderDamage) -> (u16, bool) {
     match damage {
         RenderDamage::FullSurface => (0, true),
         RenderDamage::Regions(regions) => (u16::try_from(regions.len()).unwrap_or(u16::MAX), false),
         RenderDamage::None => (0, false),
     }
-}
-
-/// Paint `text` from column `x` of row `y`, each cell in exactly `style`.
-fn lower_text(canvas: &mut Canvas<'_, '_, '_>, x: u16, y: u16, text: &str, style: RenderStyle) {
-    canvas.text(x, y, text, crate::projection::style(style));
-}
-
-/// Paint `width` blank cells from column `x` of row `y`, in `style`.
-fn lower_fill(canvas: &mut Canvas<'_, '_, '_>, x: u16, y: u16, width: u16, style: RenderStyle) {
-    canvas.fill(
-        bmux_tui::geometry::Rect::new(x, y, width, 1),
-        crate::projection::style(style),
-    );
 }
 
 /// Queue declarative render operations clipped to `surface_rect` and `damage`.
@@ -481,322 +452,14 @@ fn lower_render_ops(
 ) -> bool {
     if render_ops_visible_segment_safe(ops) {
         let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
-        lower_render_ops_directly(
-            target,
+        bmux_plugin::render_paint::paint_render_ops(
+            target.cx(),
             surface_rect,
             &RenderDamage::FullSurface,
             &visible_segments,
         )
     } else {
-        lower_render_ops_directly(target, surface_rect, damage, ops)
-    }
-}
-
-fn lower_render_ops_directly(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    damage: &RenderDamage,
-    ops: &[RenderOp],
-) -> bool {
-    let mut wrote = false;
-    let mut pending_text_run = None;
-    for op in ops {
-        if !render_op_intersects_damage(op, damage) {
-            wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
-            continue;
-        }
-        if let RenderOp::TextRun { x, y, text, style } = op {
-            if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
-                wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
-                pending_text_run = Some(PendingTextRun {
-                    x: *x,
-                    y: *y,
-                    text: text.clone(),
-                    style: *style,
-                });
-            }
-            continue;
-        }
-        wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
-        wrote |= match op {
-            RenderOp::TextRun { .. } => false,
-            RenderOp::StyledText { x, y, spans } => {
-                lower_render_styled_text(target, surface_rect, *x, *y, spans)
-            }
-            RenderOp::ClearRect { rect, style } => {
-                lower_render_fill_rect(target, surface_rect, *rect, ' ', *style)
-            }
-            RenderOp::EraseRowSegment { x, y, width, style } => lower_render_fill_rect(
-                target,
-                surface_rect,
-                ExtensionRect {
-                    x: *x,
-                    y: *y,
-                    w: *width,
-                    h: 1,
-                },
-                ' ',
-                *style,
-            ),
-            RenderOp::FillRect { rect, ch, style } => {
-                lower_render_fill_rect(target, surface_rect, *rect, *ch, *style)
-            }
-            RenderOp::Border {
-                rect,
-                glyphs,
-                style,
-            } => lower_render_border(target, surface_rect, *rect, *glyphs, *style),
-            RenderOp::CellGrid { x, y, rows } => {
-                lower_render_cell_grid(target, surface_rect, *x, *y, rows)
-            }
-            RenderOp::Cells(block) => lower_render_cell_block(target, surface_rect, block),
-        };
-    }
-    wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
-    wrote
-}
-
-#[derive(Clone, Debug)]
-struct PendingTextRun {
-    x: u16,
-    y: u16,
-    text: String,
-    style: RenderStyle,
-}
-
-fn merge_pending_text_run(
-    pending: &mut Option<PendingTextRun>,
-    x: u16,
-    y: u16,
-    text: &str,
-    style: RenderStyle,
-) -> bool {
-    let Some(pending) = pending.as_mut() else {
-        return false;
-    };
-    if pending.y != y || pending.style != style {
-        return false;
-    }
-    let pending_width = render_text_width_u16(pending.text.as_str());
-    if pending.x.saturating_add(pending_width) != x {
-        return false;
-    }
-    pending.text.push_str(text);
-    true
-}
-
-fn flush_pending_text_run(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    pending: &mut Option<PendingTextRun>,
-) -> bool {
-    let Some(pending) = pending.take() else {
-        return false;
-    };
-    lower_render_text_run(
-        target,
-        surface_rect,
-        pending.x,
-        pending.y,
-        &pending.text,
-        pending.style,
-    )
-}
-
-fn lower_render_text_run(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    text: &str,
-    style: RenderStyle,
-) -> bool {
-    if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
-        return false;
-    }
-    let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
-        return false;
-    };
-    lower_text(target, clipped_x, y, &clipped, style);
-    true
-}
-
-fn lower_render_styled_text(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    spans: &[bmux_plugin::RenderTextSpan],
-) -> bool {
-    let mut wrote = false;
-    let mut cursor = x;
-    for span in spans {
-        if span.text.is_empty() {
-            continue;
-        }
-        wrote |= lower_render_text_run(target, surface_rect, cursor, y, &span.text, span.style);
-        cursor = cursor.saturating_add(render_text_width_u16(&span.text));
-    }
-    wrote
-}
-
-fn lower_render_fill_rect(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    rect: ExtensionRect,
-    ch: char,
-    style: RenderStyle,
-) -> bool {
-    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
-        return false;
-    };
-    if rect.is_empty() {
-        return false;
-    }
-    if ch == ' ' {
-        for y in rect.y..rect.bottom() {
-            lower_fill(target, rect.x, y, rect.w, style);
-        }
-        return true;
-    }
-    let row = ch.to_string().repeat(usize::from(rect.w));
-    for y in rect.y..rect.bottom() {
-        lower_text(target, rect.x, y, &row, style);
-    }
-    true
-}
-
-fn lower_render_border(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    rect: ExtensionRect,
-    glyphs: bmux_plugin::BorderGlyphs,
-    style: RenderStyle,
-) -> bool {
-    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
-        return false;
-    };
-    if rect.w == 0 || rect.h == 0 {
-        return false;
-    }
-    let vertical = glyphs.vertical.to_string();
-    if rect.h == 1 {
-        let row = glyphs.horizontal.to_string().repeat(usize::from(rect.w));
-        lower_text(target, rect.x, rect.y, &row, style);
-        return true;
-    }
-    if rect.w == 1 {
-        for y in rect.y..rect.bottom() {
-            lower_text(target, rect.x, y, &vertical, style);
-        }
-        return true;
-    }
-    let inner_width = usize::from(rect.w.saturating_sub(2));
-    let horizontal = glyphs.horizontal.to_string().repeat(inner_width);
-    let top = format!("{}{horizontal}{}", glyphs.top_left, glyphs.top_right);
-    let bottom = format!("{}{horizontal}{}", glyphs.bottom_left, glyphs.bottom_right);
-    lower_text(target, rect.x, rect.y, &top, style);
-    for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
-        lower_text(target, rect.x, y, &vertical, style);
-        lower_text(target, rect.right().saturating_sub(1), y, &vertical, style);
-    }
-    lower_text(
-        target,
-        rect.x,
-        rect.bottom().saturating_sub(1),
-        &bottom,
-        style,
-    );
-    true
-}
-
-fn lower_render_cell_grid(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    rows: &[Vec<bmux_plugin::RenderCell>],
-) -> bool {
-    let mut wrote = false;
-    for (row_offset, row) in rows.iter().enumerate() {
-        let Ok(row_offset) = u16::try_from(row_offset) else {
-            break;
-        };
-        let cell_y = y.saturating_add(row_offset);
-        if cell_y < surface_rect.y || cell_y >= surface_rect.bottom() {
-            continue;
-        }
-        for (col_offset, cell) in row.iter().enumerate() {
-            let Ok(col_offset) = u16::try_from(col_offset) else {
-                break;
-            };
-            let cell_x = x.saturating_add(col_offset);
-            if cell_x < surface_rect.x || cell_x >= surface_rect.right() {
-                continue;
-            }
-            let Some(ch) = cell.ch else {
-                continue;
-            };
-            lower_text(
-                target,
-                cell_x,
-                cell_y,
-                ch.encode_utf8(&mut [0; 4]),
-                cell.style,
-            );
-            wrote = true;
-        }
-    }
-    wrote
-}
-
-/// Paint a block's visible cells; transparent cells keep what is beneath.
-/// A wide symbol is painted only when all of its cells are inside the surface.
-fn lower_render_cell_block(
-    target: &mut Canvas<'_, '_, '_>,
-    surface_rect: ExtensionRect,
-    block: &bmux_presentation_scene::scene::CellBlock,
-) -> bool {
-    let mut wrote = false;
-    for row in 0..block.height {
-        let cell_y = block.y.saturating_add(row);
-        if cell_y < surface_rect.y || cell_y >= surface_rect.bottom() {
-            continue;
-        }
-        for column in 0..block.width {
-            let cell_x = block.x.saturating_add(column);
-            let Some(cell) = block.get(column, row) else {
-                continue;
-            };
-            let Some(symbol) = cell.symbol.as_ref() else {
-                continue;
-            };
-            let width = symbol.width().max(1);
-            if cell_x < surface_rect.x || cell_x.saturating_add(width) > surface_rect.right() {
-                continue;
-            }
-            let mut buffer = [0; 4];
-            lower_text(
-                target,
-                cell_x,
-                cell_y,
-                symbol.as_str(&mut buffer),
-                cell.style,
-            );
-            wrote = true;
-        }
-    }
-    wrote
-}
-
-fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
-    match damage {
-        RenderDamage::None => false,
-        RenderDamage::FullSurface => true,
-        RenderDamage::Regions(regions) => regions
-            .iter()
-            .copied()
-            .any(|region| render_op_bounds(op).intersects(region)),
+        bmux_plugin::render_paint::paint_render_ops(target.cx(), surface_rect, damage, ops)
     }
 }
 
@@ -1088,46 +751,6 @@ fn terminal_graphic_fill_contains(
         TerminalGraphicFill::Right { thickness_px } => {
             width.saturating_sub(x) <= usize::from(thickness_px)
         }
-    }
-}
-
-fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
-    match op {
-        RenderOp::TextRun { x, y, text, .. } => ExtensionRect {
-            x: *x,
-            y: *y,
-            w: render_text_width_u16(text),
-            h: 1,
-        },
-        RenderOp::StyledText { x, y, spans } => ExtensionRect {
-            x: *x,
-            y: *y,
-            w: spans.iter().fold(0_u16, |width, span| {
-                width.saturating_add(render_text_width_u16(&span.text))
-            }),
-            h: 1,
-        },
-        RenderOp::ClearRect { rect, .. }
-        | RenderOp::FillRect { rect, .. }
-        | RenderOp::Border { rect, .. } => *rect,
-        RenderOp::EraseRowSegment { x, y, width, .. } => ExtensionRect {
-            x: *x,
-            y: *y,
-            w: *width,
-            h: 1,
-        },
-        RenderOp::CellGrid { x, y, rows } => ExtensionRect {
-            x: *x,
-            y: *y,
-            w: rows
-                .iter()
-                .map(Vec::len)
-                .max()
-                .and_then(|width| u16::try_from(width).ok())
-                .unwrap_or(u16::MAX),
-            h: u16::try_from(rows.len()).unwrap_or(u16::MAX),
-        },
-        RenderOp::Cells(block) => block.rect(),
     }
 }
 
@@ -2340,7 +1963,7 @@ const fn render_style_to_cell_style(style: RenderStyle) -> CellStyle {
         underline: style.underline,
         inverse: style.reverse,
         strike: style.strikethrough,
-        hidden: false,
+        hidden: style.hidden,
     }
 }
 

@@ -51,6 +51,7 @@ pub const fn render_style(style: Style) -> RenderStyle {
         dim: style.modifiers.contains(Modifier::DIM),
         blink: style.modifiers.contains(Modifier::SLOW_BLINK),
         strikethrough: style.modifiers.contains(Modifier::CROSSED_OUT),
+        hidden: style.modifiers.contains(Modifier::HIDDEN),
     }
 }
 

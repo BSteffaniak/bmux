@@ -3,9 +3,9 @@
 //! The attach renderer paints straight into a frame (see [`crate::canvas`]); operations are only
 //! kept where output is retained across frames, an extension's output replayed while it is
 //! unchanged.
-use bmux_plugin::{RenderColor, RenderNamedColor, RenderStyle};
+use bmux_plugin::RenderStyle;
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
 
 /// One retained, already clipped operation.
@@ -315,58 +315,13 @@ pub fn prepare_content_overlays(
 /// Preserve all declarative terminal style attributes without terminal encoding.
 #[must_use]
 pub fn style(value: RenderStyle) -> Style {
-    let mut result = Style::new();
-    if let Some(color) = value.fg {
-        result = result.fg(render_color(color));
-    }
-    if let Some(color) = value.bg {
-        result = result.bg(render_color(color));
-    }
-    for (enabled, flag) in [
-        (value.bold, Modifier::BOLD),
-        (value.dim, Modifier::DIM),
-        (value.italic, Modifier::ITALIC),
-        (value.underline, Modifier::UNDERLINE),
-        (value.reverse, Modifier::REVERSED),
-        (value.blink, Modifier::SLOW_BLINK),
-        (value.strikethrough, Modifier::CROSSED_OUT),
-    ] {
-        if enabled {
-            result = result.add_modifier(flag);
-        }
-    }
-    result
-}
-
-const fn render_color(value: RenderColor) -> Color {
-    match value {
-        RenderColor::Default => Color::Default,
-        RenderColor::Indexed(index) => Color::Indexed(index),
-        RenderColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
-        RenderColor::Named(named) => match named {
-            RenderNamedColor::Black => Color::Black,
-            RenderNamedColor::Red => Color::Red,
-            RenderNamedColor::Green => Color::Green,
-            RenderNamedColor::Yellow => Color::Yellow,
-            RenderNamedColor::Blue => Color::Blue,
-            RenderNamedColor::Magenta => Color::Magenta,
-            RenderNamedColor::Cyan => Color::Cyan,
-            RenderNamedColor::White => Color::White,
-            RenderNamedColor::BrightBlack => Color::BrightBlack,
-            RenderNamedColor::BrightRed => Color::BrightRed,
-            RenderNamedColor::BrightGreen => Color::BrightGreen,
-            RenderNamedColor::BrightYellow => Color::BrightYellow,
-            RenderNamedColor::BrightBlue => Color::BrightBlue,
-            RenderNamedColor::BrightMagenta => Color::BrightMagenta,
-            RenderNamedColor::BrightCyan => Color::BrightCyan,
-            RenderNamedColor::BrightWhite => Color::BrightWhite,
-        },
-    }
+    bmux_plugin::render_paint::tui_style(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::style::Modifier;
 
     #[test]
     fn original_overlay_spans_are_sparse_clipped_and_reverse_is_explicit() {

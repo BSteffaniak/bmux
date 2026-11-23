@@ -204,6 +204,9 @@ pub struct RenderStyle {
     pub dim: bool,
     pub blink: bool,
     pub strikethrough: bool,
+    /// Concealed text (SGR 8): the cell keeps its symbol for selection and copying, but
+    /// the terminal does not show it.
+    pub hidden: bool,
 }
 
 impl RenderStyle {
@@ -219,6 +222,7 @@ impl RenderStyle {
             dim: false,
             blink: false,
             strikethrough: false,
+            hidden: false,
         }
     }
 

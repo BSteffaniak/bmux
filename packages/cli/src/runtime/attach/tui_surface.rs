@@ -131,7 +131,8 @@ mod tests {
                     | Modifier::UNDERLINE
                     | Modifier::SLOW_BLINK
                     | Modifier::REVERSED
-                    | Modifier::CROSSED_OUT,
+                    | Modifier::CROSSED_OUT
+                    | Modifier::HIDDEN,
             );
 
         let converted = render_style(style);
@@ -145,5 +146,6 @@ mod tests {
         assert!(converted.blink);
         assert!(converted.reverse);
         assert!(converted.strikethrough);
+        assert!(converted.hidden);
     }
 }

@@ -1614,6 +1614,7 @@ pub fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
         dim: style.dim,
         blink: style.blink,
         strikethrough: style.strikethrough,
+        hidden: false,
     }
 }
 

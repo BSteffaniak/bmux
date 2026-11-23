@@ -4,7 +4,7 @@ use bmux_plugin::{
 };
 use std::collections::BTreeMap;
 
-use super::clip_extension_rect;
+use bmux_plugin::render_paint::clip_extension_rect;
 
 pub(super) fn render_ops_visible_segment_safe(ops: &[RenderOp]) -> bool {
     ops.iter().all(render_op_visible_segment_safe)

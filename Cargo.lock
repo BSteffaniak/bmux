@@ -5860,6 +5860,7 @@ dependencies = [
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_cell_geometry",
  "bmux_codec",
  "bmux_ipc",
  "bmux_keyboard",

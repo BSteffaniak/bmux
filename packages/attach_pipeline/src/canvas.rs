@@ -10,8 +10,7 @@
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::image::ImagePlacement;
 use bmux_tui::paint::{LocalRect, PaintCx, SizedCell};
-use bmux_tui::style::{Color, Style};
-use bmux_tui::text::{Line, Span};
+use bmux_tui::style::Style;
 
 use crate::AttachCursorState;
 use crate::projection::{PaintOperation, ProjectionFailure};
@@ -75,50 +74,14 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
 
     /// Fill `rect` with blanks in `style`.
     pub fn fill(&mut self, rect: Rect, style: Style) {
-        self.cx.fill(LocalRect::terminal(rect), " ", style);
+        bmux_plugin::render_paint::paint_blanks(self.cx, rect, style);
     }
 
     /// Paint `text` from column `x` of row `y`, replacing each cell it covers with exactly
     /// `style`: colors it leaves unset are the terminal's defaults, as the reset before every run
     /// of terminal output makes them.
     pub fn text(&mut self, x: u16, y: u16, text: &str, style: Style) {
-        let explicit = |color: Option<Color>| Some(color.unwrap_or(Color::Default));
-        let style = Style {
-            fg: explicit(style.fg),
-            bg: explicit(style.bg),
-            ..style
-        };
-        if text.is_ascii() {
-            // Each ASCII byte is one narrow cell: no grapheme segmentation needed.
-            self.cx.replace_cells(
-                i32::from(x),
-                i64::from(y),
-                (0..text.len()).map(|index| SizedCell {
-                    symbol: &text[index..=index],
-                    width: 1,
-                    style,
-                }),
-            );
-            return;
-        }
-        if text.chars().all(standalone_char) {
-            // Every character is a grapheme of its own (box drawing, most symbols).
-            self.cx.replace_cells(
-                i32::from(x),
-                i64::from(y),
-                text.char_indices().map(|(start, ch)| SizedCell {
-                    symbol: &text[start..start + ch.len_utf8()],
-                    width: u8::try_from(bmux_cell_geometry::scalar_width(ch)).unwrap_or(1),
-                    style,
-                }),
-            );
-            return;
-        }
-        let width = bmux_plugin::render_text_width_u16(text);
-        self.cx.write_line(
-            LocalRect::new(i32::from(x), i64::from(y), width, 1),
-            &Line::from_spans(vec![Span::styled(text, style)]),
-        );
+        bmux_plugin::render_paint::paint_terminal_text(self.cx, x, y, text, style);
     }
 
     /// Paint a run of cells from column `x` of row `y`, each a grapheme with the columns it
@@ -215,14 +178,6 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
             }
         }
     }
-}
-
-/// Whether `ch` is always a grapheme of its own, one or two columns wide: not zero-width (a
-/// joiner, a combining mark, a variation selector) and not one of the characters that combine with
-/// a neighbour into one grapheme (regional indicators, emoji skin-tone modifiers).
-fn standalone_char(ch: char) -> bool {
-    !matches!(ch, '\u{1f1e6}'..='\u{1f1ff}' | '\u{1f3fb}'..='\u{1f3ff}')
-        && matches!(bmux_cell_geometry::scalar_width(ch), 1 | 2)
 }
 
 /// Paint into `buffer` through a canvas (a frame painted over what `buffer` holds), for callers
