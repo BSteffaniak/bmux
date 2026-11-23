@@ -58,6 +58,8 @@ fn now_ms() -> u64 {
 struct Settings {
     /// More programs to treat as agents (with no screen rules).
     agents: Vec<String>,
+    /// More names or exact paths each agent runs as, by agent id.
+    aliases: std::collections::BTreeMap<String, Vec<String>>,
     /// Read agents' screens with their rules (on by default).
     screen_rules: bool,
 }
@@ -65,8 +67,8 @@ struct Settings {
 impl Settings {
     fn parse(value: Option<&toml::Value>) -> Result<Self, String> {
         let mut settings = Self {
-            agents: Vec::new(),
             screen_rules: true,
+            ..Self::default()
         };
         let Some(value) = value else {
             return Ok(settings);
@@ -85,6 +87,24 @@ impl Settings {
                             name.as_str()
                                 .map(str::to_string)
                                 .ok_or("agents must be a list of program names")
+                        })
+                        .collect::<Result<_, _>>()?;
+                }
+                "aliases" => {
+                    const SHAPE: &str =
+                        "aliases must map agent ids to lists of program names or paths";
+                    settings.aliases = value
+                        .as_table()
+                        .ok_or(SHAPE)?
+                        .iter()
+                        .map(|(agent, names)| {
+                            let names = names
+                                .as_array()
+                                .ok_or(SHAPE)?
+                                .iter()
+                                .map(|name| name.as_str().map(str::to_string).ok_or(SHAPE))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok::<_, &str>((agent.clone(), names))
                         })
                         .collect::<Result<_, _>>()?;
                 }
@@ -151,10 +171,17 @@ impl Knowledge {
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
         extra.extend(settings.agents.iter().cloned());
+        // Configured aliases come last, so they win over the rule files'.
         let catalog = identify::Catalog::new(
             rules
                 .values()
-                .map(|agent| (agent.id.as_str(), agent.aliases.as_slice())),
+                .map(|agent| (agent.id.as_str(), agent.aliases.as_slice()))
+                .chain(
+                    settings
+                        .aliases
+                        .iter()
+                        .map(|(agent, names)| (agent.as_str(), names.as_slice())),
+                ),
             &extra,
         );
         Self {
@@ -594,8 +621,8 @@ mod tests {
         assert_eq!(
             Settings::parse(None).unwrap(),
             Settings {
-                agents: Vec::new(),
-                screen_rules: true
+                screen_rules: true,
+                ..Settings::default()
             }
         );
         let value =
@@ -604,8 +631,15 @@ mod tests {
             Settings::parse(Some(&value)).unwrap(),
             Settings {
                 agents: vec!["mybot".into()],
-                screen_rules: false
+                screen_rules: false,
+                ..Settings::default()
             }
+        );
+        let value = toml::from_str::<toml::Value>("aliases = { claude = 3 }").unwrap();
+        assert!(
+            Settings::parse(Some(&value))
+                .unwrap_err()
+                .contains("aliases")
         );
         let value = toml::from_str::<toml::Value>("agent = ['typo']").unwrap();
         assert!(Settings::parse(Some(&value)).unwrap_err().contains("agent"));
@@ -640,6 +674,25 @@ mod tests {
             ..Settings::default()
         };
         assert!(Knowledge::load(&off, &[]).rules_for("claude").is_none());
+    }
+
+    #[test]
+    fn configured_aliases_name_agents_with_or_without_rules() {
+        let value = toml::from_str::<toml::Value>(
+            "[aliases]\nclaude = ['work-claude', '/opt/ai/bin/run-agent']\nmybot = ['mb']",
+        )
+        .unwrap();
+        let settings = Settings::parse(Some(&value)).unwrap();
+        let knowledge = Knowledge::load(&settings, &[]);
+        let identify = |command: &str| knowledge.catalog.identify(&[command.to_string()]);
+        // A rule-backed agent keeps its screen rules under its other names.
+        assert_eq!(identify("work-claude --resume").as_deref(), Some("claude"));
+        assert_eq!(identify("/opt/ai/bin/run-agent").as_deref(), Some("claude"));
+        assert!(knowledge.rules_for("claude").is_some());
+        // Any other id is an agent without rules.
+        assert_eq!(identify("mb").as_deref(), Some("mybot"));
+        assert!(knowledge.rules_for("mybot").is_none());
+        assert_eq!(identify("/usr/bin/run-agent"), None);
     }
 
     #[test]

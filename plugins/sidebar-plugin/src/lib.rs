@@ -1180,10 +1180,7 @@ fn render_template(
             "{fact_icon}",
             fact.and_then(|fact| fact.icon_id.as_deref()).unwrap_or(""),
         )
-        .replace(
-            "{state_icon}",
-            &state_glyph(activity, tab.active).0.to_string(),
-        )
+        .replace("{state_icon}", &state_glyph(activity).0.to_string())
         .replace(
             "{state}",
             activity.map_or("", |activity| activity.state.label()),
@@ -1356,15 +1353,11 @@ fn paint_sidebar_field(
     }
 }
 
-/// A tab's state glyph and color. The tab being shown, when idle, is a solid
-/// bright dot rather than the dim idle ring.
-fn state_glyph(activity: Option<&activity::TabActivity>, active: bool) -> (char, RenderColor) {
+/// A tab's state glyph and color. They show only what the tab is doing; the
+/// card's tint and accent bar show which tab is selected.
+fn state_glyph(activity: Option<&activity::TabActivity>) -> (char, RenderColor) {
     let state = activity.map_or(activity::TabState::Idle, |activity| activity.state);
-    if active && state == activity::TabState::Idle {
-        ('●', RenderColor::Named(RenderNamedColor::BrightWhite))
-    } else {
-        (state.glyph(), state.color())
-    }
+    (state.glyph(), state.color())
 }
 
 /// The sidebar's colors: the terminal's own background, a tinted card for
@@ -1533,7 +1526,7 @@ fn build_surface_with_hits(
         if projected.start == item.y
             && let Some(activity) = &activity
         {
-            let (glyph, color) = state_glyph(Some(activity), tab.active);
+            let (glyph, color) = state_glyph(Some(activity));
             if title_text.starts_with(glyph) {
                 ops.push(RenderOp::text_run(
                     2,
@@ -2992,7 +2985,7 @@ mod tests {
             text,
             [
                 " TABS                         4",
-                "▎ ● editor                 nvim",
+                "▎ ○ editor                 nvim",
                 "▎   /work/bmux · main* ↑2",
                 "  ◉ claude              working",
                 "    /work/bmux/plugins",
@@ -3005,6 +2998,127 @@ mod tests {
             "{}",
             text.join("\n")
         );
+    }
+
+    /// A card's painted state glyph with its color, and its summary.
+    type PaintedCard = (Option<(String, Option<RenderColor>)>, String);
+
+    /// Each named card's painted state glyph with its color, and the last
+    /// word of its first line (its summary).
+    fn painted_cards(state: &CompanionState, names: &[&str]) -> Vec<PaintedCard> {
+        let surface = build_surface(state, 1);
+        let text = surface_text(&surface, 32, 10);
+        names
+            .iter()
+            .map(|name| {
+                let row = text
+                    .iter()
+                    .position(|line| line.split_whitespace().any(|word| word == *name))
+                    .and_then(|row| u16::try_from(row).ok())
+                    .unwrap_or_else(|| panic!("no card for {name}: {text:?}"));
+                // The glyph painted last over the title is the one shown.
+                let glyph = surface.ops.iter().rev().find_map(|op| match op {
+                    RenderOp::TextRun {
+                        x: 2,
+                        y,
+                        text,
+                        style,
+                    } if *y == row => Some((text.clone(), style.fg)),
+                    _ => None,
+                });
+                let summary = text[usize::from(row)]
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or_default()
+                    .to_string();
+                (glyph, summary)
+            })
+            .collect()
+    }
+
+    /// Selecting a tab moves the selection, never what each agent's card
+    /// says it is doing: working, waiting for an answer, or stopped.
+    #[test]
+    fn switching_tabs_keeps_every_agents_painted_state() {
+        use bmux_tabs_plugin_api::tabs_status::{
+            AgentActivity, TabAgent, TabStatus, TabStatusSnapshot,
+        };
+        let now = 600_000;
+        let agents = [
+            ("working", AgentActivity::Working, None),
+            ("asking", AgentActivity::Blocked, None),
+            ("stopped", AgentActivity::Idle, Some(now - 60_000)),
+        ];
+        let mut state = CompanionState::new(shown_settings(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 10));
+        state.activity.replace(TabStatusSnapshot {
+            tabs: (1..=3_u128)
+                .zip(&agents)
+                .map(|(index, (_, activity, finished_at_ms))| TabStatus {
+                    tab_id: Uuid::from_u128(index),
+                    panes: 1,
+                    running_command: Some("claude".into()),
+                    cwd: None,
+                    title: None,
+                    git: None,
+                    last_exit: None,
+                    output_at_ms: Some(now - 500),
+                    attention_at_ms: None,
+                    attention: None,
+                    agent: Some(TabAgent {
+                        name: "claude".into(),
+                        activity: *activity,
+                        message: (*activity == AgentActivity::Blocked)
+                            .then(|| "Which layout?".into()),
+                        changed_at_ms: now - 60_000,
+                        finished_at_ms: *finished_at_ms,
+                    }),
+                })
+                .collect(),
+            now_ms: now,
+            revision: 1,
+        });
+        let names = agents.map(|(name, ..)| name);
+        let painted = |state: &CompanionState| painted_cards(state, &names);
+        let select = |state: &mut CompanionState, selected: u128| {
+            state.replace_tabs(tabs_list::TabListSnapshot {
+                tabs: (1..=3_u128)
+                    .zip(&agents)
+                    .map(|(index, (name, ..))| tabs_list::TabListEntry {
+                        id: Uuid::from_u128(index),
+                        name: (*name).to_string(),
+                        active: index == selected,
+                        workspace: "default".to_string(),
+                        workspace_id: Uuid::nil(),
+                    })
+                    .collect(),
+                revision: 1,
+            });
+            if let Some(active) = state.snapshot.tabs.iter().find(|tab| tab.active) {
+                state.activity.mark_viewed(active.id);
+            }
+        };
+        select(&mut state, 1);
+        let first = painted(&state);
+        let summaries = first
+            .iter()
+            .map(|(_, summary)| summary.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, ["working", "input", "stopped"]);
+        let glyphs = first
+            .iter()
+            .map(|(glyph, _)| glyph.clone().unwrap())
+            .collect::<Vec<_>>();
+        for (index, glyph) in glyphs.iter().enumerate() {
+            for other in &glyphs[index + 1..] {
+                assert_ne!(glyph.0, other.0, "three different glyphs: {glyphs:?}");
+                assert_ne!(glyph.1, other.1, "three different colors: {glyphs:?}");
+            }
+        }
+        for selected in [2, 3, 1, 3] {
+            select(&mut state, selected);
+            assert_eq!(painted(&state), first, "after selecting tab {selected}");
+        }
     }
 
     #[test]

@@ -566,6 +566,46 @@ mod tests {
         assert_eq!(tracker.snapshot().len(), 0);
     }
 
+    /// Claude installed through Nix runs as `.claude-wrapped_`; its pane
+    /// still reads as working, waiting for an answer, and stopped.
+    #[test]
+    fn a_nix_wrapped_claude_works_asks_and_stops() {
+        const ASKING: &str = "☐ Layout\n\nWhich layout should the gutter use?\n\n❯ 1. Icon + count\n  2. Count only\n\n─────\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        let rules = claude();
+        let has_rules = |agent: &str| agent == "claude";
+        let mut tracker = Tracker::default();
+        tracker.set_jobs(
+            &[job(
+                40,
+                "/nix/store/9jdr2bi3w9h9jc67lxa76vd84ygsgrp7-claude-code-with-ca-certs/bin/.claude-wrapped_ --resume",
+            )],
+            &catalog(),
+        );
+        assert_eq!(tracker.agent(PANE), Some("claude"));
+
+        tracker.apply_screen(PANE, WORKING, &rules);
+        tracker.settle(1_000, has_rules);
+        assert_eq!(
+            state(&tracker).map(|(state, _)| state),
+            Some(AgentState::Working)
+        );
+
+        tracker.apply_screen(PANE, ASKING, &rules);
+        tracker.settle(2_000, has_rules);
+        assert_eq!(
+            state(&tracker).map(|(state, _)| state),
+            Some(AgentState::Blocked)
+        );
+
+        tracker.apply_screen(PANE, IDLE, &rules);
+        tracker.settle(3_000, has_rules);
+        tracker.settle(3_000 + IDLE_SETTLE_MS, has_rules);
+        assert_eq!(
+            state(&tracker).map(|(state, _)| state),
+            Some(AgentState::Idle)
+        );
+    }
+
     #[test]
     fn agents_without_rules_work_while_they_print() {
         let has_rules = |_: &str| false;

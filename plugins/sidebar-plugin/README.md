@@ -5,7 +5,8 @@ on which git branch, and whether it needs you.
 
 Each tab is a card: a state glyph, the tab's name and, at the right, its
 running command or state; below it, dimmed, the focused pane's directory and
-git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you are
+git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you
+are
 looking at has an accent bar and a tinted background.
 
 ```text
@@ -22,13 +23,17 @@ looking at has an accent bar and a tinted background.
 
 States, most urgent first:
 
-| Glyph | State | When |
-| --- | --- | --- |
+| Glyph      | State   | When                                                                                                                                                                                         |
+| ---------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `◆` yellow | blocked | its agent needs you to answer or approve something, or (any other program) the tab rang the bell or sent a notification since you last looked at it; the message replaces the directory line |
-| `▲` red | failed | its last command exited non-zero (needs OSC 133 shell integration) |
-| `◉` green | working | its agent is working, or another command is running and produced output in the last few seconds |
-| `●` blue | done | its agent finished since you last looked at the tab |
-| `○` dim | idle | otherwise (the tab you are looking at shows a bright `●`) |
+| `▲` red    | failed  | its last command exited non-zero (needs OSC 133 shell integration)                                                                                                                           |
+| `◉` green  | working | its agent is working, or another command is running and produced output in the last few seconds                                                                                              |
+| `■` blue   | stopped | its agent is not working: it finished, or waits at its prompt                                                                                                                                |
+| `○` dim    | idle    | otherwise                                                                                                                                                                                    |
+
+An agent's state shows what the agent is doing whichever tab you are looking
+at; the selected tab is marked by its tinted card and accent bar, never by its
+state glyph.
 
 A tab's agent state comes from the agents plugin (`bmux.agents`, see
 `plugins/agents-plugin/README.md`), which recognizes coding agents in each

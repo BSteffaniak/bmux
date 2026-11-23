@@ -8,8 +8,10 @@
 //!
 //! - **blocked**: it needs the user to answer or approve something;
 //! - **working**: it is working;
-//! - **done**: it finished since this client last viewed the tab;
-//! - **idle**: otherwise.
+//! - **stopped**: otherwise: it finished, or waits at its prompt.
+//!
+//! An agent's state is what the agent is doing, whichever tab this client
+//! shows: viewing a tab never changes it.
 //!
 //! Any other tab is **blocked** when it rang the bell or sent a notification
 //! since it was viewed, **failed** when its last command exited non-zero,
@@ -34,7 +36,7 @@ pub enum TabState {
     Blocked,
     Failed,
     Working,
-    Done,
+    Stopped,
     Idle,
 }
 
@@ -45,7 +47,7 @@ impl TabState {
             Self::Blocked => '◆',
             Self::Failed => '▲',
             Self::Working => '◉',
-            Self::Done => '●',
+            Self::Stopped => '■',
             Self::Idle => '○',
         }
     }
@@ -56,7 +58,7 @@ impl TabState {
             Self::Blocked => RenderNamedColor::Yellow,
             Self::Failed => RenderNamedColor::Red,
             Self::Working => RenderNamedColor::Green,
-            Self::Done => RenderNamedColor::Blue,
+            Self::Stopped => RenderNamedColor::Blue,
             Self::Idle => RenderNamedColor::BrightBlack,
         })
     }
@@ -67,7 +69,7 @@ impl TabState {
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::Working => "working",
-            Self::Done => "done",
+            Self::Stopped => "stopped",
             Self::Idle => "idle",
         }
     }
@@ -168,7 +170,7 @@ impl ActivityView {
             .map(|program| program.rsplit('/').next().unwrap_or(program).to_string());
         let (state, summary, message) = status.agent.as_ref().map_or_else(
             || Self::program_state(status, now, viewed, program.as_deref()),
-            |agent| Self::agent_state(agent, viewed),
+            Self::agent_state,
         );
         let cwd = status.cwd.as_deref().map(|cwd| self.shorten_home(cwd));
         let branch = status.git.as_ref().map(|git| {
@@ -197,7 +199,7 @@ impl ActivityView {
                 parts.push(branch.clone());
             }
             // How long an agent has waited since it finished.
-            if matches!(state, TabState::Done | TabState::Idle)
+            if matches!(state, TabState::Stopped | TabState::Idle)
                 && let Some(at) = status
                     .agent
                     .as_ref()
@@ -218,9 +220,8 @@ impl ActivityView {
         })
     }
 
-    /// An agent's state, summary and message: done once it finished since
-    /// the tab was viewed.
-    fn agent_state(agent: &TabAgent, viewed: u64) -> (TabState, Option<String>, Option<String>) {
+    /// An agent's state, summary and message, from what it is doing alone.
+    fn agent_state(agent: &TabAgent) -> (TabState, Option<String>, Option<String>) {
         match agent.activity {
             AgentActivity::Blocked => (
                 TabState::Blocked,
@@ -228,10 +229,7 @@ impl ActivityView {
                 agent.message.clone(),
             ),
             AgentActivity::Working => (TabState::Working, Some("working".to_string()), None),
-            AgentActivity::Idle if agent.finished_at_ms.is_some_and(|at| at > viewed) => {
-                (TabState::Done, Some("done".to_string()), None)
-            }
-            AgentActivity::Idle => (TabState::Idle, Some(agent.name.clone()), None),
+            AgentActivity::Idle => (TabState::Stopped, Some("stopped".to_string()), None),
         }
     }
 
@@ -359,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_move_through_working_blocked_done_and_idle() {
+    fn agents_show_working_blocked_and_stopped_distinctly() {
         let tab = Uuid::from_u128(1);
         let mut status = status(1);
         status.running_command = Some("claude --resume".into());
@@ -371,34 +369,71 @@ mod tests {
             behind: 0,
         });
         status.agent = Some(agent(AgentActivity::Working, None));
-        let activity = view(vec![status.clone()], 10_000)
+        let working = view(vec![status.clone()], 10_000)
             .activity(tab, false)
             .unwrap();
-        assert_eq!(activity.state, TabState::Working);
-        assert_eq!(activity.summary.as_deref(), Some("working"));
-        assert_eq!(activity.detail, "~/repo · main* ↑2");
-        assert_eq!(activity.agent.as_deref(), Some("claude"));
+        assert_eq!(working.state, TabState::Working);
+        assert_eq!(working.summary.as_deref(), Some("working"));
+        assert_eq!(working.detail, "~/repo · main* ↑2");
+        assert_eq!(working.agent.as_deref(), Some("claude"));
 
+        // Waiting for the user's answer shows the question.
         status.agent = Some(agent(AgentActivity::Blocked, None));
-        let activity = view(vec![status.clone()], 10_000)
+        let blocked = view(vec![status.clone()], 10_000)
             .activity(tab, false)
             .unwrap();
-        assert_eq!(activity.state, TabState::Blocked);
-        assert_eq!(activity.summary.as_deref(), Some("needs input"));
-        assert_eq!(activity.detail, "approve edit?");
+        assert_eq!(blocked.state, TabState::Blocked);
+        assert_eq!(blocked.summary.as_deref(), Some("needs input"));
+        assert_eq!(blocked.detail, "approve edit?");
 
-        // It finished a minute ago and nobody looked: done.
+        // No longer working: stopped, with how long ago it finished.
         status.agent = Some(agent(AgentActivity::Idle, Some(9_000)));
-        let mut done = view(vec![status], 70_000);
-        let activity = done.activity(tab, false).unwrap();
-        assert_eq!(activity.state, TabState::Done);
-        assert_eq!(activity.detail, "~/repo · main* ↑2 · 1m");
-        // Viewing it makes it idle, named by its agent.
-        done.mark_viewed(tab);
-        let activity = done.activity(tab, false).unwrap();
-        assert_eq!(activity.state, TabState::Idle);
-        assert_eq!(activity.summary.as_deref(), Some("claude"));
-        assert_eq!(done.activity(tab, true).unwrap().state, TabState::Idle);
+        let stopped = view(vec![status], 70_000).activity(tab, false).unwrap();
+        assert_eq!(stopped.state, TabState::Stopped);
+        assert_eq!(stopped.summary.as_deref(), Some("stopped"));
+        assert_eq!(stopped.detail, "~/repo · main* ↑2 · 1m");
+
+        // Each state looks different at a glance: glyph, color and label.
+        let looks = [working.state, blocked.state, stopped.state];
+        for (index, state) in looks.iter().enumerate() {
+            for other in &looks[index + 1..] {
+                assert_ne!(state.glyph(), other.glyph());
+                assert_ne!(state.color(), other.color());
+                assert_ne!(state.label(), other.label());
+            }
+            // None looks like a tab doing nothing.
+            assert_ne!(state.glyph(), TabState::Idle.glyph());
+            assert_ne!(state.color(), TabState::Idle.color());
+        }
+    }
+
+    #[test]
+    fn switching_tabs_does_not_change_an_agents_state() {
+        for (activity, finished, expected) in [
+            (AgentActivity::Working, None, TabState::Working),
+            (AgentActivity::Blocked, None, TabState::Blocked),
+            (AgentActivity::Idle, Some(9_000), TabState::Stopped),
+            (AgentActivity::Idle, None, TabState::Stopped),
+        ] {
+            let tab = Uuid::from_u128(1);
+            let other = Uuid::from_u128(2);
+            let mut status = status(1);
+            status.running_command = Some("claude".into());
+            status.agent = Some(agent(activity, finished));
+            let mut view = view(vec![status, self::status(2)], 70_000);
+            let mut seen = Vec::new();
+            // Never viewed, then shown, then left for another tab, then back.
+            seen.push(view.activity(tab, false).unwrap());
+            view.mark_viewed(tab);
+            seen.push(view.activity(tab, true).unwrap());
+            view.mark_viewed(other);
+            seen.push(view.activity(tab, false).unwrap());
+            seen.push(view.activity(tab, true).unwrap());
+            for shown in &seen {
+                assert_eq!(shown.state, expected, "{activity:?}");
+                assert_eq!(shown, &seen[0], "{activity:?}");
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,9 @@ Every second or so the plugin lists each pane's foreground job: the processes
 in its terminal's foreground process group. A job is an agent when one of its
 programs is named by an agent's rule file (its `id` or `aliases`), when a
 runtime runs one (`node …/@anthropic-ai/claude-code/cli.js`, `npx
-@openai/codex`, `uv run aider`), or when it is in `agents` (below). Programs
+@openai/codex`, `uv run aider`), or when it is in `agents` or `aliases`
+(below). Nix wrappers are seen through: `.claude-wrapped` and
+`.claude-wrapped_` run `claude`. Programs
 started without shell integration count too. The agent ends with its job.
 
 ## What it is doing
@@ -101,6 +103,11 @@ line_regex = ['^\s*Allow .*\? \[y/n\]']
 [plugins.settings."bmux.agents"]
 agents = ["mybot"]    # more programs to treat as agents (no screen rules)
 screen_rules = true   # read agents' screens with their rules
+
+# Other names, or exact paths, an agent runs as. Naming a known agent keeps
+# its screen rules; any other id is an agent without rules.
+[plugins.settings."bmux.agents".aliases]
+claude = ["work-claude", "/opt/ai/bin/launch-claude"]
 ```
 
 `aider`, `goose`, `crush`, `omp`, `mastracode`, `openhands` and `plandex` are

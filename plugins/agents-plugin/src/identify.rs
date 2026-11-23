@@ -37,23 +37,32 @@ const RUNTIMES: &[&str] = &[
 /// Options of those runtimes whose argument is code, not a program.
 const CODE_OPTIONS: &[&str] = &["-e", "--eval", "-p", "--print", "-c", "-m"];
 
-/// Every agent name, lowercased, and the agent it names.
+/// Every agent name, lowercased, and every agent path, and the agent each
+/// names.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     names: HashMap<String, String>,
+    /// Aliases given as paths: they match that exact program path only.
+    paths: HashMap<String, String>,
 }
 
 impl Catalog {
-    /// Names from `(id, aliases)` pairs, then rule-less `extra` agents.
+    /// Names from `(id, aliases)` pairs (later pairs win), then rule-less
+    /// `extra` agents. An alias containing a path separator is a path.
     pub fn new<'a>(
         agents: impl IntoIterator<Item = (&'a str, &'a [String])>,
         extra: &[String],
     ) -> Self {
         let mut names = HashMap::new();
+        let mut paths = HashMap::new();
         for (id, aliases) in agents {
             names.insert(id.to_lowercase(), id.to_string());
-            for alias in aliases {
-                names.insert(alias.to_lowercase(), id.to_string());
+            for alias in aliases.iter().map(|alias| alias.trim()) {
+                if alias.contains(['/', '\\']) {
+                    paths.insert(alias.to_string(), id.to_string());
+                } else if !alias.is_empty() {
+                    names.insert(alias.to_lowercase(), id.to_string());
+                }
             }
         }
         for (name, id) in EXTRA_NAMES {
@@ -69,7 +78,7 @@ impl Catalog {
                 names.entry(name.clone()).or_insert(name);
             }
         }
-        Self { names }
+        Self { names, paths }
     }
 
     /// The agent the foreground job's command lines (leader first) run.
@@ -130,6 +139,9 @@ impl Catalog {
     }
 
     fn lookup(&self, word: &str) -> Option<String> {
+        if let Some(agent) = self.paths.get(word) {
+            return Some(agent.clone());
+        }
         let name = program_name(word);
         let name = [".js", ".mjs", ".cjs", ".ts", ".py", ".exe", ".cmd"]
             .iter()
@@ -146,13 +158,24 @@ impl Catalog {
 }
 
 /// A program's name: its path's last component, lowercased, without a login
-/// shell's leading `-`.
+/// shell's leading `-`, and seen through a Nix wrapper.
 fn program_name(word: &str) -> String {
-    word.rsplit(['/', '\\'])
+    let name = word
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(word)
         .trim_start_matches('-')
-        .to_lowercase()
+        .to_lowercase();
+    nix_wrapped(&name).map_or_else(|| name.clone(), str::to_string)
+}
+
+/// The program a Nix wrapper runs: `wrapProgram` renames `NAME` to
+/// `.NAME-wrapped`, and each further wrapping appends `_`.
+fn nix_wrapped(name: &str) -> Option<&str> {
+    name.strip_prefix('.')?
+        .trim_end_matches('_')
+        .strip_suffix("-wrapped")
+        .filter(|wrapped| !wrapped.is_empty())
 }
 
 #[cfg(test)]
@@ -212,6 +235,41 @@ mod tests {
         assert_eq!(identify("bash -c claude"), None);
         assert_eq!(identify("python3 manage.py runserver"), None);
         assert_eq!(identify("node"), None);
+    }
+
+    #[test]
+    fn nix_wrapped_programs_name_their_agents() {
+        for (command, agent) in [
+            (
+                "/nix/store/9jdr2bi3w9h9jc67lxa76vd84ygsgrp7-claude-code-with-ca-certs/bin/.claude-wrapped_ --resume",
+                "claude",
+            ),
+            ("/nix/store/x-claude-code/bin/.claude-wrapped", "claude"),
+            ("/nix/store/x-codex/bin/.codex-wrapped__", "codex"),
+            (
+                "/nix/store/x-nodejs/bin/.node-wrapped /x/@anthropic-ai/claude-code/cli.js",
+                "claude",
+            ),
+        ] {
+            assert_eq!(identify(command).as_deref(), Some(agent), "{command}");
+        }
+        assert_eq!(identify("/nix/store/x-vim/bin/.vim-wrapped"), None);
+        assert_eq!(identify(".-wrapped"), None);
+    }
+
+    #[test]
+    fn aliases_may_be_names_or_exact_paths() {
+        let claude = vec!["my-claude".to_string(), "/opt/tools/bin/launch".to_string()];
+        let catalog = Catalog::new([("claude", claude.as_slice())], &[]);
+        let identify = |command: &str| catalog.identify(&[command.to_string()]);
+        assert_eq!(identify("/usr/bin/My-Claude -c").as_deref(), Some("claude"));
+        assert_eq!(identify("/opt/tools/bin/launch").as_deref(), Some("claude"));
+        assert_eq!(
+            identify("node /opt/tools/bin/launch --x").as_deref(),
+            Some("claude")
+        );
+        // A path alias names that program only, not others called the same.
+        assert_eq!(identify("/usr/bin/launch"), None);
     }
 
     #[test]
