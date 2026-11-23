@@ -8,10 +8,6 @@ pub use crate::grid_fragment::{
     GridTransform, PreparedGridFragment, PreparedGridOverlay, UnsupportedGridFragments,
 };
 
-/// Inert retained-scene transport and capture; no host lifecycle authority.
-#[cfg(feature = "serde")]
-pub mod portable;
-
 use std::sync::Arc;
 
 use crate::buffer::Buffer;

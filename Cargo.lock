@@ -1833,7 +1833,7 @@ dependencies = [
 [[package]]
 name = "bcode_agent_permissions"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_policy",
  "bcode_agent_profile",
@@ -1845,7 +1845,7 @@ dependencies = [
 [[package]]
 name = "bcode_agent_policy"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_policy_models",
  "bcode_agent_profile",
@@ -1859,7 +1859,7 @@ dependencies = [
 [[package]]
 name = "bcode_agent_policy_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "hyperchad_docs_config",
  "hyperchad_docs_config_derive",
@@ -1870,7 +1870,7 @@ dependencies = [
 [[package]]
 name = "bcode_agent_profile"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "bcode_shell_command_analysis_models",
@@ -1883,7 +1883,7 @@ dependencies = [
 [[package]]
 name = "bcode_agent_runtime"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_model_schema",
@@ -1903,7 +1903,7 @@ dependencies = [
 [[package]]
 name = "bcode_auth_broker_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "axum",
  "bcode_model",
@@ -1921,7 +1921,7 @@ dependencies = [
 [[package]]
 name = "bcode_auth_broker_provider_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_confined_fs",
@@ -1941,7 +1941,7 @@ dependencies = [
 [[package]]
 name = "bcode_bedrock_provider_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -1971,7 +1971,7 @@ dependencies = [
 [[package]]
 name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -1997,7 +1997,7 @@ dependencies = [
 [[package]]
 name = "bcode_bundled_plugins"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_auth_broker_plugin",
  "bcode_auth_broker_provider_plugin",
@@ -2052,7 +2052,7 @@ dependencies = [
 [[package]]
 name = "bcode_claude_code"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2063,7 +2063,7 @@ dependencies = [
 [[package]]
 name = "bcode_claude_code_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_claude_code",
  "bcode_harness_models",
@@ -2078,7 +2078,7 @@ dependencies = [
 [[package]]
 name = "bcode_client"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
@@ -2123,7 +2123,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "async-trait",
  "bcode_code_review_models",
@@ -2147,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_github"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review_models",
  "bcode_code_review_provider",
@@ -2160,7 +2160,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_graphite"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review_models",
  "bcode_code_review_provider",
@@ -2172,7 +2172,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2181,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review",
  "bcode_code_review_models",
@@ -2199,7 +2199,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_provider"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review_models",
  "serde",
@@ -2209,7 +2209,7 @@ dependencies = [
 [[package]]
 name = "bcode_code_review_ui"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_client",
@@ -2247,7 +2247,7 @@ dependencies = [
 [[package]]
 name = "bcode_codex_harness_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_harness_models",
  "bcode_plugin_sdk",
@@ -2262,7 +2262,7 @@ dependencies = [
 [[package]]
 name = "bcode_command"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_session_models",
@@ -2276,7 +2276,7 @@ dependencies = [
 [[package]]
 name = "bcode_compressed_session_search_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_confined_fs",
  "bcode_plugin_sdk",
@@ -2293,7 +2293,7 @@ dependencies = [
 [[package]]
 name = "bcode_config"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_policy_models",
  "bcode_config_layers",
@@ -2323,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "bcode_config_layers"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bmux_config_composition",
  "serde",
@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "bcode_confined_fs"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "libc",
  "tempfile",
@@ -2345,7 +2345,7 @@ dependencies = [
 [[package]]
 name = "bcode_daemon_lifecycle"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_ipc",
@@ -2367,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "bcode_database_observability"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "async-trait",
  "bcode_metrics",
@@ -2378,7 +2378,7 @@ dependencies = [
 [[package]]
 name = "bcode_default_agents_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_permissions",
  "bcode_agent_policy",
@@ -2398,7 +2398,7 @@ dependencies = [
 [[package]]
 name = "bcode_document_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
@@ -2416,7 +2416,7 @@ dependencies = [
 [[package]]
 name = "bcode_eval"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_config",
@@ -2445,7 +2445,7 @@ dependencies = [
 [[package]]
 name = "bcode_eval_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2454,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "bcode_eval_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -2477,7 +2477,7 @@ dependencies = [
 [[package]]
 name = "bcode_fake_provider_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "base64 0.22.1",
  "bcode_confined_fs",
@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "bcode_feedback"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_feedback_models",
  "futures 0.3.34",
@@ -2517,7 +2517,7 @@ dependencies = [
 [[package]]
 name = "bcode_feedback_cli"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_feedback_client",
@@ -2532,7 +2532,7 @@ dependencies = [
 [[package]]
 name = "bcode_feedback_client"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_config",
@@ -2546,7 +2546,7 @@ dependencies = [
 [[package]]
 name = "bcode_feedback_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2555,7 +2555,7 @@ dependencies = [
 [[package]]
 name = "bcode_feedback_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_config",
@@ -2572,7 +2572,7 @@ dependencies = [
 [[package]]
 name = "bcode_file_references_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_filesystem_models",
  "bcode_plugin_sdk",
@@ -2588,7 +2588,7 @@ dependencies = [
 [[package]]
 name = "bcode_filesystem_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -2596,7 +2596,7 @@ dependencies = [
 [[package]]
 name = "bcode_filesystem_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_confined_fs",
  "bcode_filesystem_models",
@@ -2628,7 +2628,7 @@ dependencies = [
 [[package]]
 name = "bcode_forge"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_forge_models",
  "reqwest 0.12.28",
@@ -2640,7 +2640,7 @@ dependencies = [
 [[package]]
 name = "bcode_forge_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -2648,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "bcode_git"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_git_models",
  "bmux_pty",
@@ -2658,7 +2658,7 @@ dependencies = [
 [[package]]
 name = "bcode_git_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -2666,7 +2666,7 @@ dependencies = [
 [[package]]
 name = "bcode_git_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_forge_models",
@@ -2682,7 +2682,7 @@ dependencies = [
 [[package]]
 name = "bcode_github_review_publisher_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review_github",
  "bcode_code_review_models",
@@ -2696,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "bcode_graphite_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_code_review_graphite",
  "bcode_code_review_models",
@@ -2707,7 +2707,7 @@ dependencies = [
 [[package]]
 name = "bcode_harness_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_provider_auth_models",
  "serde",
@@ -2718,7 +2718,7 @@ dependencies = [
 [[package]]
 name = "bcode_harness_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "bcode_ipc"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
@@ -2777,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "bcode_jev_provider_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
@@ -2793,7 +2793,7 @@ dependencies = [
 [[package]]
 name = "bcode_keymap"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_keymap_models",
  "bmux_keyboard",
@@ -2802,7 +2802,7 @@ dependencies = [
 [[package]]
 name = "bcode_keymap_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -2810,7 +2810,7 @@ dependencies = [
 [[package]]
 name = "bcode_loop_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -2843,7 +2843,7 @@ dependencies = [
 [[package]]
 name = "bcode_markdown_render"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bmux_markdown",
 ]
@@ -2851,7 +2851,7 @@ dependencies = [
 [[package]]
 name = "bcode_metrics"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "libc",
  "serde",
@@ -2862,7 +2862,7 @@ dependencies = [
 [[package]]
 name = "bcode_metrics_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -2879,7 +2879,7 @@ dependencies = [
 [[package]]
 name = "bcode_model"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "hyperchad_docs_config",
@@ -2892,7 +2892,7 @@ dependencies = [
 [[package]]
 name = "bcode_model_catalog"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_confined_fs",
  "bcode_model",
@@ -2910,7 +2910,7 @@ dependencies = [
 [[package]]
 name = "bcode_model_catalog_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2919,7 +2919,7 @@ dependencies = [
 [[package]]
 name = "bcode_model_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_config",
@@ -2938,7 +2938,7 @@ dependencies = [
 [[package]]
 name = "bcode_model_provider_runtime"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_model_schema",
@@ -2955,7 +2955,7 @@ dependencies = [
 [[package]]
 name = "bcode_model_schema"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2964,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "bcode_ocr_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
@@ -2982,7 +2982,7 @@ dependencies = [
 [[package]]
 name = "bcode_openai_compatible_provider_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "base64 0.22.1",
  "bcode_config",
@@ -3013,7 +3013,7 @@ dependencies = [
 [[package]]
 name = "bcode_openai_responses"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_model_schema",
@@ -3025,7 +3025,7 @@ dependencies = [
 [[package]]
 name = "bcode_opencode_session_import_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
@@ -3040,12 +3040,12 @@ dependencies = [
 [[package]]
 name = "bcode_path_display"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 
 [[package]]
 name = "bcode_pi_session_import_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
@@ -3057,7 +3057,7 @@ dependencies = [
 [[package]]
 name = "bcode_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_harness_models",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "bcode_plugin_config"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_ipc",
@@ -3105,7 +3105,7 @@ dependencies = [
 [[package]]
 name = "bcode_plugin_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_harness_models",
  "bcode_keymap_models",
@@ -3118,7 +3118,7 @@ dependencies = [
 [[package]]
 name = "bcode_plugin_sdk"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
@@ -3135,6 +3135,7 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_view_models",
  "bmux_keyboard",
+ "bmux_plugin",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "bmux_text_edit",
@@ -3153,7 +3154,7 @@ dependencies = [
 [[package]]
 name = "bcode_presentation_policy_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -3161,7 +3162,7 @@ dependencies = [
 [[package]]
 name = "bcode_project_instructions"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -3171,7 +3172,7 @@ dependencies = [
 [[package]]
 name = "bcode_prompt_cache"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
@@ -3184,7 +3185,7 @@ dependencies = [
 [[package]]
 name = "bcode_prompt_cache_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_session_models",
@@ -3194,7 +3195,7 @@ dependencies = [
 [[package]]
 name = "bcode_prompt_profile"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_session_models",
@@ -3206,7 +3207,7 @@ dependencies = [
 [[package]]
 name = "bcode_prompt_profile_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
@@ -3219,7 +3220,7 @@ dependencies = [
 [[package]]
 name = "bcode_provider_auth"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "base64 0.22.1",
  "bcode_config",
@@ -3243,7 +3244,7 @@ dependencies = [
 [[package]]
 name = "bcode_provider_auth_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -3253,7 +3254,7 @@ dependencies = [
 [[package]]
 name = "bcode_question_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_plugin_models",
  "bcode_plugin_sdk",
@@ -3270,7 +3271,7 @@ dependencies = [
 [[package]]
 name = "bcode_ralph"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
@@ -3286,7 +3287,7 @@ dependencies = [
 [[package]]
 name = "bcode_ralph_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "serde",
@@ -3295,7 +3296,7 @@ dependencies = [
 [[package]]
 name = "bcode_read_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_markdown_render",
@@ -3311,7 +3312,7 @@ dependencies = [
 [[package]]
 name = "bcode_recap"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "base64 0.22.1",
  "bcode_confined_fs",
@@ -3329,7 +3330,7 @@ dependencies = [
 [[package]]
 name = "bcode_recap_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "base64 0.22.1",
  "bcode_command",
@@ -3347,7 +3348,7 @@ dependencies = [
 [[package]]
 name = "bcode_sdk_session_import_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
@@ -3359,7 +3360,7 @@ dependencies = [
 [[package]]
 name = "bcode_server"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3438,7 +3439,7 @@ dependencies = [
 [[package]]
 name = "bcode_session"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3468,7 +3469,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_bridge"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_bridge_models",
  "serde_json",
@@ -3479,7 +3480,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_bridge_embedded"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_bundled_plugins",
  "bcode_client",
@@ -3495,7 +3496,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_bridge_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_feedback_models",
  "serde",
@@ -3505,7 +3506,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_bridge_runtime"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_bridge",
  "serde",
@@ -3517,7 +3518,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_bridge_server"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_client",
@@ -3536,7 +3537,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_derivation_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_model",
@@ -3552,7 +3553,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_feed"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "hex",
@@ -3566,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_import"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "serde",
@@ -3575,7 +3576,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_migration"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "async-trait",
  "bcode_session_migration_target",
@@ -3591,7 +3592,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_migration_target"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "async-trait",
  "bcode_session_models",
@@ -3602,7 +3603,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_milestones_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_config",
@@ -3616,7 +3617,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_harness_models",
  "bcode_model_catalog_models",
@@ -3631,7 +3632,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_search"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_harness_models",
  "bcode_session_models",
@@ -3644,7 +3645,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_view"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_harness_models",
@@ -3663,7 +3664,7 @@ dependencies = [
 [[package]]
 name = "bcode_session_view_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "partial-json-fixer",
@@ -3674,7 +3675,7 @@ dependencies = [
 [[package]]
 name = "bcode_settings"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_skill_models",
@@ -3688,7 +3689,7 @@ dependencies = [
 [[package]]
 name = "bcode_shell_command_analysis"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_shell_command_analysis_models",
  "brush-parser",
@@ -3697,7 +3698,7 @@ dependencies = [
 [[package]]
 name = "bcode_shell_command_analysis_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -3705,7 +3706,7 @@ dependencies = [
 [[package]]
 name = "bcode_shell_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_agent_profile",
  "bcode_config",
@@ -3743,7 +3744,7 @@ dependencies = [
 [[package]]
 name = "bcode_skill"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_skill_models",
@@ -3756,7 +3757,7 @@ dependencies = [
 [[package]]
 name = "bcode_skill_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_tool",
  "serde",
@@ -3766,7 +3767,7 @@ dependencies = [
 [[package]]
 name = "bcode_skills_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -3789,7 +3790,7 @@ dependencies = [
 [[package]]
 name = "bcode_syntax_render"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bmux_syntax_render",
 ]
@@ -3797,7 +3798,7 @@ dependencies = [
 [[package]]
 name = "bcode_tantivy_session_search_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
@@ -3812,7 +3813,7 @@ dependencies = [
 [[package]]
 name = "bcode_tool"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_tool_models",
  "serde",
@@ -3822,7 +3823,7 @@ dependencies = [
 [[package]]
 name = "bcode_tool_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3831,7 +3832,7 @@ dependencies = [
 [[package]]
 name = "bcode_tool_runtime"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_xray",
  "bcode_xray_models",
@@ -3846,7 +3847,7 @@ dependencies = [
 [[package]]
 name = "bcode_tui_components"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_markdown_render",
  "bcode_plugin_models",
@@ -3863,7 +3864,7 @@ dependencies = [
 [[package]]
 name = "bcode_tui_theme"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_markdown_render",
  "bcode_presentation_policy_models",
@@ -3880,7 +3881,7 @@ dependencies = [
 [[package]]
 name = "bcode_tui_theme_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
 ]
@@ -3888,7 +3889,7 @@ dependencies = [
 [[package]]
 name = "bcode_usage"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "bcode_usage_models",
@@ -3899,7 +3900,7 @@ dependencies = [
 [[package]]
 name = "bcode_usage_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "serde",
@@ -3908,7 +3909,7 @@ dependencies = [
 [[package]]
 name = "bcode_usage_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -3926,7 +3927,7 @@ dependencies = [
 [[package]]
 name = "bcode_vim_edit"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tui_components",
@@ -3940,7 +3941,7 @@ dependencies = [
 [[package]]
 name = "bcode_vim_edit_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
@@ -3954,7 +3955,7 @@ dependencies = [
 [[package]]
 name = "bcode_vox"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "audioadapter-buffers",
  "clap",
@@ -3977,7 +3978,7 @@ dependencies = [
 [[package]]
 name = "bcode_vox_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_plugin_sdk",
@@ -3989,7 +3990,7 @@ dependencies = [
 [[package]]
 name = "bcode_web_search_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
@@ -4008,7 +4009,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_model",
  "bcode_session_models",
@@ -4030,7 +4031,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow_discovery"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_workflow",
@@ -4048,7 +4049,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -4076,7 +4077,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow_store"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_metrics",
@@ -4097,7 +4098,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow_view"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_workflow",
  "bcode_workflow_view_models",
@@ -4107,7 +4108,7 @@ dependencies = [
 [[package]]
 name = "bcode_workflow_view_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "serde",
@@ -4117,7 +4118,7 @@ dependencies = [
 [[package]]
 name = "bcode_worktree"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
@@ -4131,7 +4132,7 @@ dependencies = [
 [[package]]
 name = "bcode_worktree_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_session_models",
  "serde",
@@ -4140,7 +4141,7 @@ dependencies = [
 [[package]]
 name = "bcode_worktree_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_client",
  "bcode_command",
@@ -4163,7 +4164,7 @@ dependencies = [
 [[package]]
 name = "bcode_xray"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_confined_fs",
  "bcode_xray_models",
@@ -4179,7 +4180,7 @@ dependencies = [
 [[package]]
 name = "bcode_xray_models"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4188,7 +4189,7 @@ dependencies = [
 [[package]]
 name = "bcode_xray_plugin"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bcode?branch=master#5458d1e1729ede75f208f27612573b4afc3c21fa"
+source = "git+https://github.com/BSteffaniak/bcode?branch=master#6b8d5edf0401c8ae9b9f0124e8b28d50b14ea3d4"
 dependencies = [
  "bcode_command",
  "bcode_plugin_sdk",
@@ -13232,7 +13233,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -13275,7 +13276,7 @@ checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -15181,7 +15182,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15219,7 +15220,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]

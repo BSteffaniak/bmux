@@ -12,7 +12,7 @@ Four paths draw non-pane UI in the attach client today.
 | Path | Types | Producers | Rendered natively? |
 | --- | --- | --- | --- |
 | A. Plugin surfaces + layouts | `bmux_plugin::surface::PluginSurface` (`Vec<RenderOp>`), `bmux_plugin::layout` | sidebar, tab bar (strip, menu, toasts), host notification (`local_presentation.rs`) | yes |
-| B. Portable frontend presentations | `bmux_tui::presentation::portable::PortablePresentation` | none in tree (embedder API only) | no: observers and headless clients only |
+| B. Portable frontend presentations (removed; see "Embedding hosts") | `bmux_tui::presentation::portable::PortablePresentation` | none in tree (embedder API only) | no: observers and headless clients only |
 | C. Render extensions | `bmux_plugin::render::AttachRenderExtension`, `RenderLayerScene` | decoration renderer, pane text redaction, visual adapters | yes |
 | D. Host overlays | `AttachSurface` + `RenderOp` lowered straight into `RetainedSurface` | prompts, help, damage overlay | yes |
 
