@@ -418,6 +418,33 @@ impl std::str::FromStr for Profile {
 mod tests {
     use super::*;
 
+    /// Every drawn profile, for 300 seeds, as it printed when this test was written. Changing a
+    /// profile's draws changes every run's (and every regression seed's) shape, so it must be
+    /// deliberate: regenerate with `UPDATE_PROFILE_DRAWS=1`.
+    #[test]
+    fn drawn_profiles_are_pinned() {
+        let drawn = (0..300_u64)
+            .map(|seed| {
+                // Scrambled, so neighbouring seeds draw unlike profiles.
+                let mut state = seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let profile = Profile::draw(|bound| {
+                    state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (state >> 33) % bound
+                });
+                format!("{seed} {profile}\n")
+            })
+            .collect::<String>();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/profile-draws.txt");
+        if std::env::var_os("UPDATE_PROFILE_DRAWS").is_some() {
+            std::fs::write(path, &drawn).unwrap();
+        }
+        let pinned = std::fs::read_to_string(path).unwrap();
+        for (line, (now, then)) in drawn.lines().zip(pinned.lines()).enumerate() {
+            assert_eq!(now, then, "profile {line} draws differently");
+        }
+        assert_eq!(drawn.lines().count(), pinned.lines().count());
+    }
+
     #[test]
     fn a_profile_prints_and_parses_back() {
         let mut state = 7_u64;
