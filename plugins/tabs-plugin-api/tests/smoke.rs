@@ -45,6 +45,64 @@ fn pane_event_variant_is_tagged() {
 fn interface_ids_match_bpdl_source() {
     assert_eq!(tabs_state::INTERFACE_ID, "tabs-state");
     assert_eq!(tabs_events::INTERFACE_ID, "tabs-events");
+    assert_eq!(
+        bmux_tabs_plugin_api::tabs_personal_views::INTERFACE_ID,
+        "tabs-personal-views/v1"
+    );
+    assert_eq!(
+        bmux_tabs_plugin_api::tabs_personal_commands::INTERFACE_ID,
+        "tabs-personal-commands/v1"
+    );
+}
+
+#[test]
+fn personal_view_contracts_take_no_owner_and_round_trip() {
+    use bmux_tabs_plugin_api::tabs_personal_commands::client::{
+        AddTabRequest, EnsureDefaultRequest,
+    };
+    use bmux_tabs_plugin_api::tabs_personal_views::{
+        PersonalMember, PersonalView, PersonalViewError, PersonalWorkspace,
+    };
+    // Requests identify the mutation and the view, never an owner.
+    let add = AddTabRequest {
+        mutation_id: uuid::Uuid::from_u128(1),
+        view_id: uuid::Uuid::from_u128(2),
+        expected_revision: 3,
+        context_id: uuid::Uuid::from_u128(4),
+        before: None,
+    };
+    let json = serde_json::to_value(&add).unwrap();
+    assert!(json.get("owner").is_none());
+    let _ = EnsureDefaultRequest {
+        mutation_id: uuid::Uuid::nil(),
+    };
+    let view = PersonalView {
+        view_id: uuid::Uuid::from_u128(2),
+        owner: uuid::Uuid::from_u128(9),
+        name: "work".into(),
+        schema_version: 1,
+        revision: 3,
+        is_default: true,
+        workspaces: vec![PersonalWorkspace {
+            workspace_id: uuid::Uuid::nil(),
+            initialized: true,
+            members: vec![PersonalMember {
+                member_id: uuid::Uuid::from_u128(5),
+                context_id: uuid::Uuid::from_u128(4),
+                label: Some("mine".into()),
+            }],
+        }],
+    };
+    let round: PersonalView = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+    assert_eq!(round, view);
+    let conflict = PersonalViewError::RevisionConflict {
+        current_revision: 4,
+    };
+    assert!(
+        serde_json::to_string(&conflict)
+            .unwrap()
+            .contains("revision_conflict")
+    );
 }
 
 #[test]

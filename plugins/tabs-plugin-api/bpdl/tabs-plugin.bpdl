@@ -342,6 +342,150 @@ interface tabs-commands {
         -> result<tab-ack, tab-error>;
 }
 
+// Durable personal tab views: per-owner arrangements of references to shared
+// tabs. A view never owns a tab's lifetime; removing a reference leaves the
+// tab running and discoverable through `tabs-catalog-v1.list-tabs`.
+//
+// The owner is always the principal bound to the invoking client by the
+// host (`clients-identity/v1.current-principal`); no operation accepts an
+// owner, and it appears only as returned metadata. View ids are scoped to
+// their owner: another owner's views are indistinguishable from absent ones.
+@capability(TABS_READ)
+@interface-version(1)
+interface tabs-personal-views {
+    // One reference to a tab (a context id) inside a workspace arrangement.
+    // `member-id` is stable identity independent of position and label.
+    record personal-member {
+        member-id: uuid,
+        context-id: uuid,
+        // Personal label overriding the shared tab name in this view only.
+        label: string?,
+    }
+
+    // A workspace arrangement. A workspace without an arrangement has never
+    // been initialized; an initialized arrangement may be explicitly empty.
+    record personal-workspace {
+        workspace-id: uuid,
+        initialized: bool,
+        members: list<personal-member>,
+    }
+
+    // A complete view. Members may reference tabs that are not currently
+    // live; projections filter them, and confirmed deletion prunes them.
+    record personal-view {
+        view-id: uuid,
+        owner: uuid,
+        name: string,
+        schema-version: u32,
+        revision: u64,
+        is-default: bool,
+        workspaces: list<personal-workspace>,
+    }
+
+    record personal-view-summary {
+        view-id: uuid,
+        owner: uuid,
+        name: string,
+        revision: u64,
+        is-default: bool,
+    }
+
+    variant personal-view-error {
+        // The invoking client has no host-bound principal.
+        no-principal,
+        // No such view for this owner.
+        not-found,
+        // The owner has no default view yet, or the workspace has no
+        // arrangement yet.
+        not-initialized,
+        revision-conflict { current-revision: u64 },
+        // The mutation id was already used with a different request.
+        mutation-conflict,
+        // A referenced member, tab or position does not exist, or the
+        // request would leave the owner without a valid default.
+        invalid-reference,
+        already-exists,
+        limit-exceeded { limit: string },
+        unsupported-version { schema-version: u32 },
+        corrupt-state { reason: string },
+        storage-unavailable { reason: string },
+    }
+
+    // Reading never initializes, seeds or rewrites storage.
+    query list-views() -> result<list<personal-view-summary>, personal-view-error>;
+    query get-view(view-id: uuid) -> result<personal-view, personal-view-error>;
+    query default-view() -> result<personal-view, personal-view-error>;
+}
+
+// Mutations of the invoking owner's views. Every command is idempotent per
+// owner by `mutation-id`: repeating an id with the same request returns the
+// recorded acknowledgement (before revisions are re-evaluated); reusing it
+// with a different request fails with `mutation-conflict`. Commands that edit
+// a view carry the view revision they expect. Success is returned only after
+// the change and its outcome are durably committed together.
+@capability(TABS_WRITE)
+@interface-version(1)
+interface tabs-personal-commands {
+    record personal-ack {
+        view-id: uuid,
+        // The view's revision after the command.
+        revision: u64,
+        // The member a tab command created, found or edited.
+        member-id: uuid?,
+    }
+
+    // Create the owner's default view when it has none; otherwise return it.
+    command ensure-default(mutation-id: uuid)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    command create-view(mutation-id: uuid, view-id: uuid, name: string)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    command rename-view(mutation-id: uuid, view-id: uuid, expected-revision: u64, name: string)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Forget a view. Tabs are never affected. The default view cannot be
+    // deleted until another view is the default.
+    command delete-view(mutation-id: uuid, view-id: uuid, expected-revision: u64)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    command set-default-view(mutation-id: uuid, view-id: uuid)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Seed the workspace arrangement once from the canonical shared order.
+    // An initialized arrangement (even an empty one) is never reseeded.
+    command initialize-workspace(
+        mutation-id: uuid,
+        view-id: uuid,
+        expected-revision: u64,
+        workspace-id: uuid,
+    ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Add a live tab to its workspace's arrangement (seeding it first when
+    // uninitialized), before `before` or at the end. A tab already present
+    // returns its existing member unchanged and unmoved.
+    command add-tab(
+        mutation-id: uuid,
+        view-id: uuid,
+        expected-revision: u64,
+        context-id: uuid,
+        before: uuid?,
+    ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Remove a reference. The tab keeps running and stays discoverable.
+    command remove-tab(mutation-id: uuid, view-id: uuid, expected-revision: u64, member-id: uuid)
+        -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Move a member before another member of its workspace, or to the end.
+    command move-tab(
+        mutation-id: uuid,
+        view-id: uuid,
+        expected-revision: u64,
+        member-id: uuid,
+        before: uuid?,
+    ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
+    // Set or clear (`label` absent) a member's personal label.
+    command set-label(
+        mutation-id: uuid,
+        view-id: uuid,
+        expected-revision: u64,
+        member-id: uuid,
+        label: string?,
+    ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
+}
+
 interface tabs-events {
     // A single event describing a pane-level state change.
     variant pane-event {
@@ -471,6 +615,8 @@ world tabs {
     provide tabs-commands;
     provide tabs-events capability bmux.tabs.read;
     provide tabs-placement-v1;
+    provide tabs-personal-views;
+    provide tabs-personal-commands;
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;

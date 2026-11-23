@@ -16,6 +16,7 @@ pub mod declaration {
 mod arrangements;
 mod cwd;
 mod durable_storage;
+mod personal_views;
 mod status;
 mod storage_migration;
 
@@ -41,6 +42,8 @@ use bmux_tabs_plugin_api::tabs_commands::{
     PaneMutationError, PaneResizeDirection, PaneZoomAck, Selector, TabAck, TabError,
     TabMovePlacement, TabsCommandsService,
 };
+use bmux_tabs_plugin_api::tabs_personal_commands as personal_commands;
+use bmux_tabs_plugin_api::tabs_personal_views;
 use bmux_tabs_plugin_api::tabs_state::{
     self, ActiveTabPaneQueryError, ActiveTabPaneSet, FloatingPaneState, PaneState, TabEntry,
     TabsStateService,
@@ -1330,6 +1333,8 @@ impl TabsPlugin {
         }
         arrangements::activate(context, self.runtime_state.clone())
             .map_err(PluginCommandError::failed)?;
+        personal_views::activate(context, &tab_states(&self.runtime_state))
+            .map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
         // `subscribe::<PaneEvent>(...)` without racing the first emit.
@@ -1384,6 +1389,45 @@ impl TabsPlugin {
             },
             "tabs-catalog-v1", "list-tabs" => |_req: (), ctx| {
                 Ok(list_catalog(ctx))
+            },
+            "tabs-personal-views/v1", "list-views" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(personal_views::list_views_for_caller(ctx))
+            },
+            "tabs-personal-views/v1", "get-view" => |req: tabs_personal_views::client::GetViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(personal_views::get_view_for_caller(ctx, req.view_id))
+            },
+            "tabs-personal-views/v1", "default-view" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(personal_views::default_view_for_caller(ctx))
+            },
+            "tabs-personal-commands/v1", "ensure-default" => |req: personal_commands::client::EnsureDefaultRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::EnsureDefault))
+            },
+            "tabs-personal-commands/v1", "create-view" => |req: personal_commands::client::CreateViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::CreateView { view_id: req.view_id, name: req.name }))
+            },
+            "tabs-personal-commands/v1", "rename-view" => |req: personal_commands::client::RenameViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::RenameView { view_id: req.view_id, expected_revision: req.expected_revision, name: req.name }))
+            },
+            "tabs-personal-commands/v1", "delete-view" => |req: personal_commands::client::DeleteViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::DeleteView { view_id: req.view_id, expected_revision: req.expected_revision }))
+            },
+            "tabs-personal-commands/v1", "set-default-view" => |req: personal_commands::client::SetDefaultViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::SetDefaultView { view_id: req.view_id }))
+            },
+            "tabs-personal-commands/v1", "initialize-workspace" => |req: personal_commands::client::InitializeWorkspaceRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::InitializeWorkspace { view_id: req.view_id, expected_revision: req.expected_revision, workspace_id: req.workspace_id }))
+            },
+            "tabs-personal-commands/v1", "add-tab" => |req: personal_commands::client::AddTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::AddTab { view_id: req.view_id, expected_revision: req.expected_revision, context_id: req.context_id, before: req.before }))
+            },
+            "tabs-personal-commands/v1", "remove-tab" => |req: personal_commands::client::RemoveTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::RemoveTab { view_id: req.view_id, expected_revision: req.expected_revision, member_id: req.member_id }))
+            },
+            "tabs-personal-commands/v1", "move-tab" => |req: personal_commands::client::MoveTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::MoveTab { view_id: req.view_id, expected_revision: req.expected_revision, member_id: req.member_id, before: req.before }))
+            },
+            "tabs-personal-commands/v1", "set-label" => |req: personal_commands::client::SetLabelRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::SetLabel { view_id: req.view_id, expected_revision: req.expected_revision, member_id: req.member_id, label: req.label }))
             },
             "tabs-state", "list-tabs" => |req: ListTabsArgs, ctx| {
                 let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref(), ActiveMarking::Caller)
@@ -1509,6 +1553,24 @@ impl TabsPlugin {
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
         })
+    }
+
+    /// One `tabs-personal-commands/v1` operation for the invoking client.
+    fn personal_command(
+        &self,
+        context: &NativeServiceContext,
+        mutation_id: Uuid,
+        command: &personal_views::Command,
+    ) -> Result<
+        bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck,
+        bmux_tabs_plugin_api::tabs_personal_views::PersonalViewError,
+    > {
+        personal_views::apply_for_caller(
+            context,
+            &tab_states(&self.runtime_state),
+            mutation_id,
+            command,
+        )
     }
 
     fn activate_with_async(
@@ -1704,6 +1766,14 @@ fn handle_context_event(
                 caller,
                 *context_id,
             );
+            // Confirmed deletion prunes every owner's personal views.
+            if let Err(error) = personal_views::prune_deleted_context(
+                caller,
+                &tab_states(&shared.runtime_state),
+                *context_id,
+            ) {
+                log_tab_rename_error(caller, error);
+            }
             publish_tab_list_snapshot(caller, &shared.runtime_state);
         }
         // Selection is per client and lives in the contexts plugin; it never
@@ -2828,6 +2898,22 @@ fn create_tab_with_policy(
     policy: &cwd::DirectoryPolicy,
     source: Option<(Uuid, Uuid)>,
 ) -> Result<TabAck, String> {
+    create_tab_joining_view(caller, runtime_state, name, policy, source).map(|(ack, _)| ack)
+}
+
+/// Create a tab, then add it to the creating principal's view.
+///
+/// The tab exists once the context is created. A failed view update is
+/// logged and returned beside the successful acknowledgement, never as a
+/// failed creation: the tab keeps running and stays discoverable. A retry of
+/// the view update finds the existing member instead of duplicating it.
+fn create_tab_joining_view(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    name: Option<String>,
+    policy: &cwd::DirectoryPolicy,
+    source: Option<(Uuid, Uuid)>,
+) -> Result<(TabAck, Result<personal_views::CreatedTabJoin, String>), String> {
     let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
@@ -2871,10 +2957,22 @@ fn create_tab_with_policy(
         context_id,
     )?;
     publish_tab_list_snapshot(caller, runtime_state);
-    Ok(TabAck {
-        ok: true,
-        id: Some(context_id.to_string()),
-    })
+    let joined = personal_views::join_created_tab_for_caller(
+        caller,
+        &tab_states(runtime_state),
+        context_id,
+        context_workspace_id(&context),
+    );
+    if let Err(error) = &joined {
+        log_tab_rename_error(caller, format!("tab {context_id} created; {error}"));
+    }
+    Ok((
+        TabAck {
+            ok: true,
+            id: Some(context_id.to_string()),
+        },
+        joined,
+    ))
 }
 
 fn normalize_tab_name(name: &str) -> Result<String, String> {
@@ -4802,6 +4900,14 @@ bmux_plugin_sdk::plugin!(TabsPlugin);
 fn interface_ids_match_bpdl_constants() {
     assert_eq!(tabs_state::INTERFACE_ID.as_str(), "tabs-state");
     assert_eq!(tabs_commands::INTERFACE_ID.as_str(), "tabs-commands");
+    assert_eq!(
+        tabs_personal_views::INTERFACE_ID.as_str(),
+        "tabs-personal-views/v1"
+    );
+    assert_eq!(
+        personal_commands::INTERFACE_ID.as_str(),
+        "tabs-personal-commands/v1"
+    );
 }
 
 #[cfg(test)]
@@ -8063,6 +8169,154 @@ mod tests {
         assert_eq!(history.lock().unwrap().get(&(b, Uuid::nil())), Some(&alpha));
         assert_eq!(history.lock().unwrap().get(&(a, Uuid::nil())), Some(&alpha));
         assert_eq!(history.lock().unwrap().len(), 2);
+    }
+
+    /// The byte routes resolve the owner through a nested
+    /// `clients-identity/v1.current-principal` call made on the invoking
+    /// client's host port, so two clients of different principals reach
+    /// different documents and a client without a principal reaches none.
+    #[test]
+    // TestServiceRouter requires the SDK's unboxed PluginError; the router,
+    // the two clients and the call log read best as one scenario.
+    #[allow(clippy::result_large_err, clippy::too_many_lines)]
+    fn personal_view_routes_resolve_the_owner_from_the_invoking_client() {
+        use bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck;
+        use bmux_tabs_plugin_api::tabs_personal_views::{PersonalView, PersonalViewError};
+        let storage = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+        let principals = BTreeMap::from([
+            (Uuid::from_u128(0xC1), Uuid::from_u128(0xA1)),
+            (Uuid::from_u128(0xC2), Uuid::from_u128(0xA2)),
+        ]);
+        let resolved = Arc::new(Mutex::new(Vec::new()));
+        let router = InvocationTestHost(checked_test_router({
+            let storage = Arc::clone(&storage);
+            let resolved = Arc::clone(&resolved);
+            Arc::new(move |_, client, _, _, interface, operation, payload| {
+                match (interface, operation) {
+                    ("clients-identity/v1", "current-principal") => {
+                        use bmux_clients_plugin_api::clients_identity::{
+                            IdentityError, LocalPrincipal,
+                        };
+                        resolved.lock().unwrap().push(client);
+                        let result: Result<LocalPrincipal, IdentityError> = client
+                            .ok_or(IdentityError::NoCurrentClient)
+                            .and_then(|client| {
+                                principals
+                                    .get(&client)
+                                    .map(|principal_id| LocalPrincipal {
+                                        principal_id: *principal_id,
+                                    })
+                                    .ok_or(IdentityError::PrincipalUnavailable)
+                            });
+                        encode_service_message(&result)
+                    }
+                    ("storage-query/v1", "get") => {
+                        let request: StorageGetRequest = decode_service_message(&payload)?;
+                        let value = storage.lock().unwrap().get(request.key.as_str()).cloned();
+                        encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
+                    }
+                    ("storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)?;
+                        storage
+                            .lock()
+                            .unwrap()
+                            .insert(request.key.to_string(), request.value);
+                        encode_service_message(&())
+                    }
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "personal_view_router",
+                    }),
+                }
+            })
+        }));
+        let plugin = TabsPlugin::default();
+        let invoke = |client: Option<Uuid>, interface: &str, operation: &str, payload: Vec<u8>| {
+            let (capability, kind) = if interface == "tabs-personal-commands/v1" {
+                ("bmux.tabs.write", ServiceKind::Command)
+            } else {
+                ("bmux.tabs.read", ServiceKind::Query)
+            };
+            let mut context = service_test_context(
+                Some(&router),
+                interface,
+                operation,
+                payload,
+                capability,
+                kind,
+            );
+            context.host_service_port = Some(router.port("bmux.tabs", client));
+            context.caller_client_id = client;
+            let response = plugin.invoke_service(&context);
+            assert!(response.error.is_none(), "{:?}", response.error);
+            response.payload
+        };
+        let ensure =
+            |client: Option<Uuid>, mutation: u128| -> Result<PersonalAck, PersonalViewError> {
+                decode_service_message(&invoke(
+                    client,
+                    "tabs-personal-commands/v1",
+                    "ensure-default",
+                    encode_service_message(&personal_commands::client::EnsureDefaultRequest {
+                        mutation_id: Uuid::from_u128(mutation),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+            };
+        let default_view = |client: Option<Uuid>| -> Result<PersonalView, PersonalViewError> {
+            decode_service_message(&invoke(
+                client,
+                "tabs-personal-views/v1",
+                "default-view",
+                encode_service_message(&()).unwrap(),
+            ))
+            .unwrap()
+        };
+
+        let a = ensure(Some(Uuid::from_u128(0xC1)), 1).unwrap();
+        assert_eq!(
+            default_view(Some(Uuid::from_u128(0xC2))),
+            Err(PersonalViewError::NotInitialized)
+        );
+        let b = ensure(Some(Uuid::from_u128(0xC2)), 1).unwrap();
+        assert_ne!(a.view_id, b.view_id);
+        let view = default_view(Some(Uuid::from_u128(0xC1))).unwrap();
+        assert_eq!(
+            (view.view_id, view.owner),
+            (a.view_id, Uuid::from_u128(0xA1))
+        );
+        let get: Result<PersonalView, PersonalViewError> = decode_service_message(&invoke(
+            Some(Uuid::from_u128(0xC2)),
+            "tabs-personal-views/v1",
+            "get-view",
+            encode_service_message(&tabs_personal_views::client::GetViewRequest {
+                view_id: a.view_id,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(get, Err(PersonalViewError::NotFound));
+        // No client, or a client without a principal: no owner, no write.
+        let before = storage.lock().unwrap().clone();
+        assert_eq!(ensure(None, 2), Err(PersonalViewError::NoPrincipal));
+        assert_eq!(
+            ensure(Some(Uuid::from_u128(0xC3)), 2),
+            Err(PersonalViewError::NoPrincipal)
+        );
+        assert_eq!(*storage.lock().unwrap(), before);
+        // Every resolution saw exactly the invoking client.
+        assert_eq!(
+            *resolved.lock().unwrap(),
+            vec![
+                Some(Uuid::from_u128(0xC1)),
+                Some(Uuid::from_u128(0xC2)),
+                Some(Uuid::from_u128(0xC2)),
+                Some(Uuid::from_u128(0xC1)),
+                Some(Uuid::from_u128(0xC2)),
+                None,
+                Some(Uuid::from_u128(0xC3)),
+            ]
+        );
     }
 }
 

@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 const CONTRACT: &[u8] = b"bmux.tabs/arrangements-writer-v2\n";
+const CONTRACT_FILE: &str = "bmux.tabs.arrangements.writer";
+const PERSONAL_VIEWS_CONTRACT: &[u8] = b"bmux.tabs/personal-views-writer-v1\n";
+const PERSONAL_VIEWS_CONTRACT_FILE: &str = "bmux.tabs.personal-views.writer";
 
 #[cfg(not(test))]
 pub fn configure(data_dir: &str) -> Result<(), String> {
@@ -31,15 +34,29 @@ fn validate_data_dir(data_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Which on-disk writer contract a lock enforces: the contract file name and
+/// the exact bytes every compatible writer agrees on.
+struct WriterContract {
+    file: &'static str,
+    bytes: &'static [u8],
+}
+
+const ARRANGEMENTS_WRITER: WriterContract = WriterContract {
+    file: CONTRACT_FILE,
+    bytes: CONTRACT,
+};
+
 pub struct ArrangementMutation {
     local: Mutex<()>,
     name: &'static str,
+    contract: WriterContract,
 }
 impl ArrangementMutation {
     pub const fn new() -> Self {
         Self {
             local: Mutex::new(()),
             name: "bmux.tabs.arrangements.lock",
+            contract: ARRANGEMENTS_WRITER,
         }
     }
 
@@ -47,6 +64,21 @@ impl ArrangementMutation {
         Self {
             local: Mutex::new(()),
             name: "bmux.tabs.transfer.lock",
+            contract: ARRANGEMENTS_WRITER,
+        }
+    }
+
+    /// Serializes personal-view repository transactions. Independent of the
+    /// shared arrangement lock and writer contract, so personal documents can
+    /// evolve their format without touching the shared order's writers.
+    pub const fn personal_views() -> Self {
+        Self {
+            local: Mutex::new(()),
+            name: "bmux.tabs.personal-views.lock",
+            contract: WriterContract {
+                file: PERSONAL_VIEWS_CONTRACT_FILE,
+                bytes: PERSONAL_VIEWS_CONTRACT,
+            },
         }
     }
 
@@ -62,7 +94,7 @@ impl ArrangementMutation {
             #[cfg(not(test))]
             return Err("tabs durable storage has not been activated".into());
         };
-        let file = acquire_named(root, self.name, Duration::from_secs(2))?;
+        let file = acquire_named(root, self.name, &self.contract, Duration::from_secs(2))?;
         Ok(ArrangementGuard {
             _local: local,
             _file: Some(file),
@@ -77,10 +109,20 @@ pub struct ArrangementGuard<'a> {
 
 #[cfg(test)]
 fn acquire(root: &Path, timeout: Duration) -> Result<File, String> {
-    acquire_named(root, "bmux.tabs.arrangements.lock", timeout)
+    acquire_named(
+        root,
+        "bmux.tabs.arrangements.lock",
+        &ARRANGEMENTS_WRITER,
+        timeout,
+    )
 }
 
-fn acquire_named(root: &Path, name: &str, timeout: Duration) -> Result<File, String> {
+fn acquire_named(
+    root: &Path,
+    name: &str,
+    writer: &WriterContract,
+    timeout: Duration,
+) -> Result<File, String> {
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let file = OpenOptions::new()
         .read(true)
@@ -103,12 +145,17 @@ fn acquire_named(root: &Path, name: &str, timeout: Duration) -> Result<File, Str
             }
         }
     }
-    let contract = root.join("bmux.tabs.arrangements.writer");
+    let contract = root.join(writer.file);
     match std::fs::read(&contract) {
-        Ok(bytes) if bytes == CONTRACT => {}
-        Ok(_) => return Err("unsupported or corrupt tabs arrangement writer contract".into()),
+        Ok(bytes) if bytes == writer.bytes => {}
+        Ok(_) => {
+            return Err(format!(
+                "unsupported or corrupt tabs writer contract {}",
+                writer.file
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bmux_plugin::filesystem::publish_new(&contract, CONTRACT)
+            bmux_plugin::filesystem::publish_new(&contract, writer.bytes)
                 .map_err(|error| error.to_string())?;
         }
         Err(error) => return Err(error.to_string()),
@@ -155,6 +202,27 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(std::fs::read_to_string(state).unwrap(), "80");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn personal_view_lock_has_its_own_lock_and_writer_contract() {
+        let root =
+            std::env::temp_dir().join(format!("bmux-tabs-personal-{}", uuid::Uuid::new_v4()));
+        let personal = ArrangementMutation::personal_views();
+        let held = acquire_named(&root, personal.name, &personal.contract, Duration::ZERO).unwrap();
+        // The shared arrangement authority stays available while a personal
+        // transaction runs, and each keeps its own contract file.
+        drop(acquire(&root, Duration::ZERO).unwrap());
+        assert!(acquire_named(&root, personal.name, &personal.contract, Duration::ZERO).is_err());
+        drop(held);
+        assert_eq!(
+            std::fs::read(root.join(PERSONAL_VIEWS_CONTRACT_FILE)).unwrap(),
+            PERSONAL_VIEWS_CONTRACT
+        );
+        assert_eq!(std::fs::read(root.join(CONTRACT_FILE)).unwrap(), CONTRACT);
+        std::fs::write(root.join(PERSONAL_VIEWS_CONTRACT_FILE), b"future").unwrap();
+        assert!(acquire_named(&root, personal.name, &personal.contract, Duration::ZERO).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

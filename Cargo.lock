@@ -6503,6 +6503,7 @@ dependencies = [
  "bmux_workspaces_plugin_api",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "toml 1.2.2+spec-1.1.0",
  "tracing",

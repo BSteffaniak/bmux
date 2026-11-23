@@ -24,6 +24,7 @@ bmux_tabs_plugin_api         = { workspace = true }
 bmux_workspaces_plugin_api   = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
+sha2                         = { workspace = true }
 tokio                        = { workspace = true, features = ["rt", "sync", "time"] }
 toml                         = { workspace = true }
 tracing                      = { workspace = true }
