@@ -73,6 +73,17 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
         {
             Ok(())
         }
+        // The tabs plugin, in process, lists panes (ids, focus, running
+        // command, directory) from its status observer, which has no client:
+        // read-only, the same list it reads while handling requests.
+        StreamProvenance::HostInternal
+            if ctx.caller_client_id.is_none()
+                && ctx.request.caller_plugin_id == "bmux.tabs"
+                && ctx.request.service.interface_id == "pane-runtime-state"
+                && ctx.request.operation == "list-panes" =>
+        {
+            Ok(())
+        }
         // The cluster plugin, in process, names the clients that observe frames
         // (`attach_state::authorize_observer` re-checks this exact pairing).
         StreamProvenance::HostInternal
@@ -346,6 +357,21 @@ mod tests {
             *origin.lock().unwrap() = StreamProvenance::Invalid;
             assert!(authorize_route(&ctx).is_err());
         }
+        // Only the tabs plugin's status observer may list panes without a client.
+        *origin.lock().unwrap() = StreamProvenance::HostInternal;
+        let mut ctx = context("pane-runtime-state", "list-panes", Vec::new());
+        ctx.caller_client_id = None;
+        assert!(authorize_route(&ctx).is_err());
+        ctx.request.caller_plugin_id = "bmux.tabs".into();
+        assert!(authorize_route(&ctx).is_ok());
+        ctx.caller_client_id = Some(crate::ids::new_uuid());
+        assert!(authorize_route(&ctx).is_err());
+        ctx.caller_client_id = None;
+        ctx.request.operation = "focus-pane".into();
+        assert!(authorize_route(&ctx).is_err());
+        ctx.request.operation = "list-panes".into();
+        *origin.lock().unwrap() = StreamProvenance::Invalid;
+        assert!(authorize_route(&ctx).is_err());
         *origin.lock().unwrap() = StreamProvenance::HostInternal;
         for (interface, operation) in [
             ("attach-runtime-state/v2", "observe-pane-frames-future"),

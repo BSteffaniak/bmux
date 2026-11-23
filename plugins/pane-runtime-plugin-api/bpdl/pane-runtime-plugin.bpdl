@@ -540,6 +540,8 @@ interface pane-runtime-state {
         name: string?,
         shell: string,
         active_command: string?,
+        // The directory shell integration last reported.
+        cwd: string?,
         focused: bool,
     }
 

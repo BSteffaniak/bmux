@@ -16,9 +16,8 @@ use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{PromptMarkKind,
 use bmux_tabs_plugin_api::tabs_status::{GitStatus, TabStatus};
 use uuid::Uuid;
 
-/// How long a git status or an observed directory stays fresh.
+/// How long a git status stays fresh.
 const GIT_TTL: Duration = Duration::from_secs(4);
-const DIRECTORY_TTL: Duration = Duration::from_secs(5);
 /// How long `git status` may take before it is abandoned.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -48,13 +47,14 @@ pub struct PaneInfo {
     pub id: Uuid,
     pub focused: bool,
     pub running_command: Option<String>,
+    /// The directory shell integration last reported.
+    pub cwd: Option<String>,
 }
 
 /// One tab and its panes.
 #[derive(Debug, Clone)]
 pub struct TabPanes {
     pub tab_id: Uuid,
-    pub session_id: Uuid,
     pub panes: Vec<PaneInfo>,
 }
 
@@ -62,7 +62,6 @@ pub struct TabPanes {
 pub struct StatusBoard {
     panes: HashMap<Uuid, PaneSignals>,
     git: HashMap<String, (Instant, Option<GitStatus>)>,
-    observed: HashMap<Uuid, (Instant, Option<String>)>,
     published: Option<Vec<TabStatus>>,
 }
 
@@ -124,18 +123,17 @@ impl StatusBoard {
             }
             PaneEvent::Restarted { pane_id, .. } => {
                 self.panes.remove(pane_id);
-                self.observed.remove(pane_id);
             }
             _ => {}
         }
     }
 
-    /// Build every tab's status. `observe` finds a pane's working directory
-    /// when its program never sent OSC 7; `git` reads a directory's status.
+    /// Build every tab's status. A pane's directory is what its program last
+    /// reported with OSC 7, else what shell integration last reported; `git`
+    /// reads a directory's status.
     pub fn build(
         &mut self,
         tabs: &[TabPanes],
-        observe: &mut dyn FnMut(Uuid, Uuid) -> Option<String>,
         git: &mut dyn FnMut(&str) -> Option<GitStatus>,
     ) -> Vec<TabStatus> {
         let live = tabs
@@ -143,7 +141,6 @@ impl StatusBoard {
             .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
             .collect::<std::collections::HashSet<_>>();
         self.panes.retain(|pane, _| live.contains(pane));
-        self.observed.retain(|pane, _| live.contains(pane));
         let now = Instant::now();
         tabs.iter()
             .map(|tab| {
@@ -157,16 +154,7 @@ impl StatusBoard {
                     signals
                         .as_ref()
                         .and_then(|signals| signals.cwd.clone())
-                        .or_else(|| match self.observed.get(&pane.id) {
-                            Some((at, cwd)) if now.duration_since(*at) < DIRECTORY_TTL => {
-                                cwd.clone()
-                            }
-                            _ => {
-                                let cwd = observe(tab.session_id, pane.id);
-                                self.observed.insert(pane.id, (now, cwd.clone()));
-                                cwd
-                            }
-                        })
+                        .or_else(|| pane.cwd.clone())
                 });
                 let git = cwd.as_deref().and_then(|cwd| match self.git.get(cwd) {
                     Some((at, status)) if now.duration_since(*at) < GIT_TTL => status.clone(),
@@ -339,13 +327,13 @@ mod tests {
     fn tab(tab: u128, panes: &[(u128, bool, Option<&str>)]) -> TabPanes {
         TabPanes {
             tab_id: Uuid::from_u128(tab),
-            session_id: Uuid::from_u128(9),
             panes: panes
                 .iter()
                 .map(|(id, focused, command)| PaneInfo {
                     id: Uuid::from_u128(*id),
                     focused: *focused,
                     running_command: command.map(str::to_string),
+                    cwd: (*id == 13).then(|| "/elsewhere".to_string()),
                 })
                 .collect(),
         }
@@ -434,25 +422,17 @@ mod tests {
             },
             40,
         );
-        let mut observed = 0;
         let mut git_reads = 0;
         let tabs = [tab(1, &[(11, true, Some("nvim")), (12, false, None)])];
-        let built = board.build(
-            &tabs,
-            &mut |_, _| {
-                observed += 1;
-                None
-            },
-            &mut |cwd| {
-                git_reads += 1;
-                (cwd == "/repo").then(|| GitStatus {
-                    branch: "main".into(),
-                    dirty: true,
-                    ahead: 0,
-                    behind: 0,
-                })
-            },
-        );
+        let built = board.build(&tabs, &mut |cwd| {
+            git_reads += 1;
+            (cwd == "/repo").then(|| GitStatus {
+                branch: "main".into(),
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+            })
+        });
         assert_eq!(built.len(), 1);
         let status = &built[0];
         assert_eq!(status.panes, 2);
@@ -467,26 +447,15 @@ mod tests {
         assert_eq!(status.output_at_ms, Some(20));
         assert_eq!(status.attention_at_ms, Some(30));
         assert_eq!(status.attention.as_deref(), Some("claude: needs input"));
-        // OSC 7 directories need no observation; git status is cached.
-        assert_eq!(observed, 0);
-        board.build(&tabs, &mut |_, _| None, &mut |_| unreachable!("cached"));
+        // Git status is cached.
+        board.build(&tabs, &mut |_| unreachable!("cached"));
         assert_eq!(git_reads, 1);
         assert!(board.changed(&built));
         assert!(!board.changed(&built));
-        // A pane without OSC 7 is observed (and cached), and closed panes are forgotten.
+        // A pane without OSC 7 uses the shell's directory, and closed panes are forgotten.
         let tabs = [tab(1, &[(13, true, None)])];
-        let mut observations = 0;
-        for _ in 0..2 {
-            board.build(
-                &tabs,
-                &mut |_, _| {
-                    observations += 1;
-                    Some("/elsewhere".into())
-                },
-                &mut |_| None,
-            );
-        }
-        assert_eq!(observations, 1);
+        let built = board.build(&tabs, &mut |_| None);
+        assert_eq!(built[0].cwd.as_deref(), Some("/elsewhere"));
         assert_eq!(board.git_cache_len(), 2);
         assert!(board.panes.is_empty());
     }

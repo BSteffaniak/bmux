@@ -93,18 +93,20 @@ pub fn list_panes(
         session_id: session_id.0,
         panes: summaries
             .into_iter()
-            .map(|p| PaneSummary {
-                id: p.id,
-                name: p.name,
-                shell: handle
-                    .0
-                    .pane_scrollback_metadata(session_id, p.id)
-                    .map_or_else(String::new, |metadata| metadata.shell),
-                active_command: handle
-                    .0
-                    .pane_scrollback_metadata(session_id, p.id)
-                    .and_then(|metadata| metadata.active_command),
-                focused: p.focused,
+            .map(|p| {
+                let metadata = handle.0.pane_scrollback_metadata(session_id, p.id);
+                PaneSummary {
+                    id: p.id,
+                    name: p.name,
+                    shell: metadata
+                        .as_ref()
+                        .map_or_else(String::new, |metadata| metadata.shell.clone()),
+                    active_command: metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.active_command.clone()),
+                    cwd: metadata.and_then(|metadata| metadata.last_known_cwd),
+                    focused: p.focused,
+                }
             })
             .collect(),
     })

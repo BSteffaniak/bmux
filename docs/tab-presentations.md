@@ -221,9 +221,12 @@ A tab counts as an agent when its running command's program is in `agents`.
 
 The data comes from the tabs plugin's `bmux.tabs/tabs-status` state, which it
 derives on the server from each pane's terminal signals (title, OSC 7
-directory, bell, OSC 9/777 notifications, OSC 133 exit status), its output, its
-running command and `git status` of the focused pane's directory, so remote
-attach clients see the server's repositories.
+directory, bell, OSC 9/777 notifications, OSC 133 exit status), its output,
+the running command and directory bmux's shell integration reports (bash, zsh,
+fish and nu, on by default through `behavior.pane_shell_integration`) and
+`git status` of the focused pane's directory, so remote attach clients see the
+server's repositories. Without shell integration a tab shows no running command
+and so never counts as working.
 
 Sidebar templates support `{state_icon}`, `{state}`, `{name}`, `{command}`,
 `{cwd}`, `{branch}`, `{detail}`, `{marker}`, `{index}`, `{id}`, `{active}`,

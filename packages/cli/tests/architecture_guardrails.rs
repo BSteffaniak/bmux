@@ -3626,7 +3626,9 @@ fn presentation_plugins_own_product_projection_and_interaction() {
 #[test]
 fn plugin_surface_paint_contract_excludes_graphics_payloads() {
     let surface_source = production_section(include_str!("../../plugin/src/surface.rs"));
-    let render_source = production_section(include_str!("../../plugin/src/render.rs"));
+    // `RenderOp` lives in the shared presentation paint vocabulary;
+    // `bmux_plugin::render` re-exports it.
+    let render_source = production_section(include_str!("../../presentation-scene/src/paint.rs"));
     let render_op = render_source
         .split("pub enum RenderOp {")
         .nth(1)

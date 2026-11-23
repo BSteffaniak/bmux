@@ -2660,6 +2660,7 @@ fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
                                     id: pane.id,
                                     focused: pane.focused,
                                     running_command: pane.active_command,
+                                    cwd: pane.cwd,
                                 })
                                 .collect::<Vec<_>>()
                         })
@@ -2668,33 +2669,10 @@ fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
                 .clone();
             Some(status::TabPanes {
                 tab_id: context.id,
-                session_id,
                 panes,
             })
         })
         .collect()
-}
-
-/// The working directory the pane runtime observes for a pane.
-fn observed_directory(
-    caller: &(impl ServiceCaller + Sync),
-    session_id: Uuid,
-    pane_id: Uuid,
-) -> Option<String> {
-    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1;
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
-    let source = bmux_plugin::block_on_typed_dispatch(
-        pane_runtime_spawn_v1::client::capture_source(&mut client, session_id, pane_id),
-    )
-    .ok()?
-    .ok()?;
-    bmux_plugin::block_on_typed_dispatch(pane_runtime_spawn_v1::client::observe_directory(
-        &mut client,
-        source,
-    ))
-    .ok()?
-    .ok()
-    .map(|observation| observation.path)
 }
 
 static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2702,14 +2680,11 @@ static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoard>) {
     let caller = shared.caller.as_ref();
     let tabs = tab_panes(caller);
+
     let Ok(mut board) = board.lock() else {
         return;
     };
-    let statuses = board.build(
-        &tabs,
-        &mut |session, pane| observed_directory(caller, session, pane),
-        &mut status::git_status,
-    );
+    let statuses = board.build(&tabs, &mut status::git_status);
     if !board.changed(&statuses) {
         return;
     }
@@ -4987,6 +4962,7 @@ mod tests {
                     name: None,
                     shell: "sh".to_string(),
                     active_command: None,
+                    cwd: None,
                     focused: true,
                 },
                 api_pane_runtime_state::PaneSummary {
@@ -4994,6 +4970,7 @@ mod tests {
                     name: None,
                     shell: "sh".to_string(),
                     active_command: None,
+                    cwd: None,
                     focused: false,
                 },
             ],

@@ -152,6 +152,8 @@ pub struct PaneScrollbackMetadata {
     pub name: Option<String>,
     pub shell: String,
     pub active_command: Option<String>,
+    /// The directory shell integration last reported.
+    pub last_known_cwd: Option<String>,
 }
 
 /// Bounded structured terminal-grid scrollback window for one pane.

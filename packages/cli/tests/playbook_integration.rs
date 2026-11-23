@@ -370,6 +370,20 @@ fn playbook_real_attach_presentation_combinations_reach_shell_and_resize() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_sidebar_shows_a_running_agent_working() {
+    let (json, pass) = run_playbook_fixture("attach_real_sidebar_agent.dsl");
+    assert!(pass, "sidebar agent playbook should pass: {json:#}");
+}
+
+#[test]
+#[serial]
+fn playbook_real_attach_sidebar_flags_a_background_bell_as_needing_input() {
+    let (json, pass) = run_playbook_fixture("attach_real_sidebar_attention.dsl");
+    assert!(pass, "sidebar attention playbook should pass: {json:#}");
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_sidebar_shows_each_tabs_git_status() {
     let (json, pass) = run_playbook_fixture("attach_real_sidebar_status.dsl");
     assert!(pass, "sidebar status playbook should pass: {json:#}");

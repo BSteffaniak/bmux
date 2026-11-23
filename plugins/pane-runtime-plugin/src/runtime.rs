@@ -11407,16 +11407,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     ) -> Option<bmux_pane_runtime_state::PaneScrollbackMetadata> {
         self.with_lock_read(|manager| {
             let pane = manager.runtimes.get(&session_id)?.panes.get(&pane_id)?;
-            let active_command = pane
+            let (active_command, last_known_cwd) = pane
                 .resurrection_state
                 .lock()
                 .ok()
-                .and_then(|state| state.active_command.clone());
+                .map(|state| (state.active_command.clone(), state.last_known_cwd.clone()))
+                .unwrap_or_default();
             Some(bmux_pane_runtime_state::PaneScrollbackMetadata {
                 pane_id,
                 name: pane.meta.name.clone(),
                 shell: pane.meta.shell.clone(),
                 active_command,
+                last_known_cwd,
             })
         })
         .flatten()
