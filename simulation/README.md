@@ -27,13 +27,21 @@ cargo sim pane-runtime --tui 42                    # ... with the run of seed 42
 cargo sim pane-runtime --fleet                     # continuously, printing findings
 cargo sim pty --regression                         # its pinned seeds
 cargo sim pane-runtime --check                     # is everything it links deterministic?
+cargo sim pane-runtime --coverage                  # did a `runs = false` crate run?
 ```
 
 `cargo sim NAME [ARGS]` (an alias for `cargo xtask sim`) builds and runs member
 `NAME` in release mode. `--check` instead runs `sim-check` (`check/`), which checks
 everything `NAME` links with `switchy_cargo`: each local crate scanned by the rules in
 its manifest's `[package.metadata.switchy.simulation]`, and every other crate on the
-audit list in `determinism.toml`. Runs are configured through simvar's environment:
+audit list in `determinism.toml`. `--coverage` builds `NAME` instrumented for coverage
+(in `target/sim-coverage`), runs it, and fails if a line of a crate marked `runs = false`
+ran; it needs LLVM's tools (`rustup component add llvm-tools-preview`, `nix build
+.#llvm-tools`, or `LLVM_PROFDATA` and `LLVM_COV`).
+
+Cargo runs in this directory, so builds read `.cargo/config.toml`: `getrandom` (uuid, rand's
+OS generator, hasher seeds) draws from the run's seed. Runs are configured through simvar's
+environment:
 
 | Variable | Meaning |
 | --- | --- |

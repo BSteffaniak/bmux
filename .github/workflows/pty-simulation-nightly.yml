@@ -83,6 +83,34 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/findings
 
+  # Crates marked `runs = false` are not scanned by `cargo sim NAME --check`, on their word that
+  # simulations never run them. Coverage-instrumented fleets check that word: any line of such
+  # a crate that runs fails the job.
+  run-claims:
+    name: runs = false (${{ matrix.simulation }})
+    runs-on: ubuntu-latest
+    needs: [rust-version]
+    strategy:
+      fail-fast: false
+      matrix:
+        simulation: [pane-runtime, pty, local-terminal]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+          components: llvm-tools-preview
+
+      - name: Check the claims against what runs
+        shell: bash
+        env:
+          SIMULATOR_RUNS: "300"
+          PANE_RUNTIME_SIM_GUIDED: "1"
+        run: cargo sim ${{ matrix.simulation }} --coverage
+
   # Every schedule of each pane runtime scenario within its full bound (two departures from the
   # default schedule), under one and two executor workers, one scenario per job.
   explore:

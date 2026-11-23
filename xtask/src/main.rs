@@ -3,6 +3,7 @@ mod artifacts;
 mod bterm;
 mod bterm_run;
 mod build;
+mod sim_coverage;
 
 use artifacts::{Result, error};
 use std::{collections::BTreeMap, env, path::PathBuf};
@@ -242,8 +243,23 @@ fn simulate(args: &[String]) -> Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| error("xtask has no parent directory"))?;
-    let mut command = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    if args[1..].iter().any(|arg| arg == "--coverage") {
+        // `cargo sim NAME --coverage [ARGS]`: check the `runs = false` claims of what NAME
+        // links against what its runs execute.
+        let rest: Vec<String> = args[1..]
+            .iter()
+            .filter(|arg| *arg != "--coverage")
+            .skip_while(|arg| *arg == "--")
+            .cloned()
+            .collect();
+        return sim_coverage::check(&cargo, &root.join("simulation"), name, &rest);
+    }
+    let mut command = std::process::Command::new(cargo);
     command
+        // In simulation/, so cargo reads simulation/.cargo/config.toml (simulation builds'
+        // settings, such as where `getrandom` draws from).
+        .current_dir(root.join("simulation"))
         .args(["run", "--release", "--manifest-path"])
         .arg(root.join("simulation").join("Cargo.toml"));
     if args[1..].iter().any(|arg| arg == "--check") {
