@@ -26,7 +26,7 @@ reason = "Adler-32."
 name = "ahash"
 version = "^0.8"
 verdict = "restricted"
-reason = "A randomly seeded hasher; reached only through hash maps, which scanned crates may not use."
+reason = "Seeded from memory addresses in this build (no runtime-rng), which no interception reaches; HashMap and HashSet, where iteration order would show it, are forbidden in scanned crates."
 
 [[audit]]
 name = "aho-corasick"
@@ -242,7 +242,7 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 name = "foldhash"
 version = "^0.2"
 verdict = "restricted"
-reason = "A randomly seeded hasher; reached only through hash maps, which scanned crates may not use."
+reason = "Seeded from memory addresses and the clock, which no interception reaches; HashMap and HashSet, where iteration order would show it, are forbidden in scanned crates."
 
 [[audit]]
 name = "form_urlencoded"
@@ -314,19 +314,19 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 name = "getrandom"
 version = "^0.2"
 verdict = "restricted"
-reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+reason = "OS randomness that cannot be redirected on the systems it supports (its custom backend is a fallback for other targets). Reached through rand 0.8's OsRng and thread_rng, which the shared rules forbid."
 
 [[audit]]
 name = "getrandom"
 version = "^0.3"
-verdict = "restricted"
-reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+verdict = "controlled"
+reason = "Simulation builds (`--cfg getrandom_backend=\"custom\"`, simulation/.cargo/config.toml) send every call to switchy_random's custom backend: bytes from the run's seed, and a panic outside a run."
 
 [[audit]]
 name = "getrandom"
 version = "^0.4"
-verdict = "restricted"
-reason = "OS randomness. Callers reach it through uuid, rand and hasher seeds; the shared rules forbid those entry points (20.3 intercepts it outright)."
+verdict = "controlled"
+reason = "Simulation builds (`--cfg getrandom_backend=\"custom\"`, simulation/.cargo/config.toml) send every call to switchy_random's custom backend: bytes from the run's seed, and a panic outside a run."
 
 [[audit]]
 name = "h2"
@@ -1454,7 +1454,7 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 name = "uuid"
 version = "^1"
 verdict = "restricted"
-reason = "Uuid::new_v4 reads OS randomness; the shared rules forbid new_v4 (ids come from switchy_uuid or a crate's seeded ids module)."
+reason = "Uuid::new_v4 draws from getrandom, which simulation builds redirect to the run's seed; the shared rules still forbid it, so ids come from switchy_uuid or a crate's seeded ids module."
 
 [[audit]]
 name = "want"

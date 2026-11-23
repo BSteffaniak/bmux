@@ -1,0 +1,7 @@
+# Simulation builds only: cargo reads this file when it runs in simulation/ (as `cargo sim`
+# does), never for the main workspace, so real builds never see these settings.
+
+[build]
+# `getrandom` 0.3 and 0.4 (uuid, rand's OS generator, hashers' seeds) call switchy_random's
+# custom backend, which draws from the simulation run's seed and panics outside a run.
+rustflags = ["--cfg", 'getrandom_backend="custom"']
