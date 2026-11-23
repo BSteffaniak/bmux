@@ -72,8 +72,14 @@ use uuid::Uuid;
 /// alongside the concrete `Arc<RwLock<ContextState>>` so consumers can
 /// read context-state through the trait surface without naming the
 /// concrete plugin-owned type.
+///
+/// Every removal through this surface (for example the session-death
+/// teardown pane-runtime performs) is announced as `ContextEvent::Closed`
+/// on the contexts plugin's own bus, so consumers observe confirmed deletion
+/// no matter which path removed the context.
 struct ContextStateAdapter {
     inner: Arc<RwLock<ContextState>>,
+    events: ContextEvents,
 }
 
 impl ContextStateAdapter {
@@ -113,6 +119,15 @@ impl ContextStateReader for ContextStateAdapter {
             |state| state.resolve_id(selector),
             Err("context-state lock poisoned"),
         )
+    }
+}
+
+impl ContextStateAdapter {
+    /// Announce removals after the state lock is released.
+    fn announce_closed(&self, removed: impl IntoIterator<Item = Uuid>) {
+        for context_id in removed {
+            self.events.emit(ContextEvent::Closed { context_id });
+        }
     }
 }
 
@@ -170,17 +185,23 @@ impl ContextStateWriter for ContextStateAdapter {
         selector: &PrimitiveContextSelector,
         force: bool,
     ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
-        self.with_write(
+        let closed = self.with_write(
             |state| state.close(client_id, selector, force),
             Err("context-state lock poisoned"),
-        )
+        );
+        if let Ok((context_id, _)) = &closed {
+            self.announce_closed([*context_id]);
+        }
+        closed
     }
 
     fn remove_contexts_for_session(&self, session_id: SessionId) -> Vec<Uuid> {
-        self.with_write(
+        let removed = self.with_write(
             |state| state.remove_contexts_for_session(session_id),
             Vec::new(),
-        )
+        );
+        self.announce_closed(removed.iter().copied());
+        removed
     }
 
     fn bind_session(
@@ -203,10 +224,14 @@ impl ContextStateWriter for ContextStateAdapter {
         context_id: Uuid,
         preferred_client: Option<ClientId>,
     ) -> Option<(Uuid, Option<SessionId>)> {
-        self.with_write(
+        let removed = self.with_write(
             |state| state.remove_context_by_id(context_id, preferred_client),
             None,
-        )
+        );
+        if let Some((context_id, _)) = &removed {
+            self.announce_closed([*context_id]);
+        }
+        removed
     }
 
     fn snapshot(&self) -> ContextStateSnapshot {
@@ -476,6 +501,7 @@ impl ContextsPlugin {
         // surface without naming the concrete plugin-owned type.
         let adapter = ContextStateAdapter {
             inner: Arc::clone(&state),
+            events: self.events(),
         };
         let handle = Arc::new(RwLock::new(ContextStateHandle::new(adapter)));
         registry.register::<ContextStateHandle>(&handle);
@@ -829,7 +855,7 @@ fn compensate_created_session(
     session_id: SessionId,
     original: CreateContextError,
 ) -> CreateContextError {
-    match kill_session_via_sessions_plugin(caller, session_id) {
+    match kill_session_via_sessions_plugin(caller, session_id, false) {
         Ok(()) => original,
         Err(cleanup) => CreateContextError::Failed {
             reason: format!("{original:?}; created-session cleanup failed: {cleanup}"),
@@ -1042,6 +1068,25 @@ fn resolve_selection_target(
     Ok((context, session_id))
 }
 
+/// Close a context for everyone.
+///
+/// Ordering rule: terminate, then forget. A context bound to a session is
+/// removed only after that session has been terminated through the sessions
+/// plugin. If termination fails the error is returned and nothing else
+/// happens: the context stays listed, bound, selected by whoever had it and
+/// retryable, so a failed close never reports success while leaving an
+/// orphaned session behind. A session that is already gone (`not-found`)
+/// counts as terminated.
+///
+/// `force` is forwarded unchanged as the session's `force-local` override;
+/// the sessions plugin decides who may use it. Removing the context itself
+/// has no forced variant.
+///
+/// Terminating a session can remove its contexts through the session-death
+/// path, which announces `Closed` itself; the context is then neither removed
+/// nor announced twice. Every client whose selection pointed at the closed
+/// context moves to the most recently used remaining context, or to no
+/// selection when none remain.
 #[instrument(
     level = "debug",
     target = "bmux_contexts_plugin::lifecycle",
@@ -1069,11 +1114,23 @@ fn close_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| CloseContextError::Failed { reason })?;
 
+    let (target_id, bound_session_id) = resolve_close_target(events, &context_selector)?;
+    if let Some(session_id) = bound_session_id {
+        kill_session_via_sessions_plugin(caller, session_id, force).map_err(|reason| {
+            CloseContextError::Failed {
+                reason: format!(
+                    "terminating session {} of context {target_id} failed; the context was kept: {reason}",
+                    session_id.0
+                ),
+            }
+        })?;
+    }
+
     let CloseOutcome {
-        removed_id,
-        bound_session_id,
+        removed_here,
         replacement,
-    } = mutate_state_close(events, client_id, &context_selector, force)?;
+    } = mutate_state_close(events, client_id, target_id)?;
+    let removed_id = target_id;
 
     tracing::Span::current().record("removed_id", tracing::field::display(removed_id));
     if let Some((replacement_context_id, replacement_session_id)) = replacement {
@@ -1089,15 +1146,11 @@ fn close_context_local(
         }
     }
 
-    // Cross-plugin orchestration: if the closed context had a bound
-    // session runtime, kill it via the sessions plugin.
-    if let Some(session_id) = bound_session_id {
-        let _ = kill_session_via_sessions_plugin(caller, session_id);
+    if removed_here {
+        events.emit(ContextEvent::Closed {
+            context_id: removed_id,
+        });
     }
-
-    events.emit(ContextEvent::Closed {
-        context_id: removed_id,
-    });
 
     // Auto-focus-sibling: if the caller had this context selected and
     // a replacement was chosen by `ContextState::close`, mirror the
@@ -1135,13 +1188,11 @@ fn close_context_local(
     })
 }
 
-/// Result of `mutate_state_close`, extending `ContextState::close` with
-/// the sibling the underlying state picked for the caller's new active
-/// selection (if any). `replacement` is `None` when either no contexts
-/// remain or the caller didn't actually have this context selected.
+/// Result of `mutate_state_close`: whether this call removed the context
+/// (rather than the session-death path having removed it already) and the
+/// caller's selection afterwards, if any.
 struct CloseOutcome {
-    removed_id: ::uuid::Uuid,
-    bound_session_id: Option<SessionId>,
+    removed_here: bool,
     replacement: Option<(::uuid::Uuid, Option<SessionId>)>,
 }
 
@@ -1299,12 +1350,30 @@ fn rename_session_via_sessions_plugin(
     })
 }
 
+/// Resolve the context a close targets, and its bound session, without
+/// changing anything.
+#[allow(clippy::significant_drop_tightening)]
+fn resolve_close_target(
+    events: &ContextEvents,
+    context_selector: &PrimitiveContextSelector,
+) -> Result<(Uuid, Option<SessionId>), CloseContextError> {
+    let state = events
+        .local_state()
+        .map_err(|reason| CloseContextError::Failed { reason })?;
+    let guard = state.read().map_err(|_| CloseContextError::Failed {
+        reason: "context state lock poisoned".to_string(),
+    })?;
+    let id = guard
+        .resolve_id(context_selector)
+        .map_err(|_| CloseContextError::NotFound)?;
+    Ok((id, guard.session_by_context.get(&id).copied()))
+}
+
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_close(
     events: &ContextEvents,
     client_id: ClientId,
-    context_selector: &PrimitiveContextSelector,
-    force: bool,
+    context_id: Uuid,
 ) -> Result<CloseOutcome, CloseContextError> {
     let state = events
         .local_state()
@@ -1312,13 +1381,12 @@ fn mutate_state_close(
     let mut guard = state.write().map_err(|_| CloseContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
-    let (removed_id, bound_session_id) = guard
-        .close(client_id, context_selector, force)
-        .map_err(|_reason| CloseContextError::NotFound)?;
-    // After `close`, the caller's `selected_by_client` now either
-    // points at the replacement (if ContextState picked one) or is
-    // absent (no contexts remain). Read it back to drive the event
-    // emission above.
+    let removed_here = guard
+        .remove_context_by_id(context_id, Some(client_id))
+        .is_some();
+    // The caller's `selected_by_client` now either points at the
+    // replacement (if ContextState picked one) or is absent (no
+    // contexts remain). Read it back to drive the event emission.
     let replacement = guard
         .selected_by_client
         .get(&client_id)
@@ -1328,8 +1396,7 @@ fn mutate_state_close(
             (context_id, session_id)
         });
     Ok(CloseOutcome {
-        removed_id,
-        bound_session_id,
+        removed_here,
         replacement,
     })
 }
@@ -1362,6 +1429,7 @@ fn create_session_via_sessions_plugin(
 fn kill_session_via_sessions_plugin(
     caller: &(impl ServiceCaller + Sync),
     session_id: SessionId,
+    force_local: bool,
 ) -> Result<(), String> {
     use bmux_sessions_plugin_api::sessions_commands::{self, KillSessionError};
     use bmux_sessions_plugin_api::sessions_state::SessionSelector;
@@ -1373,7 +1441,7 @@ fn kill_session_via_sessions_plugin(
             id: Some(session_id.0),
             name: None,
         },
-        false,
+        force_local,
     ))
     .map_err(|err| format!("sessions-commands:kill-session failed: {err}"))?;
     match result {
@@ -1949,7 +2017,10 @@ mod tests {
         let session = SessionId::new();
         let workspace = Uuid::new_v4();
         let source = Arc::new(RwLock::new(ContextState::default()));
-        let source_adapter = ContextStateAdapter { inner: source };
+        let source_adapter = ContextStateAdapter {
+            inner: source,
+            events: ContextEvents::default(),
+        };
         let default = source_adapter.create(client, Some("default".into()), BTreeMap::new());
         let target = source_adapter.create(
             client,
@@ -1963,6 +2034,7 @@ mod tests {
         let restored = Arc::new(RwLock::new(ContextState::default()));
         let adapter = ContextStateAdapter {
             inner: restored.clone(),
+            events: ContextEvents::default(),
         };
         adapter.restore_snapshot(source_adapter.snapshot());
         assert_eq!(adapter.context_for_session(session), Some(target.id));
@@ -2073,11 +2145,13 @@ mod tests {
         let inner = Arc::new(RwLock::new(context_state));
         let adapter = ContextStateAdapter {
             inner: Arc::clone(&inner),
+            events: ContextEvents::default(),
         };
         let snapshot = adapter.snapshot();
         let restored_inner = Arc::new(RwLock::new(ContextState::default()));
         let restored_adapter = ContextStateAdapter {
             inner: Arc::clone(&restored_inner),
+            events: ContextEvents::default(),
         };
         restored_adapter.restore_snapshot(snapshot);
         let restored = restored_inner.read().expect("restored state should lock");
@@ -2338,6 +2412,183 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    /// Kill-session calls the close path made: `(session, force-local)`.
+    type KillLog = Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>;
+
+    /// A sessions host whose `kill-session` fails while `fail` is set.
+    fn install_kill_session_router(
+        fail: Arc<std::sync::atomic::AtomicBool>,
+        kills: KillLog,
+    ) -> InvocationTestHost {
+        use bmux_sessions_plugin_api::sessions_commands::{self, KillSessionError, SessionAck};
+        let router: bmux_plugin::test_support::TestServiceRouter = Arc::new(
+            // The test router ABI returns PluginError by value.
+            #[allow(clippy::result_large_err)]
+            move |_, _, _, _, interface, operation, payload| match (interface, operation) {
+                ("sessions-commands", "kill-session") => {
+                    let request: sessions_commands::client::KillSessionRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    let session = request.selector.id.expect("close kills by id");
+                    kills.lock().unwrap().push((session, request.force_local));
+                    let result: Result<SessionAck, KillSessionError> =
+                        if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                            Err(KillSessionError::Failed {
+                                reason: "session refused to stop".into(),
+                            })
+                        } else {
+                            Ok(SessionAck { id: session })
+                        };
+                    encode_service_message(&result)
+                }
+                ("sessions-commands", "select-session") => {
+                    let ack: Result<SessionAck, sessions_commands::SelectSessionError> =
+                        Ok(SessionAck { id: Uuid::nil() });
+                    encode_service_message(&ack)
+                }
+                ("logging-command/v1", "write") => encode_service_message(&()),
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "kill_session_router",
+                }),
+            },
+        );
+        InvocationTestHost(checked_test_router(router))
+    }
+
+    #[test]
+    fn close_terminates_the_session_before_forgetting_and_keeps_the_tab_on_failure() {
+        let client = ClientId::new();
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let state_handle = Arc::new(RwLock::new(ContextState::default()));
+        let (first, second) = {
+            let mut state = state_handle.write().unwrap();
+            let first = state
+                .create_bound(client, Some("first".into()), BTreeMap::new(), first_session)
+                .id;
+            let second = state
+                .create_bound(
+                    client,
+                    Some("second".into()),
+                    BTreeMap::new(),
+                    second_session,
+                )
+                .id;
+            state
+                .select_for_client(client, &PrimitiveContextSelector::ById(first))
+                .unwrap();
+            drop(state);
+            (first, second)
+        };
+        let states = Arc::new(PluginStateRegistry::new());
+        let _existing = states.register::<ContextState>(&state_handle);
+        let bus = Arc::new(EventBus::new());
+        bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        let events = ContextEvents::new(Some(Arc::clone(&bus)), states);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let kills = KillLog::default();
+        let host = install_kill_session_router(Arc::clone(&fail), Arc::clone(&kills));
+        let events_rx = subscribe_events(&bus);
+        let ctx = test_service_context(&host, client.0);
+        let target = WireSelector {
+            id: Some(first),
+            name: None,
+        };
+
+        // Termination failure is surfaced; the tab stays whole and selected.
+        let error = close_context_local(&events, &ctx, Some(client.0), &target, true)
+            .expect_err("a failed session termination must fail the close");
+        assert!(
+            matches!(&error, CloseContextError::Failed { reason } if reason.contains("session refused to stop")),
+            "{error:?}"
+        );
+        {
+            let state = state_handle.read().unwrap();
+            assert!(state.contexts.contains_key(&first));
+            assert_eq!(state.session_by_context.get(&first), Some(&first_session));
+            assert_eq!(state.selected_by_client.get(&client), Some(&first));
+            drop(state);
+        }
+        assert!(
+            drain_events_after_short_wait(&events_rx).is_empty(),
+            "a failed close announced a change"
+        );
+
+        // Retry succeeds once the session can be terminated.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let ack = close_context_local(&events, &ctx, Some(client.0), &target, false)
+            .expect("retried close should succeed");
+        assert_eq!(ack.id, first);
+        assert_eq!(ack.session_id, Some(first_session.0));
+        {
+            let state = state_handle.read().unwrap();
+            assert!(!state.contexts.contains_key(&first));
+            assert_eq!(state.selected_by_client.get(&client), Some(&second));
+            drop(state);
+        }
+        // `force` reached the session as its force-local override, each attempt.
+        assert_eq!(
+            *kills.lock().unwrap(),
+            vec![(first_session.0, true), (first_session.0, false)]
+        );
+        let emitted = drain_events_after_short_wait(&events_rx);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, ContextEvent::Closed { .. }))
+                .collect::<Vec<_>>(),
+            vec![&ContextEvent::Closed { context_id: first }]
+        );
+        assert!(emitted.contains(&ContextEvent::Selected { context_id: second }));
+
+        // Closing what is already gone is reported, not silently accepted.
+        assert!(matches!(
+            close_context_local(&events, &ctx, Some(client.0), &target, false),
+            Err(CloseContextError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn session_death_removal_announces_confirmed_deletion() {
+        let client = ClientId::new();
+        let dead = SessionId::new();
+        let bus = Arc::new(EventBus::new());
+        bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        let adapter = ContextStateAdapter {
+            inner: Arc::new(RwLock::new(ContextState::default())),
+            events: ContextEvents::new(
+                Some(Arc::clone(&bus)),
+                Arc::new(PluginStateRegistry::new()),
+            ),
+        };
+        let doomed = adapter.create(client, Some("doomed".into()), BTreeMap::new());
+        adapter.bind_session(doomed.id, dead).unwrap();
+        let survivor = adapter.create(client, Some("survivor".into()), BTreeMap::new());
+        adapter.bind_session(survivor.id, SessionId::new()).unwrap();
+        let events_rx = subscribe_events(&bus);
+
+        // The neutral writer surface pane-runtime uses when a session dies.
+        let handle = ContextStateHandle::new(adapter);
+        assert_eq!(handle.0.remove_contexts_for_session(dead), vec![doomed.id]);
+        assert_eq!(
+            handle.0.remove_contexts_for_session(dead),
+            Vec::<Uuid>::new()
+        );
+
+        assert_eq!(
+            drain_events_after_short_wait(&events_rx),
+            vec![ContextEvent::Closed {
+                context_id: doomed.id
+            }]
+        );
+        assert_eq!(
+            handle
+                .0
+                .current_for_client(client)
+                .map(|context| context.id),
+            Some(survivor.id)
+        );
     }
 
     #[test]

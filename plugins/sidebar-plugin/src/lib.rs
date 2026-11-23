@@ -262,6 +262,10 @@ struct CompanionState {
     presentation_pending: std::cell::Cell<bool>,
     settings: Settings,
     revision: u64,
+    /// The broadcast catalog as received, before client-local selection.
+    catalog: tabs_list::TabListSnapshot,
+    /// This attachment's own selection (`tabs-local-view`), when known.
+    selected_context_id: Option<Uuid>,
     snapshot: tabs_list::TabListSnapshot,
     /// The highlighted tab, moved by the pointer (hover) and the keyboard.
     cursor: ItemCursor<Uuid>,
@@ -318,6 +322,11 @@ impl CompanionState {
             hits: std::cell::RefCell::new(HitTables::new(4)),
             settings,
             revision: 0,
+            catalog: tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 0,
+            },
+            selected_context_id: None,
             snapshot: tabs_list::TabListSnapshot {
                 tabs: Vec::new(),
                 revision: 0,
@@ -547,7 +556,16 @@ impl CompanionState {
         self.snapshot.tabs.iter().map(|tab| tab.id).collect()
     }
 
-    fn replace_tabs(&mut self, snapshot: tabs_list::TabListSnapshot) {
+    /// Apply a catalog snapshot. The shared catalog cannot know which tab is
+    /// this attachment's, so a known client-local selection decides `active`,
+    /// exactly as the tab bar does.
+    fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
+        self.catalog = snapshot.clone();
+        if let Some(selected) = self.selected_context_id {
+            for tab in &mut snapshot.tabs {
+                tab.active = tab.id == selected;
+            }
+        }
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
             let keys = self.tab_ids();
@@ -566,6 +584,39 @@ impl CompanionState {
             }
             self.revision = self.revision.saturating_add(1).max(1);
         }
+    }
+
+    /// Fact and status text affect wrapping, row geometry and hit regions,
+    /// so drop measurements and republish; optionally reveal the active tab.
+    fn remeasure(&mut self, reveal_active: bool) {
+        self.measured_items.get_mut().clear();
+        self.revision = self.revision.saturating_add(1).max(1);
+        if reveal_active && let Some(active) = self.snapshot.tabs.iter().position(|tab| tab.active)
+        {
+            self.reveal(active);
+        }
+    }
+
+    fn select(&mut self, context_id: Option<Uuid>) {
+        if self.selected_context_id != context_id {
+            self.selected_context_id = context_id;
+            self.replace_tabs(self.catalog.clone());
+        }
+    }
+}
+
+/// The next client-local selection. A bus without the channel, or one whose
+/// channel closed, never yields; the catalog flags then stand.
+async fn next_selection(slot: &mut Option<SelectionReceiver>) -> Option<Uuid> {
+    loop {
+        let Some(rx) = slot.as_mut() else {
+            return std::future::pending().await;
+        };
+        if rx.changed().await.is_err() {
+            *slot = None;
+            continue;
+        }
+        return rx.borrow_and_update().context_id;
     }
 }
 
@@ -678,6 +729,7 @@ impl SidebarPresentation {
             .events
             .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
             .map_err(|error| format!("subscribing to tabs list: {error}"))?;
+        let (initial_selection, mut selection_rx) = subscribe_selection(&resources.events);
         let mut facts_rx = facts.subscribe()?;
         let (initial_status, mut status_rx) = subscribe_tab_status(&resources.events)?;
         let presentation = Self::install_with_state(
@@ -698,6 +750,7 @@ impl SidebarPresentation {
                 .ok_or_else(|| "sidebar companion is closed".to_string())?;
             companion.facts = Some(facts);
             companion.activity.replace(initial_status.as_ref().clone());
+            companion.selected_context_id = initial_selection;
             companion.replace_tabs(initial.as_ref().clone());
             publish_companion(companion)?;
             let owner = std::sync::Arc::downgrade(&presentation.owner);
@@ -708,10 +761,15 @@ impl SidebarPresentation {
                 loop {
                     let mut status = None;
                     let mut ticked = false;
+                    let mut selection = None;
                     let tabs = tokio::select! {
                         result = tabs_rx.changed() => {
                             if result.is_err() { break; }
                             Some(tabs_rx.borrow_and_update().as_ref().clone())
+                        }
+                        context_id = next_selection(&mut selection_rx) => {
+                            selection = Some(context_id);
+                            None
                         }
                         result = facts_rx.changed() => {
                             if result.is_err() { break; }
@@ -749,20 +807,12 @@ impl SidebarPresentation {
                     }
                     if let Some(tabs) = tabs {
                         companion.replace_tabs(tabs);
+                    } else if let Some(context_id) = selection {
+                        companion.select(context_id);
                     } else {
-                        // Fact and status text affect wrapping, row geometry and
-                        // hit regions. Only a fact change brings the active tab
-                        // back into view; status updates and ticks keep the
-                        // scroll where the user left it.
-                        let facts_changed = !ticked && !status_changed;
-                        companion.measured_items.get_mut().clear();
-                        companion.revision = companion.revision.saturating_add(1).max(1);
-                        if facts_changed
-                            && let Some(active) =
-                                companion.snapshot.tabs.iter().position(|tab| tab.active)
-                        {
-                            companion.reveal(active);
-                        }
+                        // Only a fact change brings the active tab back into
+                        // view; status updates and ticks keep the scroll.
+                        companion.remeasure(!ticked && !status_changed);
                     }
                     companion.presentation_pending.set(true);
                     if let Err(error) = publish_companion(companion) {
@@ -1548,6 +1598,25 @@ fn build_surface_with_hits(
 
 /// Follow the tabs plugin's forwarded `tabs-status` state on this runtime's
 /// bus, registering its decoder when nothing has yet.
+type SelectionReceiver = tokio::sync::watch::Receiver<
+    std::sync::Arc<bmux_tabs_plugin_api::tabs_local_view::TabSelection>,
+>;
+
+/// This attachment's client-local selection (`tabs-local-view`) and its
+/// receiver; both absent on buses that do not publish it.
+fn subscribe_selection(
+    events: &std::sync::Arc<bmux_plugin::EventBus>,
+) -> (Option<Uuid>, Option<SelectionReceiver>) {
+    events
+        .subscribe_state::<bmux_tabs_plugin_api::tabs_local_view::TabSelection>(
+            &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
+        )
+        .ok()
+        .map_or((None, None), |(selection, rx)| {
+            (selection.context_id, Some(rx))
+        })
+}
+
 fn subscribe_tab_status(
     events: &std::sync::Arc<bmux_plugin::EventBus>,
 ) -> Result<
@@ -2376,6 +2445,98 @@ mod tests {
             .unwrap();
         tokio::task::yield_now().await;
         assert!(owner.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_tab_follows_this_attachments_selection_not_the_catalog_flag() {
+        let resources = bmux_plugin::AttachPresentationResources::isolated(4);
+        let first = Uuid::from_u128(21);
+        let second = Uuid::from_u128(22);
+        let entry = |id, active| tabs_list::TabListEntry {
+            id,
+            name: id.to_string(),
+            active,
+            workspace: "default".to_string(),
+            workspace_id: Uuid::nil(),
+        };
+        // The shared catalog claims `first`; this attachment selected `second`.
+        resources.events.register_state_channel(
+            tabs_list::STATE_KIND,
+            tabs_list::TabListSnapshot {
+                tabs: vec![entry(first, true), entry(second, false)],
+                revision: 1,
+            },
+        );
+        resources.events.register_state_channel(
+            bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_local_view::TabSelection {
+                context_id: Some(second),
+            },
+        );
+        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let active = |presentation: &SidebarPresentation| {
+            presentation
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.active)
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(active(&presentation), vec![second]);
+
+        resources
+            .events
+            .publish_state(
+                &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
+                bmux_tabs_plugin_api::tabs_local_view::TabSelection {
+                    context_id: Some(first),
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while active(&presentation) != vec![first] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // A later catalog without any flag keeps this attachment's selection.
+        resources
+            .events
+            .publish_state(
+                &tabs_list::STATE_KIND,
+                tabs_list::TabListSnapshot {
+                    tabs: vec![entry(first, false), entry(second, false)],
+                    revision: 2,
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let revision = presentation
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .revision;
+                if revision == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(active(&presentation), vec![first]);
     }
 
     #[test]

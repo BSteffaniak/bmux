@@ -382,9 +382,12 @@ interface tabs-events {
 // Payload semantics:
 // - `tabs` is the ordered list of live tabs; consumers render
 //   positional indices (`1:`, `2:`, …) from this order.
-// - `active` on each entry is `true` for the current active tab
-//   (as resolved by the plugin's effective-current-context logic) and
-//   `false` otherwise.
+// - `active` on each entry is `false`. The current tab is per client
+//   (each client's own contexts selection) and this snapshot reaches
+//   every client, so it marks none; consumers read their client's
+//   selection from `tabs-local-view`. Caller-scoped queries
+//   (`tabs-state.list-tabs`, `tabs-catalog-v1.list-tabs`) mark the
+//   invoking client's current tab.
 // - `revision` is a monotonic counter advancing on every publish;
 //   consumers can use it to deduplicate or order updates.
 // Client-local selection, published by attach rather than the shared catalog.

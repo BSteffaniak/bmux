@@ -220,6 +220,10 @@ impl ContextState {
     /// as a destination for replacement selection. Returns the removed
     /// context's id + bound session (if any).
     ///
+    /// Removing state has no forced variant, so `_force` is unused here; the
+    /// `close-context` service honours `force` when it terminates the bound
+    /// session, before any state is removed.
+    ///
     /// # Errors
     ///
     /// Returns a static error message when the selector does not

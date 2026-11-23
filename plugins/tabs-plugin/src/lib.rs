@@ -32,8 +32,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     LogWriteLevel, LogWriteRequest, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
     PromptValue, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
-    TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
-    VolatileStateSetRequest,
+    TypedServiceRegistry,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use bmux_tabs_plugin_api::tabs_catalog_v1::{self, TabsCatalogV1Service};
@@ -54,8 +53,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
 
-const ACTIVE_TAB_CONTEXT_KEY: &str = "tabs.active_context_id";
-const PREVIOUS_TAB_CONTEXT_KEY: &str = "tabs.previous_context_id";
+/// Retired storage keys of the former process-global "active tab" marker.
+///
+/// The marker recorded whichever client switched last and was preferred over
+/// the caller's own selection, so it is no longer an authority: the current
+/// tab is always the caller's contexts selection. These keys are only cleared,
+/// once, by [`retire_global_active_marker`].
+const RETIRED_ACTIVE_TAB_KEY: &str = "tabs.active_context_id";
+const RETIRED_PREVIOUS_TAB_KEY: &str = "tabs.previous_context_id";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 
 fn storage_key(key: &str) -> bmux_plugin_sdk::StorageKey {
@@ -1207,15 +1212,14 @@ fn emit_pane_event(
     }
 }
 
-/// Shared previous-tab history keyed by caller and workspace. Callers without
-/// an attachment identity have a separate slot and never supply client history.
-/// Command handlers and typed services share the same map.
-type LastSelectedByClient = Arc<Mutex<BTreeMap<(Option<Uuid>, Uuid), Uuid>>>;
+/// Previous-tab history keyed by `(client, workspace)`. Only invocations that
+/// act for a client have history: a caller-less switch records nothing and a
+/// caller-less `last-tab` has no previous tab, so no shared slot ever stands in
+/// for a client. Command handlers and services share the same map.
+type LastSelectedByClient = Arc<Mutex<BTreeMap<(Uuid, Uuid), Uuid>>>;
 
 #[derive(Debug, Default)]
 struct TabRuntimeState {
-    active_context_id: Option<Uuid>,
-    previous_context_id: Option<Uuid>,
     #[cfg(test)]
     tab_order_ids: Option<Vec<Uuid>>,
     #[cfg(test)]
@@ -1382,7 +1386,7 @@ impl TabsPlugin {
                 Ok(list_catalog(ctx))
             },
             "tabs-state", "list-tabs" => |req: ListTabsArgs, ctx| {
-                let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref())
+                let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref(), ActiveMarking::Caller)
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
                 Ok(tabs)
             },
@@ -1634,6 +1638,13 @@ impl TabsPlugin {
         // `<data_dir>/plugin-storage/bmux.tabs/tabs.order.bin`
         // by the kernel storage service, so the user sees their tab
         // order exactly as they left it before the server shutdown.
+        if let Err(error) = retire_global_active_marker(shared.caller.as_ref()) {
+            // Stale marker data is inert; retry on the next activation.
+            log_tab_rename_error(
+                shared.caller.as_ref(),
+                format!("retiring the global active-tab marker failed: {error}"),
+            );
+        }
         let snapshot_started = Instant::now();
         publish_tab_list_snapshot(shared.caller.as_ref(), &shared.runtime_state);
         let snapshot_publish_us = snapshot_started.elapsed().as_micros();
@@ -1658,7 +1669,7 @@ async fn receive_catalog_event<E: Send + Sync>(
 }
 
 /// Dispatch a single `ContextEvent` against the tabs-plugin's
-/// persisted tab order + active marker. Create/select event bursts
+/// persisted tab order. Create/select event bursts
 /// are coalesced so the hot `new-tab` path does not publish the
 /// same tab list three times.
 fn handle_context_event(
@@ -1695,23 +1706,17 @@ fn handle_context_event(
             );
             publish_tab_list_snapshot(caller, &shared.runtime_state);
         }
-        ContextEvent::Selected { context_id } => {
-            let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
+        // Selection is per client and lives in the contexts plugin; it never
+        // changes the shared catalog. `Selected` still publishes because it
+        // closes the `Created` burst, which deliberately does not publish.
+        ContextEvent::Selected { .. } => {
             publish_tab_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Renamed { context_id, name } => {
             cache_known_context(&shared.runtime_state, *context_id, Some(name.clone()));
             publish_tab_list_snapshot(caller, &shared.runtime_state);
         }
-        ContextEvent::SessionActiveContextChanged { context_id, .. } => {
-            if in_memory_runtime_context_id(&shared.runtime_state, ACTIVE_TAB_CONTEXT_KEY)
-                == Some(*context_id)
-            {
-                return;
-            }
-            let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
-            publish_tab_list_snapshot(caller, &shared.runtime_state);
-        }
+        ContextEvent::SessionActiveContextChanged { .. } => {}
     }
 }
 
@@ -1945,8 +1950,7 @@ fn append_contexts_to_stored_tab_order(
 }
 
 /// Remove `context_id` from the persisted `tabs.order` list.
-/// No-op when the id is not present. Also clears the active marker
-/// if it was pointing at the removed context.
+/// No-op when the id is not present.
 #[cfg(test)]
 fn remove_context_from_tab_order(
     caller: &impl HostRuntimeApi,
@@ -1956,76 +1960,14 @@ fn remove_context_from_tab_order(
     let mut order_ids = get_stored_tab_order_ids(caller)?;
     let len_before = order_ids.len();
     order_ids.retain(|id| *id != context_id);
-    if order_ids.len() == len_before {
-        // Not in list — nothing to persist. Still clear active if it
-        // matches, below.
-    } else {
+    if order_ids.len() != len_before {
         set_stored_tab_order_ids(caller, &order_ids)?;
     }
     if let Ok(mut state) = runtime_state.lock() {
         state.tab_order_ids = Some(order_ids);
         state.tab_order_dirty = false;
     }
-    // Clear active marker if it points at the removed context.
-    if let Ok(Some(active)) = get_runtime_context_id(caller, runtime_state, ACTIVE_TAB_CONTEXT_KEY)
-        && active == context_id
-    {
-        let _ = clear_runtime_context_id(caller, runtime_state, ACTIVE_TAB_CONTEXT_KEY);
-        let _ = set_stored_context_id(caller, ACTIVE_TAB_CONTEXT_KEY, None);
-    }
-    if let Ok(Some(previous)) =
-        get_runtime_context_id(caller, runtime_state, PREVIOUS_TAB_CONTEXT_KEY)
-        && previous == context_id
-    {
-        let _ = clear_runtime_context_id(caller, runtime_state, PREVIOUS_TAB_CONTEXT_KEY);
-    }
     Ok(())
-}
-
-/// Update `ACTIVE_TAB_CONTEXT_KEY` to `context_id`, moving the
-/// previous active context (if any and different) into
-/// `PREVIOUS_TAB_CONTEXT_KEY` so `last-tab` still works.
-fn mark_context_active_cached(
-    runtime_state: &TabRuntimeStateHandle,
-    previous_context: Option<Uuid>,
-    context_id: Uuid,
-) {
-    if let Ok(mut state) = runtime_state.lock() {
-        if let Some(previous) = previous_context
-            && previous != context_id
-        {
-            state.previous_context_id = Some(previous);
-        }
-        state.active_context_id = Some(context_id);
-    }
-}
-
-fn mark_context_active(
-    caller: &(impl HostRuntimeApi + Sync),
-    runtime_state: &TabRuntimeStateHandle,
-    context_id: Uuid,
-) -> Result<(), String> {
-    let previous = get_runtime_context_id(caller, runtime_state, ACTIVE_TAB_CONTEXT_KEY)
-        .ok()
-        .flatten();
-    if previous == Some(context_id) {
-        return Ok(());
-    }
-    if let Some(previous) = previous {
-        let _ = set_runtime_context_id(
-            caller,
-            runtime_state,
-            PREVIOUS_TAB_CONTEXT_KEY,
-            Some(previous),
-        );
-    }
-    set_runtime_context_id(
-        caller,
-        runtime_state,
-        ACTIVE_TAB_CONTEXT_KEY,
-        Some(context_id),
-    )?;
-    set_stored_context_id(caller, ACTIVE_TAB_CONTEXT_KEY, Some(context_id))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2136,7 +2078,12 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
         "list-tabs" => {
             let session_filter = option_value(&context.arguments, "session");
             let as_json = has_flag(&context.arguments, "json");
-            let tabs = list_tabs(context, &plugin.runtime_state, session_filter.as_deref())?;
+            let tabs = list_tabs(
+                context,
+                &plugin.runtime_state,
+                session_filter.as_deref(),
+                ActiveMarking::Caller,
+            )?;
             if !emit_to_stdout {
                 // Rendering list output is only meaningful from the
                 // CLI; attach keybindings don't have a useful surface
@@ -2571,10 +2518,22 @@ fn workspace_names(caller: &(impl ServiceCaller + Sync)) -> BTreeMap<Uuid, Strin
     .collect()
 }
 
+/// Which tab, if any, a tab listing marks `active`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveMarking {
+    /// The invoking client's own current tab (its contexts selection).
+    Caller,
+    /// No tab. A listing broadcast to every client has no single viewer, so
+    /// it marks nothing; each client reads its own selection from
+    /// `tabs-local-view`.
+    Unmarked,
+}
+
 fn list_tabs(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
     session_filter: Option<&str>,
+    marking: ActiveMarking,
 ) -> Result<Vec<TabEntry>, String> {
     let contexts = list_contexts(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
@@ -2587,8 +2546,10 @@ fn list_tabs(
     } else {
         contexts
     };
-    let current_context =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, &selected)?;
+    let current_context = match marking {
+        ActiveMarking::Caller => caller_current_tab(caller, &selected)?,
+        ActiveMarking::Unmarked => None,
+    };
 
     let workspace_names = workspace_names(caller);
     Ok(selected
@@ -2784,11 +2745,14 @@ static TAB_LIST_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// when the state channel has not been registered (plugin not yet
 /// activated). The channel is seeded empty in `activate`, so once the
 /// plugin is active this publish always succeeds.
+///
+/// The snapshot reaches every client, so no entry is marked `active`
+/// ([`ActiveMarking::Unmarked`]), whichever client triggered the publish.
 fn publish_tab_list_snapshot(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
 ) {
-    let Ok(entries) = list_tabs(caller, runtime_state, None) else {
+    let Ok(entries) = list_tabs(caller, runtime_state, None, ActiveMarking::Unmarked) else {
         return;
     };
     publish_tab_list_entries(runtime_state, entries);
@@ -2892,10 +2856,6 @@ fn create_tab_with_policy(
     let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
-    let previous_context =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)
-            .ok()
-            .flatten();
     let mut attributes = BTreeMap::new();
     attributes.insert("workspace".to_string(), active_workspace_attribute(caller));
     let context = if *policy == cwd::DirectoryPolicy::RuntimeDefault {
@@ -2935,7 +2895,6 @@ fn create_tab_with_policy(
         context_workspace_id(&context),
         context_id,
     )?;
-    mark_context_active_cached(runtime_state, previous_context, context_id);
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(TabAck {
         ok: true,
@@ -2958,10 +2917,8 @@ fn rename_tab(
 ) -> Result<TabAck, String> {
     let name = normalize_tab_name(name)?;
     let contexts = list_contexts_in_active_workspace(caller)?;
-    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
-    let context_id =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
-            .ok_or_else(|| "no current tab to rename".to_string())?;
+    let context_id = caller_current_tab(caller, &contexts)?
+        .ok_or_else(|| "no current tab to rename".to_string())?;
     rename_tab_context(caller, runtime_state, context_id, name)
 }
 
@@ -3002,7 +2959,7 @@ fn current_tab(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
 ) -> Result<Option<(Uuid, String)>, String> {
-    list_tabs(caller, runtime_state, None)?
+    list_tabs(caller, runtime_state, None, ActiveMarking::Caller)?
         .into_iter()
         .find(|tab| tab.active)
         .map(|tab| {
@@ -3152,8 +3109,7 @@ fn switch_tab_with_contexts(
     timing: SwitchTabTiming,
 ) -> Result<TabAck, String> {
     let resolve_started = Instant::now();
-    let previous_context =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, contexts)?;
+    let previous_context = caller_current_tab(caller, contexts)?;
     let context_id = resolve_context_id_from_contexts(contexts, selector)?;
     let resolve_us = resolve_started.elapsed().as_micros();
     let select_started = Instant::now();
@@ -3162,7 +3118,8 @@ fn switch_tab_with_contexts(
     let remember_started = Instant::now();
     // Crossing a workspace boundary must not replace either workspace's
     // previous tab. Workspace selection restores the active tab separately.
-    if let Some(previous) = previous_context
+    if let Some(client) = caller_client_id
+        && let Some(previous) = previous_context
         && previous != context_id
         && let Some(previous_summary) = contexts.iter().find(|entry| entry.id == previous)
         && let Some(selected_summary) = contexts.iter().find(|entry| entry.id == context_id)
@@ -3171,17 +3128,8 @@ fn switch_tab_with_contexts(
         last_selected_by_client
             .lock()
             .map_err(|_| "tab history lock poisoned".to_string())?
-            .insert(
-                (caller_client_id, context_workspace_id(selected_summary)),
-                previous,
-            );
+            .insert((client, context_workspace_id(selected_summary)), previous);
     }
-    let _ = set_runtime_context_id(
-        caller,
-        runtime_state,
-        ACTIVE_TAB_CONTEXT_KEY,
-        Some(context_id),
-    );
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
     publish_tab_list_snapshot(caller, runtime_state);
@@ -3289,9 +3237,7 @@ fn cycle_tab(
         return Err("no alternate tab available".to_string());
     }
     let resolve_started = Instant::now();
-    let current_context =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
-            .unwrap_or(contexts[0].id);
+    let current_context = caller_current_tab(caller, &contexts)?.unwrap_or(contexts[0].id);
     let current_index = contexts
         .iter()
         .position(|context| context.id == current_context)
@@ -3302,11 +3248,13 @@ fn cycle_tab(
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         TabCycleDirection::Last => {
+            let client = caller_client_id
+                .ok_or_else(|| "no previously active tab available (no client)".to_string())?;
             let workspace_id = context_workspace_id(&contexts[current_index]);
             let remembered = last_selected_by_client
                 .lock()
                 .map_err(|_| "tab history lock poisoned".to_string())?
-                .get(&(caller_client_id, workspace_id))
+                .get(&(client, workspace_id))
                 .copied()
                 .ok_or_else(|| "no previously active tab available".to_string())?;
             if !contexts.iter().any(|context| context.id == remembered) {
@@ -3430,9 +3378,8 @@ fn close_current_tab(
 ) -> Result<TabAck, String> {
     let contexts = list_contexts_in_active_workspace(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
-    let current_id =
-        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
-            .ok_or_else(|| "no current tab to close".to_string())?;
+    let current_id = caller_current_tab(caller, &contexts)?
+        .ok_or_else(|| "no current tab to close".to_string())?;
 
     // If there is another tab to switch to, do so before closing.
     if contexts.len() > 1 {
@@ -3479,164 +3426,46 @@ fn resolve_context_id_from_contexts(
         .ok_or_else(|| "target context not found".to_string())
 }
 
-fn resolve_effective_current_context_with_contexts(
-    caller: &(impl HostRuntimeApi + Sync),
-    runtime_state: &TabRuntimeStateHandle,
+/// The invoking client's current tab among `contexts`.
+///
+/// "Current" is the caller's own selection in the contexts plugin
+/// (`contexts-state/current-context`). The host scopes that query to the
+/// client that issued this invocation (nested calls keep the original
+/// caller), so two clients never resolve each other's tab. There is no
+/// tabs-owned fallback: a host-internal invocation that acts for no client
+/// has no current tab, and the contexts plugin rejects the query instead of
+/// borrowing another client's selection. Broadcast listings never ask (see
+/// [`ActiveMarking::Unmarked`]).
+fn caller_current_tab(
+    caller: &(impl ServiceCaller + Sync),
     contexts: &[ContextSummary],
 ) -> Result<Option<Uuid>, String> {
-    let stored_active = in_memory_runtime_context_id(runtime_state, ACTIVE_TAB_CONTEXT_KEY)
-        .filter(|id| contexts.iter().any(|context| context.id == *id));
-    if stored_active.is_some() {
-        return Ok(stored_active);
-    }
-    let current = current_context(caller)?
+    Ok(current_context(caller)?
         .map(|context| context.id)
-        .filter(|id| contexts.iter().any(|context| context.id == *id));
-    if current.is_some() {
-        return Ok(current);
-    }
-    let stored_active = get_runtime_context_id(caller, runtime_state, ACTIVE_TAB_CONTEXT_KEY)?
-        .filter(|id| contexts.iter().any(|context| context.id == *id));
-    Ok(stored_active)
+        .filter(|id| contexts.iter().any(|context| context.id == *id)))
 }
 
-fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
-    let response = caller
-        .storage_get(&StorageGetRequest::new(storage_key(key)))
-        .map_err(|error| error.to_string())?;
-    let Some(value) = response.value else {
-        return Ok(None);
-    };
-    let text = String::from_utf8(value).map_err(|error| error.to_string())?;
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    let id = Uuid::parse_str(text.trim()).map_err(|error| error.to_string())?;
-    Ok(Some(id))
-}
-
-fn get_runtime_context_id(
-    caller: &impl HostRuntimeApi,
-    runtime_state: &TabRuntimeStateHandle,
-    key: &str,
-) -> Result<Option<Uuid>, String> {
-    if let Some(context_id) = in_memory_runtime_context_id(runtime_state, key) {
-        return Ok(Some(context_id));
-    }
-    if let Some(id) = get_volatile_context_id(caller, key)? {
-        return Ok(Some(id));
-    }
-    get_stored_context_id(caller, key)
-}
-
-fn in_memory_runtime_context_id(runtime_state: &TabRuntimeStateHandle, key: &str) -> Option<Uuid> {
-    let state = runtime_state.lock().ok()?;
-    match key {
-        ACTIVE_TAB_CONTEXT_KEY => state.active_context_id,
-        PREVIOUS_TAB_CONTEXT_KEY => state.previous_context_id,
-        _ => None,
-    }
-}
-
-fn get_volatile_context_id(
-    caller: &impl HostRuntimeApi,
-    key: &str,
-) -> Result<Option<Uuid>, String> {
-    let response = caller
-        .call_service::<_, bmux_plugin_sdk::VolatileStateGetResponse>(
-            "bmux.storage",
-            bmux_plugin_sdk::ServiceKind::Query,
-            "volatile-state-query/v1",
-            "get",
-            &VolatileStateGetRequest::new(storage_key(key)),
-        )
-        .map_err(|error| error.to_string())?;
-    let Some(value) = response.value else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let text = String::from_utf8(value).map_err(|error| error.to_string())?;
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    let id = Uuid::parse_str(text.trim()).map_err(|error| error.to_string())?;
-    Ok(Some(id))
-}
-
-fn set_runtime_context_id(
-    caller: &impl HostRuntimeApi,
-    runtime_state: &TabRuntimeStateHandle,
-    key: &str,
-    context_id: Option<Uuid>,
-) -> Result<(), String> {
-    if set_in_memory_runtime_context_id(runtime_state, key, context_id) {
-        return Ok(());
-    }
-    context_id.map_or_else(
-        || clear_runtime_context_id(caller, runtime_state, key),
-        |context_id| {
+/// One-time migration: clear the durable mirror of the retired global
+/// active-tab marker.
+///
+/// Plugin storage has no delete, so a retired key is cleared by writing an
+/// empty value, which every reader treats as absent. Keys already empty (or
+/// never written) are left untouched, so the migration is idempotent and an
+/// interrupted run simply finishes on the next activation. Nothing reads these
+/// keys as authority any more; clearing them only drops stale data.
+fn retire_global_active_marker(caller: &impl HostRuntimeApi) -> Result<(), String> {
+    for key in [RETIRED_ACTIVE_TAB_KEY, RETIRED_PREVIOUS_TAB_KEY] {
+        let stored = caller
+            .storage_get(&StorageGetRequest::new(storage_key(key)))
+            .map_err(|error| error.to_string())?
+            .value;
+        if stored.is_some_and(|value| !value.is_empty()) {
             caller
-                .call_service::<_, ()>(
-                    "bmux.storage",
-                    bmux_plugin_sdk::ServiceKind::Command,
-                    "volatile-state-command/v1",
-                    "set",
-                    &VolatileStateSetRequest::new(
-                        storage_key(key),
-                        context_id.to_string().into_bytes(),
-                    ),
-                )
-                .map_err(|error| error.to_string())
-        },
-    )
-}
-
-fn set_in_memory_runtime_context_id(
-    runtime_state: &TabRuntimeStateHandle,
-    key: &str,
-    context_id: Option<Uuid>,
-) -> bool {
-    let Ok(mut state) = runtime_state.lock() else {
-        return false;
-    };
-    match key {
-        ACTIVE_TAB_CONTEXT_KEY => state.active_context_id = context_id,
-        PREVIOUS_TAB_CONTEXT_KEY => state.previous_context_id = context_id,
-        _ => return false,
+                .storage_set(&StorageSetRequest::new(storage_key(key), Vec::new()))
+                .map_err(|error| error.to_string())?;
+        }
     }
-    true
-}
-
-fn clear_runtime_context_id(
-    caller: &impl HostRuntimeApi,
-    runtime_state: &TabRuntimeStateHandle,
-    key: &str,
-) -> Result<(), String> {
-    if set_in_memory_runtime_context_id(runtime_state, key, None) {
-        return Ok(());
-    }
-    caller
-        .call_service::<_, ()>(
-            "bmux.storage",
-            bmux_plugin_sdk::ServiceKind::Command,
-            "volatile-state-command/v1",
-            "clear",
-            &VolatileStateClearRequest::new(storage_key(key)),
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn set_stored_context_id(
-    caller: &impl HostRuntimeApi,
-    key: &str,
-    context_id: Option<Uuid>,
-) -> Result<(), String> {
-    let value = context_id.map_or_else(Vec::new, |id| id.to_string().into_bytes());
-    caller
-        .storage_set(&StorageSetRequest::new(storage_key(key), value))
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn order_contexts_for_navigation(
@@ -3864,6 +3693,11 @@ struct TabsSharedState {
 /// Typed implementation of [`TabsCommandsService`]. Wraps a
 /// [`TypedServiceCaller`] so trait methods can drive host calls
 /// directly without a per-call [`NativeServiceContext`].
+///
+/// The caller is captured at registration and the typed trait methods carry
+/// no invocation context, so this handle acts for no client: it has no
+/// current tab and records no per-client history. Client-scoped requests
+/// reach the byte path (`invoke_service`), which carries the invoking client.
 pub struct TabsCommandsHandle {
     shared: TabsSharedState,
 }
@@ -4493,6 +4327,8 @@ impl TabsCommandsService for TabsCommandsHandle {
         let last_selected = self.shared.last_selected_by_client.clone();
         Box::pin(async move {
             let selector = parse_selector(&target).map_err(|reason| TabError::Failed { reason })?;
+            // This handle acts for no client (see `TabsCommandsHandle`), so
+            // the switch records no previous-tab history.
             switch_tab(
                 &*caller,
                 &self.shared.runtime_state,
@@ -4689,7 +4525,13 @@ impl TabsStateService for TabsStateHandle {
     ) -> Pin<Box<dyn Future<Output = Vec<TabEntry>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            list_tabs(&*caller, &self.shared.runtime_state, session.as_deref()).unwrap_or_default()
+            list_tabs(
+                &*caller,
+                &self.shared.runtime_state,
+                session.as_deref(),
+                ActiveMarking::Caller,
+            )
+            .unwrap_or_default()
         })
     }
 
@@ -5899,32 +5741,6 @@ mod tests {
                             .insert(request.key.to_string(), request.value);
                         encode_service_message(&())
                     }
-                    ("volatile-state-query/v1", "get") => {
-                        let request: VolatileStateGetRequest = decode_service_message(&payload)?;
-                        let value = self
-                            .storage
-                            .lock()
-                            .expect("storage lock should succeed")
-                            .get(request.key.as_str())
-                            .cloned();
-                        encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse { value })
-                    }
-                    ("volatile-state-command/v1", "set") => {
-                        let request: VolatileStateSetRequest = decode_service_message(&payload)?;
-                        self.storage
-                            .lock()
-                            .expect("storage lock should succeed")
-                            .insert(request.key.to_string(), request.value);
-                        encode_service_message(&())
-                    }
-                    ("volatile-state-command/v1", "clear") => {
-                        let request: VolatileStateClearRequest = decode_service_message(&payload)?;
-                        self.storage
-                            .lock()
-                            .expect("storage lock should succeed")
-                            .remove(request.key.as_str());
-                        encode_service_message(&())
-                    }
                     _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                         operation: "mock_service",
                     }),
@@ -6173,7 +5989,8 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         let runtime_state = runtime_state();
         seed_tab_order(&host, &sessions);
-        let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("list should succeed");
 
         assert_eq!(tabs.len(), 2);
         assert!(tabs[0].active);
@@ -6189,13 +6006,18 @@ mod tests {
         let host = MockHost::with_sessions(sessions);
         let runtime_state = runtime_state();
 
-        let by_name =
-            list_tabs(&host, &runtime_state, Some("beta")).expect("list by name should succeed");
+        let by_name = list_tabs(&host, &runtime_state, Some("beta"), ActiveMarking::Caller)
+            .expect("list by name should succeed");
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].name, "beta");
 
-        let by_id = list_tabs(&host, &runtime_state, Some(&beta_id.to_string()))
-            .expect("list by id should succeed");
+        let by_id = list_tabs(
+            &host,
+            &runtime_state,
+            Some(&beta_id.to_string()),
+            ActiveMarking::Caller,
+        )
+        .expect("list by id should succeed");
         assert_eq!(by_id.len(), 1);
         assert_eq!(by_id[0].id, beta_id.to_string());
     }
@@ -6298,7 +6120,8 @@ mod tests {
         let runtime_state = runtime_state();
         seed_tab_order(&host, &sessions);
 
-        let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("list should succeed");
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs[0].name, "tab-1");
         assert_eq!(tabs[1].name, "tab-2");
@@ -6447,7 +6270,8 @@ mod tests {
         assert!(persisted_order.contains(&first_id));
         assert_eq!(persisted_order.last(), Some(&created_id));
 
-        let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("list should succeed");
         let ids = tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>();
         let first_text = first_id.to_string();
         let created_text = created_id.to_string();
@@ -6728,7 +6552,8 @@ mod tests {
         )
         .expect("next tab should succeed");
 
-        let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("list should succeed");
         assert_eq!(tabs.len(), 3);
         let tab_ids = tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>();
         let first_text = first_id.to_string();
@@ -6774,7 +6599,8 @@ mod tests {
             .expect("mru context lock should succeed") = vec![third_id, second_id, first_id];
         let runtime_state = runtime_state();
 
-        let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("list should succeed");
         let ids = tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>();
         let first_text = first_id.to_string();
         let second_text = second_id.to_string();
@@ -6800,7 +6626,8 @@ mod tests {
             .lock()
             .expect("mru context lock should succeed") = vec![second_id, third_id, first_id];
 
-        let tabs = list_tabs(&host, &runtime_state, None).expect("second list should succeed");
+        let tabs = list_tabs(&host, &runtime_state, None, ActiveMarking::Caller)
+            .expect("second list should succeed");
         let ids = tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>();
         assert_eq!(
             ids,
@@ -6840,13 +6667,14 @@ mod tests {
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
         let runtime_state = runtime_state();
+        let client = Some(Uuid::new_v4());
 
         let _ = cycle_tab(
             &host,
             &runtime_state,
             TabCycleDirection::Next,
             &last_selected_by_client,
-            None,
+            client,
         )
         .expect("next tab should succeed");
 
@@ -6855,7 +6683,7 @@ mod tests {
             &runtime_state,
             TabCycleDirection::Last,
             &last_selected_by_client,
-            None,
+            client,
         )
         .expect("last tab should use remembered selection");
 
@@ -6865,8 +6693,36 @@ mod tests {
     }
 
     #[test]
+    fn caller_less_switches_record_no_history_and_have_no_last_tab() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let history = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
+
+        cycle_tab(
+            &host,
+            &runtime_state,
+            TabCycleDirection::Next,
+            &history,
+            None,
+        )
+        .expect("a caller-less switch still switches");
+        assert!(history.lock().unwrap().is_empty());
+        let error = cycle_tab(
+            &host,
+            &runtime_state,
+            TabCycleDirection::Last,
+            &history,
+            None,
+        )
+        .expect_err("no client means no previous tab");
+        assert!(error.contains("no previously active tab"));
+    }
+
+    #[test]
     fn last_tab_history_survives_workspace_round_trips() {
-        for client_id in [None, Some(Uuid::new_v4())] {
+        {
+            let client = Uuid::new_v4();
+            let client_id = Some(client);
             let workspace_a = Uuid::new_v4();
             let workspace_b = Uuid::new_v4();
             let sessions: Vec<_> = [workspace_a, workspace_a, workspace_b, workspace_b]
@@ -6882,11 +6738,10 @@ mod tests {
             let history = LastSelectedByClient::default();
             let runtime = runtime_state();
 
-            // Workspace selection uses the contexts service, then publishes
-            // an active-context update; it does not run a tab navigation command.
+            // Workspace selection uses the contexts service directly; it does
+            // not run a tab navigation command.
             let restore_workspace = |target| {
                 select_context(&host, context_selector_by_id(target)).unwrap();
-                mark_context_active(&host, &runtime, target).unwrap();
             };
             for (target, workspace_switch) in [
                 (ids[1], false),
@@ -6929,10 +6784,7 @@ mod tests {
             .unwrap();
             assert_eq!(ack.id, Some(ids[2].to_string()));
 
-            // An unrelated attachment cannot borrow this caller's history,
-            // even if the legacy global slot contains a valid tab.
-            set_runtime_context_id(&host, &runtime, PREVIOUS_TAB_CONTEXT_KEY, Some(ids[3]))
-                .unwrap();
+            // An unrelated attachment cannot borrow this caller's history.
             assert!(
                 cycle_tab(
                     &host,
@@ -6948,7 +6800,7 @@ mod tests {
             history
                 .lock()
                 .unwrap()
-                .insert((client_id, workspace_b), ids[0]);
+                .insert((client, workspace_b), ids[0]);
             assert!(
                 cycle_tab(
                     &host,
@@ -6962,7 +6814,7 @@ mod tests {
             history
                 .lock()
                 .unwrap()
-                .insert((client_id, workspace_b), Uuid::new_v4());
+                .insert((client, workspace_b), Uuid::new_v4());
             assert!(
                 cycle_tab(
                     &host,
@@ -7426,16 +7278,18 @@ mod tests {
                         &bmux_tabs_plugin_api::tabs_list::STATE_KIND,
                     )
                     .unwrap();
-                assert_eq!(
-                    catalog
-                        .tabs
-                        .iter()
-                        .find(|entry| entry.active)
-                        .unwrap()
-                        .id,
-                    expected_id
-                );
+                // The broadcast catalog marks no tab: each attachment shows its
+                // own selection, which attach publishes on `tabs-local-view`.
+                assert!(catalog.tabs.iter().all(|entry| !entry.active));
                 assert_selected_context(&context_state, expected_id);
+                events
+                    .publish_state(
+                        &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
+                        bmux_tabs_plugin_api::tabs_local_view::TabSelection {
+                            context_id: Some(expected_id),
+                        },
+                    )
+                    .unwrap();
                 let expected = format!("({target})");
                 for _ in 0..20 {
                     tokio::task::yield_now().await;
@@ -7752,7 +7606,7 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         let runtime_state = runtime_state();
         seed_tab_order(&host, &sessions);
-        set_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY, Some(second)).expect("seed active");
+        select_context(&host, context_selector_by_id(second)).expect("select second");
 
         move_tab(&host, &runtime_state, first, third, TabMovePlacement::After)
             .expect("move should succeed");
@@ -7761,7 +7615,7 @@ mod tests {
             get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).expect("order readable");
         assert_eq!(order, vec![second, third, first]);
         assert_eq!(
-            get_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY).expect("active readable"),
+            caller_current_tab(&host, &list_contexts(&host).unwrap()).expect("current readable"),
             Some(second)
         );
     }
@@ -8009,92 +7863,229 @@ mod tests {
         assert_eq!(order, vec![a, c]);
     }
 
-    /// Closing the currently active context also clears the
-    /// `ACTIVE_TAB_CONTEXT_KEY` marker so stale pointers don't
-    /// linger.
     #[test]
-    fn remove_context_from_tab_order_clears_stale_active_marker() {
+    fn retiring_global_active_marker_clears_its_durable_mirror_idempotently() {
         let host = MockHost::with_sessions(Vec::new());
-        let a = Uuid::from_u128(42);
-        let runtime_state = runtime_state();
+        let stale = Uuid::from_u128(42).to_string().into_bytes();
+        for key in [RETIRED_ACTIVE_TAB_KEY, RETIRED_PREVIOUS_TAB_KEY] {
+            host.storage
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), stale.clone());
+        }
+        host.storage
+            .lock()
+            .unwrap()
+            .insert("tabs.unrelated".to_string(), stale.clone());
 
-        set_stored_tab_order_ids(&host, &[a]).expect("seed order");
-        set_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY, Some(a)).expect("set active");
-        remove_context_from_tab_order(&host, &runtime_state, a).expect("remove A");
+        retire_global_active_marker(&host).expect("first migration");
+        retire_global_active_marker(&host).expect("repeat migration is a no-op");
 
-        let active = get_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY).expect("active readable");
-        assert!(active.is_none());
-    }
+        let storage = host.storage.lock().unwrap();
+        for key in [RETIRED_ACTIVE_TAB_KEY, RETIRED_PREVIOUS_TAB_KEY] {
+            assert_eq!(storage.get(key), Some(&Vec::new()), "{key} not cleared");
+        }
+        assert_eq!(storage.get("tabs.unrelated"), Some(&stale));
+        drop(storage);
 
-    /// `Selected` event promotes the target into
-    /// `ACTIVE_TAB_CONTEXT_KEY` and demotes the previous active
-    /// into `PREVIOUS_TAB_CONTEXT_KEY` so `last-tab` still works.
-    #[test]
-    fn mark_context_active_promotes_previous_to_last_tab_slot() {
-        let host = MockHost::with_sessions(Vec::new());
-        let a = Uuid::from_u128(11);
-        let b = Uuid::from_u128(22);
-        let runtime_state = runtime_state();
-
-        set_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY, Some(a)).expect("seed active = A");
-        mark_context_active(&host, &runtime_state, b).expect("mark B active");
-
-        assert_eq!(
-            get_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY).expect("active readable"),
-            Some(b)
-        );
-        assert_eq!(
-            get_runtime_context_id(&host, &runtime_state, PREVIOUS_TAB_CONTEXT_KEY)
-                .expect("previous readable"),
-            Some(a)
-        );
-    }
-
-    /// Re-selecting the already-active context is a no-op on the
-    /// previous-tab slot (no spurious swap to itself).
-    #[test]
-    fn mark_context_active_is_idempotent_when_already_active() {
-        let host = MockHost::with_sessions(Vec::new());
-        let a = Uuid::from_u128(7);
-        let runtime_state = runtime_state();
-
-        set_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY, Some(a)).expect("seed active");
-        mark_context_active(&host, &runtime_state, a).expect("re-mark active");
-
-        assert_eq!(
-            get_stored_context_id(&host, ACTIVE_TAB_CONTEXT_KEY).expect("active readable"),
-            Some(a)
-        );
-        assert_eq!(
-            get_runtime_context_id(&host, &runtime_state, PREVIOUS_TAB_CONTEXT_KEY)
-                .expect("previous readable"),
-            None
-        );
+        // A fresh installation never writes the retired keys at all.
+        let fresh = MockHost::with_sessions(Vec::new());
+        retire_global_active_marker(&fresh).expect("fresh migration");
+        assert!(fresh.storage.lock().unwrap().is_empty());
     }
 
     #[test]
     fn runtime_state_is_plugin_instance_scoped() {
-        let host = MockHost::with_sessions(Vec::new());
         let first_runtime_state = runtime_state();
         let second_runtime_state = runtime_state();
-        let active = Uuid::from_u128(99);
+        let id = Uuid::from_u128(99);
 
-        set_runtime_context_id(
-            &host,
-            &first_runtime_state,
-            ACTIVE_TAB_CONTEXT_KEY,
-            Some(active),
+        cache_known_context(&first_runtime_state, id, Some("first".into()));
+
+        assert!(
+            first_runtime_state
+                .lock()
+                .unwrap()
+                .known_contexts
+                .contains_key(&id)
+        );
+        assert!(
+            second_runtime_state
+                .lock()
+                .unwrap()
+                .known_contexts
+                .is_empty()
+        );
+    }
+
+    /// A real contexts plugin behind a router that forwards each invocation's
+    /// own client, so selection is genuinely per caller.
+    #[allow(clippy::result_large_err)] // TestServiceRouter requires the SDK's unboxed PluginError.
+    fn per_client_context_router() -> (
+        InvocationTestHost,
+        Arc<std::sync::RwLock<bmux_contexts_plugin::ContextState>>,
+    ) {
+        let state = Arc::new(std::sync::RwLock::new(
+            bmux_contexts_plugin::ContextState::default(),
+        ));
+        let context_states = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        context_states.register(&state);
+        let router = InvocationTestHost(checked_test_router(Arc::new(
+            move |_, caller_client, capability, kind, interface, operation, payload| {
+                if interface.starts_with("contexts-") {
+                    let mut context =
+                        service_test_context(None, interface, operation, payload, capability, kind);
+                    context.plugin_id = "bmux.contexts".into();
+                    context.caller_client_id = caller_client;
+                    let response = bmux_contexts_plugin::ContextsPlugin::with_host_state(
+                        Arc::clone(&context_states),
+                    )
+                    .invoke_service(&context);
+                    assert!(response.error.is_none(), "{:?}", response.error);
+                    Ok(response.payload)
+                } else if interface == "storage-query/v1" {
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
+                } else if interface == "storage-command/v1" {
+                    encode_service_message(&())
+                } else {
+                    Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "per_client_context_router",
+                    })
+                }
+            },
+        )));
+        (router, state)
+    }
+
+    fn client_service_context(router: &InvocationTestHost, client: Uuid) -> NativeServiceContext {
+        let mut context = service_test_context(
+            Some(router),
+            "tabs-state",
+            "list-tabs",
+            Vec::new(),
+            "bmux.tabs.read",
+            ServiceKind::Query,
+        );
+        context.host_service_port = Some(router.port("bmux.tabs", Some(client)));
+        context.caller_client_id = Some(client);
+        context
+    }
+
+    fn active_tab(context: &NativeServiceContext, runtime: &TabRuntimeStateHandle) -> Option<Uuid> {
+        list_tabs(context, runtime, None, ActiveMarking::Caller)
+            .unwrap()
+            .into_iter()
+            .find(|tab| tab.active)
+            .map(|tab| Uuid::parse_str(&tab.id).unwrap())
+    }
+
+    #[test]
+    fn two_callers_each_resolve_and_act_on_their_own_current_tab() {
+        let (router, state) = per_client_context_router();
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let (alpha, beta) = {
+            let mut guard = state.write().unwrap();
+            let alpha = guard
+                .create(
+                    bmux_session_models::ClientId(a),
+                    Some("alpha".into()),
+                    BTreeMap::new(),
+                )
+                .id;
+            let beta = guard
+                .create(
+                    bmux_session_models::ClientId(a),
+                    Some("beta".into()),
+                    BTreeMap::new(),
+                )
+                .id;
+            guard
+                .selected_by_client
+                .insert(bmux_session_models::ClientId(b), alpha);
+            drop(guard);
+            (alpha, beta)
+        };
+        let ctx_a = client_service_context(&router, a);
+        let ctx_b = client_service_context(&router, b);
+        let runtime = runtime_state();
+        let events = Arc::new(bmux_plugin::EventBus::new());
+        events.register_state_channel(
+            bmux_tabs_plugin_api::tabs_list::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 0,
+            },
+        );
+        runtime.lock().unwrap().events = Some(Arc::clone(&events));
+        let history = LastSelectedByClient::default();
+        let selected = |client: Uuid| {
+            state
+                .read()
+                .unwrap()
+                .selected_by_client
+                .get(&bmux_session_models::ClientId(client))
+                .copied()
+        };
+
+        // B switches last; that must not make B's tab current for A.
+        switch_tab(
+            &ctx_b,
+            &runtime,
+            context_selector_by_id(alpha),
+            &history,
+            Some(b),
         )
-        .expect("first runtime state should be writable");
+        .unwrap();
+        assert_eq!(active_tab(&ctx_a, &runtime), Some(beta));
+        assert_eq!(active_tab(&ctx_b, &runtime), Some(alpha));
 
-        assert_eq!(
-            in_memory_runtime_context_id(&first_runtime_state, ACTIVE_TAB_CONTEXT_KEY),
-            Some(active)
-        );
-        assert_eq!(
-            in_memory_runtime_context_id(&second_runtime_state, ACTIVE_TAB_CONTEXT_KEY),
-            None
-        );
+        // The broadcast catalog has no single viewer, so it marks nothing.
+        let (catalog, _) = events
+            .subscribe_state::<bmux_tabs_plugin_api::tabs_list::TabListSnapshot>(
+                &bmux_tabs_plugin_api::tabs_list::STATE_KIND,
+            )
+            .unwrap();
+        assert_eq!(catalog.tabs.len(), 2);
+        assert!(catalog.tabs.iter().all(|tab| !tab.active));
+
+        // A renames its own tab, not the tab B touched last.
+        let renamed = rename_tab(&ctx_a, &runtime, "mine").unwrap();
+        assert_eq!(renamed.id, Some(beta.to_string()));
+
+        // A cycles from its own tab.
+        let cycled =
+            cycle_tab(&ctx_a, &runtime, TabCycleDirection::Next, &history, Some(a)).unwrap();
+        assert_eq!(cycled.id, Some(alpha.to_string()));
+        assert_eq!(selected(a), Some(alpha));
+
+        // B moves away; A then closes its own current tab (alpha), not B's.
+        switch_tab(
+            &ctx_b,
+            &runtime,
+            context_selector_by_id(beta),
+            &history,
+            Some(b),
+        )
+        .unwrap();
+        let closed = close_current_tab(&ctx_a, &runtime, &history, Some(a), None).unwrap();
+        assert_eq!(closed.id, Some(alpha.to_string()));
+        let remaining = state
+            .read()
+            .unwrap()
+            .contexts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![beta]);
+        assert_eq!(selected(b), Some(beta));
+        assert_eq!(active_tab(&ctx_b, &runtime), Some(beta));
+
+        // Last-tab history is per caller. A's latest entry comes from its own
+        // close moving it alpha -> beta; B's from its own alpha -> beta.
+        assert_eq!(history.lock().unwrap().get(&(b, Uuid::nil())), Some(&alpha));
+        assert_eq!(history.lock().unwrap().get(&(a, Uuid::nil())), Some(&alpha));
+        assert_eq!(history.lock().unwrap().len(), 2);
     }
 }
 

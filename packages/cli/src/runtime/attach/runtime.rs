@@ -7651,11 +7651,12 @@ fn truncate_attach_status_message(message: &str) -> String {
 ///
 /// Two event variants drive attach retargeting:
 ///
-/// - `Selected { context_id }` — classic selection delta. We do NOT
-///   know which client initiated it from this variant, so we only
-///   retarget if the event id differs from the already-attached
-///   context. This is a safety net; the normal path uses
-///   `SessionActiveContextChanged`.
+/// - `Selected { context_id }` — names no initiator and is forwarded to
+///   every streaming client, so it never retargets: acting on it dragged
+///   attachments that do not follow onto another client's tab. Every
+///   selection of a session-bound context also emits
+///   `SessionActiveContextChanged`; a context without a session has
+///   nothing to attach.
 ///
 /// - `SessionActiveContextChanged { session_id, context_id,
 ///   initiator_client_id }` — multi-client-aware broadcast. If the
@@ -7705,42 +7706,16 @@ async fn handle_context_event_forwarded(
                 .dirty
                 .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
         }
-        ContextEvent::Selected { context_id } => {
-            // Safety net: if the richer
-            // `SessionActiveContextChanged` variant did not arrive
-            // (e.g. legacy select path, or a future plugin that only
-            // emits `Selected`), still retarget when this client
-            // appears to have initiated — we can't know the initiator
-            // here, so we rely on the `attached_context_id` diff as a
-            // conservative trigger and defer to
-            // `SessionActiveContextChanged` for multi-client policy.
-            if view_state.attached_context_id == Some(*context_id) {
-                return Ok(());
-            }
-            // Without initiator info we cannot drag peers safely; only
-            // retarget self. A reasonable heuristic is "always retarget
-            // on Selected" because `Selected` is always scoped to a
-            // client, and any plugin emitting it for another client
-            // should use the richer variant. Implementers of new
-            // selection events should emit
-            // `SessionActiveContextChanged` instead.
-            debug!(
-                context_id = %context_id,
-                "attach.context_event.selected_retarget"
-            );
-            retarget_attach_to_context(client, view_state, *context_id).await?;
-            view_state
-                .dirty
-                .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
-        }
         ContextEvent::Renamed { .. } => {
             refresh_attach_status_catalog_best_effort(client, view_state).await;
         }
-        ContextEvent::Created { .. } | ContextEvent::Closed { .. } => {
-            // Creation and closure are informational here. Retarget
-            // happens via the accompanying `Selected` /
-            // `SessionActiveContextChanged` events that
-            // `create_context_local` / `close_context_local` emit.
+        ContextEvent::Created { .. }
+        | ContextEvent::Closed { .. }
+        | ContextEvent::Selected { .. } => {
+            // Informational here. Retarget happens only via
+            // `SessionActiveContextChanged`, which carries the initiator so
+            // follow policy applies; `Selected` cannot say whose selection
+            // it was.
         }
     }
     Ok(())
