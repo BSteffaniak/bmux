@@ -829,10 +829,14 @@ impl RetainedPointerRouter {
             })
             .filter_map(|other| intersect_rects(visible, other.paint_rect()?))
             .collect::<Vec<_>>();
-        if !rect_has_uncovered_area(visible, &occluders) {
+        let cursor = compositor.cursor_for_hit(&hit)?;
+        // A resize handle sits on the boundary its own drag moves: the
+        // surfaces it resizes cover it until they are laid out again, on
+        // every step. The drag still owns the pointer, so keep its shape.
+        if !rect_has_uncovered_area(visible, &occluders) && !is_resize_cursor(cursor) {
             return None;
         }
-        compositor.cursor_for_hit(&hit)
+        Some(cursor)
     }
 
     #[must_use]
@@ -1042,6 +1046,20 @@ fn hit_target_is_present(
                 .iter()
                 .any(|region| region.id == hit.region_id)
     })
+}
+
+/// Whether `cursor` marks a resize handle.
+const fn is_resize_cursor(cursor: bmux_plugin::surface::PluginSurfaceCursor) -> bool {
+    use bmux_plugin::surface::PluginSurfaceCursor;
+    matches!(
+        cursor,
+        PluginSurfaceCursor::ResizeHorizontal
+            | PluginSurfaceCursor::ResizeVertical
+            | PluginSurfaceCursor::Tui {
+                role: bmux_tui::hit::HitRole::ResizeHandle,
+                ..
+            }
+    )
 }
 
 fn retarget_hit(

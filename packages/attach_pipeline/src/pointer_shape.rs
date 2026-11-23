@@ -460,6 +460,49 @@ mod tests {
         );
     }
 
+    /// Dragging a resize handle moves the boundary it sits on, so the
+    /// surfaces it resizes cover it until they are laid out again. Its drag
+    /// keeps the resize shape through that; removal or a modal still end it.
+    #[test]
+    fn a_captured_resize_handle_keeps_its_shape_while_what_it_resizes_covers_it() {
+        let cover = || {
+            RetainedSurface::with_payload(
+                Uuid::from_u128(3),
+                DamageRect::new(2, 2, 6, 3),
+                0,
+                2,
+                RetainedOpacity::Opaque,
+                RetainedSurfacePayload::RenderOps(Vec::new()),
+            )
+        };
+        for (cursor, shape) in [
+            (
+                PluginSurfaceCursor::ResizeHorizontal,
+                PointerShape::EwResize,
+            ),
+            (PluginSurfaceCursor::ResizeVertical, PointerShape::NsResize),
+        ] {
+            let mut compositor = scene(vec![content(), chrome(cursor)]);
+            let mut router = RetainedPointerRouter::default();
+            router.capture(compositor.hit_test(3, 3).unwrap());
+            replace(&mut compositor, vec![content(), chrome(cursor), cover()]);
+            assert_eq!(
+                resolve_pointer_shape(input(&compositor, &router, Some((15, 8))), |_| None),
+                ResolvedPointerShape::Shape(shape)
+            );
+            // Gone, or under a modal: the scene decides again.
+            let mut modal = cover();
+            modal.modal = true;
+            for surfaces in [vec![content()], vec![content(), chrome(cursor), modal]] {
+                replace(&mut compositor, surfaces);
+                assert_ne!(
+                    resolve_pointer_shape(input(&compositor, &router, Some((15, 8))), |_| None),
+                    ResolvedPointerShape::Shape(shape)
+                );
+            }
+        }
+    }
+
     #[test]
     fn removed_clipped_or_occluded_capture_cannot_override_scene() {
         let mut compositor = scene(vec![content(), chrome(PluginSurfaceCursor::Pointer)]);
