@@ -59,6 +59,8 @@ only ever runs in the directory the shell itself reports, with
 ```toml
 [plugins.settings."bmux.sidebar"]
 placement = "left" # or "right"
+grouping = "none"          # or "workspace": tabs under a header per workspace
+scope = "all_workspaces"   # or "current_workspace": only the shown tab's workspace
 width = 28         # until you resize it
 minimum_width = 16
 maximum_width = 60
@@ -75,6 +77,7 @@ collapsed_width = 8
 visible = false            # closed when a client attaches
 remember_visibility = false # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
+remember_groups = true      # start with the groups last collapsed collapsed
 ```
 
 Templates support `{state_icon}`, `{state}`, `{name}`, `{command}`, `{cwd}`,
@@ -91,6 +94,18 @@ resolver with the independent tab-bar plugin.
 Show or hide it in one attach client with `plugin:bmux.sidebar:toggle`
 (`ctrl+alt+s` by default), `plugin:bmux.sidebar:show` or
 `plugin:bmux.sidebar:hide`. See `docs/tab-presentations.md` for details.
+
+With `grouping = "workspace"`, each workspace's tabs sit under a header that
+sums up what they are doing: how many need input (`◆`), failed (`▲`), are
+working (`◉`) and have stopped (`■`), most pressing first, or how many tabs it
+holds when none is doing anything. Click a header (or press Enter or space on
+it) to collapse or expand its group; left and right collapse and expand. A
+collapsed header still shows its sum, and is marked when it hides the tab you
+are looking at. Collapsed groups are remembered on this machine unless
+`remember_groups = false`.
+
+`scope = "current_workspace"` lists only the workspace of the tab you are
+looking at, grouped or not, and follows you as you switch tabs.
 
 Resize it by dragging the edge that faces the panes (the pointer shows a resize
 cursor there, on terminals that support OSC 22 pointer shapes), or with

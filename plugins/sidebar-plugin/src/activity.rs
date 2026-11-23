@@ -31,7 +31,8 @@ use uuid::Uuid;
 /// Output within this long counts as working.
 const WORKING_WINDOW: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered most pressing first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TabState {
     Blocked,
     Failed,

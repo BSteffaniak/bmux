@@ -45,9 +45,28 @@ enum Placement {
     Right,
 }
 
+/// How the sidebar organizes its tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grouping {
+    /// One flat list.
+    None,
+    /// Under a collapsible header per workspace.
+    Workspace,
+}
+
+/// Which tabs the sidebar lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    AllWorkspaces,
+    /// Only the workspace of the tab this client shows.
+    CurrentWorkspace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     placement: Placement,
+    grouping: Grouping,
+    scope: Scope,
     width: u16,
     minimum_width: u16,
     maximum_width: u16,
@@ -62,8 +81,16 @@ struct Settings {
     collapse_below_width: u16,
     collapsed_width: u16,
     visibility: VisibilitySettings,
-    /// Start from the width last dragged or stepped to on this machine.
-    remember_width: bool,
+    remember: Remember,
+}
+
+/// What the sidebar remembers on this machine between starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Remember {
+    /// The width last dragged or stepped to.
+    width: bool,
+    /// Which groups were collapsed.
+    groups: bool,
 }
 
 impl Default for Settings {
@@ -89,7 +116,12 @@ impl Default for Settings {
                 visible: false,
                 ..VisibilitySettings::default()
             },
-            remember_width: true,
+            remember: Remember {
+                width: true,
+                groups: true,
+            },
+            grouping: Grouping::None,
+            scope: Scope::AllWorkspaces,
         }
     }
 }
@@ -111,6 +143,7 @@ impl Settings {
                 }
             };
         }
+        parse_organization(table, &mut settings)?;
         for (key, target) in [
             ("width", &mut settings.width),
             ("minimum_width", &mut settings.minimum_width),
@@ -168,7 +201,8 @@ impl Settings {
         for (key, target) in [
             ("visible", &mut settings.visibility.visible),
             ("remember_visibility", &mut settings.visibility.remember),
-            ("remember_width", &mut settings.remember_width),
+            ("remember_width", &mut settings.remember.width),
+            ("remember_groups", &mut settings.remember.groups),
         ] {
             if let Some(value) = table.get(key) {
                 *target = value.as_bool().ok_or_else(|| {
@@ -193,6 +227,36 @@ impl Settings {
         }
         Ok(settings)
     }
+}
+
+/// `grouping` and `scope`: how the sidebar organizes its tabs and which it lists.
+fn parse_organization(
+    table: &toml::map::Map<String, toml::Value>,
+    settings: &mut Settings,
+) -> Result<(), PluginCommandError> {
+    if let Some(grouping) = table.get("grouping") {
+        settings.grouping = match grouping.as_str() {
+            Some("none") => Grouping::None,
+            Some("workspace") => Grouping::Workspace,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(format!(
+                    "bmux.sidebar grouping must be 'none' or 'workspace', got {grouping}"
+                )));
+            }
+        };
+    }
+    if let Some(scope) = table.get("scope") {
+        settings.scope = match scope.as_str() {
+            Some("all_workspaces") => Scope::AllWorkspaces,
+            Some("current_workspace") => Scope::CurrentWorkspace,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(format!(
+                    "bmux.sidebar scope must be 'all_workspaces' or 'current_workspace', got {scope}"
+                )));
+            }
+        };
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -262,12 +326,16 @@ struct CompanionState {
     /// This attachment's own selection (`tabs-local-view`), when known.
     selected_context_id: Option<Uuid>,
     snapshot: tabs_list::TabListSnapshot,
-    /// The highlighted tab, moved by the pointer (hover) and the keyboard.
-    cursor: ItemCursor<Uuid>,
+    /// The highlighted row, moved by the pointer (hover) and the keyboard.
+    cursor: ItemCursor<SidebarHit>,
+    /// Workspaces whose tabs are hidden under their header.
+    collapsed: std::collections::BTreeSet<Uuid>,
+    /// Where collapsed groups are remembered, when they are.
+    groups_memory: Option<std::path::PathBuf>,
     /// What each tab is doing, from the tabs plugin's `tabs-status`.
     activity: activity::ActivityView,
     scroll: bmux_tui_components::scroll_view::ScrollViewState,
-    measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
+    measured_items: std::cell::RefCell<std::collections::BTreeMap<SidebarHit, MeasuredSidebarItem>>,
     /// What each published revision's region keys mean.
     hits: std::cell::RefCell<HitTables<SidebarHit>>,
     /// The width the sidebar asks for, within its minimum and maximum.
@@ -294,12 +362,61 @@ const WIDTH_STEP: u16 = 2;
 const WIDTH_FILE: &str = "sidebar-width";
 
 /// The typed meaning of a sidebar region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SidebarHit {
     Tab(Uuid),
+    /// A workspace's header, by workspace id.
+    Group(Uuid),
     /// The edge facing the panes, dragged to resize the sidebar.
     ResizeEdge,
 }
+
+/// One row of the sidebar's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarRow {
+    /// A workspace's header: the indices of its listed tabs in the snapshot,
+    /// and whether they are hidden under it.
+    Group {
+        id: Uuid,
+        name: String,
+        tabs: Vec<usize>,
+        collapsed: bool,
+    },
+    /// A tab, by its index in the snapshot.
+    Tab(usize),
+}
+
+impl SidebarRow {
+    /// The row's identity, for the cursor, hit regions and measurements.
+    const fn item(&self, tabs: &[tabs_list::TabListEntry]) -> SidebarHit {
+        match self {
+            Self::Group { id, .. } => SidebarHit::Group(*id),
+            Self::Tab(index) => SidebarHit::Tab(tabs[*index].id),
+        }
+    }
+}
+
+/// The owner-local region id of a row, and its inverse.
+fn item_region_id(item: SidebarHit) -> String {
+    match item {
+        SidebarHit::Tab(id) => tab_region_id(id),
+        SidebarHit::Group(id) => format!("group:{id}"),
+        SidebarHit::ResizeEdge => RESIZE_EDGE_REGION.to_string(),
+    }
+}
+
+fn region_item(region: &str) -> Option<SidebarHit> {
+    if region == RESIZE_EDGE_REGION {
+        return Some(SidebarHit::ResizeEdge);
+    }
+    if let Some(id) = region.strip_prefix("group:") {
+        return Uuid::parse_str(id).ok().map(SidebarHit::Group);
+    }
+    region_tab_id(region).map(SidebarHit::Tab)
+}
+
+/// The file in the local state directory that remembers collapsed groups.
+const GROUPS_FILE: &str = "sidebar-collapsed-groups";
 
 /// The owner-local region id of a tab row, and its inverse, for events without
 /// a typed key (the stateless service fallback has no hit table).
@@ -329,8 +446,21 @@ impl CompanionState {
         let activity = activity::ActivityView::default();
         let width_memory = local_state_dir
             .as_deref()
-            .filter(|_| settings.remember_width)
+            .filter(|_| settings.remember.width)
             .map(|directory| directory.join(WIDTH_FILE));
+        let groups_memory = local_state_dir
+            .as_deref()
+            .filter(|_| settings.remember.groups)
+            .map(|directory| directory.join(GROUPS_FILE));
+        let collapsed = groups_memory
+            .as_deref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| Uuid::parse_str(line.trim()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         let width = width_memory
             .as_deref()
             .and_then(|file| std::fs::read_to_string(file).ok())
@@ -339,6 +469,8 @@ impl CompanionState {
                 width.clamp(settings.minimum_width, settings.maximum_width)
             });
         Self {
+            collapsed,
+            groups_memory,
             width,
             width_memory,
             resize: None,
@@ -423,8 +555,8 @@ impl CompanionState {
             &mut self.scroll,
             0,
         );
-        if let Some(index) = self.snapshot.tabs.iter().position(|tab| tab.active) {
-            self.reveal(index);
+        if let Some(row) = self.active_row() {
+            self.reveal(row);
         }
         true
     }
@@ -448,7 +580,7 @@ impl CompanionState {
 
     fn measure_item(
         &self,
-        id: Uuid,
+        id: SidebarHit,
         title: String,
         description: String,
         status: String,
@@ -504,7 +636,7 @@ impl CompanionState {
             }
             let content = fields
                 .iter()
-                .fold(Column::new().id(format!("tab:{id}")), |column, field| {
+                .fold(Column::new().id(item_region_id(id)), |column, field| {
                     column.child(field.clone())
                 });
             let layout = content.layout(
@@ -562,7 +694,7 @@ impl CompanionState {
             render(&self.settings.title_template)
         };
         self.measure_item(
-            tab.id,
+            SidebarHit::Tab(tab.id),
             title,
             render(&self.settings.description_template),
             render(&self.settings.status_template),
@@ -576,8 +708,8 @@ impl CompanionState {
             LayoutId::new("sidebar.items"),
             LogicalSize::new(u64::from(self.width), 0),
         );
-        for index in 0..self.snapshot.tabs.len() {
-            let item = self.measured_tab(index);
+        for row in self.rows() {
+            let item = self.measured_row(&row);
             let y = content.size.height;
             content.size.height = y.saturating_add(item.layout.size.height);
             content
@@ -615,8 +747,135 @@ impl CompanionState {
         );
     }
 
-    fn tab_ids(&self) -> Vec<Uuid> {
-        self.snapshot.tabs.iter().map(|tab| tab.id).collect()
+    /// The listed rows: every tab in scope, under its workspace's header when
+    /// grouped, with a collapsed workspace's tabs left out.
+    fn rows(&self) -> Vec<SidebarRow> {
+        let tabs = &self.snapshot.tabs;
+        let current = tabs
+            .iter()
+            .find(|tab| tab.active)
+            .map(|tab| tab.workspace_id);
+        let listed = tabs.iter().enumerate().filter(|(_, tab)| {
+            self.settings.scope == Scope::AllWorkspaces
+                || current.is_none_or(|current| tab.workspace_id == current)
+        });
+        if self.settings.grouping == Grouping::None {
+            return listed.map(|(index, _)| SidebarRow::Tab(index)).collect();
+        }
+        // The catalog lists tabs in workspace order; keep a workspace's tabs
+        // together under the first place it appears.
+        let mut groups: Vec<(Uuid, String, Vec<usize>)> = Vec::new();
+        for (index, tab) in listed {
+            match groups.iter_mut().find(|(id, ..)| *id == tab.workspace_id) {
+                Some((.., members)) => members.push(index),
+                None => groups.push((tab.workspace_id, tab.workspace.clone(), vec![index])),
+            }
+        }
+        let mut rows = Vec::new();
+        for (id, name, members) in groups {
+            let collapsed = self.collapsed.contains(&id);
+            rows.push(SidebarRow::Group {
+                id,
+                name,
+                tabs: members.clone(),
+                collapsed,
+            });
+            if !collapsed {
+                rows.extend(members.into_iter().map(SidebarRow::Tab));
+            }
+        }
+        rows
+    }
+
+    /// The row showing this client's tab: its own, or its collapsed group's.
+    fn active_row(&self) -> Option<usize> {
+        let active = self.snapshot.tabs.iter().position(|tab| tab.active)?;
+        self.rows().iter().position(|row| match row {
+            SidebarRow::Tab(index) => *index == active,
+            SidebarRow::Group {
+                tabs, collapsed, ..
+            } => *collapsed && tabs.contains(&active),
+        })
+    }
+
+    /// Every listed row's identity, in order.
+    fn item_keys(&self) -> Vec<SidebarHit> {
+        self.rows()
+            .iter()
+            .map(|row| row.item(&self.snapshot.tabs))
+            .collect()
+    }
+
+    /// A row's measured card: a tab's, or a workspace header's single line.
+    fn measured_row(&self, row: &SidebarRow) -> std::cell::Ref<'_, MeasuredSidebarItem> {
+        match row {
+            SidebarRow::Tab(index) => self.measured_tab(*index),
+            SidebarRow::Group {
+                id,
+                name,
+                collapsed,
+                ..
+            } => {
+                let width = usize::from(self.allocated_width().saturating_sub(4));
+                let marker = if *collapsed { '▸' } else { '▾' };
+                self.measure_item(
+                    SidebarHit::Group(*id),
+                    format!("{marker} {name}"),
+                    String::new(),
+                    String::new(),
+                    width,
+                )
+            }
+        }
+    }
+
+    /// Collapse or expand `workspace`'s group and remember it. Returns a
+    /// description of a failure to remember it.
+    fn toggle_group(&mut self, workspace: Uuid) -> Option<String> {
+        if !self.collapsed.remove(&workspace) {
+            self.collapsed.insert(workspace);
+        }
+        self.revision = self.revision.saturating_add(1).max(1);
+        let layout = self.scroll_layout();
+        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
+            &layout,
+            &mut self.scroll,
+            0,
+        );
+        let keys = self.item_keys();
+        self.cursor.retain(&keys);
+        self.remember_groups().err()
+    }
+
+    /// Remember the collapsed groups for the next start, when this
+    /// installation does.
+    ///
+    /// # Errors
+    /// Returns a description of a failure to write them.
+    fn remember_groups(&self) -> Result<(), String> {
+        let Some(file) = &self.groups_memory else {
+            return Ok(());
+        };
+        let text = self
+            .collapsed
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = file.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&temporary, text)?;
+            std::fs::rename(&temporary, file)
+        };
+        write().map_err(|error| {
+            format!(
+                "remembering collapsed sidebar groups in {}: {error}",
+                file.display()
+            )
+        })
     }
 
     /// Apply a catalog snapshot. The shared catalog cannot know which tab is
@@ -631,19 +890,19 @@ impl CompanionState {
         }
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
-            let keys = self.tab_ids();
+            let keys = self.item_keys();
             self.cursor.retain(&keys);
             self.measured_items
                 .get_mut()
-                .retain(|id, _| self.snapshot.tabs.iter().any(|tab| tab.id == *id));
+                .retain(|item, _| keys.contains(item));
             let layout = self.scroll_layout();
             bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
                 &layout,
                 &mut self.scroll,
                 0,
             );
-            if let Some(active) = self.snapshot.tabs.iter().position(|tab| tab.active) {
-                self.reveal(active);
+            if let Some(row) = self.active_row() {
+                self.reveal(row);
             }
             self.revision = self.revision.saturating_add(1).max(1);
         }
@@ -654,9 +913,8 @@ impl CompanionState {
     fn remeasure(&mut self, reveal_active: bool) {
         self.measured_items.get_mut().clear();
         self.revision = self.revision.saturating_add(1).max(1);
-        if reveal_active && let Some(active) = self.snapshot.tabs.iter().position(|tab| tab.active)
-        {
-            self.reveal(active);
+        if reveal_active && let Some(row) = self.active_row() {
+            self.reveal(row);
         }
     }
 
@@ -1564,20 +1822,127 @@ fn resize_edge(state: &CompanionState, content_rows: u16) -> Option<ExtensionRec
     Some(ExtensionRect::new(x, 0, 1, height.max(1)))
 }
 
+/// What a group's tabs are doing, as `◆1 ◉2 ■3`-style counts in their
+/// states' colors, most pressing first, within `room` cells; the tab count
+/// when none is doing anything.
+fn group_summary(
+    state: &CompanionState,
+    tabs: &[usize],
+    room: usize,
+) -> Vec<(String, Option<RenderColor>)> {
+    let mut counts = std::collections::BTreeMap::<activity::TabState, usize>::new();
+    for index in tabs {
+        let tab = &state.snapshot.tabs[*index];
+        if let Some(activity) = state.activity.activity(tab.id, tab.active)
+            && activity.state != activity::TabState::Idle
+        {
+            *counts.entry(activity.state).or_default() += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    let mut used = 0;
+    for (tab_state, count) in counts {
+        let text = format!("{}{count}", tab_state.glyph());
+        let cells = bmux_cell_geometry::display_width(&text) + usize::from(!parts.is_empty());
+        if used + cells > room {
+            break;
+        }
+        used += cells;
+        parts.push((text, Some(tab_state.color())));
+    }
+    if parts.is_empty() {
+        let count = tabs.len().to_string();
+        if count.len() <= room {
+            parts.push((count, None));
+        }
+    }
+    parts
+}
+
 fn sidebar_region(
-    id: Uuid,
+    item: SidebarHit,
     width: u16,
     row: u16,
     height: u16,
     hits: &mut HitTable<SidebarHit>,
 ) -> PluginSurfaceRegion {
     PluginSurfaceRegion::new(
-        tab_region_id(id),
+        item_region_id(item),
         ExtensionRect::new(1, row, width.saturating_sub(2), height.max(1)),
     )
     .endpoint(input_endpoint())
     .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
-    .key(hits.key(SidebarHit::Tab(id)))
+    .key(hits.key(item))
+}
+
+/// Paint a workspace's header row: its marker and name, and at the right
+/// what its tabs are doing: how many need input, failed, are working and
+/// have stopped, most pressing first, or else how many tabs it holds. A
+/// collapsed header is marked when it hides this client's tab.
+fn paint_group_header(
+    state: &CompanionState,
+    palette: &SidebarPalette,
+    ops: &mut Vec<RenderOp>,
+    (width, start_row, end_row): (u16, u16, u16),
+    (tabs, collapsed, hovered): (&[usize], bool, bool),
+    title: &str,
+) {
+    let holds_active = collapsed && tabs.iter().any(|index| state.snapshot.tabs[*index].active);
+    let card = if holds_active {
+        palette.active_card
+    } else if hovered {
+        palette.hover_card
+    } else {
+        palette.base
+    };
+    if holds_active || hovered {
+        ops.push(RenderOp::fill_rect(
+            ExtensionRect::new(0, start_row, width, end_row.saturating_sub(start_row)),
+            ' ',
+            card,
+        ));
+    }
+    // The title keeps at least a few cells; the counts take the rest, the
+    // least pressing dropped first when they do not fit.
+    let title_room = bmux_cell_geometry::display_width(title).min(8);
+    let room = usize::from(width.saturating_sub(4)).saturating_sub(title_room + 1);
+    let parts = group_summary(state, tabs, room);
+    let summary_width = parts
+        .iter()
+        .map(|(text, _)| bmux_cell_geometry::display_width(text))
+        .sum::<usize>()
+        + parts.len().saturating_sub(1);
+    let summary_x = width
+        .saturating_sub(1)
+        .saturating_sub(u16::try_from(summary_width).unwrap_or(u16::MAX));
+    ops.push(RenderOp::text_run(
+        2,
+        start_row,
+        truncate_to_width(title, usize::from(summary_x.saturating_sub(3))),
+        palette.heading.background_of(card),
+    ));
+    let mut x = summary_x;
+    for (text, color) in parts {
+        let style = color.map_or(palette.muted, |color| RenderStyle::new().foreground(color));
+        let cells = u16::try_from(bmux_cell_geometry::display_width(&text)).unwrap_or(u16::MAX);
+        ops.push(RenderOp::text_run(
+            x,
+            start_row,
+            text,
+            style.background_of(card),
+        ));
+        x = x.saturating_add(cells).saturating_add(1);
+    }
+    if holds_active {
+        for bar_row in start_row..end_row {
+            ops.push(RenderOp::text_run(
+                0,
+                bar_row,
+                "▎",
+                palette.accent.background_of(card),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1597,7 +1962,24 @@ fn build_surface_with_hits(
     // Content-sized surfaces are finalized from the emitted item geometry below.
     let height = u16::MAX;
     let heading = state.settings.heading.to_uppercase();
-    let count = state.snapshot.tabs.len().to_string();
+    let rows = state.rows();
+    // Tabs in scope, including those under collapsed headers.
+    let count = rows
+        .iter()
+        .map(|row| match row {
+            SidebarRow::Tab(_) => 1,
+            SidebarRow::Group {
+                tabs, collapsed, ..
+            } => {
+                if *collapsed {
+                    tabs.len()
+                } else {
+                    0
+                }
+            }
+        })
+        .sum::<usize>()
+        .to_string();
     let count_x = width
         .saturating_sub(1)
         .saturating_sub(u16::try_from(count.len()).unwrap_or(u16::MAX));
@@ -1611,7 +1993,7 @@ fn build_surface_with_hits(
         semantics: Some(bmux_tui::semantic::SemanticScene::new()),
         text: std::collections::BTreeMap::new(),
     };
-    let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
+    let mut regions = Vec::with_capacity(rows.len());
     let layout = state.scroll_layout();
     let visible = state.scroll.vertical_offset()
         ..state
@@ -1619,7 +2001,7 @@ fn build_surface_with_hits(
             .vertical_offset()
             .saturating_add(layout.size.height);
     let mut row = 1_u16;
-    for (index, tab) in state.snapshot.tabs.iter().enumerate() {
+    for (index, listed) in rows.iter().enumerate() {
         let item = &layout.children[0].node.children[index];
         let item_end = item.y.saturating_add(item.node.size.height);
         let Some(projected) =
@@ -1627,11 +2009,40 @@ fn build_surface_with_hits(
         else {
             continue;
         };
-        let fact = state.tab_fact(tab);
-        let activity = state.activity.activity(tab.id, tab.active);
         let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
         let end_row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
-        let hovered = state.cursor.hovered() == Some(&tab.id);
+        let tab_index = match listed {
+            SidebarRow::Tab(tab_index) => *tab_index,
+            SidebarRow::Group {
+                id,
+                tabs,
+                collapsed,
+                ..
+            } => {
+                let hovered = state.cursor.hovered() == Some(&SidebarHit::Group(*id));
+                paint_group_header(
+                    state,
+                    &palette,
+                    &mut ops,
+                    (width, start_row, end_row),
+                    (tabs, *collapsed, hovered),
+                    &state.measured_row(listed).title,
+                );
+                row = end_row;
+                regions.push(sidebar_region(
+                    SidebarHit::Group(*id),
+                    width,
+                    start_row,
+                    row.saturating_sub(start_row),
+                    &mut hits,
+                ));
+                continue;
+            }
+        };
+        let tab = &state.snapshot.tabs[tab_index];
+        let fact = state.tab_fact(tab);
+        let activity = state.activity.activity(tab.id, tab.active);
+        let hovered = state.cursor.hovered() == Some(&SidebarHit::Tab(tab.id));
         // The card's background: tinted when active or hovered.
         let card = if tab.active {
             palette.active_card
@@ -1657,7 +2068,7 @@ fn build_surface_with_hits(
             },
             |fact| fact_style(fact.role, palette.title).background_of(card),
         );
-        let measured = state.measured_tab(index);
+        let measured = state.measured_tab(tab_index);
         let title_text = measured.title.clone();
         for (field, child) in measured.fields.iter().zip(&measured.layout.children) {
             let style = match child.node.id.as_str() {
@@ -1722,7 +2133,7 @@ fn build_surface_with_hits(
         }
         row = end_row;
         regions.push(sidebar_region(
-            tab.id,
+            SidebarHit::Tab(tab.id),
             width,
             start_row,
             row.saturating_sub(start_row),
@@ -1816,28 +2227,21 @@ fn subscribe_tab_status(
         .map_err(|error| format!("subscribing to tab status: {error}"))
 }
 
-/// The tab an event is addressed to: through the hit table of the revision it
-/// was published with when it carries a typed key (a retired revision resolves
-/// to nothing), otherwise through its owner-local region id.
-fn hit_tab(companion: &CompanionState, event: &AttachInputEvent) -> Option<Uuid> {
-    match hit(companion, event)? {
-        SidebarHit::Tab(id) => Some(id),
-        SidebarHit::ResizeEdge => None,
-    }
-}
-
-/// What an event is addressed to, resolved like [`hit_tab`].
+/// What an event is addressed to: through the hit table of the revision it
+/// was published with when it carries a typed key (a retired revision
+/// resolves to nothing), otherwise through its owner-local region id.
 fn hit(companion: &CompanionState, event: &AttachInputEvent) -> Option<SidebarHit> {
     let target = event.target.as_ref()?;
-    match target.key {
-        Some(key) => companion
-            .hits
-            .borrow()
-            .resolve(target.revision, key)
-            .copied(),
-        None if target.region == RESIZE_EDGE_REGION => Some(SidebarHit::ResizeEdge),
-        None => region_tab_id(&target.region).map(SidebarHit::Tab),
-    }
+    target.key.map_or_else(
+        || region_item(&target.region),
+        |key| {
+            companion
+                .hits
+                .borrow()
+                .resolve(target.revision, key)
+                .copied()
+        },
+    )
 }
 
 /// Drag the resize edge: a left press on it captures the pointer, dragging
@@ -1946,11 +2350,8 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let previous = companion.cursor.clone();
     let previous_edge = companion.edge_hovered;
     companion.edge_hovered = hovered == Some(SidebarHit::ResizeEdge);
-    let tab = match hovered {
-        Some(SidebarHit::Tab(id)) => Some(id),
-        _ => None,
-    };
-    if !companion.cursor.set_hovered(tab) && previous_edge == companion.edge_hovered {
+    let row = hovered.filter(|hit| *hit != SidebarHit::ResizeEdge);
+    if !companion.cursor.set_hovered(row) && previous_edge == companion.edge_hovered {
         return false;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
@@ -1997,18 +2398,39 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     }
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
-    let target = hit_tab(companion, event)?;
+    let target = hit(companion, event).filter(|hit| *hit != SidebarHit::ResizeEdge)?;
     let input = match event.key.as_deref()? {
         "up" => CursorInput::Up,
         "down" => CursorInput::Down,
         "home" => CursorInput::Home,
         "end" => CursorInput::End,
+        // On a header, left collapses, right expands and space toggles.
+        key @ ("left" | "right" | "space") => {
+            let SidebarHit::Group(workspace) = target else {
+                return None;
+            };
+            let collapsed = companion.collapsed.contains(&workspace);
+            let toggle = match key {
+                "left" => !collapsed,
+                "right" => collapsed,
+                _ => true,
+            };
+            let status_message = toggle.then(|| companion.toggle_group(workspace)).flatten();
+            let dirty = toggle && publish_companion(companion).is_ok();
+            drop(guard);
+            return Some(AttachInputResult {
+                consumed: true,
+                dirty,
+                status_message,
+                ..AttachInputResult::default()
+            });
+        }
         _ => return None,
     };
     let previous_scroll = companion.scroll;
     let previous_cursor = companion.cursor.clone();
-    // The keyboard moves from the focused tab; the highlight follows it.
-    let keys = companion.tab_ids();
+    // The keyboard moves from the focused row; the highlight follows it.
+    let keys = companion.item_keys();
     companion.cursor.set_cursor(Some(target));
     if let CursorOutcome::Moved(next) = companion.cursor.apply(&keys, input) {
         if let Some(index) = keys.iter().position(|id| *id == next) {
@@ -2043,15 +2465,31 @@ fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<Att
     if !is_activation(event) {
         return None;
     }
-    let target = {
-        let guard = owner.lock().ok()?;
-        hit_tab(guard.as_ref()?, event)?
-    };
-    Some(AttachInputResult {
-        consumed: true,
-        service_invocation: switch_tab_invocation(target),
-        ..AttachInputResult::default()
-    })
+    let mut guard = owner.lock().ok()?;
+    let companion = guard.as_mut()?;
+    match hit(companion, event)? {
+        SidebarHit::Tab(target) => {
+            drop(guard);
+            Some(AttachInputResult {
+                consumed: true,
+                service_invocation: switch_tab_invocation(target),
+                ..AttachInputResult::default()
+            })
+        }
+        // A header collapses or expands its workspace's group.
+        SidebarHit::Group(workspace) => {
+            let status_message = companion.toggle_group(workspace);
+            let dirty = publish_companion(companion).is_ok();
+            drop(guard);
+            Some(AttachInputResult {
+                consumed: true,
+                dirty,
+                status_message,
+                ..AttachInputResult::default()
+            })
+        }
+        SidebarHit::ResizeEdge => None,
+    }
 }
 
 /// A left press, or Enter, both of which switch to the tab under them.
@@ -2730,7 +3168,7 @@ mod tests {
             revision: 1,
         });
         let before = build_surface(&state, 1);
-        state.cursor.set_hovered(Some(second));
+        state.cursor.set_hovered(Some(SidebarHit::Tab(second)));
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[3], after.ops[3]);
         assert_ne!(before.ops[4], after.ops[4]);
@@ -3092,6 +3530,233 @@ mod tests {
         }
     }
 
+    /// Two workspaces' tabs: `bmux` (tabs 1–3, tab 1 shown) with agents
+    /// working, needing input and stopped, and `notes` (tab 4) idle.
+    fn grouped_state(settings: Settings, state_dir: Option<std::path::PathBuf>) -> CompanionState {
+        use bmux_tabs_plugin_api::tabs_status::{
+            AgentActivity, TabAgent, TabStatus, TabStatusSnapshot,
+        };
+        let mut state = CompanionState::new(settings, state_dir);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 14));
+        let now = 600_000;
+        let status = |index: u128, activity: Option<AgentActivity>| TabStatus {
+            tab_id: Uuid::from_u128(index),
+            panes: 1,
+            running_command: None,
+            cwd: None,
+            title: None,
+            git: None,
+            last_exit: None,
+            output_at_ms: None,
+            attention_at_ms: None,
+            attention: None,
+            agent: activity.map(|activity| TabAgent {
+                name: "claude".into(),
+                activity,
+                message: None,
+                changed_at_ms: now - 5_000,
+                finished_at_ms: None,
+            }),
+        };
+        state.activity.replace(TabStatusSnapshot {
+            tabs: vec![
+                status(1, Some(AgentActivity::Working)),
+                status(2, Some(AgentActivity::Blocked)),
+                status(3, Some(AgentActivity::Idle)),
+                status(4, None),
+            ],
+            now_ms: now,
+            revision: 1,
+        });
+        let tab = |index: u128, name: &str, workspace: &str, workspace_id: u128| {
+            tabs_list::TabListEntry {
+                id: Uuid::from_u128(index),
+                name: name.to_string(),
+                active: index == 1,
+                workspace: workspace.to_string(),
+                workspace_id: Uuid::from_u128(workspace_id),
+            }
+        };
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                tab(1, "build", "bmux", 100),
+                tab(2, "review", "bmux", 100),
+                tab(3, "docs", "bmux", 100),
+                tab(4, "todo", "notes", 200),
+            ],
+            revision: 1,
+        });
+        state
+    }
+
+    fn grouped() -> Settings {
+        Settings {
+            grouping: Grouping::Workspace,
+            ..shown_settings()
+        }
+    }
+
+    /// A pointer press on `region`, addressed by its owner-local id.
+    fn press(region: &str) -> AttachInputEvent {
+        AttachInputEvent {
+            target: Some(bmux_plugin::AttachInputTarget {
+                surface: SURFACE_ID.to_string(),
+                region: region.to_string(),
+                revision: 0,
+                key: None,
+            }),
+            event_kind: "pointer".to_string(),
+            phase: "down".to_string(),
+            button: Some("left".to_string()),
+            ..AttachInputEvent::default()
+        }
+    }
+
+    fn key(region: &str, key: &str) -> AttachInputEvent {
+        AttachInputEvent {
+            event_kind: "key".to_string(),
+            phase: "press".to_string(),
+            button: None,
+            key: Some(key.to_string()),
+            ..press(region)
+        }
+    }
+
+    /// Grouped, each workspace's tabs sit under its header, which says what
+    /// they are doing: how many need input, are working and have stopped.
+    #[test]
+    fn grouped_tabs_sit_under_headers_that_sum_up_their_work() {
+        let state = grouped_state(grouped(), None);
+        let text = surface_text(&build_surface(&state, 1), 32, 8);
+        assert_eq!(
+            text,
+            [
+                " TABS                         4",
+                "  ▾ bmux               ◆1 ◉1 ■1",
+                "▎ ◉ build               working",
+                "  ◆ review          needs input",
+                "  ■ docs                stopped",
+                "    5s",
+                "  ▾ notes                     1",
+                "  ○ todo",
+            ],
+            "{}",
+            text.join("\n")
+        );
+        // Flat is unchanged: no headers.
+        let flat = grouped_state(shown_settings(), None);
+        let text = surface_text(&build_surface(&flat, 1), 32, 6);
+        assert_eq!(text[1], "▎ ◉ build               working");
+        assert_eq!(text[5], "  ○ todo");
+    }
+
+    /// Clicking a header collapses its group, and the next start remembers
+    /// it; a collapsed group still sums up its work, and is marked when it
+    /// hides the tab this client shows.
+    #[test]
+    fn clicking_a_header_collapses_its_group_and_it_is_remembered() {
+        let dir = scratch_dir();
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(grouped_state(
+            grouped(),
+            Some(dir.clone()),
+        ))));
+        let bmux = format!("group:{}", Uuid::from_u128(100));
+        let result = super::handle_local_input(&owner, &press(&bmux)).unwrap();
+        assert!(result.consumed && result.service_invocation.is_none());
+        let text = {
+            let guard = owner.lock().unwrap();
+            surface_text(&build_surface(guard.as_ref().unwrap(), 1), 32, 4)
+        };
+        assert_eq!(
+            text,
+            [
+                " TABS                         4",
+                "▎ ▸ bmux               ◆1 ◉1 ■1",
+                "  ▾ notes                     1",
+                "  ○ todo",
+            ],
+            "{}",
+            text.join("\n")
+        );
+        drop(owner);
+        let again = grouped_state(grouped(), Some(dir.clone()));
+        assert_eq!(surface_text(&build_surface(&again, 1), 32, 2)[1], text[1]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On a header, left collapses, right expands and space toggles; Enter
+    /// toggles like a click.
+    #[test]
+    fn header_keys_collapse_and_expand_its_group() {
+        let owner =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(grouped_state(grouped(), None))));
+        let notes = Uuid::from_u128(200);
+        let region = format!("group:{notes}");
+        let collapsed = |owner: &CompanionHandle| {
+            owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .collapsed
+                .contains(&notes)
+        };
+        for (pressed, expected) in [
+            ("left", true),
+            ("left", true),
+            ("right", false),
+            ("right", false),
+            ("space", true),
+            ("enter", false),
+        ] {
+            super::handle_local_input(&owner, &key(&region, pressed)).unwrap();
+            assert_eq!(collapsed(&owner), expected, "after {pressed}");
+        }
+    }
+
+    /// Showing only the current workspace lists just the shown tab's
+    /// workspace, grouped or not, and follows the shown tab.
+    #[test]
+    fn current_workspace_scope_lists_only_the_shown_tabs_workspace() {
+        for grouping in [Grouping::None, Grouping::Workspace] {
+            let mut state = grouped_state(
+                Settings {
+                    grouping,
+                    scope: Scope::CurrentWorkspace,
+                    ..shown_settings()
+                },
+                None,
+            );
+            let names = |state: &CompanionState| {
+                surface_text(&build_surface(state, 1), 32, 8)
+                    .iter()
+                    .filter_map(|line| {
+                        ["build", "review", "docs", "todo"]
+                            .into_iter()
+                            .find(|name| line.contains(name))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(&state), ["build", "review", "docs"], "{grouping:?}");
+            assert_eq!(
+                surface_text(&build_surface(&state, 1), 32, 1)[0],
+                " TABS                         3"
+            );
+            state.select(Some(Uuid::from_u128(4)));
+            assert_eq!(names(&state), ["todo"], "{grouping:?}");
+        }
+    }
+
+    /// A narrow header keeps the most pressing counts.
+    #[test]
+    fn a_narrow_header_drops_the_least_pressing_counts_first() {
+        let mut state = grouped_state(grouped(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 16, 14));
+        let header = surface_text(&build_surface(&state, 1), 16, 2)[1].clone();
+        assert!(header.ends_with("◆1 ◉1"), "{header:?}");
+        assert!(header.contains("bmux"), "{header:?}");
+    }
+
     /// A sidebar installed like an attach client's, shown at `placement`
     /// and allocated `rect`, remembering its width in `state_dir`.
     struct Installed {
@@ -3387,20 +4052,20 @@ mod tests {
             screen_row: None,
         };
         assert_eq!(
-            hit_tab(&state, &event(Some(target.clone()))),
-            Some(Uuid::from_u128(5))
+            hit(&state, &event(Some(target.clone()))),
+            Some(SidebarHit::Tab(Uuid::from_u128(5)))
         );
         let retired = bmux_plugin::AttachInputTarget {
             revision: 3,
             ..target.clone()
         };
-        assert_eq!(hit_tab(&state, &event(Some(retired))), None);
+        assert_eq!(hit(&state, &event(Some(retired))), None);
         let unknown = bmux_plugin::AttachInputTarget {
             key: Some(bmux_presentation_scene::scene::HitKey(9)),
             ..target
         };
-        assert_eq!(hit_tab(&state, &event(Some(unknown))), None);
-        assert_eq!(hit_tab(&state, &event(None)), None);
+        assert_eq!(hit(&state, &event(Some(unknown))), None);
+        assert_eq!(hit(&state, &event(None)), None);
         assert_eq!(
             region_tab_id(&tab_region_id(Uuid::from_u128(5))),
             Some(Uuid::from_u128(5))
@@ -3793,9 +4458,9 @@ mod tests {
                 .copied()
         };
         assert!(update_keyboard(&owner, &key("end")).unwrap().consumed);
-        assert_eq!(hovered(&owner), Some(Uuid::from_u128(4)));
+        assert_eq!(hovered(&owner), Some(SidebarHit::Tab(Uuid::from_u128(4))));
         assert!(update_keyboard(&owner, &key("home")).unwrap().consumed);
-        assert_eq!(hovered(&owner), Some(Uuid::from_u128(1)));
+        assert_eq!(hovered(&owner), Some(SidebarHit::Tab(Uuid::from_u128(1))));
         assert!(update_keyboard(&owner, &key("x")).is_none());
     }
 
@@ -3878,7 +4543,10 @@ mod tests {
         assert!(update_keyboard(&owner, &event).unwrap().dirty);
         let guard = owner.lock().unwrap();
         let state = guard.as_ref().unwrap();
-        assert_eq!(state.cursor.hovered(), Some(&Uuid::from_u128(2)));
+        assert_eq!(
+            state.cursor.hovered(),
+            Some(&SidebarHit::Tab(Uuid::from_u128(2)))
+        );
         assert!(state.scroll.vertical_offset() > 0);
         drop(guard);
     }
