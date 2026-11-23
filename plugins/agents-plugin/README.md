@@ -104,11 +104,19 @@ line_regex = ['^\s*Allow .*\? \[y/n\]']
 agents = ["mybot"]    # more programs to treat as agents (no screen rules)
 screen_rules = true   # read agents' screens with their rules
 
-# Other names, or exact paths, an agent runs as. Naming a known agent keeps
-# its screen rules; any other id is an agent without rules.
+# Other names, exact paths, or regex patterns an agent runs as. Naming a
+# known agent keeps its screen rules; any other id is an agent without rules.
 [plugins.settings."bmux.agents".aliases]
-claude = ["work-claude", "/opt/ai/bin/launch-claude"]
+claude = [
+  "work-claude",                                  # program name
+  "/opt/ai/bin/launch-claude",                    # exact program path
+  { regex = '^/nix/store/[^/]+-claude-code' },    # whole command line
+]
 ```
+
+A `regex` alias matches anywhere in a foreground process's whole command line
+(program and arguments; anchor it with `^`/`$`), and is tried before names. An
+invalid pattern rejects the settings.
 
 `aider`, `goose`, `crush`, `omp`, `mastracode`, `openhands` and `plandex` are
 recognized by name without rules.

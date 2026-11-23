@@ -44,6 +44,9 @@ pub struct Catalog {
     names: HashMap<String, String>,
     /// Aliases given as paths: they match that exact program path only.
     paths: HashMap<String, String>,
+    /// Patterns of whole command lines, and the agent each names; they are
+    /// tried before names.
+    patterns: Vec<(regex::Regex, String)>,
 }
 
 impl Catalog {
@@ -78,15 +81,34 @@ impl Catalog {
                 names.entry(name.clone()).or_insert(name);
             }
         }
-        Self { names, paths }
+        Self {
+            names,
+            paths,
+            patterns: Vec::new(),
+        }
+    }
+
+    /// This catalog, also naming an agent by each `(pattern, agent)`: a
+    /// command line the pattern matches anywhere in runs that agent.
+    #[must_use]
+    pub fn with_patterns(
+        mut self,
+        patterns: impl IntoIterator<Item = (regex::Regex, String)>,
+    ) -> Self {
+        self.patterns.extend(patterns);
+        self
     }
 
     /// The agent the foreground job's command lines (leader first) run.
     #[must_use]
     pub fn identify(&self, commands: &[String]) -> Option<String> {
-        commands
-            .iter()
-            .find_map(|command| self.identify_command(command))
+        commands.iter().find_map(|command| {
+            self.patterns
+                .iter()
+                .find(|(pattern, _)| pattern.is_match(command))
+                .map(|(_, agent)| agent.clone())
+                .or_else(|| self.identify_command(command))
+        })
     }
 
     fn identify_command(&self, command: &str) -> Option<String> {

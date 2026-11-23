@@ -60,6 +60,8 @@ struct Settings {
     agents: Vec<String>,
     /// More names or exact paths each agent runs as, by agent id.
     aliases: std::collections::BTreeMap<String, Vec<String>>,
+    /// Patterns of command lines each agent runs as: `(agent id, regex)`.
+    patterns: Vec<(String, String)>,
     /// Read agents' screens with their rules (on by default).
     screen_rules: bool,
 }
@@ -91,22 +93,7 @@ impl Settings {
                         .collect::<Result<_, _>>()?;
                 }
                 "aliases" => {
-                    const SHAPE: &str =
-                        "aliases must map agent ids to lists of program names or paths";
-                    settings.aliases = value
-                        .as_table()
-                        .ok_or(SHAPE)?
-                        .iter()
-                        .map(|(agent, names)| {
-                            let names = names
-                                .as_array()
-                                .ok_or(SHAPE)?
-                                .iter()
-                                .map(|name| name.as_str().map(str::to_string).ok_or(SHAPE))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            Ok::<_, &str>((agent.clone(), names))
-                        })
-                        .collect::<Result<_, _>>()?;
+                    (settings.aliases, settings.patterns) = parse_aliases(value)?;
                 }
                 "screen_rules" => {
                     settings.screen_rules = value
@@ -118,6 +105,40 @@ impl Settings {
         }
         Ok(settings)
     }
+}
+
+/// `aliases`: each agent id's list of program names, exact paths, and
+/// `{ regex = "…" }` patterns of whole command lines.
+type Aliases = (
+    std::collections::BTreeMap<String, Vec<String>>,
+    Vec<(String, String)>,
+);
+
+fn parse_aliases(value: &toml::Value) -> Result<Aliases, String> {
+    const SHAPE: &str =
+        "aliases must map agent ids to lists of program names, paths or { regex = \"…\" } patterns";
+    let mut names = std::collections::BTreeMap::new();
+    let mut patterns = Vec::new();
+    for (agent, entries) in value.as_table().ok_or(SHAPE)? {
+        let mut agent_names = Vec::new();
+        for entry in entries.as_array().ok_or(SHAPE)? {
+            if let Some(name) = entry.as_str() {
+                agent_names.push(name.to_string());
+                continue;
+            }
+            let pattern = entry
+                .as_table()
+                .filter(|table| table.len() == 1)
+                .and_then(|table| table.get("regex"))
+                .and_then(toml::Value::as_str)
+                .ok_or(SHAPE)?;
+            regex::Regex::new(pattern)
+                .map_err(|error| format!("aliases.{agent}: invalid regex `{pattern}`: {error}"))?;
+            patterns.push((agent.clone(), pattern.to_string()));
+        }
+        names.insert(agent.clone(), agent_names);
+    }
+    Ok((names, patterns))
 }
 
 /// Every agent's rules and names.
@@ -183,7 +204,12 @@ impl Knowledge {
                         .map(|(agent, names)| (agent.as_str(), names.as_slice())),
                 ),
             &extra,
-        );
+        )
+        .with_patterns(settings.patterns.iter().filter_map(|(agent, pattern)| {
+            regex::Regex::new(pattern)
+                .ok()
+                .map(|pattern| (pattern, agent.clone()))
+        }));
         Self {
             rules,
             catalog,
@@ -693,6 +719,48 @@ mod tests {
         assert_eq!(identify("mb").as_deref(), Some("mybot"));
         assert!(knowledge.rules_for("mybot").is_none());
         assert_eq!(identify("/usr/bin/run-agent"), None);
+    }
+
+    #[test]
+    fn alias_patterns_match_whole_command_lines() {
+        let value = toml::from_str::<toml::Value>(
+            r"aliases = { claude = [{ regex = '^/nix/store/[^/]+-claude-code[^/]*/bin/' }, 'cc'], helper = [{ regex = '\bagent-runner\b.*--model' }] }",
+        )
+        .unwrap();
+        let settings = Settings::parse(Some(&value)).unwrap();
+        let knowledge = Knowledge::load(&settings, &[]);
+        let identify = |command: &str| knowledge.catalog.identify(&[command.to_string()]);
+        assert_eq!(
+            identify("/nix/store/abc-claude-code-2.1/bin/launcher --resume").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(identify("cc").as_deref(), Some("claude"));
+        assert_eq!(
+            identify("python3 /srv/agent-runner.py --model big").as_deref(),
+            Some("helper")
+        );
+        assert_eq!(identify("python3 /srv/agent-runner.py"), None);
+        // A later process of the job can match too.
+        assert_eq!(
+            knowledge
+                .catalog
+                .identify(&["tee log".into(), "/srv/agent-runner --model x".into()])
+                .as_deref(),
+            Some("helper")
+        );
+
+        for (source, error) in [
+            ("aliases = { claude = [{ regex = '(' }] }", "invalid regex"),
+            ("aliases = { claude = [{ pattern = 'x' }] }", "aliases"),
+            (
+                "aliases = { claude = [{ regex = 'x', other = 1 }] }",
+                "aliases",
+            ),
+        ] {
+            let value = toml::from_str::<toml::Value>(source).unwrap();
+            let message = Settings::parse(Some(&value)).unwrap_err();
+            assert!(message.contains(error), "{source}: {message}");
+        }
     }
 
     #[test]
