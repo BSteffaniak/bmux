@@ -406,7 +406,9 @@ declare_bundled_plugins! {
     definition = bmux_decoration_plugin::plugin_definition();
 }
 
-/// Load one selected implementation into this host's scoped executor.
+/// Load one selected implementation into this host's scoped executor. Not
+/// activated: production callers use [`with_activated_local_plugin`].
+#[cfg(test)]
 #[allow(clippy::result_large_err)] // Plugin error types carry context payloads
 pub(super) fn load_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
@@ -3102,6 +3104,59 @@ fn command_lifecycle_context(
 }
 
 /// Retire a fresh command-local instance after its command succeeded.
+/// Run `work` against a fresh instance of `plugin_id` in this process, activated for it: every
+/// service invocation runs inside an activation, so a bare loaded instance refuses one. The
+/// instance is retired afterwards, as a command-local plugin is.
+///
+/// # Errors
+/// Lookup, load, activation and retirement failures, and `work`'s own.
+pub(in crate::runtime) fn with_activated_local_plugin<T>(
+    plugin_id: &str,
+    work: impl FnOnce(&ProductionPlugin) -> Result<T>,
+) -> Result<T> {
+    let state = selected_command_state()?;
+    let plugin = state.registry.get(plugin_id).with_context(|| {
+        format_plugin_not_found_message(plugin_id, &state.registry.plugin_ids())
+    })?;
+    let definitions = standalone_provider_definitions(&state)?;
+    let loaded = load_plugin_with_definitions(
+        plugin,
+        &plugin_host_metadata(),
+        &state.available_capability_providers,
+        &state.config,
+        &definitions,
+        &state,
+        None,
+    )
+    .with_context(|| format!("failed loading plugin '{plugin_id}'"))?;
+    let context = plugin_command_context(
+        &state.config,
+        &state.paths,
+        &plugin.declaration,
+        "",
+        &[],
+        state.available_services.clone(),
+        state.available_capability_names.clone(),
+        state.enabled_plugins.clone(),
+        state.plugin_search_roots.clone(),
+        state.registered_plugin_infos.clone(),
+        Vec::new(),
+        None,
+        bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
+    );
+    if let Err(error) = loaded.activate_owned(&context) {
+        // Settle the failed activation's cleanup; report the activation failure.
+        if let Err(cleanup) = retire_command_local_plugin(&state, plugin, &loaded) {
+            tracing::warn!(%plugin_id, %cleanup, "failed local plugin activation cleanup");
+        }
+        return Err(anyhow::Error::from(error))
+            .with_context(|| format!("plugin '{plugin_id}' activation failed"));
+    }
+    let result = work(&loaded);
+    retire_command_local_plugin(&state, plugin, &loaded)?;
+    result
+}
+
 fn retire_command_local_plugin(
     state: &RuntimeCommandState,
     plugin: &bmux_plugin::RegisteredPlugin,
@@ -4142,6 +4197,87 @@ enabled_by_default = false
             },
         );
         (definition, calls)
+    }
+
+    /// A service invoked in this process reaches its plugin: the instance is
+    /// activated for it (a bare loaded instance refuses every invocation).
+    #[cfg(feature = "bundled-plugin-clipboard")]
+    #[test]
+    fn local_plugin_services_run_inside_an_activation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let driver = crate::runtime_owner::RuntimeDriver::new(runtime).unwrap();
+        let owner = driver.owner();
+        let mut registry = PluginRegistry::new();
+        register_static_bundled_plugins(&mut registry);
+        let root = temp_dir();
+        let paths = ConfigPaths::new(
+            root.join("config"),
+            root.join("runtime"),
+            root.join("data"),
+            root.join("state"),
+        );
+        let state = build_runtime_command_state(
+            BmuxConfig::default(),
+            paths,
+            Arc::new(registry),
+            Some(&owner),
+        )
+        .expect("isolated selected command runtime should resolve");
+        let service = state
+            .available_services
+            .iter()
+            .find(|service| service.interface_id == "clipboard-write/v1")
+            .cloned()
+            .expect("the clipboard plugin provides clipboard-write/v1");
+        let response = owner.handle().block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let _selected = SelectedCommandStateGuard::enter(&state);
+                with_activated_local_plugin("bmux.clipboard", |loaded| {
+                    Ok(loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
+                        host_service_port: None,
+                        plugin_id: "bmux.clipboard".to_string(),
+                        request: bmux_plugin_sdk::ServiceRequest {
+                            caller_plugin_id: "bmux.core".to_string(),
+                            service,
+                            // Unknown, so nothing touches the real clipboard.
+                            operation: "no_such_operation".to_string(),
+                            payload: Vec::new(),
+                        },
+                        required_capabilities: Vec::new(),
+                        provided_capabilities: Vec::new(),
+                        services: Vec::new(),
+                        available_capabilities: Vec::new(),
+                        enabled_plugins: Vec::new(),
+                        plugin_search_roots: Vec::new(),
+                        host: plugin_host_metadata(),
+                        connection: bmux_plugin_sdk::HostConnectionInfo {
+                            config_dir: String::new(),
+                            config_dir_candidates: Vec::new(),
+                            runtime_dir: String::new(),
+                            data_dir: String::new(),
+                            state_dir: String::new(),
+                        },
+                        settings: None,
+                        plugin_settings_map: BTreeMap::new(),
+                        caller_client_id: None,
+                        cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                        host_kernel_bridge: None,
+                    })?)
+                })
+            })
+            .await
+            .unwrap()
+        });
+        // The plugin itself answered: it does not know the operation.
+        let error = response
+            .expect("an activated instance accepts the invocation")
+            .error
+            .expect("an unknown operation is refused by the plugin");
+        assert!(!error.message.contains("activation"), "{error:?}");
     }
 
     #[test]

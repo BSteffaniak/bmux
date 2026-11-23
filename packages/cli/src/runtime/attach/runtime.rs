@@ -1915,7 +1915,7 @@ use super::super::{
     KernelClientFactory, Keymap, RuntimeAction, action_dispatch, attach,
     attach_quit_failure_status, available_capability_providers, available_service_descriptors,
     command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
-    host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
+    host_kernel_bridge, map_attach_client_error, merged_runtime_keybindings,
     parse_session_selector, parse_uuid_value, perf_telemetry, plugin_command_policy_hints,
     plugin_host_metadata, resolve_plugin_search_paths, scan_available_plugins,
 };
@@ -9338,11 +9338,12 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         .context("clipboard service unavailable; ensure a provider is enabled and discoverable")?;
 
     let provider_plugin_id = match &service.provider {
-        bmux_plugin_sdk::ProviderId::Plugin(plugin_id) => plugin_id,
+        bmux_plugin_sdk::ProviderId::Plugin(plugin_id) => plugin_id.clone(),
         bmux_plugin_sdk::ProviderId::Host => {
             anyhow::bail!("clipboard service provider must be plugin-owned")
         }
     };
+    let provider_plugin_id = provider_plugin_id.as_str();
     let provider = registry.get(provider_plugin_id).with_context(|| {
         format!("clipboard service provider '{provider_plugin_id}' was not found")
     })?;
@@ -9359,13 +9360,6 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let loaded = load_plugin(
-        provider,
-        &plugin_host_metadata(),
-        &available_capability_providers(&config, &registry)?,
-        &config,
-    )
-    .with_context(|| format!("failed loading clipboard service provider '{provider_plugin_id}'"))?;
 
     let connection = bmux_plugin_sdk::HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
@@ -9379,41 +9373,47 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
-    let response = loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
-        host_service_port: None,
-        plugin_id: provider_plugin_id.clone(),
-        request: ServiceRequest {
-            caller_plugin_id: "bmux.core".to_string(),
-            service,
-            operation: "copy_text".to_string(),
-            payload,
-        },
-        required_capabilities: provider
-            .declaration
-            .required_capabilities
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        provided_capabilities: provider
-            .declaration
-            .provided_capabilities
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        services: available_service_descriptors(&config, &registry)?,
-        available_capabilities,
-        enabled_plugins,
-        plugin_search_roots,
-        host: plugin_host_metadata(),
-        connection,
-        settings: None,
-        plugin_settings_map: std::collections::BTreeMap::new(),
-        caller_client_id: None,
-        cancellation: bmux_plugin_sdk::CancellationToken::default(),
-        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
-            host_kernel_bridge,
-        )),
-    })?;
+    // Every service invocation runs inside an activation: give the provider one.
+    let response =
+        super::super::plugin_runtime::with_activated_local_plugin(provider_plugin_id, |loaded| {
+            Ok(
+                loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
+                    host_service_port: None,
+                    plugin_id: provider_plugin_id.to_string(),
+                    request: ServiceRequest {
+                        caller_plugin_id: "bmux.core".to_string(),
+                        service,
+                        operation: "copy_text".to_string(),
+                        payload,
+                    },
+                    required_capabilities: provider
+                        .declaration
+                        .required_capabilities
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    provided_capabilities: provider
+                        .declaration
+                        .provided_capabilities
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    services: available_service_descriptors(&config, &registry)?,
+                    available_capabilities,
+                    enabled_plugins,
+                    plugin_search_roots,
+                    host: plugin_host_metadata(),
+                    connection,
+                    settings: None,
+                    plugin_settings_map: std::collections::BTreeMap::new(),
+                    caller_client_id: None,
+                    cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                    host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+                        host_kernel_bridge,
+                    )),
+                })?,
+            )
+        })?;
     if let Some(error) = response.error {
         anyhow::bail!(error.message);
     }
