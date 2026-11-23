@@ -38,6 +38,8 @@ pub const FORBIDDEN: &[&str] = &[
     "std::time::SystemTime",
     "SystemTime::now",
     "std::process::Command",
+    // The host's process id: a run would depend on which process ran it.
+    "process::id()",
     "std::env::var",
     "env::var(",
     "env::var_os(",

@@ -117,7 +117,7 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
     }
     let state = Mutex::new(RuntimeReadiness {
         instance: crate::ids::new_uuid(),
-        process_id: std::process::id(),
+        process_id: crate::platform::files::process_id(),
         executable_sha256,
         managed_target_identity,
         runtime_dir: context.connection.runtime_dir.clone(),

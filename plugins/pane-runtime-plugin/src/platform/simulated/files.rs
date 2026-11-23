@@ -10,6 +10,12 @@ use switchy_fs::sync::{File, OpenOptions, Permissions};
 /// Where the stand-in for this process's executable lives in the run's file system.
 const EXECUTABLE: &str = "/opt/bmux/bin/bmux";
 
+/// This process's id, a stand-in: the simulated kernel runs no process for it, and the host's
+/// id would make a run depend on which process ran it.
+pub(crate) const fn process_id() -> u32 {
+    1
+}
+
 /// The stand-in executable's contents.
 const EXECUTABLE_IMAGE: &[u8] = b"#!simulated bmux\n";
 

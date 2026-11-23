@@ -2,7 +2,9 @@
 use std::path::Path;
 use switchy_fs::sync::{File, OpenOptions, Permissions};
 
-pub(crate) use super::native::{current_executable, executable_sha256, retain_executable};
+pub(crate) use super::native::{
+    current_executable, executable_sha256, process_id, retain_executable,
+};
 
 /// Whether this process's executable is identified by its mapped image (Linux), rather than by
 /// a digest its launcher attests.

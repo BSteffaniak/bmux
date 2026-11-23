@@ -5,7 +5,9 @@ pub(crate) mod atomic;
 use std::path::Path;
 use switchy_fs::sync::{File, OpenOptions};
 
-pub(crate) use super::native::{current_executable, executable_sha256, retain_executable};
+pub(crate) use super::native::{
+    current_executable, executable_sha256, process_id, retain_executable,
+};
 
 /// Windows executables are identified by a digest their launcher attests.
 pub(crate) const EXECUTABLE_MAPPED: bool = false;

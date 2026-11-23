@@ -10,7 +10,9 @@ pub(crate) fn commit(path: &Path, value: &impl Serialize) -> std::io::Result<()>
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("receipt parent missing"))?;
-    let temporary: PathBuf = path.with_extension(format!("tmp-{}", std::process::id()));
+    // Unique to this write: concurrent writers (in other processes too) never share a staging
+    // file, and a simulated run names it the same whichever process runs it.
+    let temporary: PathBuf = path.with_extension(format!("tmp-{}", crate::ids::new_uuid()));
     let mut file = atomic::create(&temporary)
         .map_err(|error| stage_error("create state staging file", &error))?;
     file.write_all(&bytes)

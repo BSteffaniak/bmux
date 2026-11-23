@@ -1,6 +1,11 @@
 //! What the native targets share: finding programs on this host, and this process's executable.
 use std::path::{Path, PathBuf};
 
+/// This process's id.
+pub(crate) fn process_id() -> u32 {
+    std::process::id()
+}
+
 /// This process's executable.
 ///
 /// # Errors
