@@ -173,6 +173,18 @@ differs, with the text around it. Each crate on the simulated path enforces this
 a crate the simulation starts running gets one too. A std lock must never be held across a
 switch point: simulations poll tasks on several workers.
 
+A fix for a bug a simulation found (a fleet, guided or explored run, or a determinism
+check) says so in its commit message's trailers, so these fixes can be listed with
+`git log --format='%h %s' --grep='^Found-by: simulation'`:
+
+```text
+Found-by: simulation (pane-runtime)
+Simulation-replay: SIMULATOR_SEED=... SIMULATOR_EPOCH_OFFSET=... PANE_RUNTIME_SIM_PROFILE=...
+```
+
+Give the simulation's name, and the replay variables that reproduced it on the build it was
+found with. Add the seed to that simulation's `regression-seeds`, with a note.
+
 The pane runtime plugin names an operating system only in `src/platform/` (native
 Unix, native Windows and simulated targets, plus the host's files). Core logic
 branches on `bmux_pty::behavior()` instead of `cfg(unix)`/`cfg(windows)`, so the
