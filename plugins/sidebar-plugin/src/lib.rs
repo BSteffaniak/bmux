@@ -802,7 +802,7 @@ impl CompanionState {
         let width = usize::from(self.allocated_width().saturating_sub(4));
         let activity = self
             .activity
-            .activity(tab.id, tab.active)
+            .activity(tab.id)
             .map(|activity| activity.fitted(width.saturating_sub(2)));
         let render = |template: &str| {
             render_template(
@@ -926,7 +926,9 @@ impl CompanionState {
                 )])
             }
             activity::TabState::Idle => view::styled(summary, tui_style(palette.muted)),
-            activity::TabState::Working | activity::TabState::Stopped => {
+            activity::TabState::Working
+            | activity::TabState::Stopped
+            | activity::TabState::Done => {
                 let mut spans = vec![Span::styled(summary, tui_style(state_style))];
                 if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
                     spans.push(Span::styled(format!(" {since}"), tui_style(palette.muted)));
@@ -2147,7 +2149,7 @@ fn group_summary(
     let mut counts = std::collections::BTreeMap::<activity::TabState, usize>::new();
     for index in tabs {
         let tab = &state.snapshot.tabs[*index];
-        if let Some(activity) = state.activity.activity(tab.id, tab.active)
+        if let Some(activity) = state.activity.activity(tab.id)
             && activity.state != activity::TabState::Idle
         {
             *counts.entry(activity.state).or_default() += 1;
@@ -2392,9 +2394,6 @@ impl CompanionState {
             ticked,
             animated,
         } = changes;
-        if let Some(active) = self.snapshot.tabs.iter().find(|tab| tab.active) {
-            self.activity.mark_viewed(active.id);
-        }
         if let Some(appearance) = &appearance {
             self.apply_appearance(appearance);
         }
@@ -3202,6 +3201,39 @@ mod tests {
 
     /// Shown, with the still working glyph: a spinner's frame depends on the
     /// time a test runs.
+    /// A tab doing nothing, with no signals.
+    fn idle_status() -> bmux_tabs_plugin_api::tabs_status::TabStatus {
+        bmux_tabs_plugin_api::tabs_status::TabStatus {
+            tab_id: Uuid::nil(),
+            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+            state_since_ms: None,
+            panes: 1,
+            running_command: None,
+            cwd: None,
+            title: None,
+            git: None,
+            last_exit: None,
+            output_at_ms: None,
+            attention_at_ms: None,
+            attention: None,
+            agent: None,
+        }
+    }
+
+    /// The state the tabs plugin publishes for a tab whose only signal is
+    /// its agent's activity.
+    fn published(
+        activity: Option<bmux_tabs_plugin_api::tabs_status::AgentActivity>,
+    ) -> bmux_tabs_plugin_api::tabs_status::TabState {
+        use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabState};
+        match activity {
+            Some(AgentActivity::Working) => TabState::Working,
+            Some(AgentActivity::Blocked) => TabState::NeedsInput,
+            Some(AgentActivity::Idle) => TabState::Stopped,
+            None => TabState::Idle,
+        }
+    }
+
     fn shown_settings() -> Settings {
         Settings {
             visibility: VisibilitySettings {
@@ -4012,8 +4044,8 @@ mod tests {
         let now = 600_000;
         let status = |index: u128, activity: Option<AgentActivity>| TabStatus {
             tab_id: Uuid::from_u128(index),
-            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
-            state_since_ms: None,
+            state: published(activity),
+            state_since_ms: activity.map(|_| now - 5_000),
             panes: 1,
             running_command: None,
             cwd: None,
@@ -4263,8 +4295,8 @@ mod tests {
         let now = 600_000;
         let status = |index: u128, activity, message: Option<&str>| TabStatus {
             tab_id: Uuid::from_u128(index),
-            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
-            state_since_ms: None,
+            state: published(Some(activity)),
+            state_since_ms: Some(now - 5_000),
             panes: 1,
             running_command: Some("claude".into()),
             cwd: Some("/work/bmux".into()),
@@ -4363,6 +4395,39 @@ mod tests {
             })))
             .is_err()
         );
+    }
+
+    /// A tab whose agent finished while nobody looked shows a check mark and
+    /// how long ago, and counts in its group's header and the heading.
+    #[test]
+    fn a_finished_unseen_tab_shows_done() {
+        use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabState as Published};
+        let mut state = grouped_state(grouped(), None);
+        let mut snapshot = state.activity.snapshot().unwrap().clone();
+        let docs = snapshot
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.tab_id == Uuid::from_u128(3))
+            .unwrap();
+        docs.state = Published::Done;
+        docs.state_since_ms = Some(snapshot.now_ms - 120_000);
+        assert_eq!(
+            docs.agent.as_ref().map(|agent| agent.activity),
+            Some(AgentActivity::Idle)
+        );
+        state.activity.replace(snapshot);
+        let surface = build_surface(&state, 1);
+        let text = surface_text(&surface, 32, 6);
+        let row = text.iter().position(|line| line.contains("docs")).unwrap();
+        assert!(text[row].contains("✓ docs"), "{text:?}");
+        assert!(text[row].ends_with("done 2m"), "{text:?}");
+        let glyph = painted_row(&surface, u16::try_from(row).unwrap())
+            .into_iter()
+            .find(|(_, text, _)| text.starts_with('✓'))
+            .and_then(|(.., style)| style.fg);
+        assert_eq!(glyph, Some(activity::TabState::Done.color()));
+        assert!(text[0].contains("✓1"), "the heading counts it: {text:?}");
+        assert!(text[1].contains("✓1"), "its group's header too: {text:?}");
     }
 
     /// Scrolled into a group, its header stays pinned at the top of the list,
@@ -4515,8 +4580,8 @@ mod tests {
             tabs: (1..=6_u128)
                 .map(|index| TabStatus {
                     tab_id: Uuid::from_u128(index),
-                    state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
-                    state_since_ms: None,
+                    state: bmux_tabs_plugin_api::tabs_status::TabState::Working,
+                    state_since_ms: Some(now - 1_000),
                     panes: 1,
                     running_command: Some("claude".into()),
                     cwd: Some(format!("/work/repo-{index}")),
@@ -5285,7 +5350,7 @@ mod tests {
                     .iter()
                     .map(|id| TabStatus {
                         tab_id: *id,
-                        state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+                        state: bmux_tabs_plugin_api::tabs_status::TabState::Working,
                         state_since_ms: None,
                         panes: 2,
                         running_command: Some("cargo nextest run".into()),
@@ -5375,7 +5440,7 @@ mod tests {
     #[test]
     fn tabs_show_their_activity_as_status_cards() {
         use bmux_tabs_plugin_api::tabs_status::{
-            AgentActivity, GitStatus, TabAgent, TabStatus, TabStatusSnapshot,
+            AgentActivity, GitStatus, TabAgent, TabState, TabStatus, TabStatusSnapshot,
         };
         let mut state = CompanionState::new(shown_settings(), None);
         state.allocation = Some(ExtensionRect::new(0, 0, 32, 12));
@@ -5388,18 +5453,7 @@ mod tests {
         };
         let status = |index: u128| TabStatus {
             tab_id: Uuid::from_u128(index),
-            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
-            state_since_ms: None,
-            panes: 1,
-            running_command: None,
-            cwd: None,
-            title: None,
-            git: None,
-            last_exit: None,
-            output_at_ms: None,
-            attention_at_ms: None,
-            attention: None,
-            agent: None,
+            ..idle_status()
         };
         let now = 600_000;
         let agent = |name: &str, activity, message: Option<&str>| TabAgent {
@@ -5427,11 +5481,14 @@ mod tests {
                     cwd: Some("/work/bmux/plugins".into()),
                     output_at_ms: Some(now - 1_000),
                     agent: Some(agent("claude", AgentActivity::Working, None)),
+                    state: TabState::Working,
+                    state_since_ms: Some(now - 5_000),
                     ..status(2)
                 },
                 TabStatus {
                     last_exit: Some(101),
                     cwd: Some("/work/build".into()),
+                    state: TabState::Failed,
                     ..status(3)
                 },
                 TabStatus {
@@ -5442,6 +5499,7 @@ mod tests {
                         AgentActivity::Blocked,
                         Some("approve edit?"),
                     )),
+                    state: TabState::NeedsInput,
                     ..status(4)
                 },
             ],
@@ -5534,8 +5592,8 @@ mod tests {
                 .zip(&agents)
                 .map(|(index, (_, activity, finished_at_ms))| TabStatus {
                     tab_id: Uuid::from_u128(index),
-                    state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
-                    state_since_ms: None,
+                    state: published(Some(*activity)),
+                    state_since_ms: Some(now - 60_000),
                     panes: 1,
                     running_command: Some("claude".into()),
                     cwd: None,
@@ -5574,9 +5632,6 @@ mod tests {
                     .collect(),
                 revision: 1,
             });
-            if let Some(active) = state.snapshot.tabs.iter().find(|tab| tab.active) {
-                state.activity.mark_viewed(active.id);
-            }
         };
         select(&mut state, 1);
         let first = painted(&state);

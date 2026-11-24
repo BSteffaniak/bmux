@@ -103,6 +103,27 @@ fn fixture(settings: Settings, width: u16, height: u16) -> CompanionState {
     state
 }
 
+/// What the tabs plugin would publish for the fixture's tabs; `triage`
+/// finished unseen.
+fn with_published_states(snapshot: &mut TabStatusSnapshot) {
+    use bmux_tabs_plugin_api::tabs_status::TabState;
+    let now = snapshot.now_ms;
+    for (tab, state, since) in [
+        (1, TabState::Working, Some(now - 194_000)),
+        (2, TabState::NeedsInput, Some(now - 41_000)),
+        (3, TabState::Failed, None),
+        (4, TabState::Idle, None),
+        (5, TabState::Done, Some(now - 720_000)),
+        (6, TabState::Working, Some(now - 12_000)),
+        (7, TabState::Idle, None),
+        (8, TabState::Idle, None),
+    ] {
+        let status = &mut snapshot.tabs[tab - 1];
+        status.state = state;
+        status.state_since_ms = since;
+    }
+}
+
 /// What the fixture's tabs are doing.
 fn statuses() -> TabStatusSnapshot {
     let now = 3_600_000;
@@ -139,7 +160,7 @@ fn statuses() -> TabStatusSnapshot {
         attention: None,
         agent,
     };
-    TabStatusSnapshot {
+    let mut snapshot = TabStatusSnapshot {
         tabs: vec![
             status(
                 1,
@@ -198,7 +219,9 @@ fn statuses() -> TabStatusSnapshot {
         ],
         now_ms: now,
         revision: 1,
-    }
+    };
+    with_published_states(&mut snapshot);
+    snapshot
 }
 
 fn color_json(color: Option<bmux_plugin::RenderColor>) -> serde_json::Value {

@@ -63,6 +63,34 @@ only once the required runtime capability is available; source edits alone do
 not
 verify effective behavior.
 
+## Tab states
+
+The tabs plugin decides, on the server, the one state every view shows for
+a tab, published in `bmux.tabs/tabs-status` (`state`, `state-since-ms`), most
+pressing first:
+
+- **needs input**: its agent needs an answer or approval, or a pane rang the
+  bell or sent a notification since anyone looked at the tab;
+- **failed**: a command exited non-zero, until someone looks at the tab (by
+  default) or until the next command;
+- **done**: its agent finished since anyone looked at the tab;
+- **working**: its agent works, or a command runs and printed in the last
+  three seconds;
+- **stopped**: its agent finished or waits at its prompt, and that was seen;
+- **idle**: otherwise.
+
+An agent counts as finished once it has stayed idle for 1.5 seconds after
+working, so a pause between steps or before a question is not a finish.
+Looking at a tab means some attach client shows it while its terminal has
+focus (`clients-presence-state-v1`); it marks everything the tab recorded as
+seen, for every client. Recorded finishes, bells and failures, and how far
+they were seen, are saved in the plugin's storage and survive restarts.
+
+```toml
+[plugins.settings."bmux.tabs"]
+failed_clears = "when_seen" # or "on_next_command"
+```
+
 ## Services
 
 - **`tabs-state`** -- `list-tabs` (query)

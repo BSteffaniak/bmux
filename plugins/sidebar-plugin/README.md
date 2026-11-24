@@ -31,25 +31,27 @@ background toward its foreground or accent, so they read the same on light
 and dark themes, and states and workspaces use your terminal's own colors.
 Below 20 columns cards are one line and their state is their glyph.
 
-States, most urgent first:
+States, most urgent first, as the tabs plugin decides them for every view
+(see its README):
 
-| Glyph      | State   | When                                                                                                                                                                                         |
-| ---------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `◆` yellow | blocked | its agent needs you to answer or approve something, or (any other program) the tab rang the bell or sent a notification since you last looked at it; the message replaces the directory line |
-| `▲` red    | failed  | its last command exited non-zero (needs OSC 133 shell integration)                                                                                                                           |
-| `◉` green  | working | its agent is working, or another command is running and produced output in the last few seconds                                                                                              |
-| `■` blue   | stopped | its agent is not working: it finished, or waits at its prompt                                                                                                                                |
-| `○` dim    | idle    | otherwise                                                                                                                                                                                    |
+| Glyph       | State       | When                                                                                                                                       |
+| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line |
+| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                          |
+| `◉` green   | working     | its agent is working (a spinner by default), or another command is running and produced output in the last few seconds                    |
+| `■` blue    | stopped     | its agent finished or waits at its prompt, and someone has looked since                                                                    |
+| `○` dim     | idle        | otherwise                                                                                                                                  |
 
-An agent's state shows what the agent is doing whichever tab you are looking
-at; the selected tab is marked by its tinted card and accent bar, never by its
-state glyph.
+Looking at a tab means some attach client shows it while its terminal has
+focus; it counts for every client, and what was not yet seen is kept across
+detaching and restarts. The selected tab is marked by its tinted card and bar,
+never by its state glyph.
 
 A tab's agent state comes from the agents plugin (`bmux.agents`, see
 `plugins/agents-plugin/README.md`), which recognizes coding agents in each
 pane's foreground and reads what they are doing from their screens and their
-own reports; a tab with several shows its most pressing. "Since you last
-looked" is per attach client.
+own reports; a tab with several shows its most pressing.
 
 The data comes from the tabs plugin's `bmux.tabs/tabs-status` state, which it
 derives on the server from each pane's terminal signals (title, OSC 7
