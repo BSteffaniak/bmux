@@ -1,8 +1,8 @@
-id = "agy"
-version = "2026.10.05.1"
+aliases            = ["antigravity", "antigravity-cli"]
+id                 = "agy"
 min_engine_version = 1
-updated_at = "2026-10-05T00:00:00Z"
-aliases = ["antigravity", "antigravity-cli"]
+updated_at         = "2026-11-24T00:00:00Z"
+version            = "2026.11.24.1"
 
 # Evidence: Antigravity CLI 1.2.17 live pane reads, plus reporter captures
 # from 1.1.28 through 1.2.16.
@@ -22,59 +22,83 @@ aliases = ["antigravity", "antigravity-cli"]
 # directly under the prompt box's bottom border. The idle footer reads
 # "? for shortcuts".
 #
-# Background tasks and subagents show "· N task(s)" in the footer and a task
-# panel under the prompt box. Once the agent is back at its prompt they do
-# not count as working.
+# The task panel under the idle prompt can still show live background work.
+# Require a running row above the task footer because the count can appear
+# with task entries that do not say they are running.
 
 [[rules]]
-id = "permission_prompt"
-state = "blocked"
-priority = 300
-region = "bottom_non_empty_lines(2)"
+contains        = ["navigate", "tab amend"]
+id              = "permission_prompt"
+priority        = 300
+region          = "bottom_non_empty_lines(2)"
+state           = "blocked"
 visible_blocker = true
-contains = ["navigate", "tab amend"]
 
 [[rules]]
-id = "question_prompt"
-state = "blocked"
-priority = 290
-region = "bottom_non_empty_lines(2)"
+contains        = ["navigate", "esc skip"]
+id              = "question_prompt"
+priority        = 290
+region          = "bottom_non_empty_lines(2)"
+state           = "blocked"
 visible_blocker = true
-contains = ["navigate", "esc skip"]
 
 [[rules]]
+contains = [
+    "do you trust the contents of this project?",
+    "yes, i trust this folder",
+    "enter confirm",
+]
 id = "trust_prompt"
-state = "blocked"
 priority = 280
 region = "bottom_non_empty_lines(8)"
+state = "blocked"
 visible_blocker = true
-contains = ["do you trust the contents of this project?", "yes, i trust this folder", "enter confirm"]
 
 # Pre-1.1.28 permission dialog.
 [[rules]]
+any = [
+    { contains = [
+        "do you want to proceed?",
+    ] },
+    { contains = [
+        "tab amend",
+        "edit command",
+    ] },
+]
+contains = ["requesting permission for:"]
 id = "legacy_permission_prompt"
-state = "blocked"
 priority = 270
 region = "whole_recent"
+state = "blocked"
 visible_blocker = true
-contains = ["requesting permission for:"]
-any = [
-  { contains = ["do you want to proceed?"] },
-  { contains = ["tab amend", "edit command"] },
+
+[[rules]]
+background_working = true
+id = "background_task_running"
+priority = 120
+regex = [
+    '''(?mx)
+    ^[\x20\t]*●[\x20\t]+\[[0-9]{2}:[0-9]{2}:[0-9]{2}\][^\n]*[\x20\t]+running[\x20\t]*\n
+    (?:[\x20\t]*(?:[●○][\x20\t]+\[[0-9]{2}:[0-9]{2}:[0-9]{2}\][^\n]*)?\n)*
+    [\x20\t]*\?[\x20\t]+for[\x20\t]+shortcuts\b[^\n]*·[\x20\t]+[1-9][0-9]*[\x20\t]+task\(s\)[\x20\t]+·[\x20\t]+/tasks[\x20\t]*\s*\z
+''',
 ]
-
-[[rules]]
-id = "esc_cancel_footer_working"
-state = "working"
-priority = 110
-region = "bottom_non_empty_lines(2)"
-visible_working = true
-regex = ['(?m)^\s*─{3,}\s*esc to cancel\b']
-
-[[rules]]
-id = "spinner_working"
-state = "working"
-priority = 100
 region = "bottom_non_empty_lines(12)"
+state = "working"
 visible_working = true
-line_regex = ['^\s*[\u2801-\u28FF]+\s+\S']
+
+[[rules]]
+id              = "esc_cancel_footer_working"
+priority        = 110
+regex           = ['(?m)^\s*─{3,}\s*esc to cancel\b']
+region          = "bottom_non_empty_lines(2)"
+state           = "working"
+visible_working = true
+
+[[rules]]
+id              = "spinner_working"
+line_regex      = ['^\s*[\u2801-\u28FF]+\s+\S']
+priority        = 100
+region          = "bottom_non_empty_lines(12)"
+state           = "working"
+visible_working = true

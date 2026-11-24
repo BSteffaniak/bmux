@@ -670,6 +670,35 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_counts_running_task_rows_under_the_prompt() {
+        let agy = agent("antigravity");
+        let footer = "? for shortcuts     auto · Gemini 4 Neon · medium · 1 task(s) · /tasks";
+        let running = "  ● [16:47:02] cargo fmt && cargo test running";
+        let prompt = "────────────────────\n>\n────────────────────";
+        for (text, expected) in [
+            (
+                format!("{prompt}\n{running}\n{footer}"),
+                Some(RuleState::Working),
+            ),
+            (
+                format!("{prompt}\n  ● [16:47:02] cargo fmt && cargo test completed\n{footer}"),
+                None,
+            ),
+            (format!("{running}\n{prompt}\n{footer}"), None),
+            (
+                format!("{prompt}\n{running}\n↑/↓ Navigate · tab Amend\n{footer}"),
+                Some(RuleState::Blocked),
+            ),
+        ] {
+            assert_eq!(
+                screen(&agy, &text).map(|(state, _)| state),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn bcode_reads_live_activity_and_ignores_stale_transcript_status() {
         let bcode = agent("bcode");
         let composer = "┌ Message ─────┐\n│ Ask Bcode…   │\n└──────────────┘";
