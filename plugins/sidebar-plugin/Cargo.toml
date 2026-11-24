@@ -27,7 +27,6 @@ bmux_tui_components = { workspace = true, features = [
 ] }
 bmux_unicode_segmentation = { workspace = true }
 bmux_workspaces_plugin_api = { workspace = true }
-shlex = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }

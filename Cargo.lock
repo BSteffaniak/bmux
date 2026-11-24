@@ -6386,7 +6386,6 @@ dependencies = [
  "bmux_unicode_segmentation",
  "bmux_workspaces_plugin_api",
  "serde_json",
- "shlex 2.0.1",
  "tokio",
  "toml 1.2.2+spec-1.1.0",
  "tracing",

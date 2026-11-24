@@ -158,13 +158,47 @@ fn command_program(command: &str) -> Option<String> {
             && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
-    let first = command.split_whitespace().next()?;
+    let mut remaining = command.trim_start();
+    let first = remaining.split_whitespace().next()?;
     let program = if is_assignment(first) {
-        shlex::Shlex::new(command).find(|word| !is_assignment(word))?
+        while remaining
+            .split_whitespace()
+            .next()
+            .is_some_and(is_assignment)
+        {
+            remaining = remaining.get(shell_word_end(remaining)?..)?.trim_start();
+        }
+        let word = remaining.get(..shell_word_end(remaining)?)?;
+        let unquoted = word
+            .strip_prefix('"')
+            .and_then(|word| word.strip_suffix('"'))
+            .or_else(|| {
+                word.strip_prefix('\'')
+                    .and_then(|word| word.strip_suffix('\''))
+            });
+        unquoted.unwrap_or(word)
     } else {
-        first.to_string()
+        first
     };
-    Some(program.rsplit('/').next().unwrap_or(&program).to_string())
+    (!program.is_empty()).then(|| program.rsplit('/').next().unwrap_or(program).to_string())
+}
+
+/// Find the end of one shell word without expanding its contents or executing shell syntax.
+fn shell_word_end(command: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut chars = command.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match (quote, character) {
+            (Some(active), character) if active == character => quote = None,
+            (None | Some('"'), '\\') => {
+                chars.next()?;
+            }
+            (None, '"' | '\'') => quote = Some(character),
+            (None, character) if character.is_whitespace() => return Some(index),
+            _ => {}
+        }
+    }
+    quote.is_none().then_some(command.len())
 }
 
 impl ActivityView {
