@@ -598,6 +598,24 @@ interface tabs-status {
         finished-at-ms: u64?,
     }
 
+    // What a tab is doing, most pressing first. The tabs plugin decides it
+    // once, on the server, for every view to show alike.
+    enum tab-state {
+        @default idle,
+        // Its agent finished or waits at its prompt, and that was seen.
+        stopped,
+        // Its agent works, or a command runs and prints.
+        working,
+        // Its agent finished since anyone last looked at the tab.
+        done,
+        // A command exited non-zero (until seen, or until the next command,
+        // by the tabs plugin's `failed_clears` setting).
+        failed,
+        // Its agent needs an answer or approval, or a pane rang the bell or
+        // sent a notification since anyone last looked at the tab.
+        needs-input,
+    }
+
     record tab-status {
         tab-id: uuid,
         panes: u32,
@@ -617,6 +635,11 @@ interface tabs-status {
         // The most recent notification text, when there is one.
         attention: string?,
         agent: tab-agent?,
+        // What the tab is doing; a tab looked at is one shown, by any client,
+        // in a terminal that has focus.
+        state: tab-state,
+        // When the tab entered its state, when that is known.
+        state-since-ms: u64?,
     }
 
     record tab-status-snapshot {

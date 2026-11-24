@@ -436,6 +436,8 @@ mod tests {
                 .iter()
                 .map(|(tab, activity, finished_at_ms)| TabStatus {
                     tab_id: Uuid::from_u128(*tab),
+                    state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+                    state_since_ms: None,
                     panes: 1,
                     running_command: None,
                     cwd: None,

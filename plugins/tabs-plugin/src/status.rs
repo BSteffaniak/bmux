@@ -24,6 +24,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bmux_agents_plugin_api::agent_states::{AgentSnapshot, AgentState, PaneAgent};
 use bmux_tabs_plugin_api::tabs_bells::TabBells;
 use bmux_tabs_plugin_api::tabs_status::{AgentActivity, GitStatus, TabAgent, TabStatus};
+
+use crate::attention::{AgentSignal, AttentionBook, FailedClears, Observation};
 use uuid::Uuid;
 
 /// How long a git status stays fresh.
@@ -128,9 +130,30 @@ pub struct StatusBoard {
     git: HashMap<String, (Instant, Option<GitStatus>)>,
     published: Option<Vec<TabStatus>>,
     published_bells: Option<Vec<TabBells>>,
+    /// What deserves a look in each tab, and whether anyone has looked.
+    attention: AttentionBook,
+    /// The attention book changed since it was last taken to be saved.
+    attention_changed: bool,
+    failed_clears: FailedClears,
 }
 
 impl StatusBoard {
+    /// A board starting from a saved attention book, ending failed states by
+    /// `failed_clears`.
+    #[must_use]
+    pub fn new(attention: AttentionBook, failed_clears: FailedClears) -> Self {
+        Self {
+            attention,
+            failed_clears,
+            ..Self::default()
+        }
+    }
+
+    /// The attention book, when it changed since this was last called.
+    pub fn take_changed_attention(&mut self) -> Option<AttentionBook> {
+        std::mem::take(&mut self.attention_changed).then(|| self.attention.clone())
+    }
+
     /// Take the agents plugin's latest snapshot.
     pub fn set_agents(&mut self, snapshot: &AgentSnapshot) {
         self.agents = snapshot
@@ -216,12 +239,16 @@ impl StatusBoard {
         }
     }
 
-    /// Build every tab's status. A pane's directory is what the running
-    /// command reported with OSC 7, else what its shell reported; `git` reads
-    /// a directory's status and only ever sees a trusted directory.
+    /// Build every tab's status at `now_ms`, with its state: tabs in
+    /// `looked_at` are shown by a client whose terminal has focus. A pane's
+    /// directory is what the running command reported with OSC 7, else what
+    /// its shell reported; `git` reads a directory's status and only ever
+    /// sees a trusted directory.
     pub fn build(
         &mut self,
         tabs: &[TabPanes],
+        looked_at: &std::collections::HashSet<Uuid>,
+        now_ms: u64,
         git: &mut dyn FnMut(&str) -> Option<GitStatus>,
     ) -> Vec<TabStatus> {
         let live = tabs
@@ -230,6 +257,11 @@ impl StatusBoard {
             .collect::<std::collections::HashSet<_>>();
         self.panes.retain(|pane, _| live.contains(pane));
         self.seen.retain(|pane, _| live.contains(pane));
+        // A tab list without tabs is a catalog not yet read: keep the book.
+        if !tabs.is_empty() {
+            let live_tabs = tabs.iter().map(|tab| tab.tab_id).collect();
+            self.attention_changed |= self.attention.retain(&live_tabs);
+        }
         for pane in tabs.iter().flat_map(|tab| &tab.panes) {
             if let Some(signals) = self.panes.get_mut(&pane.id) {
                 settle(signals, pane);
@@ -280,25 +312,49 @@ impl StatusBoard {
                     })
                     .max_by_key(|(at, _)| *at);
                 let agent = self.tab_agent(tab);
+                let last_exit = tab_signals
+                    .iter()
+                    .filter_map(|signals| signals.last_exit)
+                    .max_by_key(|(at, _)| *at);
+                let output_at_ms = tab_signals
+                    .iter()
+                    .filter_map(|signals| signals.output_at_ms)
+                    .max();
+                let running_command = focused.and_then(|pane| pane.running_command.clone());
+                let observation = Observation {
+                    agent: agent.as_ref().map(|agent| AgentSignal {
+                        activity: agent.activity,
+                        changed_at_ms: agent.changed_at_ms,
+                        finished_at_ms: agent.finished_at_ms,
+                    }),
+                    running: running_command.is_some(),
+                    output_at_ms,
+                    attention_at_ms: attention.as_ref().map(|(at, _)| *at),
+                    last_exit,
+                };
+                self.attention_changed |= self.attention.observe(
+                    tab.tab_id,
+                    &observation,
+                    looked_at.contains(&tab.tab_id),
+                    now_ms,
+                );
+                let (state, state_since_ms) =
+                    self.attention
+                        .state(tab.tab_id, &observation, self.failed_clears, now_ms);
                 TabStatus {
                     tab_id: tab.tab_id,
                     panes: u32::try_from(tab.panes.len()).unwrap_or(u32::MAX),
-                    running_command: focused.and_then(|pane| pane.running_command.clone()),
+                    running_command,
                     cwd,
                     title: signals.and_then(|signals| signals.title),
                     git,
-                    last_exit: tab_signals
-                        .iter()
-                        .filter_map(|signals| signals.last_exit)
-                        .max_by_key(|(at, _)| *at)
-                        .map(|(_, status)| status),
-                    output_at_ms: tab_signals
-                        .iter()
-                        .filter_map(|signals| signals.output_at_ms)
-                        .max(),
+                    last_exit: last_exit.map(|(_, status)| status),
+                    output_at_ms,
                     attention_at_ms: attention.as_ref().map(|(at, _)| *at),
                     attention: attention.and_then(|(_, text)| text),
                     agent,
+                    state,
+                    state_since_ms,
                 }
             })
             .collect()
@@ -635,7 +691,12 @@ mod tests {
             panes: vec![agent(11, AgentState::Idle), agent(12, AgentState::Blocked)],
             revision: 1,
         });
-        let with_agents = board.build(&tabs, &mut |_| None);
+        let with_agents = board.build(
+            &tabs,
+            &std::collections::HashSet::new(),
+            now_ms(),
+            &mut |_| None,
+        );
         let tab_agent = with_agents[0].agent.as_ref().unwrap();
         assert_eq!(
             (tab_agent.name.as_str(), tab_agent.activity),
@@ -646,7 +707,12 @@ mod tests {
             panes: vec![agent(11, AgentState::Idle), agent(12, AgentState::Idle)],
             revision: 2,
         });
-        let focused_agent = board.build(&tabs, &mut |_| None);
+        let focused_agent = board.build(
+            &tabs,
+            &std::collections::HashSet::new(),
+            now_ms(),
+            &mut |_| None,
+        );
         assert_eq!(focused_agent[0].agent.as_ref().unwrap().name, "agent11");
     }
 
@@ -676,10 +742,15 @@ mod tests {
         };
         let git_reads = std::cell::RefCell::new(Vec::new());
         let build = |board: &mut StatusBoard, command, cwd| {
-            let built = board.build(&tabs(command, cwd), &mut |dir| {
-                git_reads.borrow_mut().push(dir.to_string());
-                None
-            });
+            let built = board.build(
+                &tabs(command, cwd),
+                &std::collections::HashSet::new(),
+                now_ms(),
+                &mut |dir| {
+                    git_reads.borrow_mut().push(dir.to_string());
+                    None
+                },
+            );
             built[0].cwd.clone()
         };
         let mut board = StatusBoard::default();
@@ -788,15 +859,20 @@ mod tests {
         board.apply_signals(&[other_signals], 40);
         let mut git_reads = 0;
         let tabs = [tab(1, &[(11, true, Some("nvim")), (12, false, None)])];
-        let built = board.build(&tabs, &mut |cwd| {
-            git_reads += 1;
-            (cwd == "/repo").then(|| GitStatus {
-                branch: "main".into(),
-                dirty: true,
-                ahead: 0,
-                behind: 0,
-            })
-        });
+        let built = board.build(
+            &tabs,
+            &std::collections::HashSet::new(),
+            now_ms(),
+            &mut |cwd| {
+                git_reads += 1;
+                (cwd == "/repo").then(|| GitStatus {
+                    branch: "main".into(),
+                    dirty: true,
+                    ahead: 0,
+                    behind: 0,
+                })
+            },
+        );
         assert_eq!(built.len(), 1);
         let status = &built[0];
         assert_eq!(status.panes, 2);
@@ -813,13 +889,23 @@ mod tests {
         assert_eq!(status.attention.as_deref(), Some("claude: needs input"));
         assert_eq!(status.agent, None);
         // Git status is cached.
-        board.build(&tabs, &mut |_| unreachable!("cached"));
+        board.build(
+            &tabs,
+            &std::collections::HashSet::new(),
+            now_ms(),
+            &mut |_| unreachable!("cached"),
+        );
         assert_eq!(git_reads, 1);
         assert!(board.changed(&built));
         assert!(!board.changed(&built));
         // A pane without OSC 7 uses the shell's directory, and closed panes are forgotten.
         let tabs = [tab(1, &[(13, true, None)])];
-        let built = board.build(&tabs, &mut |_| None);
+        let built = board.build(
+            &tabs,
+            &std::collections::HashSet::new(),
+            now_ms(),
+            &mut |_| None,
+        );
         assert_eq!(built[0].cwd.as_deref(), Some("/elsewhere"));
         assert_eq!(board.git_cache_len(), 2);
         assert!(board.panes.is_empty());

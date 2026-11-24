@@ -126,6 +126,8 @@ fn statuses() -> TabStatusSnapshot {
                   exit: Option<u32>,
                   agent: Option<TabAgent>| TabStatus {
         tab_id: Uuid::from_u128(index),
+        state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+        state_since_ms: None,
         panes: 1,
         running_command: command.map(Into::into),
         cwd: Some(cwd.into()),

@@ -4012,6 +4012,8 @@ mod tests {
         let now = 600_000;
         let status = |index: u128, activity: Option<AgentActivity>| TabStatus {
             tab_id: Uuid::from_u128(index),
+            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+            state_since_ms: None,
             panes: 1,
             running_command: None,
             cwd: None,
@@ -4261,6 +4263,8 @@ mod tests {
         let now = 600_000;
         let status = |index: u128, activity, message: Option<&str>| TabStatus {
             tab_id: Uuid::from_u128(index),
+            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+            state_since_ms: None,
             panes: 1,
             running_command: Some("claude".into()),
             cwd: Some("/work/bmux".into()),
@@ -4511,6 +4515,8 @@ mod tests {
             tabs: (1..=6_u128)
                 .map(|index| TabStatus {
                     tab_id: Uuid::from_u128(index),
+                    state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+                    state_since_ms: None,
                     panes: 1,
                     running_command: Some("claude".into()),
                     cwd: Some(format!("/work/repo-{index}")),
@@ -5279,6 +5285,8 @@ mod tests {
                     .iter()
                     .map(|id| TabStatus {
                         tab_id: *id,
+                        state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+                        state_since_ms: None,
                         panes: 2,
                         running_command: Some("cargo nextest run".into()),
                         cwd: Some("/Users/someone/GitHub/project/plugins/sidebar".into()),
@@ -5380,6 +5388,8 @@ mod tests {
         };
         let status = |index: u128| TabStatus {
             tab_id: Uuid::from_u128(index),
+            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+            state_since_ms: None,
             panes: 1,
             running_command: None,
             cwd: None,
@@ -5524,6 +5534,8 @@ mod tests {
                 .zip(&agents)
                 .map(|(index, (_, activity, finished_at_ms))| TabStatus {
                     tab_id: Uuid::from_u128(index),
+                    state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+                    state_since_ms: None,
                     panes: 1,
                     running_command: Some("claude".into()),
                     cwd: None,

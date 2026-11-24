@@ -14,6 +14,7 @@ pub mod declaration {
 }
 
 mod arrangements;
+mod attention;
 mod bells;
 mod cwd;
 mod durable_storage;
@@ -2828,6 +2829,20 @@ fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
         .collect()
 }
 
+/// The tabs some client shows now: looking at a tab marks what it signalled
+/// seen.
+fn looked_at_tabs(caller: &(impl ServiceCaller + Sync)) -> std::collections::HashSet<Uuid> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(api_clients_state::client::list_clients(&mut client))
+        .map(|clients| {
+            clients
+                .into_iter()
+                .filter_map(|client| client.selected_context_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoard>) {
@@ -2838,8 +2853,10 @@ fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoar
     let Ok(mut board) = board.lock() else {
         return;
     };
-    board.apply_signals(&signals, status::now_ms());
-    let statuses = board.build(&tabs, &mut status::git_status);
+    let now_ms = status::now_ms();
+    board.apply_signals(&signals, now_ms);
+    let looked_at = looked_at_tabs(caller);
+    let statuses = board.build(&tabs, &looked_at, now_ms, &mut status::git_status);
     if let Some(bells) = board.changed_bells(&tabs)
         && let Some(events) = tab_events(&shared.runtime_state)
     {

@@ -374,6 +374,8 @@ mod tests {
     fn status(tab: u128) -> TabStatus {
         TabStatus {
             tab_id: Uuid::from_u128(tab),
+            state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
+            state_since_ms: None,
             panes: 1,
             running_command: None,
             cwd: None,
