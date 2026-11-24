@@ -118,8 +118,10 @@ highlighted, and the panes are drawn unfocused. Up, Down, Home and End move
 through the rows; Escape, a key the sidebar does not use (typing), or moving the
 pointer onto a pane hands the keyboard back to the pane.
 
-When the tabs do not fit, a scrollbar appears just inside the edge facing the
-panes; drag it or click its track to scroll.
+One column faces the panes. Drag it sideways to resize the sidebar. When the
+tabs do not fit, it also carries the scrollbar, colored from your theme (its
+track in the inactive border color, its thumb in the cursor color): drag the
+thumb to scroll, or click the track to jump there.
 
 Resize it by dragging the edge that faces the panes (the pointer shows a resize
 cursor there, on terminals that support OSC 22 pointer shapes), or with

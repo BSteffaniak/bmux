@@ -337,18 +337,17 @@ struct CompanionState {
     resize: Option<ResizeDrag>,
     /// How the pointer and keyboard are engaged with the sidebar.
     engaged: Engagement,
+    /// The colors of the column facing the panes, from the appearance.
+    edge_colors: EdgeColors,
 }
 
 /// How the pointer and keyboard are engaged with the sidebar's chrome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // Independent pointer and focus states.
 struct Engagement {
     /// The pointer is over the resize edge.
     edge_hovered: bool,
     /// The sidebar has keyboard focus in this client.
     focused: bool,
-    /// The scrollbar is being dragged.
-    scrollbar_drag: bool,
 }
 
 /// A drag of the sidebar's resize edge: where the pointer pressed, on the
@@ -357,6 +356,21 @@ struct Engagement {
 struct ResizeDrag {
     start_col: u16,
     start_width: u16,
+    /// Where on the scrollbar's track it was pressed, and how far below the
+    /// thumb's top when it was pressed on the thumb.
+    start_row: i32,
+    grab: Option<i32>,
+    mode: ColumnGesture,
+}
+
+/// What a press on the column facing the panes turned out to be, decided by
+/// its first movement: sideways resizes, up or down from the thumb scrolls,
+/// and none at all is a click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnGesture {
+    Undecided,
+    Resize,
+    Scroll,
 }
 
 /// Cells `widen` and `narrow` move the edge by.
@@ -490,6 +504,7 @@ impl CompanionState {
             width_memory,
             resize: None,
             engaged: Engagement::default(),
+            edge_colors: EdgeColors::default(),
             surfaces: None,
             layouts: None,
             facts: None,
@@ -804,17 +819,51 @@ impl CompanionState {
 
     /// The list's first column and width, and the scrollbar's column: the
     /// whole width while the rows fit; while they overflow, the scrollbar
-    /// takes the column inside the resize edge and the list the rest.
+    /// shares the resize edge's column and the list takes the rest.
     fn list_columns(&self, list_height: u16) -> ((u16, u16), Option<u16>) {
         let width = self.allocated_width();
         let overflows = self.list.borrow().total_height() > u64::from(list_height);
-        if !overflows || width < 6 {
+        if !overflows || width < 4 {
             return ((0, width), None);
         }
         match self.settings.placement {
-            Placement::Left => ((0, width - 2), Some(width - 2)),
-            Placement::Right => ((2, width - 2), Some(1)),
+            Placement::Left => ((0, width - 1), Some(width - 1)),
+            Placement::Right => ((1, width - 1), Some(0)),
         }
+    }
+
+    /// The scrollbar's track height and layout, while the rows overflow.
+    fn scrollbar_geometry(&self) -> Option<(u16, bmux_tui_components::scrollbar::ScrollbarLayout)> {
+        let keys = self.item_keys();
+        let height = self.list_height(&keys);
+        self.list_columns(height).1?;
+        let state = self.list.borrow().scrollbar_state(u64::from(height));
+        let layout = bmux_tui_components::scrollbar::Scrollbar::new()
+            .layout(bmux_tui::geometry::Rect::new(0, 0, 1, height), &state);
+        Some((height, layout))
+    }
+
+    /// Scroll so the thumb starts at track row `top`, by the list's own
+    /// scrollbar action.
+    fn scroll_thumb_to(&self, layout: bmux_tui_components::scrollbar::ScrollbarLayout, top: i32) {
+        let travel = i32::from(layout.track_len.saturating_sub(layout.thumb_len));
+        if travel == 0 {
+            return;
+        }
+        let fraction = f64::from(top.clamp(0, travel)) / f64::from(travel);
+        self.list.borrow_mut().apply_action(
+            &bmux_tui_components::virtual_list::VirtualListAction::ScrollbarDrag(fraction),
+        );
+    }
+
+    /// The pointer's row on the scrollbar's track, which starts below the
+    /// heading.
+    fn track_row(&self, event: &AttachInputEvent) -> Option<i32> {
+        let top = i32::from(self.allocation.map_or(0, |rect| rect.y)) + 1;
+        event
+            .screen_row
+            .map(|row| i32::from(row) - top)
+            .or_else(|| event.row.map(|row| i32::from(row) - 1))
     }
 
     /// Rows the list may use below the heading: the allocation's, or the
@@ -1163,6 +1212,7 @@ impl SidebarPresentation {
         let (initial_selection, mut selection_rx) = subscribe_selection(&resources.events);
         let mut facts_rx = facts.subscribe()?;
         let (initial_status, mut status_rx) = subscribe_tab_status(&resources.events)?;
+        let (initial_appearance, mut appearance_rx) = subscribe_appearance(&resources.events);
         let presentation = Self::install_with_state(
             settings,
             resources.layouts.clone(),
@@ -1181,6 +1231,9 @@ impl SidebarPresentation {
                 .ok_or_else(|| "sidebar companion is closed".to_string())?;
             companion.facts = Some(facts);
             companion.activity.replace(initial_status.as_ref().clone());
+            if let Some(appearance) = &initial_appearance {
+                companion.edge_colors = EdgeColors::from_appearance(appearance);
+            }
             companion.selected_context_id = initial_selection;
             companion.replace_tabs(initial.as_ref().clone());
             publish_companion(companion)?;
@@ -1193,6 +1246,7 @@ impl SidebarPresentation {
                     let mut status = None;
                     let mut ticked = false;
                     let mut selection = None;
+                    let mut appearance = None;
                     let tabs = tokio::select! {
                         result = tabs_rx.changed() => {
                             if result.is_err() { break; }
@@ -1212,6 +1266,10 @@ impl SidebarPresentation {
                             status = Some(status_rx.borrow_and_update().as_ref().clone());
                             None
                         }
+                        changed = next_appearance(&mut appearance_rx) => {
+                            appearance = Some(changed);
+                            None
+                        }
                         _ = tick.tick() => {
                             ticked = true;
                             None
@@ -1226,26 +1284,15 @@ impl SidebarPresentation {
                     let Some(companion) = guard.as_mut() else {
                         break;
                     };
-                    if let Some(active) = companion.snapshot.tabs.iter().find(|tab| tab.active) {
-                        companion.activity.mark_viewed(active.id);
-                    }
-                    if ticked && !companion.activity.time_sensitive() {
+                    if !companion.apply_changes(Changes {
+                        tabs,
+                        selection: selection.map(SelectionChange),
+                        status,
+                        appearance,
+                        ticked,
+                    }) {
                         continue;
                     }
-                    let status_changed = status.is_some();
-                    if let Some(status) = status {
-                        companion.activity.replace(status);
-                    }
-                    if let Some(tabs) = tabs {
-                        companion.replace_tabs(tabs);
-                    } else if let Some(context_id) = selection {
-                        companion.select(context_id);
-                    } else {
-                        // Only a fact change brings the active tab back into
-                        // view; status updates and ticks keep the scroll.
-                        companion.remeasure(!ticked && !status_changed);
-                    }
-                    companion.presentation_pending.set(true);
                     if let Err(error) = publish_companion(companion) {
                         tracing::warn!(%error, "sidebar publication failed");
                     }
@@ -1591,6 +1638,8 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     // A companion publishes only into the registry of the runtime that
     // installed it; an uninstalled one has nowhere to publish.
     let Some(registry) = companion.surfaces.as_deref() else {
+        // Nowhere to publish: nothing is waiting to be published either.
+        companion.presentation_pending.set(false);
         return Ok(());
     };
     // A hidden sidebar keeps its identity and state but draws nothing.
@@ -1882,7 +1931,7 @@ fn sidebar_regions(
         };
         let cursor = match item {
             SidebarHit::ResizeEdge => bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal,
-            SidebarHit::Scrollbar => bmux_plugin::surface::PluginSurfaceCursor::Default,
+            SidebarHit::Scrollbar => bmux_plugin::surface::PluginSurfaceCursor::ResizeVertical,
             SidebarHit::Tab(_) | SidebarHit::Group(_) => {
                 bmux_plugin::surface::PluginSurfaceCursor::Pointer
             }
@@ -1964,7 +2013,7 @@ fn build_surface_with_hits(
         x: edge.x,
         height: edge.h.min(height),
         highlighted: state.engaged.edge_hovered || state.resize.is_some(),
-        style: tui_style(palette.accent.background_of(palette.base)),
+        style: tui_style(state.edge_colors.hover.background_of(palette.base)),
     });
     let component = view::SidebarView {
         size: (width, height),
@@ -2028,6 +2077,56 @@ fn build_surface_with_hits(
     (surface, hits)
 }
 
+/// This client's selection changed, to this tab (or none).
+struct SelectionChange(Option<Uuid>);
+
+/// What changed since the sidebar last looked: a new tab list, this
+/// client's selection, tab status or appearance, or only time passing.
+struct Changes {
+    tabs: Option<tabs_list::TabListSnapshot>,
+    selection: Option<SelectionChange>,
+    status: Option<tabs_status::TabStatusSnapshot>,
+    appearance: Option<bmux_appearance::RuntimeAppearance>,
+    ticked: bool,
+}
+
+impl CompanionState {
+    /// Take `changes`; returns whether the sidebar must be republished.
+    fn apply_changes(&mut self, changes: Changes) -> bool {
+        let Changes {
+            tabs,
+            selection,
+            status,
+            appearance,
+            ticked,
+        } = changes;
+        if let Some(active) = self.snapshot.tabs.iter().find(|tab| tab.active) {
+            self.activity.mark_viewed(active.id);
+        }
+        if let Some(appearance) = &appearance {
+            self.edge_colors = EdgeColors::from_appearance(appearance);
+        }
+        if ticked && !self.activity.time_sensitive() {
+            return false;
+        }
+        let status_changed = status.is_some();
+        if let Some(status) = status {
+            self.activity.replace(status);
+        }
+        if let Some(tabs) = tabs {
+            self.replace_tabs(tabs);
+        } else if let Some(SelectionChange(context_id)) = selection {
+            self.select(context_id);
+        } else {
+            // Only a fact change brings the active tab back into
+            // view; status updates and ticks keep the scroll.
+            self.remeasure(!ticked && !status_changed);
+        }
+        self.presentation_pending.set(true);
+        true
+    }
+}
+
 /// Follow the tabs plugin's forwarded `tabs-status` state on this runtime's
 /// bus, registering its decoder when nothing has yet.
 type SelectionReceiver = tokio::sync::watch::Receiver<
@@ -2047,6 +2146,53 @@ fn subscribe_selection(
         .map_or((None, None), |(selection, rx)| {
             (selection.context_id, Some(rx))
         })
+}
+
+type AppearanceReceiver =
+    tokio::sync::watch::Receiver<std::sync::Arc<bmux_appearance::RuntimeAppearance>>;
+
+/// The runtime's appearance and its changes, on buses that carry it.
+fn subscribe_appearance(
+    events: &std::sync::Arc<bmux_plugin::EventBus>,
+) -> (
+    Option<bmux_appearance::RuntimeAppearance>,
+    Option<AppearanceReceiver>,
+) {
+    let kind = bmux_appearance::RUNTIME_APPEARANCE_STATE_KIND;
+    // Installed before the runtime first publishes it: register the channel,
+    // so that publication still arrives.
+    if events
+        .subscribe_state::<bmux_appearance::RuntimeAppearance>(&kind)
+        .is_err()
+    {
+        events.register_state_channel_with_decoder(
+            kind.clone(),
+            bmux_appearance::RuntimeAppearance::default(),
+        );
+    }
+    events
+        .subscribe_state::<bmux_appearance::RuntimeAppearance>(&kind)
+        .ok()
+        .map_or((None, None), |(appearance, rx)| {
+            (Some(appearance.as_ref().clone()), Some(rx))
+        })
+}
+
+/// The next appearance. A bus without the channel, or one whose channel
+/// closed, never yields.
+async fn next_appearance(
+    slot: &mut Option<AppearanceReceiver>,
+) -> bmux_appearance::RuntimeAppearance {
+    loop {
+        let Some(rx) = slot.as_mut() else {
+            return std::future::pending().await;
+        };
+        if rx.changed().await.is_err() {
+            *slot = None;
+            continue;
+        }
+        return rx.borrow_and_update().as_ref().clone();
+    }
 }
 
 fn subscribe_tab_status(
@@ -2093,124 +2239,87 @@ fn hit(companion: &CompanionState, event: &AttachInputEvent) -> Option<SidebarHi
     )
 }
 
-/// The list's scrollbar at column `x`: muted, its thumb lit while dragged.
+/// The list's scrollbar at column `x`, colored as the appearance colors
+/// scrollbars: a subtle track and an accent thumb, both lit while the
+/// column is hovered or the thumb dragged.
 fn scrollbar_view(
     state: &CompanionState,
     x: u16,
     list_height: u16,
-    palette: &SidebarPalette,
+    _palette: &SidebarPalette,
 ) -> view::ScrollbarView {
     use bmux_plugin::render_paint::tui_style;
+    let colors = state.edge_colors;
+    let lit = state.engaged.edge_hovered || state.resize.is_some();
     view::ScrollbarView {
         x,
         state: state.list.borrow().scrollbar_state(u64::from(list_height)),
         styles: bmux_tui_components::scrollbar::ScrollbarStyles {
-            begin: tui_style(palette.muted),
-            track: tui_style(palette.muted),
-            thumb: tui_style(if state.engaged.scrollbar_drag {
-                palette.accent
-            } else {
-                palette.title
-            }),
-            end: tui_style(palette.muted),
+            begin: tui_style(if lit { colors.hover } else { colors.track }),
+            track: tui_style(if lit { colors.hover } else { colors.track }),
+            thumb: tui_style(
+                if state
+                    .resize
+                    .is_some_and(|drag| drag.mode == ColumnGesture::Scroll)
+                {
+                    colors.hover
+                } else {
+                    colors.thumb
+                },
+            ),
+            end: tui_style(if lit { colors.hover } else { colors.track }),
         },
     }
 }
 
-/// Drag the scrollbar: a left press on it jumps there and captures the
-/// pointer, dragging follows the pointer, and releasing lets go. The
-/// scrollbar's own geometry decides the position, as the list's.
-fn update_scrollbar(
-    owner: &CompanionHandle,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-    use bmux_tui_components::scrollbar::ScrollbarOutcome;
-    use bmux_tui_components::virtual_list::VirtualListAction;
-    if event.event_kind != "pointer" {
-        return None;
-    }
-    let mut guard = owner.lock().ok()?;
-    let companion = guard.as_mut()?;
-    match (event.phase.as_str(), companion.engaged.scrollbar_drag) {
-        ("down", false)
-            if event.button.as_deref() == Some("left")
-                && hit(companion, event) == Some(SidebarHit::Scrollbar) => {}
-        ("drag", true) => {}
-        ("up", true) => {
-            companion.engaged.scrollbar_drag = false;
-            companion.revision = companion.revision.saturating_add(1).max(1);
-            let dirty = publish_companion(companion).is_ok();
-            return Some(AttachInputResult {
-                consumed: true,
-                preserve_focus: true,
-                release_capture: true,
-                dirty,
-                ..AttachInputResult::default()
-            });
-        }
-        // The drag owns the pointer until it is released.
-        (_, true) => {
-            return Some(AttachInputResult {
-                consumed: true,
-                preserve_focus: true,
-                ..AttachInputResult::default()
-            });
-        }
-        _ => return None,
-    }
-    let keys = companion.item_keys();
-    let list_height = companion.list_height(&keys);
-    // The pointer's row on the track, which starts below the heading.
-    let top = companion
-        .allocation
-        .map_or(0, |rect| rect.y)
-        .saturating_add(1);
-    let row = event
-        .screen_row
-        .map(|row| row.saturating_sub(top))
-        .or_else(|| event.row.map(|row| row.saturating_sub(1)))?;
-    let track = bmux_tui::geometry::Rect::new(0, 0, 1, list_height);
-    let mut scrollbar_state = companion
-        .list
-        .borrow()
-        .scrollbar_state(u64::from(list_height));
-    // Every step is positioned as a press there: the scrollbar's own
-    // mapping from track position to offset, for the press and the drag.
-    let outcome = bmux_tui_components::scrollbar::Scrollbar::new().handle_event(
-        track,
-        &mut scrollbar_state,
-        &Event::Mouse(MouseEvent::new(
-            MouseEventKind::Down(MouseButton::Left),
-            bmux_tui::geometry::Point::new(0, row),
-        )),
-    );
-    companion.engaged.scrollbar_drag = true;
-    if let ScrollbarOutcome::Changed { offset } = outcome {
-        let maximum = scrollbar_state.max_offset().max(1);
-        companion
-            .list
-            .borrow_mut()
-            .apply_action(&VirtualListAction::ScrollbarDrag(
-                f64::from(offset) / f64::from(maximum),
-            ));
-    }
-    companion.revision = companion.revision.saturating_add(1).max(1);
-    let dirty = publish_companion(companion).is_ok();
-    drop(guard);
-    Some(AttachInputResult {
-        consumed: true,
-        preserve_focus: true,
-        capture_pointer: true,
-        preserve_capture_across_revisions: true,
-        dirty,
-        ..AttachInputResult::default()
-    })
+/// The colors of the column facing the panes: the scrollbar's track and
+/// thumb, and the column lit under the pointer. They follow the runtime's
+/// appearance as Bcode's lists do: the inactive border for the track, the
+/// cursor (accent) for the thumb, and the active border when lit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeColors {
+    track: RenderStyle,
+    thumb: RenderStyle,
+    hover: RenderStyle,
 }
 
-/// Drag the resize edge: a left press on it captures the pointer, dragging
-/// moves it (the sidebar's width follows the pointer, within its minimum and
-/// maximum), and releasing remembers the width.
+impl Default for EdgeColors {
+    fn default() -> Self {
+        Self {
+            track: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlack),
+            thumb: RenderStyle::new().named_foreground(RenderNamedColor::Blue),
+            hover: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlue),
+        }
+    }
+}
+
+impl EdgeColors {
+    /// The colors `appearance` gives them; a color it does not give keeps
+    /// its default.
+    fn from_appearance(appearance: &bmux_appearance::RuntimeAppearance) -> Self {
+        let fallback = Self::default();
+        let color = |value: &str, fallback: RenderStyle| {
+            value.parse::<bmux_color::Rgb>().map_or(fallback, |rgb| {
+                RenderStyle::new().foreground(RenderColor::Rgb {
+                    r: rgb.r,
+                    g: rgb.g,
+                    b: rgb.b,
+                })
+            })
+        };
+        Self {
+            track: color(&appearance.border.inactive, fallback.track),
+            thumb: color(&appearance.cursor, fallback.thumb),
+            hover: color(&appearance.border.active, fallback.hover),
+        }
+    }
+}
+
+/// Press, drag and release on the column facing the panes (the resize edge,
+/// carrying the scrollbar's thumb while the rows overflow). The first
+/// movement decides: sideways resizes (within the minimum and maximum, and
+/// remembered on release); up or down from the thumb scrolls, from where it
+/// was grabbed; released without moving on the track, the list jumps there.
 fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
     if event.event_kind != "pointer" {
         return None;
@@ -2223,14 +2332,25 @@ fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<At
         let x = companion.allocation.map_or(0, |rect| rect.x);
         event.col.map(|col| x.saturating_add(col))
     })?;
+    let row = companion.track_row(event).unwrap_or(0);
     let result = match (event.phase.as_str(), companion.resize) {
         ("down", None)
             if event.button.as_deref() == Some("left")
-                && hit(companion, event) == Some(SidebarHit::ResizeEdge) =>
+                && matches!(
+                    hit(companion, event),
+                    Some(SidebarHit::ResizeEdge | SidebarHit::Scrollbar)
+                ) =>
         {
+            let grab = (hit(companion, event) == Some(SidebarHit::Scrollbar))
+                .then(|| companion.scrollbar_geometry())
+                .flatten()
+                .map(|(_, layout)| row - i32::from(layout.thumb_start));
             companion.resize = Some(ResizeDrag {
                 start_col: screen_col,
                 start_width: companion.width,
+                start_row: row,
+                grab,
+                mode: ColumnGesture::Undecided,
             });
             AttachInputResult {
                 consumed: true,
@@ -2242,29 +2362,33 @@ fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<At
                 ..AttachInputResult::default()
             }
         }
-        ("drag", Some(drag)) => {
-            let moved = i32::from(screen_col) - i32::from(drag.start_col);
-            let width = match companion.settings.placement {
-                Placement::Left => i32::from(drag.start_width) + moved,
-                Placement::Right => i32::from(drag.start_width) - moved,
-            };
-            let width = u16::try_from(width.max(0)).unwrap_or(u16::MAX);
-            let changed = companion.set_width(width);
-            AttachInputResult {
-                consumed: true,
-                preserve_focus: true,
-                dirty: changed && republish_width(companion, true),
-                ..AttachInputResult::default()
-            }
-        }
-        ("up", Some(_)) => {
+        ("drag", Some(drag)) => AttachInputResult {
+            consumed: true,
+            preserve_focus: true,
+            dirty: drag_column(companion, drag, screen_col, row),
+            ..AttachInputResult::default()
+        },
+        ("up", Some(drag)) => {
             companion.resize = None;
+            let status_message = match drag.mode {
+                ColumnGesture::Resize => companion.remember_width().err(),
+                ColumnGesture::Undecided if drag.grab.is_none() => {
+                    // A click on the track jumps there.
+                    if let Some((_, layout)) = companion.scrollbar_geometry()
+                        && (0..i32::from(layout.track_len)).contains(&row)
+                    {
+                        companion.scroll_thumb_to(layout, row - i32::from(layout.thumb_len) / 2);
+                    }
+                    None
+                }
+                ColumnGesture::Undecided | ColumnGesture::Scroll => None,
+            };
             AttachInputResult {
                 consumed: true,
                 preserve_focus: true,
                 release_capture: true,
                 dirty: republish_width(companion, false),
-                status_message: companion.remember_width().err(),
+                status_message,
                 ..AttachInputResult::default()
             }
         }
@@ -2278,6 +2402,43 @@ fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<At
     };
     drop(guard);
     Some(result)
+}
+
+/// One step of a drag on the column facing the panes: decide what it is by
+/// its first movement, then resize or scroll. Returns whether anything
+/// changed.
+fn drag_column(
+    companion: &mut CompanionState,
+    mut drag: ResizeDrag,
+    screen_col: u16,
+    row: i32,
+) -> bool {
+    let sideways = i32::from(screen_col) - i32::from(drag.start_col);
+    if drag.mode == ColumnGesture::Undecided {
+        if sideways != 0 {
+            drag.mode = ColumnGesture::Resize;
+        } else if row != drag.start_row && drag.grab.is_some() {
+            drag.mode = ColumnGesture::Scroll;
+        }
+    }
+    companion.resize = Some(drag);
+    match drag.mode {
+        ColumnGesture::Resize => {
+            let width = match companion.settings.placement {
+                Placement::Left => i32::from(drag.start_width) + sideways,
+                Placement::Right => i32::from(drag.start_width) - sideways,
+            };
+            let width = u16::try_from(width.max(0)).unwrap_or(u16::MAX);
+            companion.set_width(width) && republish_width(companion, true)
+        }
+        ColumnGesture::Scroll => {
+            if let (Some(grab), Some((_, layout))) = (drag.grab, companion.scrollbar_geometry()) {
+                companion.scroll_thumb_to(layout, row - grab);
+            }
+            republish_width(companion, false)
+        }
+        ColumnGesture::Undecided => false,
+    }
 }
 
 /// Republish after a width or resize-edge change; `layout` when the width
@@ -2313,8 +2474,12 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     };
     let previous = companion.cursor.clone();
     let previous_edge = companion.engaged.edge_hovered;
-    companion.engaged.edge_hovered = hovered == Some(SidebarHit::ResizeEdge);
-    let row = hovered.filter(|hit| *hit != SidebarHit::ResizeEdge);
+    // The column facing the panes lights up anywhere on it, thumb included.
+    companion.engaged.edge_hovered = matches!(
+        hovered,
+        Some(SidebarHit::ResizeEdge | SidebarHit::Scrollbar)
+    );
+    let row = hovered.filter(|hit| matches!(hit, SidebarHit::Tab(_) | SidebarHit::Group(_)));
     if !companion.cursor.set_hovered(row) && previous_edge == companion.engaged.edge_hovered {
         return false;
     }
@@ -2515,9 +2680,6 @@ fn handle_local_input(
         });
     }
     if let Some(result) = update_resize(owner, event) {
-        return Some(result);
-    }
-    if let Some(result) = update_scrollbar(owner, event) {
         return Some(result);
     }
     if let Some(result) = activate_tab(owner, event) {
@@ -3915,55 +4077,132 @@ mod tests {
         assert_eq!(hover(view::SCROLLBAR), Some(false));
     }
 
-    /// Rows that overflow show a scrollbar inside the edge, and dragging it
-    /// scrolls the list; rows that fit show none.
+    /// Rows that overflow put a scrollbar in the resize edge's own column:
+    /// one column faces the panes. Grabbing the thumb scrolls from where it
+    /// was grabbed, a click on the track jumps there, and pressing the track
+    /// and moving sideways resizes; rows that fit show only the edge.
     #[test]
-    fn overflowing_rows_get_a_draggable_scrollbar() {
+    fn the_edge_column_carries_the_scrollbar_and_its_gestures() {
         let state = working_cards();
         let surface = build_surface(&state, 1);
-        let scrollbar = surface
-            .interactive_regions
-            .iter()
-            .find(|region| region.local_id == view::SCROLLBAR)
-            .map(|region| region.rect)
-            .expect("a scrollbar while the rows overflow");
-        assert_eq!(scrollbar, ExtensionRect::new(30, 1, 1, 6));
-        assert!(
-            painted_row(&surface, 1)
+        let region = |surface: &PluginSurface, id: &str| {
+            surface
+                .interactive_regions
                 .iter()
-                .any(|(x, text, _)| *x == 30 && text == "█")
+                .find(|region| region.local_id == id)
+                .map(|region| region.rect)
+        };
+        let thumb = region(&surface, view::SCROLLBAR).expect("a thumb while the rows overflow");
+        let edge = region(&surface, RESIZE_EDGE_REGION).unwrap();
+        assert_eq!((thumb.x, edge.x), (31, 31), "one column for both");
+        assert_eq!(
+            tab_regions(&surface)[0].rect.w,
+            31,
+            "the list gives up only that column"
         );
+        assert!(
+            painted_row(&surface, thumb.y)
+                .iter()
+                .any(|(x, text, _)| *x == 31 && text == "█")
+        );
+
         let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
-        let drag = |phase: &str, row: u16| AttachInputEvent {
+        let pointer = |region: &str, phase: &str, col: u16, row: u16| AttachInputEvent {
+            screen_col: Some(col),
             screen_row: Some(row),
             ..AttachInputEvent {
                 phase: phase.to_string(),
-                ..press(view::SCROLLBAR)
+                ..press(region)
             }
         };
         let offset =
             |owner: &CompanionHandle| owner.lock().unwrap().as_ref().unwrap().scroll_offset();
-        let pressed = super::handle_local_input(&owner, &drag("down", 6)).unwrap();
-        assert!(pressed.capture_pointer && pressed.preserve_focus);
+        let width = |owner: &CompanionHandle| owner.lock().unwrap().as_ref().unwrap().width;
+        // Grab the thumb at its top and drag it to the bottom of the track.
+        let grabbed =
+            super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "down", 31, thumb.y))
+                .unwrap();
+        assert!(grabbed.capture_pointer && grabbed.preserve_focus);
+        super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "drag", 31, 6)).unwrap();
         let bottom = offset(&owner);
-        assert!(bottom > 0, "pressing the bottom of the track scrolls down");
-        super::handle_local_input(&owner, &drag("drag", 1)).unwrap();
-        assert_eq!(offset(&owner), 0, "dragging to the top scrolls to the top");
-        let released = super::handle_local_input(&owner, &drag("up", 1)).unwrap();
-        assert!(released.release_capture);
-        // After release, a drag is not the scrollbar's.
+        assert!(bottom > 0, "dragging the thumb down scrolls down");
+        super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "up", 31, 6)).unwrap();
+        // A click on the track near the top jumps there, and resizes nothing.
+        let before = width(&owner);
+        super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "down", 31, 1)).unwrap();
+        let clicked =
+            super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "up", 31, 1)).unwrap();
+        assert!(clicked.release_capture);
         assert!(
-            super::handle_local_input(&owner, &drag("drag", 6))
-                .is_none_or(|result| !result.consumed)
+            offset(&owner) < bottom,
+            "a click on the track jumps toward it"
         );
+        assert_eq!(width(&owner), before);
+        // Pressing the track and moving sideways resizes, and scrolls nothing.
+        let scrolled = offset(&owner);
+        super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "down", 31, 6)).unwrap();
+        super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "drag", 35, 6)).unwrap();
+        super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "up", 35, 6)).unwrap();
+        assert_eq!(width(&owner), before + 4);
+        assert_eq!(offset(&owner), scrolled);
 
-        // Rows that fit: no scrollbar.
-        let fitting = grouped_state(grouped(), None);
-        assert!(
-            !build_surface(&fitting, 1)
-                .interactive_regions
+        // Sideways from the thumb resizes too: the first movement decides.
+        let thumb = {
+            let guard = owner.lock().unwrap();
+            let surface = build_surface(guard.as_ref().unwrap(), 2);
+            drop(guard);
+            region(&surface, view::SCROLLBAR).unwrap()
+        };
+        let scrolled = offset(&owner);
+        let wider = width(&owner);
+        super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "down", 35, thumb.y)).unwrap();
+        super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "drag", 37, thumb.y)).unwrap();
+        super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "up", 37, thumb.y)).unwrap();
+        assert_eq!(width(&owner), wider + 2);
+        assert_eq!(offset(&owner), scrolled);
+
+        // Rows that fit: the edge alone, no thumb.
+        let fitting = build_surface(&grouped_state(grouped(), None), 1);
+        assert!(region(&fitting, view::SCROLLBAR).is_none());
+        assert!(region(&fitting, RESIZE_EDGE_REGION).is_some());
+    }
+
+    /// The scrollbar takes its colors from the appearance as Bcode's lists
+    /// do: the inactive border for its track, the cursor for its thumb.
+    #[test]
+    fn the_scrollbar_follows_the_appearance() {
+        let mut state = working_cards();
+        let mut appearance = bmux_appearance::RuntimeAppearance::default();
+        appearance.border.inactive = "#334455".into();
+        appearance.cursor = "#ff8800".into();
+        appearance.border.active = "#00ffaa".into();
+        state.edge_colors = EdgeColors::from_appearance(&appearance);
+        let surface = build_surface(&state, 1);
+        let column = (1..7)
+            .flat_map(|row| painted_row(&surface, row))
+            .filter(|(x, ..)| *x == 31)
+            .collect::<Vec<_>>();
+        let color = |glyph: &str| {
+            column
                 .iter()
-                .any(|region| region.local_id == view::SCROLLBAR)
+                .find(|(_, text, _)| text == glyph)
+                .and_then(|(_, _, style)| style.fg)
+        };
+        assert_eq!(
+            color("█"),
+            Some(RenderColor::Rgb {
+                r: 0xff,
+                g: 0x88,
+                b: 0
+            })
+        );
+        assert_eq!(
+            color("│"),
+            Some(RenderColor::Rgb {
+                r: 0x33,
+                g: 0x44,
+                b: 0x55
+            })
         );
     }
 
@@ -4826,14 +5065,14 @@ mod tests {
         assert_eq!(state.list.borrow().total_height(), 6);
         let surface = build_surface(&state, 1);
         assert_eq!(tab_regions(&surface).len(), 2);
-        // The rows overflow, so the scrollbar and the edge take two columns.
+        // The rows overflow, so the edge's column carries the scrollbar.
         assert_eq!(
             tab_regions(&surface)[0].rect,
-            ExtensionRect::new(0, 1, state.settings.width - 2, 1)
+            ExtensionRect::new(0, 1, state.settings.width - 1, 1)
         );
         assert_eq!(
             tab_regions(&surface)[1].rect,
-            ExtensionRect::new(0, 2, state.settings.width - 2, 1)
+            ExtensionRect::new(0, 2, state.settings.width - 1, 1)
         );
         assert!(
             surface

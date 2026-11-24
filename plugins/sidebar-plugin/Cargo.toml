@@ -10,7 +10,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_appearance           = { workspace = true }
 bmux_cell_geometry        = { workspace = true }
+bmux_color                = { workspace = true }
 bmux_plugin               = { workspace = true, features = ["tui"] }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }

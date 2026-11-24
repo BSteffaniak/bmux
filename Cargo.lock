@@ -6371,7 +6371,9 @@ dependencies = [
 name = "bmux_sidebar_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_appearance",
  "bmux_cell_geometry",
+ "bmux_color",
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",

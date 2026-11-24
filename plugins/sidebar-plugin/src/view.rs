@@ -28,7 +28,7 @@ use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
 pub const LIST_ID: &str = "sidebar.rows";
 /// The id of the resize edge's hit region.
 pub const RESIZE_EDGE: &str = "resize-edge";
-/// The scrollbar's hit region.
+/// The scrollbar thumb's hit region.
 pub const SCROLLBAR: &str = "scrollbar";
 
 /// Columns a row's content starts after: the active bar and a space.
@@ -350,15 +350,15 @@ pub struct SidebarView<'a, K> {
     pub state: &'a RefCell<VirtualListState<K>>,
     /// The rows the list may use, below the heading.
     pub list_height: u16,
-    /// The columns the list occupies: all of them, or all but the
-    /// scrollbar's and the edge's while it overflows.
+    /// The columns the list occupies: all of them, or all but the edge's
+    /// while the rows overflow and it carries the scrollbar.
     pub list_columns: (u16, u16),
     pub scrollbar: Option<ScrollbarView>,
     pub edge: Option<Edge>,
 }
 
-/// The list's scrollbar, shown while the rows overflow: its column, its
-/// state, and how it looks.
+/// The list's scrollbar, shown in the edge's column while the rows
+/// overflow: its column, its state, and how it looks.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarView {
     pub x: u16,
@@ -418,25 +418,45 @@ where
                 );
             },
         );
-        if let Some(scrollbar) = self.scrollbar {
-            let track = Rect::new(scrollbar.x, 1, 1, self.list_height);
-            scrollbar.scrollbar().paint(track, &scrollbar.state, cx);
-            cx.push_hit(
-                HitRegion::new(SCROLLBAR, track)
-                    .role(HitRole::Scroll)
-                    .pointer_intent(PointerIntent::Auto),
-            );
-        }
+        // One column faces the panes: the resize edge, carrying the
+        // scrollbar over the rows while they overflow.
+        let track = self
+            .scrollbar
+            .map(|scrollbar| Rect::new(scrollbar.x, 1, 1, self.list_height));
         if let Some(edge) = self.edge {
             if edge.highlighted {
                 for row in 0..edge.height {
-                    cx.set_cell(i32::from(edge.x), i64::from(row), "│", edge.style);
+                    let on_track =
+                        track.is_some_and(|track| row >= track.y && row < track.y + track.height);
+                    if !on_track {
+                        cx.set_cell(i32::from(edge.x), i64::from(row), "│", edge.style);
+                    }
                 }
             }
             cx.push_hit(
                 HitRegion::new(RESIZE_EDGE, Rect::new(edge.x, 0, 1, edge.height))
                     .role(HitRole::ResizeHandle)
                     .pointer_intent(PointerIntent::Auto),
+            );
+        }
+        if let (Some(scrollbar), Some(track)) = (self.scrollbar, track) {
+            let bar = scrollbar.scrollbar();
+            bar.paint(track, &scrollbar.state, cx);
+            // The thumb sits over the edge: grabbing it scrolls; the rest of
+            // the column resizes.
+            let layout = bar.layout(track, &scrollbar.state);
+            cx.push_hit(
+                HitRegion::new(
+                    SCROLLBAR,
+                    Rect::new(
+                        track.x,
+                        track.y.saturating_add(layout.thumb_start),
+                        1,
+                        layout.thumb_len.max(1),
+                    ),
+                )
+                .role(HitRole::Scroll)
+                .pointer_intent(PointerIntent::Auto),
             );
         }
     }
