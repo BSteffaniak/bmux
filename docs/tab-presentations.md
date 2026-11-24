@@ -72,13 +72,13 @@ Both plugins take the same two settings:
 ```toml
 [plugins.settings."bmux.sidebar"]   # or "bmux.tab_bar"
 visible = true                     # shown on attach (sidebar default: false)
-remember_visibility = false        # start from the last state set on this machine
+remember_visibility = true         # start from the last state set on this machine
 ```
 
-With `remember_visibility = true`, every toggle is saved under the bmux state
-directory (`plugins/<plugin id>/visibility`), and the next attach on that
-machine starts from it instead of `visible`. Clients on other machines keep
-their own.
+Every toggle is saved under the bmux state directory
+(`plugins/<plugin id>/visibility`), and the next attach on that machine starts
+from it instead of `visible`; `remember_visibility = false` turns that off.
+Clients on other machines keep their own.
 
 ## Full tab/status bar
 
@@ -190,7 +190,7 @@ content_height = false
 collapse_below_width = 80
 collapsed_width = 8
 visible = false
-remember_visibility = false
+remember_visibility = true
 ```
 
 Each tab is a card: a state glyph, the tab's name and, at the right, its

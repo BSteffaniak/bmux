@@ -84,8 +84,9 @@ and `show_compact_facts`. Canonical settings take precedence.
 
 Show or hide the bar in one attach client with `plugin:bmux.tab_bar:toggle`
 (`ctrl+alt+b` by default), `plugin:bmux.tab_bar:show` or
-`plugin:bmux.tab_bar:hide`. Set `visible = false` to start hidden and
-`remember_visibility = true` to start from the last state set on this machine.
+`plugin:bmux.tab_bar:hide`. What you last showed or hid comes back on this
+machine; set `remember_visibility = false` to start from `visible` every time
+(`visible = false` starts hidden).
 Toasts stay visible while the bar is hidden.
 
 Disable the bar with `plugins.disabled = ["bmux.tab_bar"]`. Essential attach

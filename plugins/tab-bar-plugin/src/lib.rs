@@ -2775,7 +2775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_install_remembers_visibility_when_configured() {
+    async fn runtime_install_remembers_visibility_unless_turned_off() {
         let directory =
             std::env::temp_dir().join(format!("bmux-tab-bar-visibility-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -2796,8 +2796,15 @@ mod tests {
         let _restored = TabBarPresentation::install(Some(&remember), &restored).unwrap();
         assert!(!bar_layout_shown(&restored));
 
+        // Remembering is the default.
+        let by_default = resources();
+        let _by_default = TabBarPresentation::install(None, &by_default).unwrap();
+        assert!(!bar_layout_shown(&by_default));
+
+        // Turned off, the configured default applies.
+        let forgetful = toml::Value::Table(toml::toml! { remember_visibility = false });
         let configured = resources();
-        let _configured = TabBarPresentation::install(None, &configured).unwrap();
+        let _configured = TabBarPresentation::install(Some(&forgetful), &configured).unwrap();
         assert!(bar_layout_shown(&configured));
 
         let starts_hidden = toml::Value::Table(toml::toml! { visible = false });

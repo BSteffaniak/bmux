@@ -53,7 +53,8 @@ pub struct VisibilitySettings {
     /// Whether the presentation starts shown when nothing remembered says
     /// otherwise.
     pub visible: bool,
-    /// Start from the last state remembered on this machine.
+    /// Start from the last state remembered on this machine (on unless
+    /// turned off): what you last showed or hid comes back.
     pub remember: bool,
 }
 
@@ -61,7 +62,7 @@ impl Default for VisibilitySettings {
     fn default() -> Self {
         Self {
             visible: true,
-            remember: false,
+            remember: true,
         }
     }
 }

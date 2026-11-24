@@ -75,7 +75,7 @@ content_height = false
 collapse_below_width = 80
 collapsed_width = 8
 visible = false            # closed when a client attaches
-remember_visibility = false # start from the last state set on this machine
+remember_visibility = true  # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
 remember_groups = true      # start with the groups last collapsed collapsed
 ```

@@ -2986,10 +2986,19 @@ mod tests {
         assert!(!sidebar_split_visible(&restored));
         assert_eq!(sidebar_surface_count(&restored), 0);
 
-        // Without remembering, the configured default applies.
+        // Remembering is the default.
+        let by_default =
+            runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
+        let _by_default =
+            SidebarPresentation::install_for_runtime(Some(&shown_toml()), &by_default).unwrap();
+        assert!(!sidebar_split_visible(&by_default));
+
+        // Turned off, the configured default applies.
+        let forget = toml::Value::Table(toml::toml! { visible = true
+        remember_visibility = false });
         let forgetful = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
         let _forgetful =
-            SidebarPresentation::install_for_runtime(Some(&shown_toml()), &forgetful).unwrap();
+            SidebarPresentation::install_for_runtime(Some(&forget), &forgetful).unwrap();
         assert!(sidebar_split_visible(&forgetful));
         let _ = std::fs::remove_dir_all(directory);
     }
