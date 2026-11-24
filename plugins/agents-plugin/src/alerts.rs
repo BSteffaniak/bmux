@@ -372,12 +372,13 @@ impl AgentAlerts {
                     continue;
                 }
                 let names = tab_names(&list.borrow_and_update());
-                let viewing = selection
+                let selected = selection
                     .as_ref()
                     .and_then(|receiver| receiver.borrow().context_id);
                 let Ok(mut alerts) = alerts.write() else {
                     return;
                 };
+                let viewing = viewed_tab(selected, alerts.terminal_focused());
                 for change in &found {
                     if let Some(alert) = alert_for(change, settings, viewing, &names) {
                         alerts.post(alert);
@@ -387,6 +388,13 @@ impl AgentAlerts {
         });
         Ok(Self { task })
     }
+}
+
+/// The tab the user is looking at: the one this client shows, while its
+/// terminal has focus. With another window or app in front, none is.
+#[must_use]
+pub const fn viewed_tab(selected: Option<Uuid>, terminal_focused: bool) -> Option<Uuid> {
+    if terminal_focused { selected } else { None }
 }
 
 /// Each tab's workspace and name.
@@ -587,6 +595,11 @@ mod tests {
         );
         // The tab shown here stays quiet unless `when = "always"`.
         assert_eq!(alert_for(&asking, defaults, Some(tab), &names), None);
+        // With another window in front, the tab shown here is not being
+        // looked at, so it alerts.
+        let viewing = viewed_tab(Some(tab), false);
+        assert!(alert_for(&asking, defaults, viewing, &names).is_some());
+        assert_eq!(viewed_tab(Some(tab), true), Some(tab));
         let parse = |source: &str| {
             NotifySettings::parse(Some(&toml::from_str::<toml::Value>(source).unwrap()))
         };

@@ -5503,6 +5503,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     );
     // What plugins post for this terminal, and which panes' bells reach it.
     let attach_alerts = bmux_plugin::attach_alerts(&attach_states);
+    view_state.attach_alerts = Some(attach_alerts.clone());
     let alert_wake = {
         let mut alerts = attach_alerts
             .write()
@@ -14173,6 +14174,19 @@ pub async fn handle_attach_terminal_event(
     view_state.driver_geometry = Some(geometry);
     let normalized_event = terminal_event.normalized;
     let raw_event = terminal_event.raw;
+    // Whether the user can see this client: alerts for what it shows are
+    // wanted only when they cannot.
+    if let Some(focused) = match &normalized_event {
+        Some(TerminalInputEvent::FocusGained) => Some(true),
+        Some(TerminalInputEvent::FocusLost) => Some(false),
+        _ => None,
+    } && let Some(alerts) = &view_state.attach_alerts
+    {
+        alerts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_terminal_focused(focused);
+    }
     match &normalized_event {
         Some(TerminalInputEvent::FocusGained) => {
             maybe_sync_remote_clipboard(client, view_state, ClipboardSyncTrigger::FocusGained, now)

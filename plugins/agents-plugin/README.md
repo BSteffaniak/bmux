@@ -108,7 +108,9 @@ Each attach client alerts its own terminal when an agent starts waiting for
 an answer or finishes its work: a bell, a desktop notification (OSC 777 or
 OSC 9, whichever the terminal takes), or both. By default an agent that needs
 input rings and notifies, one that finished notifies, and the tab you are
-looking at stays quiet, since its screen already shows what happened.
+looking at stays quiet, since its screen already shows what happened. You are
+looking at it only while the terminal has focus: with another window or app in
+front, that tab alerts too (the terminal must report focus, as most do).
 Finishing alerts only once the agent has stayed idle for a moment, so an agent
 stopping to ask for permission alerts only as needing input. States agents were
 already in when you attached do not alert.

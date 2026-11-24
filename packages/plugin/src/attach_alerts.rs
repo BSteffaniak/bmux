@@ -83,6 +83,9 @@ pub struct AttachAlerts {
     pending: Vec<AttachAlert>,
     wake: Arc<tokio::sync::Notify>,
     bell_policy: AttachBellPolicy,
+    /// The terminal reported losing focus (another window or app is in
+    /// front of it), and has not reported regaining it.
+    terminal_unfocused: bool,
 }
 
 impl AttachAlerts {
@@ -118,6 +121,18 @@ impl AttachAlerts {
     /// Set from the runtime's configuration.
     pub const fn set_bell_policy(&mut self, policy: AttachBellPolicy) {
         self.bell_policy = policy;
+    }
+
+    /// Whether the terminal has focus: what this client shows is in front
+    /// of the user. Assumed until the terminal reports otherwise.
+    #[must_use]
+    pub const fn terminal_focused(&self) -> bool {
+        !self.terminal_unfocused
+    }
+
+    /// Set from the terminal's focus reports.
+    pub const fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_unfocused = !focused;
     }
 }
 
@@ -165,6 +180,16 @@ mod tests {
         let mut context = std::task::Context::from_waker(waker);
         let mut future = std::pin::pin!(future);
         future.as_mut().poll(&mut context).is_ready()
+    }
+
+    #[test]
+    fn terminal_focus_is_assumed_until_reported_lost() {
+        let mut alerts = AttachAlerts::default();
+        assert!(alerts.terminal_focused());
+        alerts.set_terminal_focused(false);
+        assert!(!alerts.terminal_focused());
+        alerts.set_terminal_focused(true);
+        assert!(alerts.terminal_focused());
     }
 
     #[test]

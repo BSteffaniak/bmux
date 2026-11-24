@@ -279,6 +279,8 @@ pub struct AttachViewState {
     pub(super) observer: Option<super::observer::AttachObserverPublisher>,
     pub async_services: Option<bmux_plugin::AsyncServiceClient>,
     pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
+    /// What plugins post for this terminal, and whether it has focus.
+    pub attach_alerts: Option<std::sync::Arc<std::sync::RwLock<bmux_plugin::AttachAlerts>>>,
     /// One decoration generation per attach; layout revisions never use process state.
     pub(super) committed_source: Option<super::committed_source::CommittedSource>,
     pub observation_only: bool,
@@ -728,6 +730,7 @@ impl AttachViewState {
             decoration_lifetime: Uuid::new_v4(),
             decoration_layout_revision: 0,
             presentation_events: std::sync::Arc::new(bmux_plugin::EventBus::new()),
+            attach_alerts: None,
             presentation_extensions: std::sync::Arc::new(
                 bmux_plugin::RenderExtensionRegistry::new(),
             ),
