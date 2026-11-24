@@ -2829,18 +2829,21 @@ fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
         .collect()
 }
 
-/// The tabs some client shows now: looking at a tab marks what it signalled
-/// seen.
+/// The tabs a person is looking at now: each shown by a client whose
+/// terminal has focus. Looking at a tab marks what it signalled seen.
 fn looked_at_tabs(caller: &(impl ServiceCaller + Sync)) -> std::collections::HashSet<Uuid> {
     let mut client = dispatch_client(caller);
-    bmux_plugin::block_on_typed_dispatch(api_clients_state::client::list_clients(&mut client))
-        .map(|clients| {
-            clients
-                .into_iter()
-                .filter_map(|client| client.selected_context_id)
-                .collect()
-        })
-        .unwrap_or_default()
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_presence_state_v1::client::list_presence(&mut client),
+    )
+    .map(|clients| {
+        clients
+            .into_iter()
+            .filter(|client| client.terminal_focused)
+            .filter_map(|client| client.selected_context_id)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

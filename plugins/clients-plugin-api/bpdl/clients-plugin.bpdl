@@ -130,6 +130,30 @@ interface clients-selection-commands-v1 {
         -> result<clients-selection-state-v1.selection, clients-selection-state-v1.selection-error>;
 }
 
+// What each attached client shows and whether its terminal has focus: what a
+// person is looking at. A client's terminal counts as focused until it
+// reports otherwise.
+@capability(CLIENTS_READ)
+interface clients-presence-state-v1 {
+    record presence {
+        client-id: uuid,
+        selected-context-id: uuid?,
+        terminal-focused: bool,
+    }
+    query list-presence() -> list<presence>;
+}
+
+@capability(CLIENTS_WRITE)
+interface clients-presence-commands-v1 {
+    variant presence-error {
+        no-current-client,
+        failed { reason: string },
+    }
+    // Report, from the terminal's focus reports, whether this client's
+    // terminal has focus.
+    command set-terminal-focus(focused: bool) -> result<unit, presence-error>;
+}
+
 interface clients-events {
     // A single event describing a client lifecycle change.
     variant client-event {
@@ -185,6 +209,8 @@ world clients {
     provide clients-events capability bmux.clients.read;
     provide clients-selection-commands-v1;
     provide clients-selection-state-v1;
+    provide clients-presence-state-v1;
+    provide clients-presence-commands-v1;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;
     require capability bmux.sessions.write;

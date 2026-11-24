@@ -37,6 +37,8 @@ pub struct FollowState {
     /// Per-client opt-out of server-initiated detach. Missing entry
     /// means "allowed" (default).
     pub attach_detach_allowed: BTreeMap<ClientId, bool>,
+    /// Clients whose terminal reported losing focus and has not regained it.
+    pub unfocused_terminals: BTreeSet<ClientId>,
 }
 
 impl FollowState {
@@ -65,6 +67,7 @@ impl FollowState {
         self.selected_sessions.remove(&client_id);
         self.attached_stream_sessions.remove(&client_id);
         self.attach_detach_allowed.remove(&client_id);
+        self.unfocused_terminals.remove(&client_id);
         self.follows.remove(&client_id);
 
         #[allow(clippy::needless_collect)]

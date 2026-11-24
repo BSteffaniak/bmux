@@ -13882,6 +13882,29 @@ enum ClipboardSyncTrigger {
     ActivityAfterIdle,
 }
 
+/// Tell the server whether this client's terminal has focus, so what it shows
+/// counts as looked at only while a person can see it. Best effort: a server
+/// without the clients plugin's presence interface keeps counting it focused.
+async fn report_terminal_focus(client: &mut StreamingBmuxClient, focused: bool) {
+    use bmux_clients_plugin_api::clients_presence_commands_v1::client::SetTerminalFocusRequest;
+    let Ok(payload) = bmux_plugin_sdk::encode_service_message(&SetTerminalFocusRequest { focused })
+    else {
+        return;
+    };
+    if let Err(error) = client
+        .invoke_service_raw(
+            "bmux.clients.write",
+            InvokeServiceKind::Command,
+            "clients-presence-commands-v1",
+            "set-terminal-focus",
+            payload,
+        )
+        .await
+    {
+        tracing::debug!(%error, "terminal focus not reported");
+    }
+}
+
 async fn maybe_sync_remote_clipboard(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -14180,12 +14203,14 @@ pub async fn handle_attach_terminal_event(
         Some(TerminalInputEvent::FocusGained) => Some(true),
         Some(TerminalInputEvent::FocusLost) => Some(false),
         _ => None,
-    } && let Some(alerts) = &view_state.attach_alerts
-    {
-        alerts
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_terminal_focused(focused);
+    } {
+        if let Some(alerts) = &view_state.attach_alerts {
+            alerts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_terminal_focused(focused);
+        }
+        report_terminal_focus(client, focused).await;
     }
     match &normalized_event {
         Some(TerminalInputEvent::FocusGained) => {

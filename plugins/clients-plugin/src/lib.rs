@@ -33,6 +33,8 @@ use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
+use bmux_clients_plugin_api::clients_presence_commands_v1::{self, PresenceError};
+use bmux_clients_plugin_api::clients_presence_state_v1::{self, Presence};
 use bmux_clients_plugin_api::clients_selection_commands_v1;
 use bmux_clients_plugin_api::clients_selection_state_v1::{Selection, SelectionError};
 use bmux_clients_plugin_api::clients_state::{
@@ -551,6 +553,12 @@ impl ClientsPlugin {
                     bmux_clients_plugin_api::clients_identity::ClientsIdentityService::current_principal(&identity),
                 ))
             },
+            "clients-presence-state-v1", "list-presence" => |_req: (), _ctx| {
+                Ok::<Vec<Presence>, ServiceResponse>(list_presence(&self.events()))
+            },
+            "clients-presence-commands-v1", "set-terminal-focus" => |req: clients_presence_commands_v1::client::SetTerminalFocusRequest, ctx| {
+                Ok::<Result<(), PresenceError>, ServiceResponse>(set_terminal_focus(&self.events(), ctx.caller_client_id, req.focused))
+            },
             "clients-state", "list-clients" => |_req: (), _ctx| {
                 list_clients_local(&self.events())
                     .map_err(|e| ServiceResponse::error("list_failed", e))
@@ -592,7 +600,9 @@ impl ClientsPlugin {
             registry,
             selection.clone(),
         );
-        let _ = clients_selection_commands_v1::register_provider(registry, selection);
+        let _ = clients_selection_commands_v1::register_provider(registry, selection.clone());
+        let _ = clients_presence_state_v1::register_provider(registry, selection.clone());
+        let _ = clients_presence_commands_v1::register_provider(registry, selection);
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
             Arc::new(ClientsCommandsHandle::new(caller, self.events()));
         let _ = clients_commands::register_provider(registry, commands);
@@ -664,6 +674,70 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
             )
         })
     }
+}
+
+impl clients_presence_state_v1::ClientsPresenceStateV1Service for SelectionHandle {
+    fn list_presence<'a>(&'a self) -> Pin<Box<dyn Future<Output = Vec<Presence>> + Send + 'a>> {
+        Box::pin(async move { list_presence(&self.events) })
+    }
+}
+
+impl clients_presence_commands_v1::ClientsPresenceCommandsV1Service for SelectionHandle {
+    fn set_terminal_focus<'a>(
+        &'a self,
+        focused: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PresenceError>> + Send + 'a>> {
+        Box::pin(async move {
+            set_terminal_focus(
+                &self.events,
+                current_client_id_for_typed_handle(&self.caller),
+                focused,
+            )
+        })
+    }
+}
+
+/// What each connected client shows, and whether its terminal has focus.
+fn list_presence(events: &ClientEvents) -> Vec<Presence> {
+    let Some(state) = events.states.get::<FollowState>() else {
+        return Vec::new();
+    };
+    let Ok(state) = state.read() else {
+        return Vec::new();
+    };
+    state
+        .connected_clients
+        .iter()
+        .map(|client| Presence {
+            client_id: client.0,
+            selected_context_id: state.selected_contexts.get(client).copied().flatten(),
+            terminal_focused: !state.unfocused_terminals.contains(client),
+        })
+        .collect()
+}
+
+/// Record whether the calling client's terminal has focus.
+fn set_terminal_focus(
+    events: &ClientEvents,
+    client: Option<Uuid>,
+    focused: bool,
+) -> Result<(), PresenceError> {
+    let client = ClientId(client.ok_or(PresenceError::NoCurrentClient)?);
+    let state = events
+        .states
+        .get::<FollowState>()
+        .ok_or_else(|| PresenceError::Failed {
+            reason: "clients state unavailable".into(),
+        })?;
+    let mut state = state.write().map_err(|_| PresenceError::Failed {
+        reason: "clients state poisoned".into(),
+    })?;
+    if focused {
+        state.unfocused_terminals.remove(&client);
+    } else if state.connected_clients.contains(&client) {
+        state.unfocused_terminals.insert(client);
+    }
+    Ok(())
 }
 
 fn commit_client_selection(
@@ -1430,5 +1504,58 @@ mod definition_contract_tests {
         assert_eq!(identity.len(), 1);
         assert!(identity[0].is_reentrant_query("current-stream-provenance"));
         assert!(!identity[0].is_reentrant_query("current-principal"));
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    fn events_with(clients: &[Uuid]) -> ClientEvents {
+        let states = Arc::new(PluginStateRegistry::new());
+        let mut follow = FollowState::default();
+        for client in clients {
+            follow.connect_client(ClientId(*client));
+            follow
+                .selected_contexts
+                .insert(ClientId(*client), Some(*client));
+        }
+        let state = Arc::new(RwLock::new(follow));
+        states.register::<FollowState>(&state);
+        ClientEvents::new(None, states)
+    }
+
+    fn focused(events: &ClientEvents) -> Vec<(Uuid, bool)> {
+        list_presence(events)
+            .into_iter()
+            .map(|presence| (presence.client_id, presence.terminal_focused))
+            .collect()
+    }
+
+    /// A client's terminal counts as focused until it reports otherwise;
+    /// each client reports only its own, and disconnecting forgets it.
+    #[test]
+    fn terminal_focus_is_reported_per_client() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let events = events_with(&[a, b]);
+        assert_eq!(focused(&events), [(a, true), (b, true)]);
+        assert_eq!(
+            list_presence(&events)[0].selected_context_id,
+            Some(a),
+            "with what it shows"
+        );
+        set_terminal_focus(&events, Some(a), false).unwrap();
+        assert_eq!(focused(&events), [(a, false), (b, true)]);
+        set_terminal_focus(&events, Some(a), true).unwrap();
+        assert_eq!(focused(&events), [(a, true), (b, true)]);
+        set_terminal_focus(&events, Some(b), false).unwrap();
+        let state = events.states.get::<FollowState>().unwrap();
+        state.write().unwrap().disconnect_client(ClientId(b));
+        assert_eq!(focused(&events), [(a, true)]);
+        assert!(state.read().unwrap().unfocused_terminals.is_empty());
+        assert_eq!(
+            set_terminal_focus(&events, None, false),
+            Err(PresenceError::NoCurrentClient)
+        );
     }
 }
