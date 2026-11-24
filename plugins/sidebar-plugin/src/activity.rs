@@ -145,6 +145,28 @@ impl Default for ActivityView {
     }
 }
 
+/// Shell integration reports the full command, including leading environment assignments.
+fn command_program(command: &str) -> Option<String> {
+    fn is_assignment(word: &str) -> bool {
+        let Some((name, _)) = word.split_once('=') else {
+            return false;
+        };
+        let mut bytes = name.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    let first = command.split_whitespace().next()?;
+    let program = if is_assignment(first) {
+        shlex::Shlex::new(command).find(|word| !is_assignment(word))?
+    } else {
+        first.to_string()
+    };
+    Some(program.rsplit('/').next().unwrap_or(&program).to_string())
+}
+
 impl ActivityView {
     /// Take a new status snapshot.
     pub fn replace(&mut self, snapshot: TabStatusSnapshot) {
@@ -187,11 +209,7 @@ impl ActivityView {
         let status = self.status(tab)?;
         let now = self.now_ms()?;
         let state = TabState::from(status.state);
-        let program = status
-            .running_command
-            .as_deref()
-            .and_then(|command| command.split_whitespace().next())
-            .map(|program| program.rsplit('/').next().unwrap_or(program).to_string());
+        let program = status.running_command.as_deref().and_then(command_program);
         let agent = status.agent.as_ref();
         let summary = match state {
             TabState::Blocked => Some("needs input".to_string()),
@@ -460,6 +478,16 @@ mod tests {
         printing.running_command = Some("make watch".into());
         let shown = view(vec![printing], 10_000).activity(tab).unwrap();
         assert_eq!(shown.summary.as_deref(), Some("make"));
+
+        for command in [
+            "BCODE_CONFIG=/home/me/.config/bcode/providers/astra.toml /home/me/GitHub/bcode/target/release/bcode",
+            "BCODE_CONFIG='/home/me/provider configs/astra.toml' BCODE_PROFILE=dev '/home/me/local builds/bcode'",
+        ] {
+            let mut tab_status = status(2, tabs_status::TabState::Working);
+            tab_status.running_command = Some(command.into());
+            let shown = view(vec![tab_status], 10_000).activity(tab).unwrap();
+            assert_eq!(shown.summary.as_deref(), Some("bcode"));
+        }
 
         let mut failed = status(2, tabs_status::TabState::Failed);
         failed.last_exit = Some(101);

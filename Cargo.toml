@@ -339,6 +339,8 @@ hyperchad_docs_config_derive = { version = "0.5.0", default-features = false }
 hyperchad_docs_site = { version = "0.5.0", default-features = false }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
+bmux_agents_plugin                       = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin" }
+bmux_agents_plugin_api                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin-api" }
 bmux_application_resurrection_plugin     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/application-resurrection-plugin" }
 bmux_application_resurrection_plugin_api = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/application-resurrection-plugin-api" }
 bmux_clients_plugin                      = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/clients-plugin" }
@@ -381,8 +383,6 @@ bmux_tab_bar_plugin                      = { version = "0.0.1-alpha.4", default-
 bmux_tab_bar_plugin_api                  = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tab-bar-plugin-api" }
 bmux_tabs_plugin                         = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin" }
 bmux_tabs_plugin_api                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin-api" }
-bmux_agents_plugin                       = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin" }
-bmux_agents_plugin_api                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin-api" }
 bmux_theme_plugin                        = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/theme-plugin" }
 bmux_visual_adapters_plugin_renderer     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
 bmux_workspaces_plugin                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/workspaces-plugin" }
@@ -493,6 +493,7 @@ serde_json = { version = "1.0.154", default-features = false, features = [
 ] }
 sha2 = { version = "0.11.1", default-features = false }
 sha2_010 = { package = "sha2", version = "0.11.1", default-features = false }
+shlex = "2.0.1"
 signal-hook = { version = "0.4.6", default-features = false }
 ssh2 = { version = "0.9.7" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
