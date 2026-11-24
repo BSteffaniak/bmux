@@ -40,6 +40,11 @@ missed event never leaves a stale state. Two questions decide it:
 2. **If it is not working, is it waiting for an answer?** A blocker on its
    screen (a permission or question dialog), or its report saying so.
 
+An agent's live background-work indicator can keep it working after an idle
+title, progress signal, or report. Agent-specific screen rules opt into this
+with `background_working = true`. Explicit approval and input requests
+retain precedence over background work.
+
 Each channel is read on its own, so one cannot hide another, and a dialog-like
 line in an agent's transcript cannot make a working agent look like it is
 waiting. A title the pane had before the agent started counts only once it

@@ -32,6 +32,18 @@ region = "bottom_non_empty_lines(16)"
 state = "blocked"
 visible_blocker = true
 
+# A ready composer can coexist with work owned by a child or a managed session.
+[[rules]]
+background_working = true
+id = "background_work"
+priority = 1060
+regex = [
+    '(?m)^[ \t]*ready(?:[ \t]+·[^\n]*?)*?[ \t]+·[ \t]+(?:[1-9][0-9]* background tasks? running|children: [1-9][0-9]* known active(?: observed subtree)?)(?:[ \t]+·[^\n]*)?[ \t]*\n[ \t]*[┌╭][ \t]+Message\b',
+]
+region = "bottom_non_empty_lines(12)"
+state = "working"
+visible_working = true
+
 # Require the ready footer next to the composer so an old transcript line
 # cannot override live activity. An empty idle pane also needs no signal.
 [[rules]]

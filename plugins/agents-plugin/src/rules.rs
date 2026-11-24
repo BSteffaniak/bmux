@@ -68,6 +68,8 @@ struct RuleSpec {
     #[serde(default)]
     visible_working: bool,
     #[serde(default)]
+    background_working: bool,
+    #[serde(default)]
     skip_state_update: bool,
     #[serde(default)]
     all: Vec<GateSpec>,
@@ -200,6 +202,7 @@ struct Rule {
     priority: i32,
     region: Region,
     visible: bool,
+    background_working: bool,
     skip_state_update: bool,
     gate: Gate,
 }
@@ -336,6 +339,8 @@ pub struct Verdict {
     /// The screen shows it plainly (a prompt, a spinner, a dialog), which
     /// outranks what an agent last reported.
     pub visible: bool,
+    /// This is live background work and can coexist with an idle foreground.
+    pub background_working: bool,
     /// The screen shows something that says nothing about the state (a
     /// transcript viewer): keep the previous state.
     pub skip: bool,
@@ -392,6 +397,7 @@ impl Agent {
                         RuleState::Blocked => spec.visible_blocker,
                         RuleState::Unknown => false,
                     },
+                    background_working: state == RuleState::Working && spec.background_working,
                     skip_state_update: spec.skip_state_update,
                     gate,
                 })
@@ -439,6 +445,7 @@ impl Agent {
             rule: rule.id.clone(),
             state: rule.state,
             visible: rule.visible,
+            background_working: rule.background_working,
             skip: rule.skip_state_update || rule.state == RuleState::Unknown,
         })
     }
@@ -670,6 +677,27 @@ mod tests {
             (
                 "⠋ waiting for astra response · 1.2s · round 1 · New draft",
                 RuleState::Working,
+            ),
+            (
+                "ready · 1 background task running · New draft",
+                RuleState::Working,
+            ),
+            (
+                "ready · spent 0 · children: 2 known active observed subtree · partial",
+                RuleState::Working,
+            ),
+            (
+                "ready · children: 0 known active · complete",
+                RuleState::Idle,
+            ),
+            ("ready · 0 background tasks running", RuleState::Idle),
+            (
+                "3 background tasks running\nready · New draft",
+                RuleState::Idle,
+            ),
+            (
+                "Question\n  [ Submit ]  [ Cancel ]\nready · children: 2 known active · complete",
+                RuleState::Blocked,
             ),
             ("◐ Building… (12s)", RuleState::Working),
             (

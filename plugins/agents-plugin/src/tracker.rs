@@ -379,10 +379,15 @@ fn classify(
             .into_iter()
             .filter_map(|channel| rules.evaluate_channel(&signals, channel))
             .filter(|verdict| !verdict.skip)
-            .find_map(|verdict| says(&verdict).map(|working| (working, Some(verdict.rule))))
+            .find_map(|verdict| {
+                says(&verdict).map(|working| (working, verdict.state, verdict.rule))
+            })
     });
+    let channel_blocked = signalled
+        .as_ref()
+        .is_some_and(|(_, state, _)| *state == RuleState::Blocked);
     let working = signalled
-        .map(|(working, rule)| (working, AgentSource::Screen, rule))
+        .map(|(working, _, rule)| (working, AgentSource::Screen, Some(rule)))
         .or_else(|| {
             track
                 .report
@@ -407,6 +412,23 @@ fn classify(
         });
     if working.0 {
         return (AgentState::Working, working.1, working.2);
+    }
+    // An idle title, progress signal or report can describe the foreground
+    // turn while a live screen indicator still shows background work.
+    if !matches!(track.report, Some((AgentState::Blocked, _)))
+        && let Some(verdict) = track
+            .screen_verdict
+            .as_ref()
+            .filter(|verdict| verdict.background_working)
+    {
+        if channel_blocked {
+            return (AgentState::Blocked, working.1, working.2);
+        }
+        return (
+            AgentState::Working,
+            AgentSource::Screen,
+            Some(verdict.rule.clone()),
+        );
     }
     // 2. Not working: is it waiting for an answer?
     if let Some(verdict) = track
@@ -648,6 +670,37 @@ mod tests {
         // Another job in the pane ends the agent and its report.
         tracker.set_jobs(&[job(41, "vim")], &catalog());
         assert_eq!(tracker.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn live_background_work_outlasts_an_idle_title_and_report() {
+        let rules = claude();
+        let mut tracker = Tracker::default();
+        tracker.set_views(vec![view(None, 0)]);
+        tracker.set_jobs(&[job(40, "claude")], &catalog());
+        let footer = "✶ Waiting for 2 background agents to finish\n─────\n❯ \n─────";
+        let update = |revision, state: &str| PaneView {
+            report: Some(Report {
+                state: state.into(),
+                agent: Some("claude".into()),
+                message: None,
+            }),
+            reports: revision,
+            ..view(Some("✳ ready"), revision)
+        };
+        tracker.set_views(vec![update(1, "idle")]);
+        tracker.apply_screen(PANE, 1, footer, Some(&rules), 10);
+        tracker.settle(10, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Working);
+
+        tracker.set_views(vec![update(2, "blocked")]);
+        tracker.settle(20, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Blocked);
+
+        tracker.set_views(vec![update(3, "idle")]);
+        tracker.apply_screen(PANE, 3, "─────\n❯ \n─────", Some(&rules), 30);
+        tracker.settle(30, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
     }
 
     /// A report from before the agents plugin saw the pane is history, and a
