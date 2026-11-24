@@ -6373,10 +6373,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         // Hover, capture release and protocol-only updates can change pointer
         // presentation without cell damage (including while stationary).
         let pointer_shape = super::pointer_shape::resolve(&view_state);
-        if pointer_shape != view_state.last_pointer_shape {
-            view_state.dirty.mark_full_frame(AttachDirtySource::PluginCommand);
-        }
-        let mut frame_needs_render = view_state.dirty.needs_render() || render_deferred;
+        let pointer_shape_changed = pointer_shape != view_state.last_pointer_shape;
+        let mut frame_needs_render =
+            view_state.dirty.needs_render() || render_deferred || pointer_shape_changed;
 
         let mut scene_hydrated = false;
 
@@ -11396,8 +11395,21 @@ fn render_attach_frame_inner(
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
     // The cursor the host shows now, kept while nothing moves it.
     let previous_cursor_state = view_state.last_cursor_state;
+    // Keep the retained buffer intact across full-frame damage when any visible
+    // pane has already drawn rows and is inside an open DEC 2026 synchronized
+    // update: resetting the presenter buffer would blank those deferred rows.
+    let preserve_sync_deferred = view_state.terminal_presenter.shown()
+        && layout_state.scene.surfaces.iter().any(|surface| {
+            surface.visible
+                && surface.pane_id.is_some_and(|pane_id| {
+                    view_state
+                        .pane_buffers
+                        .get(&pane_id)
+                        .is_some_and(|buffer| buffer.rows_drawn && buffer.sync_update_deferring())
+                })
+        });
     let frame_spec = bmux_attach_pipeline::frame_presenter::FrameSpec {
-        full: frame_damage.is_full_frame(),
+        full: frame_damage.is_full_frame() && !preserve_sync_deferred,
         size: terminal_size,
         margins: terminal_render_capabilities(view_state).left_right_margins,
         host: view_state.presenting,

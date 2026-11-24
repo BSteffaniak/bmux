@@ -87,7 +87,16 @@ pub fn write_ansi_inline_frame_with_color_depth(
     write_ansi_style(writer, style, depth)?;
     for y in area.y..area.bottom() {
         writer.write_all(b"\r\x1b[2K")?;
-        emit_row_cells(writer, buffer, y, area.x, area.right(), &mut style, depth)?;
+        emit_row_cells(
+            writer,
+            buffer,
+            y,
+            area.x,
+            area.right(),
+            &mut style,
+            depth,
+            false,
+        )?;
         writer.write_all(b"\r\n")?;
     }
     write_ansi_style(writer, Style::new(), depth)
@@ -144,7 +153,7 @@ pub fn write_ansi_inline_frame_diff_with_color_depth(
             if column > 0 {
                 write!(writer, "\x1b[{column}C")?;
             }
-            emit_row_cells(writer, current, y, start, end, &mut style, depth)?;
+            emit_row_cells(writer, current, y, start, end, &mut style, depth, false)?;
             write!(writer, "\r\x1b[{distance}B")?;
         }
     }
@@ -720,9 +729,38 @@ pub(crate) fn emit_row_span(
         return Ok(());
     }
     write_ansi_move_to(writer, Point::new(start, y))?;
-    emit_row_cells(writer, buffer, y, start, end, active_style, depth)
+    emit_row_cells(writer, buffer, y, start, end, active_style, depth, true)
 }
 
+/// Whether an outer terminal may advance the cursor by a different width than
+/// `bmux_cell_geometry` expects for `symbol`, requiring an explicit CUP
+/// re-anchor before continuing the row.
+///
+/// ASCII, Box Drawing (`U+2500..=U+257F`), Block Elements (`U+2580..=U+259F`),
+/// Braille (`U+2800..=U+28FF`), and ordinary alphabetic scripts return `false`
+/// so borders, spinners, and prose incur zero extra bytes.
+fn needs_cursor_reanchor(symbol: &str) -> bool {
+    let mut chars = symbol.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        // Multi-scalar grapheme cluster (VS16, ZWJ, flags, combining marks).
+        return true;
+    }
+    matches!(
+        first,
+        '\u{2190}'..='\u{21FF}'
+            | '\u{2300}'..='\u{23FF}'
+            | '\u{25A0}'..='\u{27BF}'
+            | '\u{2900}'..='\u{2BFF}'
+            | '\u{E000}'..='\u{F8FF}'
+            | '\u{1F000}'..='\u{1FFFF}'
+            | '\u{F0000}'..='\u{10FFFF}'
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_row_cells(
     writer: &mut impl Write,
     buffer: &Buffer,
@@ -731,6 +769,7 @@ fn emit_row_cells(
     end: u16,
     active_style: &mut Style,
     depth: TerminalColorDepth,
+    reanchor_absolute: bool,
 ) -> io::Result<()> {
     let area = buffer.area();
     if y < area.y || y >= area.bottom() || start >= end {
@@ -799,6 +838,9 @@ fn emit_row_cells(
                 .min(2),
         );
         x = x.saturating_add(width.max(1));
+        if reanchor_absolute && x < end && needs_cursor_reanchor(&cell.symbol) {
+            write_ansi_move_to(writer, Point::new(x, y))?;
+        }
     }
     Ok(())
 }
@@ -1576,6 +1618,7 @@ mod tests {
                 8,
                 &mut style,
                 super::TerminalColorDepth::TrueColor,
+                true,
             )
             .unwrap();
             assert_eq!(output, b" X      ");
@@ -1938,5 +1981,32 @@ mod tests {
         assert!(output.contains("\x1b[0;1;31mA"));
         assert!(output.contains("\x1b[0;48;2;1;2;3mB"));
         assert!(output.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn ansi_frame_reanchors_cursor_after_ambiguous_symbols_but_not_borders() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        buffer.set_cell(Point::new(0, 0), "⚡", Style::new());
+        buffer.set_cell(Point::new(2, 0), "ok", Style::new());
+        let mut out = Vec::new();
+        write_ansi_frame(&mut out, &buffer, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            output.contains("⚡\x1b[1;3Ho"),
+            "expected CUP re-anchor after emoji/symbol: {output:?}"
+        );
+
+        let mut border = Buffer::empty(Rect::new(0, 0, 4, 1));
+        for x in 0..4 {
+            border.set_cell(Point::new(x, 0), "─", Style::new());
+        }
+        let mut border_out = Vec::new();
+        write_ansi_frame(&mut border_out, &border, None).unwrap();
+        let border_str = String::from_utf8(border_out).unwrap();
+        assert_eq!(
+            border_str.matches("\x1b[1;").count(),
+            1,
+            "box-drawing border should not emit per-cell CUPs: {border_str:?}"
+        );
     }
 }

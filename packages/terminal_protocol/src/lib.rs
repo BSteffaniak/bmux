@@ -136,8 +136,10 @@ impl TerminalProtocolEngine {
 
     /// Answer a CSI sequence, appending any reply to `replies`. `values` are its parameter values
     /// (an omitted one is 0), `intermediates` its private marker and intermediate bytes in order;
-    /// `cursor` is the cursor (zero-based row and column) as of the sequence, and
-    /// `bracketed_paste` whether the program has bracketed paste on.
+    /// `cursor` is the cursor (zero-based row and column) as of the sequence, `bracketed_paste`
+    /// whether the program has bracketed paste on, and `synchronized_update` whether the program
+    /// currently has DEC mode 2026 active.
+    #[allow(clippy::too_many_arguments)]
     pub fn answer_csi(
         &mut self,
         values: &[u16],
@@ -145,6 +147,7 @@ impl TerminalProtocolEngine {
         action: char,
         cursor: (u16, u16),
         bracketed_paste: bool,
+        synchronized_update: bool,
         replies: &mut Vec<u8>,
     ) {
         #[cfg(feature = "kitty-keyboard")]
@@ -164,6 +167,7 @@ impl TerminalProtocolEngine {
             self.profile,
             bracketed_paste,
             self.bracketed_paste_supported,
+            synchronized_update,
         ) {
             self.trace_csi(name, values, intermediates, action, &reply);
             replies.extend_from_slice(&reply);
@@ -373,6 +377,7 @@ fn is_default(values: &[u16]) -> bool {
     matches!(values, [] | [0])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn csi_query_reply(
     values: &[u16],
     intermediates: &[u8],
@@ -381,6 +386,7 @@ fn csi_query_reply(
     profile: ProtocolProfile,
     bracketed_paste: bool,
     bracketed_paste_supported: bool,
+    synchronized_update: bool,
 ) -> Option<(&'static str, Vec<u8>)> {
     match (intermediates, action, values) {
         (b"", 'c', _) if is_default(values) => {
@@ -396,10 +402,14 @@ fn csi_query_reply(
             "csi_dec_dsr_cursor_position",
             dec_dsr_cursor_response(cursor_pos),
         )),
-        (b"?$", 'p', _) if !is_default(values) => {
-            dec_mode_report_response(values, profile, bracketed_paste, bracketed_paste_supported)
-                .map(|reply| ("csi_dec_mode_report", reply))
-        }
+        (b"?$", 'p', _) if !is_default(values) => dec_mode_report_response(
+            values,
+            profile,
+            bracketed_paste,
+            bracketed_paste_supported,
+            synchronized_update,
+        )
+        .map(|reply| ("csi_dec_mode_report", reply)),
         _ => None,
     }
 }
@@ -409,6 +419,7 @@ fn dec_mode_report_response(
     profile: ProtocolProfile,
     bracketed_paste: bool,
     bracketed_paste_supported: bool,
+    synchronized_update: bool,
 ) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for &mode in modes {
@@ -416,6 +427,14 @@ fn dec_mode_report_response(
             if !bracketed_paste_supported {
                 0
             } else if bracketed_paste {
+                1
+            } else {
+                2
+            }
+        } else if mode == 2026 {
+            if matches!(profile, ProtocolProfile::Conservative) {
+                0
+            } else if synchronized_update {
                 1
             } else {
                 2
@@ -440,8 +459,6 @@ fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
             1004 => 2,
             2004 => 2,
             1049 => 2,
-            #[cfg(feature = "kitty-keyboard")]
-            2048 => 1, // Kitty keyboard protocol supported
             _ => 0,
         },
         ProtocolProfile::Xterm => match mode {
@@ -602,6 +619,7 @@ mod tests {
             action,
             (0, 0),
             bracketed_paste,
+            false,
             &mut replies,
         );
         replies
@@ -656,7 +674,6 @@ mod tests {
             csi(&mut engine, b"?$", &[2048], 'p', false),
             b"\x1b[?2048;0$y"
         );
-        #[cfg(feature = "kitty-keyboard")]
         assert_eq!(
             csi(
                 &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
@@ -665,7 +682,7 @@ mod tests {
                 'p',
                 false
             ),
-            b"\x1b[?2048;1$y"
+            b"\x1b[?2048;0$y"
         );
         assert_eq!(
             csi(&mut engine, b"?$", &[1, 25], 'p', false),
@@ -676,6 +693,27 @@ mod tests {
     }
 
     #[test]
+    fn dec_mode_2026_reports_synchronized_update_state() {
+        for profile in [
+            ProtocolProfile::Bmux,
+            ProtocolProfile::Xterm,
+            ProtocolProfile::Screen,
+        ] {
+            let mut engine = TerminalProtocolEngine::new(profile);
+            let mut replies = Vec::new();
+            engine.answer_csi(&[2026], b"?$", 'p', (0, 0), false, false, &mut replies);
+            assert_eq!(replies, b"\x1b[?2026;2$y");
+            replies.clear();
+            engine.answer_csi(&[2026], b"?$", 'p', (0, 0), false, true, &mut replies);
+            assert_eq!(replies, b"\x1b[?2026;1$y");
+        }
+        let mut conservative = TerminalProtocolEngine::new(ProtocolProfile::Conservative);
+        let mut replies = Vec::new();
+        conservative.answer_csi(&[2026], b"?$", 'p', (0, 0), false, true, &mut replies);
+        assert_eq!(replies, b"\x1b[?2026;0$y");
+    }
+
+    #[test]
     fn device_attributes_and_status_reports_reply() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         assert_eq!(csi(&mut engine, b"", &[0], 'c', false), b"\x1b[?1;2c");
@@ -683,8 +721,8 @@ mod tests {
         assert_eq!(csi(&mut engine, b"", &[5], 'n', false), b"\x1b[0n");
         assert_eq!(csi(&mut engine, b"?", &[5], 'n', false), b"\x1b[?0n");
         let mut replies = Vec::new();
-        engine.answer_csi(&[6], b"", 'n', (4, 9), false, &mut replies);
-        engine.answer_csi(&[6], b"?", 'n', (4, 9), false, &mut replies);
+        engine.answer_csi(&[6], b"", 'n', (4, 9), false, false, &mut replies);
+        engine.answer_csi(&[6], b"?", 'n', (4, 9), false, false, &mut replies);
         assert_eq!(replies, b"\x1b[5;10R\x1b[?5;10R");
         // Other sequences are no queries.
         assert!(csi(&mut engine, b"", &[1], 'c', false).is_empty());

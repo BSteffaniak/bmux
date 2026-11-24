@@ -4227,33 +4227,45 @@ fn queue_pane_content_for_surface(
             .map_or_else(|| entry.scrollback_viewport_base(None), |(_, base)| *base);
         let selection = scrollback.and_then(|view| entry.scrollback_selection_bounds(&view));
         if stage.focus {
-            let (cursor_row, cursor_col) = if let Some(view) = scrollback {
-                let cursor = view.cursor;
-                (
-                    u16::try_from(cursor.row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
-                    u16::try_from(cursor.col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
-                )
+            if !use_scrollback && stage.sync_deferred {
+                cursor_state = entry.last_committed_cursor;
             } else {
-                let cursor = entry.terminal_grid.grid().cursor();
-                (
-                    u16::try_from(cursor.row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
-                    u16::try_from(cursor.col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
-                )
-            };
-            let cursor_visible = if use_scrollback {
-                true
-            } else {
-                entry.terminal_grid.grid().cursor().visible
-            };
-            cursor_state = Some(AttachCursorState {
-                x: stage.content.x.saturating_add(cursor_col),
-                y: stage.content.y.saturating_add(cursor_row),
-                visible: cursor_visible,
-            });
+                let (cursor_row, cursor_col) = if let Some(view) = scrollback {
+                    let cursor = view.cursor;
+                    (
+                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                    )
+                } else {
+                    let cursor = entry.terminal_grid.grid().cursor();
+                    (
+                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                    )
+                };
+                let cursor_visible = if use_scrollback {
+                    true
+                } else {
+                    entry.terminal_grid.grid().cursor().visible
+                };
+                let next_cursor = AttachCursorState {
+                    x: stage.content.x.saturating_add(cursor_col),
+                    y: stage.content.y.saturating_add(cursor_row),
+                    visible: cursor_visible,
+                };
+                if !use_scrollback {
+                    entry.last_committed_cursor = Some(next_cursor);
+                }
+                cursor_state = Some(next_cursor);
+            }
             if let Some(trace) = render_trace.as_deref_mut() {
                 trace.push(AttachRenderTraceOp::Cursor {
                     surface_index: stage.surface_index,
-                    visible: cursor_visible,
+                    visible: cursor_state.is_some_and(|cursor| cursor.visible),
                 });
             }
         }
@@ -10211,6 +10223,122 @@ mod tests {
             host.row(1).starts_with("hellopartial") && host.row(2).starts_with(" done "),
             "{}",
             host.text()
+        );
+    }
+
+    fn render_test_cursor_step(
+        host: &mut TestHost,
+        scene: &AttachScene,
+        bufs: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+        full: bool,
+        damage: &FrameDamage,
+    ) -> Option<crate::AttachCursorState> {
+        host.frame(full, |canvas| {
+            let views = PaneScrollbackViews::new();
+            let appearance = bmux_appearance::RuntimeAppearance::default();
+            let policy = DamageCoalescingPolicy::default();
+            render_attach_scene(
+                canvas,
+                scene,
+                &[],
+                bufs,
+                damage,
+                1,
+                0,
+                &views,
+                false,
+                (20, 8),
+                &appearance,
+                policy,
+                &[],
+            )
+            .expect("render should succeed")
+        })
+        .result
+    }
+
+    #[test]
+    fn sync_deferred_pane_freezes_cursor_position_and_visibility() {
+        let pane_id = Uuid::from_u128(440);
+        let rect = AttachRect {
+            x: 0,
+            y: 1,
+            w: 20,
+            h: 6,
+        };
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(450),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: bmux_attach_layout_protocol::AttachLayer::Pane,
+                z: 0,
+                rect,
+                content_rect: rect,
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
+        let buffer = pane_buffers.entry(pane_id).or_default();
+        buffer.terminal_grid.resize(20, 6).unwrap();
+        append_pane_output(buffer, b"hello");
+
+        let mut host = TestHost::new(20, 8);
+        let first = render_test_cursor_step(
+            &mut host,
+            &scene,
+            &mut pane_buffers,
+            true,
+            &FrameDamage::full_frame(),
+        );
+        assert_eq!(
+            first,
+            Some(crate::AttachCursorState {
+                x: 5,
+                y: 1,
+                visible: true,
+            })
+        );
+
+        let entry = pane_buffers.get_mut(&pane_id).unwrap();
+        append_pane_output(entry, b"\x1b[?25l\x1b[4;10H");
+        entry.sync_update_in_progress = true;
+        let deferred = render_test_cursor_step(
+            &mut host,
+            &scene,
+            &mut pane_buffers,
+            false,
+            &content_damage(pane_id),
+        );
+        assert_eq!(
+            deferred, first,
+            "cursor must stay frozen while sync-deferred"
+        );
+
+        pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .sync_update_in_progress = false;
+        let done = render_test_cursor_step(
+            &mut host,
+            &scene,
+            &mut pane_buffers,
+            false,
+            &content_damage(pane_id),
+        );
+        assert_eq!(
+            done,
+            Some(crate::AttachCursorState {
+                x: 9,
+                y: 4,
+                visible: false,
+            })
         );
     }
 

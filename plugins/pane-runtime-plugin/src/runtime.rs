@@ -62,11 +62,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
+use switchy_async::sync::watch;
 use switchy_async::task::JoinHandle;
 use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use switchy_thread::sync::{Arc, Mutex, RwLock};
 use switchy_time::Instant;
-use switchy_async::sync::watch;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{trace, warn};
 
@@ -2074,8 +2074,13 @@ impl PaneResurrectionRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneShellMetadataEvent {
-    CommandStart { command: String, cwd: String },
-    Prompt { cwd: String },
+    CommandStart {
+        command: String,
+        cwd: String,
+    },
+    Prompt {
+        cwd: String,
+    },
     NestedReplay,
     /// A program holding the pane's marker reported its own state; published
     /// as a terminal event and never applied to the shell's metadata.
@@ -2933,6 +2938,7 @@ impl<F: ReaderFilters, I: ReaderImages> SequenceObserver for ReaderObserver<'_, 
             sequence.action(),
             cursor,
             grid.protocol_state().bracketed_paste,
+            grid.synchronized_update(),
             self.replies,
         );
     }
@@ -8350,9 +8356,14 @@ impl SessionRuntimeManager {
             // The waiter's work, held here until its thread takes it: when that thread cannot
             // start, the startup failure below still runs it, so the leader's exit is observed,
             // reaped and announced rather than lost with the closure.
-            let waiter_work: PaneWaiterWork = Arc::new(Mutex::new(Some(Box::new({ let host = host.clone(); move || {
+            let waiter_work: PaneWaiterWork = Arc::new(Mutex::new(Some(Box::new({
+                let host = host.clone();
+                move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
-                    let _completion = SupervisionCompletion { done: Arc::clone(&child_waiter_done_for_thread), execution: Arc::clone(&execution_for_waiter) };
+                    let _completion = SupervisionCompletion {
+                        done: Arc::clone(&child_waiter_done_for_thread),
+                        execution: Arc::clone(&execution_for_waiter),
+                    };
                     // Observe the exit without reaping, fence the leader's pid,
                     // then reap: from here on nothing signals that pid again.
                     if let Some(pid) = child.process_id() {
@@ -8390,31 +8401,36 @@ impl SessionRuntimeManager {
                         return;
                     }
                     if !program_execution {
-                    push_pane_runtime_notice(&host,
-                        session_id,
-                        pane_id,
-                        &output_buffer_for_waiter,
-                        &terminal_grid_for_waiter,
-                        &output_dirty_for_waiter,
-                        "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
-                    );
+                        push_pane_runtime_notice(
+                            &host,
+                            session_id,
+                            pane_id,
+                            &output_buffer_for_waiter,
+                            &terminal_grid_for_waiter,
+                            &output_dirty_for_waiter,
+                            "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
+                        );
                     }
                     if !program_execution {
-                    let _ = pane_exit_tx.send(PaneExitEvent {
-                        session_id,
-                        pane_id,
-                        exited: Arc::clone(&exited_for_waiter),
-                    });
+                        let _ = pane_exit_tx.send(PaneExitEvent {
+                            session_id,
+                            pane_id,
+                            exited: Arc::clone(&exited_for_waiter),
+                        });
                     }
                     let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                     child_waiter_done_for_thread.store(true, Ordering::SeqCst);
-                        execution_for_waiter.notify();
-                } }))));
+                    execution_for_waiter.notify();
+                }
+            }))));
             let waiter_work_for_thread = Arc::clone(&waiter_work);
             let child_waiter = switchy_thread::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
-                    let work = waiter_work_for_thread.lock().ok().and_then(|mut work| work.take());
+                    let work = waiter_work_for_thread
+                        .lock()
+                        .ok()
+                        .and_then(|mut work| work.take());
                     if let Some(work) = work {
                         work();
                     }
@@ -8838,21 +8854,37 @@ impl SessionRuntimeManager {
                     // executor workers, otherwise multipane shutdown is serial
                     // even when every pane received stop concurrently.
                     // `inject_yields` cannot see inside a macro: yield here by hand.
-                    let stopped = switchy_async::task::yield_after(switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
-                        let frozen = resurrection.lock()
-                            .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
-                            .and_then(|mut state| state.freeze());
-                        if let Err(error) = frozen {
-                            execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
-                        }
-                        if let Err(error) = execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
-                            execution.record_cleanup_error(format!("group stop failed: {error}"));
-                        }
-                        let lifetime = PaneLifetime { execution, resurrection };
-                        lifetime.revoke();
-                    } })).await;
+                    let stopped =
+                        switchy_async::task::yield_after(switchy_async::task::spawn_blocking({
+                            let host = host.clone();
+                            move || {
+                                let frozen = resurrection
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
+                                    .and_then(|mut state| state.freeze());
+                                if let Err(error) = frozen {
+                                    execution.record_cleanup_error(format!(
+                                        "checkpoint freeze failed: {error}"
+                                    ));
+                                }
+                                if let Err(error) = execution
+                                    .signal_owned_group(&host, crate::platform::StopAction::Force)
+                                {
+                                    execution.record_cleanup_error(format!(
+                                        "group stop failed: {error}"
+                                    ));
+                                }
+                                let lifetime = PaneLifetime {
+                                    execution,
+                                    resurrection,
+                                };
+                                lifetime.revoke();
+                            }
+                        }))
+                        .await;
                     if let Err(error) = stopped {
-                        execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
+                        execution_for_task
+                            .record_cleanup_error(format!("pane stop worker failed: {error}"));
                     }
                     kill_unreaped_leader(&execution_for_task, &mut child_killer);
                 }};
@@ -11080,7 +11112,11 @@ impl ServerSessionRuntimeAdapter {
         })
     }
 
-    fn mark_holder_start(&self, operation: &'static str, site: &'static std::panic::Location<'static>) {
+    fn mark_holder_start(
+        &self,
+        operation: &'static str,
+        site: &'static std::panic::Location<'static>,
+    ) {
         if let Ok(mut holder) = self.current_holder.lock() {
             *holder = Some(ManagerLockHolder {
                 operation,
@@ -13922,7 +13958,9 @@ const MAX_FOREGROUND_COMMANDS: usize = 8;
 fn foreground_group_commands(entries: &[PsProcessEntry], group: i32) -> Vec<String> {
     let mut members = entries
         .iter()
-        .filter(|entry| entry.pgid == group && !entry.command.is_empty() && !entry.state.contains('Z'))
+        .filter(|entry| {
+            entry.pgid == group && !entry.command.is_empty() && !entry.state.contains('Z')
+        })
         .collect::<Vec<_>>();
     members.sort_by_key(|entry| (i64::from(entry.pid) != i64::from(group), entry.pid));
     members
@@ -17934,7 +17972,9 @@ exit 7"#
                 TerminalGridStream::new(1, 1, GridLimits::default())
                     .expect("dummy pane terminal grid dimensions are valid"),
             )),
-            signals: Arc::new(switchy_thread::sync::Mutex::new(RetainedPaneSignals::default())),
+            signals: Arc::new(switchy_thread::sync::Mutex::new(
+                RetainedPaneSignals::default(),
+            )),
             frame_replicas: Arc::new(switchy_thread::sync::Mutex::new(BTreeMap::new())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(switchy_thread::sync::Mutex::new((1, 1))),
@@ -19408,23 +19448,41 @@ exit 7"#
         // Claude Code's titles as it starts, works and then waits.
         feed("\x1b]0;✳ Claude Code\x07".as_bytes(), &mut retained);
         feed("\x1b]0;◐ Claude Code\x07".as_bytes(), &mut retained);
-        feed("\x1b]0;◑ Touch probe marker file\x07".as_bytes(), &mut retained);
-        feed("\x1b]0;✳ Touch probe marker file\x07".as_bytes(), &mut retained);
+        feed(
+            "\x1b]0;◑ Touch probe marker file\x07".as_bytes(),
+            &mut retained,
+        );
+        feed(
+            "\x1b]0;✳ Touch probe marker file\x07".as_bytes(),
+            &mut retained,
+        );
         assert_eq!(retained.title.as_deref(), Some("✳ Touch probe marker file"));
         assert_eq!(retained.revision, 4);
         // The same title again changes nothing.
-        feed("\x1b]0;✳ Touch probe marker file\x07".as_bytes(), &mut retained);
+        feed(
+            "\x1b]0;✳ Touch probe marker file\x07".as_bytes(),
+            &mut retained,
+        );
         assert_eq!(retained.revision, 4);
         // Notifications and bells count, so a repeated one is still seen.
-        feed(b"\x1b]9;4;3\x07\x1b]777;notify;Claude;needs you\x07\x07\x07", &mut retained);
+        feed(
+            b"\x1b]9;4;3\x07\x1b]777;notify;Claude;needs you\x07\x07\x07",
+            &mut retained,
+        );
         assert_eq!(retained.progress.as_deref(), Some("4;3"));
         assert_eq!(retained.notifications, 1);
-        assert_eq!(retained.last_notification.as_deref(), Some("Claude: needs you"));
+        assert_eq!(
+            retained.last_notification.as_deref(),
+            Some("Claude: needs you")
+        );
         assert_eq!(retained.bells, 2);
         assert_eq!(retained.revision, 8);
         // The directory is kept; a prompt starting changes nothing.
         feed(b"\x1b]7;file://host/tmp\x1b\\\x1b]133;A\x07", &mut retained);
-        assert_eq!(retained.working_directory.as_deref(), Some("file://host/tmp"));
+        assert_eq!(
+            retained.working_directory.as_deref(),
+            Some("file://host/tmp")
+        );
         assert_eq!(retained.revision, 9);
         // A finished command's status is kept until the next one starts.
         feed(b"\x1b]133;C\x07out\r\n\x1b]133;D;2\x07", &mut retained);
@@ -22151,7 +22209,10 @@ exit 7"#
             }]
         );
         assert_eq!(filtered, b"beforeafter");
-        let (events, _) = parse(b"\x1b]633;bmux;launch-token;agent;working\x07", Some("launch-token"));
+        let (events, _) = parse(
+            b"\x1b]633;bmux;launch-token;agent;working\x07",
+            Some("launch-token"),
+        );
         assert_eq!(
             events,
             vec![PaneShellMetadataEvent::AgentReport {
@@ -22162,16 +22223,39 @@ exit 7"#
         );
         for marker in [
             // Without the marker, or with another pane's, or with no token at all.
-            (b"\x1b]633;bmux;agent;working\x07".as_slice(), Some("launch-token")),
-            (b"\x1b]633;bmux;old-token;agent;working\x07", Some("launch-token")),
+            (
+                b"\x1b]633;bmux;agent;working\x07".as_slice(),
+                Some("launch-token"),
+            ),
+            (
+                b"\x1b]633;bmux;old-token;agent;working\x07",
+                Some("launch-token"),
+            ),
             (b"\x1b]633;bmux;agent;working\x07", None),
             // Unknown states, extra fields, bad encodings and control characters.
-            (b"\x1b]633;bmux;launch-token;agent;sleeping\x07", Some("launch-token")),
-            (b"\x1b]633;bmux;launch-token;agent;idle;;;extra\x07", Some("launch-token")),
-            (b"\x1b]633;bmux;launch-token;agent;idle;***\x07", Some("launch-token")),
-            (b"\x1b]633;bmux;launch-token;agent;idle;YQph\x07", Some("launch-token")),
+            (
+                b"\x1b]633;bmux;launch-token;agent;sleeping\x07",
+                Some("launch-token"),
+            ),
+            (
+                b"\x1b]633;bmux;launch-token;agent;idle;;;extra\x07",
+                Some("launch-token"),
+            ),
+            (
+                b"\x1b]633;bmux;launch-token;agent;idle;***\x07",
+                Some("launch-token"),
+            ),
+            (
+                b"\x1b]633;bmux;launch-token;agent;idle;YQph\x07",
+                Some("launch-token"),
+            ),
         ] {
-            assert_eq!(parse(marker.0, marker.1).0, [], "{:?}", String::from_utf8_lossy(marker.0));
+            assert_eq!(
+                parse(marker.0, marker.1).0,
+                [],
+                "{:?}",
+                String::from_utf8_lossy(marker.0)
+            );
         }
     }
 

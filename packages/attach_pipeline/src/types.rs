@@ -248,6 +248,9 @@ pub struct PaneRenderBuffer {
     /// How long the open synchronized update holds the pane's frame back. Rendering reads this,
     /// not the clock: the client expires it ([`Self::expire_sync_update`]).
     pub sync_update_hold: SyncUpdateHold,
+    /// Last cursor state committed for this pane outside an open synchronized update, kept while
+    /// `sync_update_deferring()` is true so mid-redraw cursor jumps do not leak to the host.
+    pub last_committed_cursor: Option<AttachCursorState>,
     pub expected_stream_start: Option<u64>,
     /// A caller-owned screen copy, independent of live geometry and history.
     pub retained_screen_copy: bool,
@@ -711,6 +714,7 @@ impl Default for PaneRenderBuffer {
             text_scratch: crate::render::RowTextScratch::default(),
             sync_update_in_progress: false,
             sync_update_hold: SyncUpdateHold::Untimed,
+            last_committed_cursor: None,
             expected_stream_start: None,
             retained_screen_copy: false,
             scrollback_window: None,
