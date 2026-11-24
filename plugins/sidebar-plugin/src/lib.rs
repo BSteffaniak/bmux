@@ -1002,9 +1002,8 @@ impl CompanionState {
         self.settings.density == Density::Compact || self.allocated_width() < COMPACT_BELOW_WIDTH
     }
 
-    /// A card's state at the right of its title: a solid pill when the tab
-    /// needs the user or failed, otherwise the state (or program) in its
-    /// color and how long it has been so.
+    /// A card's state at the right of its title. Use a solid badge for
+    /// input, failure, and completion, with the age beside the state when it fits.
     fn card_state(
         &self,
         activity: &activity::TabActivity,
@@ -1019,34 +1018,29 @@ impl CompanionState {
         let summary = activity.summary.clone()?;
         let narrow = self.allocated_width() < PILL_SHORT_BELOW_WIDTH;
         let state_style = RenderStyle::new().foreground(activity.state.color());
-        let line = match activity.state {
-            activity::TabState::Blocked | activity::TabState::Failed => {
+        let label = match activity.state {
+            activity::TabState::Blocked | activity::TabState::Failed | activity::TabState::Done => {
                 let text = if narrow && activity.state == activity::TabState::Blocked {
-                    "input".to_string()
+                    "input"
                 } else {
-                    summary
+                    &summary
                 };
                 let pill = RenderStyle::new()
                     .background(activity.state.color())
                     .foreground(palette.on_pill)
                     .bold();
-                bmux_tui::text::Line::from_spans(vec![Span::styled(
-                    format!(" {text} "),
-                    tui_style(pill),
-                )])
+                Span::styled(format!(" {text} "), tui_style(pill))
             }
-            activity::TabState::Idle => view::styled(summary, tui_style(palette.muted)),
-            activity::TabState::Working
-            | activity::TabState::Stopped
-            | activity::TabState::Done => {
-                let mut spans = vec![Span::styled(summary, tui_style(state_style))];
-                if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
-                    spans.push(Span::styled(format!(" {since}"), tui_style(palette.muted)));
-                }
-                bmux_tui::text::Line::from_spans(spans)
+            activity::TabState::Idle => Span::styled(summary, tui_style(palette.muted)),
+            activity::TabState::Working | activity::TabState::Stopped => {
+                Span::styled(summary, tui_style(state_style))
             }
         };
-        Some(line)
+        let mut spans = vec![label];
+        if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
+            spans.push(Span::styled(format!(" {since}"), tui_style(palette.muted)));
+        }
+        Some(bmux_tui::text::Line::from_spans(spans))
     }
 
     /// A card's second line. With the default description, what a blocked
@@ -4632,8 +4626,7 @@ mod tests {
         assert_eq!(text[4], "  ○ todo");
     }
 
-    /// A tab that needs the user, or failed, shows a solid pill in its
-    /// state's color; other states are plain colored text.
+    /// Input is shown in a filled badge, and working uses colored text.
     #[test]
     fn attention_states_show_solid_pills() {
         let state = grouped_state(grouped(), None);
@@ -4851,8 +4844,8 @@ mod tests {
         );
     }
 
-    /// A tab whose agent finished while nobody looked shows a check mark and
-    /// how long ago, and counts in its group's header and the heading.
+    /// A finished unseen tab shows a check mark, a filled done badge, and
+    /// its age. Both the workspace header and the sidebar heading count it.
     #[test]
     fn a_finished_unseen_tab_shows_done() {
         use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabState as Published};
@@ -4874,12 +4867,20 @@ mod tests {
         let text = surface_text(&surface, 32, 6);
         let row = text.iter().position(|line| line.contains("docs")).unwrap();
         assert!(text[row].contains("✓ docs"), "{text:?}");
-        assert!(text[row].ends_with("done 2m"), "{text:?}");
-        let glyph = painted_row(&surface, u16::try_from(row).unwrap())
-            .into_iter()
+        assert!(text[row].ends_with("done  2m"), "{text:?}");
+        let runs = painted_row(&surface, u16::try_from(row).unwrap());
+        let glyph = runs
+            .iter()
             .find(|(_, text, _)| text.starts_with('✓'))
             .and_then(|(.., style)| style.fg);
-        assert_eq!(glyph, Some(activity::TabState::Done.color()));
+        let color = Some(activity::TabState::Done.color());
+        assert_eq!(glyph, color);
+        let (_, _, badge) = runs
+            .iter()
+            .find(|(_, text, _)| text == " done ")
+            .expect("done badge");
+        assert_eq!(badge.bg, color);
+        assert!(badge.bold);
         assert!(text[0].contains("✓1"), "the heading counts it: {text:?}");
         assert!(text[1].contains("✓1"), "its group's header too: {text:?}");
     }
