@@ -58,6 +58,8 @@ pub struct RetainedInteractiveRegion {
     pub endpoint: Option<bmux_plugin::AttachInputEndpoint>,
     /// The producer's typed key for this region.
     pub key: Option<bmux_presentation_scene::scene::HitKey>,
+    /// Takes keyboard focus under the pointer when focus-on-hover is on.
+    pub focus_on_hover: bool,
 }
 
 impl PartialEq<DamageRect> for RetainedInteractiveRegion {
@@ -210,6 +212,7 @@ impl RetainedSurface {
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
                 endpoint: None,
+                focus_on_hover: false,
             })
             .collect();
         self
@@ -389,6 +392,7 @@ pub fn retained_surfaces_from_plugin_surfaces_within(
                             cursor: region.cursor,
                             endpoint: region.endpoint.clone(),
                             key: region.key,
+                            focus_on_hover: region.focus_on_hover,
                         })
                     })
                     .collect()
@@ -589,6 +593,7 @@ impl RetainedSurfaceBuilder {
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
                 endpoint: None,
+                focus_on_hover: false,
             });
         self
     }
@@ -604,6 +609,7 @@ impl RetainedSurfaceBuilder {
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
                 endpoint: None,
+                focus_on_hover: false,
             })
             .collect();
         self
@@ -2858,6 +2864,7 @@ mod tests {
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Pointer,
                 endpoint: None,
+                focus_on_hover: false,
             }],
             accepts_input: true,
             layer: 0,
@@ -2926,6 +2933,7 @@ mod tests {
                 focusable: true,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
                 endpoint: None,
+                focus_on_hover: false,
             }],
             accepts_input: true,
             layer: 0,
@@ -3021,6 +3029,7 @@ mod tests {
                 focusable: true,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
                 endpoint: None,
+                focus_on_hover: false,
             }],
             accepts_input: true,
             layer: 0,
@@ -3586,6 +3595,7 @@ mod tests {
                     interface_id: "input/v1".into(),
                     operation: "event".into(),
                 }),
+                focus_on_hover: false,
             });
             surface
         }
@@ -3651,6 +3661,7 @@ mod tests {
             focusable: true,
             cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
             endpoint: Some(endpoint),
+            focus_on_hover: false,
         });
         let overlay = RetainedSurface::builder(Uuid::from_u128(2), DamageRect::new(0, 0, 80, 24))
             .layer(100)
@@ -3716,6 +3727,7 @@ mod tests {
                     focusable: false,
                     cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
                     endpoint: None,
+                    focus_on_hover: false,
                 },
                 bmux_plugin::surface::PluginSurfaceRegion {
                     key: None,
@@ -3725,6 +3737,7 @@ mod tests {
                     focusable: false,
                     cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
                     endpoint: None,
+                    focus_on_hover: false,
                 },
             ],
             accepts_input: true,

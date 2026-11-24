@@ -152,6 +152,10 @@ pub struct PluginSurfaceRegion {
     /// the interaction from `focusable` and `cursor`.
     #[serde(default)]
     pub interaction: Option<PluginSurfaceRegionInteraction>,
+    /// With focus-on-hover configured, the pointer resting on this region
+    /// gives it keyboard focus, as it does a pane.
+    #[serde(default)]
+    pub focus_on_hover: bool,
 }
 
 /// How a region behaves under the pointer and keyboard, as a `bmux_tui` hit region
@@ -343,6 +347,7 @@ impl PluginSurfaceRegion {
                     .as_ref()
                     .map(|scope| scope.as_str().to_owned()),
             }),
+            focus_on_hover: false,
         }
     }
 
@@ -387,7 +392,16 @@ impl PluginSurfaceRegion {
             endpoint: None,
             key: None,
             interaction: None,
+            focus_on_hover: false,
         }
+    }
+
+    /// Take keyboard focus when the pointer rests on this region, where the
+    /// user has focus-on-hover configured.
+    #[must_use]
+    pub const fn focus_on_hover(mut self) -> Self {
+        self.focus_on_hover = true;
+        self
     }
 
     #[must_use]
@@ -1777,6 +1791,7 @@ mod tests {
                 focusable: false,
                 cursor: PluginSurfaceCursor::Default,
                 endpoint: None,
+                focus_on_hover: false,
             },
             PluginSurfaceRegion {
                 key: None,
@@ -1786,6 +1801,7 @@ mod tests {
                 focusable: false,
                 cursor: PluginSurfaceCursor::Default,
                 endpoint: None,
+                focus_on_hover: false,
             },
         ];
         let registry = PluginSurfaceRegistry::new(2);
@@ -1809,6 +1825,7 @@ mod tests {
             focusable: false,
             cursor: PluginSurfaceCursor::Default,
             endpoint: None,
+            focus_on_hover: false,
         }];
         assert!(matches!(
             registry.publish(

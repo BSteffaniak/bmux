@@ -372,6 +372,12 @@ pub struct AttachViewState {
     pub retained_plugin_surface_ids: BTreeSet<Uuid>,
     pub plugin_pointer_router: Box<RetainedPointerRouter>,
     pub plugin_focus: RetainedFocusState,
+    /// The region its owner was last told has keyboard focus, and its endpoint
+    /// then: what a focus change must notify, even after the region is gone.
+    pub notified_plugin_focus: Option<(
+        bmux_plugin::surface::PluginSurfaceRegionId,
+        bmux_plugin::AttachInputEndpoint,
+    )>,
     /// Opaque overlay coverage used to occlude pane terminal graphics on the
     /// previous retained frame. Content-only edits within stable bounds must
     /// not invalidate every pane extension.
@@ -445,6 +451,18 @@ pub enum AttachPointerOwner {
     Selection,
 }
 
+/// The pointer over a surface region that takes keyboard focus by hover.
+#[derive(Debug, Clone)]
+pub struct HoverFocus {
+    /// The surface it is over, and the region.
+    pub surface: Uuid,
+    pub region: bmux_plugin::surface::PluginSurfaceRegionId,
+    /// Since when it has been over this region.
+    pub since: Instant,
+    /// Hovering gave this surface focus since the pointer entered it.
+    pub taken: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
@@ -453,6 +471,8 @@ pub struct AttachMouseState {
     pub last_event_at: Option<Instant>,
     pub hover_started_at: Option<Instant>,
     pub hovered_pane_id: Option<Uuid>,
+    /// The hover-focus region under the pointer, for focus-on-hover.
+    pub hover_focus: Option<HoverFocus>,
     /// Most recent left-button press cell and time, used to detect double clicks.
     pub last_click: Option<(u16, u16, Instant)>,
     pub last_focused_pane_id: Option<Uuid>,
@@ -769,6 +789,7 @@ impl AttachViewState {
             retained_plugin_surface_ids: BTreeSet::new(),
             plugin_pointer_router: Box::default(),
             plugin_focus: RetainedFocusState::default(),
+            notified_plugin_focus: None,
             opaque_overlay_rects: Vec::new(),
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,

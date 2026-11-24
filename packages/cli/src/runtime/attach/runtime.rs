@@ -3415,8 +3415,13 @@ async fn notify_extensions_of_layout(
             visible: surface.visible,
         })
         .collect();
-    publish_attach_layout_snapshot(client, view, &layout_entries, Some(current.focused_pane_id))
-        .await;
+    // While a plugin region holds the keyboard, no pane is drawn focused.
+    let focused_pane = view
+        .plugin_focus
+        .focused()
+        .is_none()
+        .then_some(current.focused_pane_id);
+    publish_attach_layout_snapshot(client, view, &layout_entries, focused_pane).await;
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -13353,7 +13358,7 @@ pub async fn handle_attach_loop_event(
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
-    match event {
+    let control = match event {
         AttachLoopEvent::Server(_server_event) => Ok(AttachLoopControl::Continue),
         AttachLoopEvent::Terminal(terminal_event) => {
             handle_attach_terminal_event(
@@ -13377,7 +13382,186 @@ pub async fn handle_attach_loop_event(
             )
             .await
         }
+    };
+    sync_plugin_focus(client, view_state).await;
+    control
+}
+
+/// The hook identity a region's owner knows it by.
+fn plugin_region_hook(target: &bmux_plugin::surface::PluginSurfaceRegionId) -> String {
+    format!(
+        "{}:{}:{}",
+        target.owner_plugin_id, target.surface_local_id, target.region_local_id
+    )
+}
+
+/// Tell owners when keyboard focus moved between their regions and the panes,
+/// however it moved, and redraw the panes as unfocused while a region holds
+/// it: exactly one place looks focused, the one keys go to.
+async fn sync_plugin_focus(client: &mut StreamingBmuxClient, view_state: &mut AttachViewState) {
+    let current = view_state.plugin_focus.focused().cloned();
+    let notified = view_state.notified_plugin_focus.as_ref().map(|(id, _)| id);
+    if current.as_ref() == notified {
+        return;
     }
+    let owner_changed = current.is_some() != notified.is_some();
+    let mut dirty = false;
+    if let Some((id, endpoint)) = view_state.notified_plugin_focus.take() {
+        dirty |= view_state.presentation_input.notify_focus_changed(
+            &endpoint,
+            &plugin_region_hook(&id),
+            false,
+        );
+    }
+    if let Some(id) = current
+        && let Some(endpoint) = view_state
+            .retained_compositor
+            .endpoint_for_region(&id)
+            .cloned()
+    {
+        dirty |= view_state.presentation_input.notify_focus_changed(
+            &endpoint,
+            &plugin_region_hook(&id),
+            true,
+        );
+        view_state.notified_plugin_focus = Some((id, endpoint));
+    }
+    if dirty {
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
+    }
+    if owner_changed {
+        let layout = view_state.cached_layout_state.clone();
+        let _ = notify_extensions_of_layout(client, view_state, None, layout.as_ref()).await;
+    }
+}
+
+/// Give keyboard focus back to the panes, telling a control that observes
+/// losing focus (a popover) so it can dismiss itself.
+fn release_plugin_focus(view_state: &mut AttachViewState) {
+    let observes_loss = view_state
+        .plugin_focus
+        .focused()
+        .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
+        .is_some_and(|endpoint| view_state.presentation_input.observes_focus_loss(endpoint));
+    if observes_loss {
+        let _ = clear_plugin_surface_focus(view_state);
+    } else {
+        let _ = view_state.plugin_focus.clear();
+    }
+}
+
+/// A press outside every plugin region gives the keyboard back to the
+/// panes; the press itself still goes where it was aimed.
+fn release_plugin_focus_on_outside_press(
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) {
+    if matches!(mouse_event.kind, MouseEventKind::Down(_))
+        && plugin_focus_yields(view_state)
+        && view_state
+            .retained_compositor
+            .hit_test(mouse_event.column, mouse_event.row)
+            .is_none()
+    {
+        release_plugin_focus(view_state);
+    }
+}
+
+/// Whether keyboard focus held by a plugin region gives way to the pointer
+/// and the keyboard: never inside a modal, which owns input until dismissed.
+fn plugin_focus_yields(view_state: &AttachViewState) -> bool {
+    view_state.plugin_focus.focused().is_some() && !view_state.retained_compositor.has_modal_scope()
+}
+
+/// Whether the region holding keyboard focus took it by hover, and so gives
+/// it back the same way.
+fn plugin_focus_is_hover_focus(view_state: &AttachViewState) -> bool {
+    view_state.plugin_focus.focused().is_some_and(|target| {
+        view_state
+            .retained_compositor
+            .surfaces()
+            .values()
+            .flat_map(|surface| &surface.interactive_regions)
+            .any(|region| region.focus_on_hover && region.id.as_ref() == Some(target))
+    })
+}
+
+/// With focus-on-hover, the pointer moves keyboard focus as it does between
+/// panes: onto a surface region that takes it by hover (after the hover
+/// delay), between such regions of one surface, and back to the panes when
+/// it leaves for one. Focus taken away while the pointer stays inside (a
+/// click that switched tabs, typing) is not retaken until it leaves and comes
+/// back. Returns whether focus moved.
+fn hover_plugin_focus(
+    view_state: &mut AttachViewState,
+    column: u16,
+    row: u16,
+    now: Instant,
+) -> bool {
+    if !view_state.mouse.config.focus_on_hover || view_state.retained_compositor.has_modal_scope() {
+        return false;
+    }
+    let hit = view_state.retained_compositor.hit_test(column, row);
+    let region = hit.as_ref().and_then(|hit| {
+        let surface = view_state
+            .retained_compositor
+            .surfaces()
+            .get(&hit.surface_id)?;
+        let region = surface.interactive_regions.get(hit.region_index)?;
+        region
+            .focus_on_hover
+            .then(|| region.id.clone().map(|id| (hit.surface_id, id)))
+            .flatten()
+    });
+    let Some((surface, region)) = region else {
+        view_state.mouse.hover_focus = None;
+        // Over a pane: a region that took focus by hover gives it back.
+        let over_pane = hit.is_none() && attach_scene_pane_at(view_state, column, row).is_some();
+        if over_pane && plugin_focus_is_hover_focus(view_state) {
+            release_plugin_focus(view_state);
+            return true;
+        }
+        return false;
+    };
+    let hover = match view_state.mouse.hover_focus.take() {
+        Some(hover) if hover.surface == surface && hover.region == region => hover,
+        Some(hover) if hover.surface == surface => crate::runtime::attach::state::HoverFocus {
+            region: region.clone(),
+            since: now,
+            ..hover
+        },
+        _ => crate::runtime::attach::state::HoverFocus {
+            surface,
+            region: region.clone(),
+            since: now,
+            taken: false,
+        },
+    };
+    let focused = view_state.plugin_focus.focused().cloned();
+    let released_inside = hover.taken && focused.is_none();
+    let delay = Duration::from_millis(view_state.mouse.config.hover_delay_ms);
+    let due = now.duration_since(hover.since) >= delay;
+    view_state.mouse.hover_focus = Some(hover);
+    // Already focused here; given back while inside; or held by a control
+    // that took focus some other way (an editor), which keeps it.
+    if focused.as_ref() == Some(&region)
+        || released_inside
+        || (focused.is_some() && !plugin_focus_is_hover_focus(view_state))
+        || !due
+    {
+        return false;
+    }
+    let moved = hit.is_some_and(|hit| {
+        view_state
+            .plugin_focus
+            .focus_hit(&view_state.retained_compositor, &hit)
+    });
+    if moved && let Some(hover) = view_state.mouse.hover_focus.as_mut() {
+        hover.taken = true;
+    }
+    moved
 }
 
 async fn handle_attached_session_removed(
@@ -15106,6 +15290,11 @@ async fn try_handle_plugin_surface_key(
     let result = match view_state.presentation_input.dispatch(&endpoint, &input) {
         bmux_plugin::AttachPresentationInputDispatch::Handled(result) => result,
         bmux_plugin::AttachPresentationInputDispatch::Unhandled => {
+            // A key the focused control does not take goes to the pane, and
+            // so does the keyboard: keys never split between two places.
+            if plugin_focus_yields(view_state) {
+                release_plugin_focus(view_state);
+            }
             return Ok(false);
         }
         bmux_plugin::AttachPresentationInputDispatch::Unregistered => {
@@ -15909,6 +16098,15 @@ async fn handle_attach_mouse_event_at(
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
     record_attach_mouse_event(mouse_event, view_state, now);
+    // Before anything forwards the pointer to an application, so focus
+    // follows it over every pane, mouse-reporting or not.
+    if matches!(mouse_event.kind, MouseEventKind::Moved)
+        && hover_plugin_focus(view_state, mouse_event.column, mouse_event.row, now)
+    {
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
+    }
 
     if !view_state.mouse.config.enabled {
         view_state.mouse.clear_pointer_gestures();
@@ -15981,6 +16179,7 @@ async fn handle_attach_mouse_event_at(
     if dismiss_plugin_focus_on_pointer_down(view_state, mouse_event) {
         return Ok(());
     }
+    release_plugin_focus_on_outside_press(view_state, mouse_event);
 
     // Resolve retained ownership before interpreting an application's mouse
     // protocol. Ignored input inside a modal must not leak to the background.
@@ -21142,6 +21341,205 @@ mod tests {
         assert_eq!(caps.cell_pixel_height, 16);
     }
 
+    /// Two panes (columns 0-9 and 10-19) and, beside them, a plugin surface
+    /// (columns 20-27) with a row that takes focus by hover and an editor
+    /// that does not.
+    fn view_with_hover_focus_surface() -> (AttachViewState, bmux_plugin::AttachInputEndpoint) {
+        let (mut view_state, _, _) = attach_view_state_with_two_panes_fixture();
+        view_state.mouse.config.focus_on_hover = true;
+        view_state.mouse.config.hover_delay_ms = 0;
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.list.input".into(),
+            interface_id: "presentation-input".into(),
+            operation: "handle-input".into(),
+        };
+        let surface = bmux_plugin::surface::PluginSurface {
+            items: Vec::new(),
+            id: bmux_plugin::surface::PluginSurfaceId::new(
+                "example.list",
+                "list",
+                Uuid::from_u128(60),
+            ),
+            revision: 1,
+            target: bmux_plugin::surface::PluginSurfaceTarget::Explicit(ExtensionRect::new(
+                20, 0, 8, 6,
+            )),
+            clip_rect: None,
+            metadata: None,
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            modal: false,
+            visible: true,
+            ops: Vec::new(),
+        }
+        .interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new("row-1", ExtensionRect::new(0, 0, 8, 2))
+                .endpoint(endpoint.clone())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+                .focus_on_hover(),
+        )
+        .interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new("row-2", ExtensionRect::new(0, 2, 8, 2))
+                .endpoint(endpoint.clone())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+                .focus_on_hover(),
+        )
+        .interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new(
+                "editor",
+                ExtensionRect::new(0, 4, 8, 2),
+            )
+            .endpoint(endpoint.clone())
+            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
+        );
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 40, 10),
+        );
+        let _ = view_state.retained_compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 40, 10),
+            DamageCoalescingPolicy::default(),
+        );
+        (view_state, endpoint)
+    }
+
+    fn focused_region(view_state: &AttachViewState) -> Option<String> {
+        view_state
+            .plugin_focus
+            .focused()
+            .map(|id| id.region_local_id.clone())
+    }
+
+    /// With focus-on-hover, the pointer moves keyboard focus onto a region
+    /// that takes it by hover, between such regions, and back to the panes
+    /// when it moves over one, exactly as it does between panes.
+    #[test]
+    fn hovering_moves_keyboard_focus_between_surface_rows_and_panes() {
+        let (mut view, _) = view_with_hover_focus_surface();
+        let now = Instant::now();
+        assert!(hover_plugin_focus(&mut view, 22, 1, now));
+        assert_eq!(focused_region(&view).as_deref(), Some("row-1"));
+        assert!(hover_plugin_focus(&mut view, 22, 3, now));
+        assert_eq!(focused_region(&view).as_deref(), Some("row-2"));
+        // Over a pane: the keyboard goes back to the panes.
+        assert!(hover_plugin_focus(&mut view, 3, 3, now));
+        assert_eq!(focused_region(&view), None);
+        // Without focus-on-hover, hovering moves nothing.
+        view.mouse.config.focus_on_hover = false;
+        assert!(!hover_plugin_focus(&mut view, 22, 1, now));
+        assert_eq!(focused_region(&view), None);
+    }
+
+    /// Focus taken away while the pointer stays inside (a click that
+    /// switched tabs, a key the list did not take) is not taken back until
+    /// the pointer leaves and returns.
+    #[test]
+    fn focus_given_back_inside_a_surface_waits_for_the_pointer_to_return() {
+        let (mut view, _) = view_with_hover_focus_surface();
+        let now = Instant::now();
+        assert!(hover_plugin_focus(&mut view, 22, 1, now));
+        let _ = view.plugin_focus.clear();
+        assert!(!hover_plugin_focus(&mut view, 23, 1, now));
+        assert!(!hover_plugin_focus(&mut view, 22, 3, now));
+        assert_eq!(focused_region(&view), None);
+        let _ = hover_plugin_focus(&mut view, 3, 3, now);
+        assert!(hover_plugin_focus(&mut view, 22, 1, now));
+        assert_eq!(focused_region(&view).as_deref(), Some("row-1"));
+    }
+
+    /// A control that took focus another way (an editor) keeps it while the
+    /// pointer wanders, and hover-focus waits out the configured delay.
+    #[test]
+    fn editors_keep_focus_and_hover_focus_waits_for_its_delay() {
+        let (mut view, _) = view_with_hover_focus_surface();
+        let now = Instant::now();
+        let editor = view.retained_compositor.hit_test(22, 5).unwrap();
+        assert!(
+            view.plugin_focus
+                .focus_hit(&view.retained_compositor, &editor)
+        );
+        assert!(!hover_plugin_focus(&mut view, 3, 3, now));
+        assert!(!hover_plugin_focus(&mut view, 22, 1, now));
+        assert_eq!(focused_region(&view).as_deref(), Some("editor"));
+
+        let _ = view.plugin_focus.clear();
+        let _ = hover_plugin_focus(&mut view, 3, 3, now);
+        view.mouse.config.hover_delay_ms = 200;
+        assert!(!hover_plugin_focus(&mut view, 22, 1, now));
+        assert!(!hover_plugin_focus(
+            &mut view,
+            22,
+            1,
+            now + Duration::from_millis(100)
+        ));
+        assert!(hover_plugin_focus(
+            &mut view,
+            22,
+            1,
+            now + Duration::from_millis(200)
+        ));
+    }
+
+    /// A press on a pane gives the keyboard back to the panes; a press on
+    /// the surface does not.
+    #[test]
+    fn pressing_a_pane_returns_keyboard_focus_to_the_panes() {
+        let (mut view, _) = view_with_hover_focus_surface();
+        let row = view.retained_compositor.hit_test(22, 1).unwrap();
+        assert!(view.plugin_focus.focus_hit(&view.retained_compositor, &row));
+        let press = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        release_plugin_focus_on_outside_press(&mut view, press(22, 3));
+        assert_eq!(focused_region(&view).as_deref(), Some("row-1"));
+        release_plugin_focus_on_outside_press(&mut view, press(3, 3));
+        assert_eq!(focused_region(&view), None);
+    }
+
+    /// Owners hear when their regions gain and lose keyboard focus, however
+    /// it moved, including when a focused region goes away.
+    #[tokio::test]
+    async fn owners_are_told_when_their_regions_gain_and_lose_focus() {
+        let (mut view, endpoint) = view_with_hover_focus_surface();
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&heard);
+        view.presentation_input.register_focus_changed(
+            endpoint,
+            std::sync::Arc::new(move |hook, focused| {
+                record.lock().unwrap().push((hook.to_string(), focused));
+                true
+            }),
+        );
+        let mut client = disconnected_focus_test_client().await;
+        let now = Instant::now();
+        let _ = hover_plugin_focus(&mut view, 22, 1, now);
+        sync_plugin_focus(&mut client, &mut view).await;
+        let _ = hover_plugin_focus(&mut view, 22, 3, now);
+        sync_plugin_focus(&mut client, &mut view).await;
+        // Nothing changed: nothing is said.
+        sync_plugin_focus(&mut client, &mut view).await;
+        let _ = hover_plugin_focus(&mut view, 3, 3, now);
+        sync_plugin_focus(&mut client, &mut view).await;
+        let hook = |region: &str| format!("example.list:list:{region}");
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [
+                (hook("row-1"), true),
+                (hook("row-1"), false),
+                (hook("row-2"), true),
+                (hook("row-2"), false),
+            ]
+        );
+    }
+
     #[test]
     fn pointer_focus_immediate_focuses_target_on_first_move() {
         let session_id = Uuid::new_v4();
@@ -22952,6 +23350,9 @@ mod tests {
                 .await
                 .unwrap()
         );
+        // A declined key goes to the pane, and so does the keyboard.
+        assert!(view.plugin_focus.focused().is_none());
+        view.plugin_focus.focus_hit(&view.retained_compositor, &hit);
         view.presentation_input.remove(&endpoint);
         // Negative control: an unknown endpoint must still reject missing wire representation.
         assert!(matches!(
@@ -24993,6 +25394,7 @@ mod tests {
             focusable: false,
             cursor: bmux_plugin::surface::PluginSurfaceCursor::Crosshair,
             endpoint: None,
+            focus_on_hover: false,
         });
         let mut surfaces = previous.surfaces().values().cloned().collect::<Vec<_>>();
         surfaces.push(surface);

@@ -115,6 +115,7 @@ mod tests {
             focusable: false,
             cursor,
             endpoint: None,
+            focus_on_hover: false,
         });
         surface
     }

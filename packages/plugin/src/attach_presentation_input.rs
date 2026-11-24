@@ -13,6 +13,17 @@ pub type AttachPresentationInputHandler =
 /// value indicates that retained presentation changed. No input is synthesized.
 pub type AttachPresentationFocusLostHandler = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Opt-in observer of a retained control's keyboard focus.
+///
+/// Called with the owner-scoped hook identity and `true` when it gains focus,
+/// `false` when it loses it, however that happened (a click, hovering with
+/// focus-on-hover, the keyboard, or the control going away).
+///
+/// Unlike [`AttachPresentationFocusLostHandler`], observing focus changes
+/// nothing about input: a click elsewhere still reaches its target. The
+/// return value indicates that retained presentation changed.
+pub type AttachPresentationFocusChangedHandler = Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
+
 pub type AttachPresentationPasteHandler =
     Arc<dyn Fn(&str, &str) -> AttachInputResult + Send + Sync>;
 
@@ -66,6 +77,7 @@ pub struct AttachPresentationInputRegistry {
     paste: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationPasteHandler>>,
     handlers: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
     focus_lost: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationFocusLostHandler>>,
+    focus_changed: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationFocusChangedHandler>>,
     commands: RwLock<BTreeMap<PresentationCommandKey, AttachPresentationCommandHandler>>,
 }
 
@@ -157,6 +169,33 @@ impl AttachPresentationInputRegistry {
         event: &AttachInputEvent,
     ) -> Option<AttachInputResult> {
         self.dispatch(endpoint, event).into_result()
+    }
+
+    pub fn register_focus_changed(
+        &self,
+        endpoint: AttachInputEndpoint,
+        handler: AttachPresentationFocusChangedHandler,
+    ) {
+        if let Ok(mut handlers) = self.focus_changed.write() {
+            handlers.insert(endpoint, handler);
+        }
+    }
+
+    /// Tell `endpoint`'s observer that `hook_id` gained (`true`) or lost
+    /// focus. Returns whether its presentation changed.
+    #[must_use]
+    pub fn notify_focus_changed(
+        &self,
+        endpoint: &AttachInputEndpoint,
+        hook_id: &str,
+        focused: bool,
+    ) -> bool {
+        let handler = self
+            .focus_changed
+            .read()
+            .ok()
+            .and_then(|handlers| handlers.get(endpoint).cloned());
+        handler.is_some_and(|handler| handler(hook_id, focused))
     }
 
     pub fn register_focus_lost(
@@ -288,6 +327,9 @@ impl AttachPresentationInputRegistry {
             handlers.remove(endpoint);
         }
         if let Ok(mut handlers) = self.focus_lost.write() {
+            handlers.remove(endpoint);
+        }
+        if let Ok(mut handlers) = self.focus_changed.write() {
             handlers.remove(endpoint);
         }
         if let Ok(mut handlers) = self.handlers.write() {

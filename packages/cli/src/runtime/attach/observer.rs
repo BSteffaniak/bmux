@@ -1069,6 +1069,7 @@ mod tests {
             focusable: true,
             cursor: PluginSurfaceCursor::Pointer,
             endpoint: Some(endpoint),
+            focus_on_hover: false,
         }];
         let mut graph = RetainedCompositor::new();
         graph.replace_surfaces(
