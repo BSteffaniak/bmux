@@ -737,6 +737,7 @@ fn set_terminal_focus(
     } else if state.connected_clients.contains(&client) {
         state.unfocused_terminals.insert(client);
     }
+    drop(state);
     Ok(())
 }
 

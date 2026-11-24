@@ -42,6 +42,86 @@ pub enum FailedClears {
     OnNextCommand,
 }
 
+impl FailedClears {
+    /// The tabs plugin's `failed_clears` setting: `"when_seen"` (the
+    /// default) or `"on_next_command"`.
+    ///
+    /// # Errors
+    /// Returns a message for any other value.
+    pub fn parse(settings: Option<&toml::Value>) -> Result<Self, String> {
+        settings
+            .and_then(|settings| settings.get("failed_clears"))
+            .map_or_else(
+                || Ok(Self::default()),
+                |value| match value.as_str() {
+                    Some("when_seen") => Ok(Self::WhenSeen),
+                    Some("on_next_command") => Ok(Self::OnNextCommand),
+                    _ => Err(format!(
+                        "bmux.tabs failed_clears must be \"when_seen\" or \"on_next_command\", got {value}"
+                    )),
+                },
+            )
+    }
+}
+
+/// The plugin storage key the book is saved under.
+pub const STORAGE_KEY: &str = "attention";
+/// The saved book's format.
+const FORMAT_VERSION: u32 = 1;
+
+/// The book as saved: its format version, then its content.
+#[derive(Debug, Serialize, Deserialize)]
+struct Saved {
+    version: u32,
+    #[serde(default)]
+    book: AttentionBook,
+}
+
+/// What loading a saved book found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Loaded {
+    /// Nothing saved yet.
+    Nothing,
+    /// A book this build reads.
+    Book(AttentionBook),
+    /// A book in a format this build does not know, left as it is: the
+    /// board neither uses nor overwrites it.
+    Unsupported,
+}
+
+impl Loaded {
+    /// Read a saved book.
+    #[must_use]
+    pub fn from_bytes(bytes: Option<&[u8]>) -> Self {
+        let Some(bytes) = bytes else {
+            return Self::Nothing;
+        };
+        match serde_json::from_slice::<Saved>(bytes) {
+            Ok(saved) if saved.version == FORMAT_VERSION => Self::Book(saved.book),
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+impl AttentionBook {
+    /// The book as saved.
+    ///
+    /// # Errors
+    /// Returns a message when it cannot be encoded.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        #[derive(Serialize)]
+        struct SavedRef<'a> {
+            version: u32,
+            book: &'a AttentionBook,
+        }
+        serde_json::to_vec(&SavedRef {
+            version: FORMAT_VERSION,
+            book: self,
+        })
+        .map_err(|error| error.to_string())
+    }
+}
+
 /// One recorded event: its order among all events, and when it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -114,7 +194,7 @@ pub struct AttentionBook {
 }
 
 impl AttentionBook {
-    fn next(&mut self, at_ms: u64) -> Event {
+    const fn next(&mut self, at_ms: u64) -> Event {
         self.last_seq += 1;
         Event {
             seq: self.last_seq,
@@ -387,9 +467,10 @@ mod tests {
         assert_eq!(state(&without_bell, &observation, 7_000), TabState::Done);
     }
 
-    /// Seen marks and events survive a save and a reload.
+    /// Seen marks and events survive a save and a reload; a book in a
+    /// format this build does not know is reported, not guessed at.
     #[test]
-    fn the_book_round_trips_through_json() {
+    fn the_book_round_trips_and_unknown_formats_are_left_alone() {
         let mut book = AttentionBook::default();
         book.observe(
             TAB,
@@ -397,11 +478,39 @@ mod tests {
             false,
             7_000,
         );
-        let saved = serde_json::to_string(&book).unwrap();
-        let loaded: AttentionBook = serde_json::from_str(&saved).unwrap();
+        let saved = book.to_bytes().unwrap();
+        let Loaded::Book(loaded) = Loaded::from_bytes(Some(&saved)) else {
+            panic!("a book");
+        };
         assert_eq!(loaded, book);
+        assert_eq!(
+            state(
+                &loaded,
+                &agent(AgentActivity::Idle, 5_000, Some(5_000)),
+                9_000
+            ),
+            TabState::Done,
+            "an unseen finish is still done after a restart"
+        );
+        assert_eq!(Loaded::from_bytes(None), Loaded::Nothing);
+        assert_eq!(
+            Loaded::from_bytes(Some(br#"{"version":2,"book":{}}"#)),
+            Loaded::Unsupported
+        );
+        assert_eq!(Loaded::from_bytes(Some(b"garbage")), Loaded::Unsupported);
         let mut pruned = loaded;
         assert!(pruned.retain(&HashSet::new()));
         assert!(pruned.tabs.is_empty());
+    }
+
+    #[test]
+    fn failed_clears_is_a_setting() {
+        let parse = |text: &str| FailedClears::parse(Some(&toml::from_str(text).unwrap()));
+        assert_eq!(FailedClears::parse(None), Ok(FailedClears::WhenSeen));
+        assert_eq!(
+            parse("failed_clears = 'on_next_command'"),
+            Ok(FailedClears::OnNextCommand)
+        );
+        assert!(parse("failed_clears = 'never'").is_err());
     }
 }

@@ -1341,6 +1341,8 @@ impl TabsPlugin {
     ) -> std::result::Result<(), PluginCommandError> {
         cwd::CwdSettings::parse(context.settings.as_ref())
             .map_err(PluginCommandError::invalid_arguments)?;
+        attention::FailedClears::parse(context.settings.as_ref())
+            .map_err(PluginCommandError::invalid_arguments)?;
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
         let migration_guard = TAB_ORDER_MUTATION
@@ -2829,6 +2831,36 @@ fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
         .collect()
 }
 
+/// The attention book saved in this plugin's storage.
+fn load_attention(caller: &(impl ServiceCaller + Sync)) -> attention::Loaded {
+    let Ok(key) = bmux_plugin_sdk::StorageKey::new(attention::STORAGE_KEY) else {
+        return attention::Loaded::Unsupported;
+    };
+    match caller.storage_get(&bmux_plugin_sdk::StorageGetRequest::new(key)) {
+        Ok(response) => attention::Loaded::from_bytes(response.value.as_deref()),
+        Err(error) => {
+            tracing::warn!(%error, "tabs attention not loaded; starting fresh without saving");
+            attention::Loaded::Unsupported
+        }
+    }
+}
+
+/// Save the attention book in this plugin's storage; a failure is logged and
+/// retried with the next change.
+fn save_attention(caller: &(impl ServiceCaller + Sync), book: &attention::AttentionBook) {
+    let saved = bmux_plugin_sdk::StorageKey::new(attention::STORAGE_KEY)
+        .map_err(|error| error.to_string())
+        .and_then(|key| Ok((key, book.to_bytes()?)))
+        .and_then(|(key, bytes)| {
+            caller
+                .storage_set(&bmux_plugin_sdk::StorageSetRequest::new(key, bytes))
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = saved {
+        tracing::warn!(%error, "tabs attention not saved");
+    }
+}
+
 /// The tabs a person is looking at now: each shown by a client whose
 /// terminal has focus. Looking at a tab marks what it signalled seen.
 fn looked_at_tabs(caller: &(impl ServiceCaller + Sync)) -> std::collections::HashSet<Uuid> {
@@ -2856,6 +2888,12 @@ fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoar
     let Ok(mut board) = board.lock() else {
         return;
     };
+    if board.attention_unloaded() {
+        board.load_attention(
+            load_attention(caller),
+            attention::FailedClears::parse(shared.settings.as_ref()).unwrap_or_default(),
+        );
+    }
     let now_ms = status::now_ms();
     board.apply_signals(&signals, now_ms);
     let looked_at = looked_at_tabs(caller);
@@ -2871,6 +2909,9 @@ fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoar
                     + 1,
             },
         );
+    }
+    if let Some(book) = board.take_changed_attention() {
+        save_attention(caller, &book);
     }
     if !board.changed(&statuses) {
         return;
