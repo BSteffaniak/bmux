@@ -618,7 +618,6 @@ async fn wait_for_shutdown_progress(
     // notice timer never advances this state.
     let started = std::time::Instant::now();
     let mut observations = ShutdownIdleTimer::new(started, OWNED_STOP_TIMEOUT);
-    let mut reported_revision = 0;
     loop {
         if process.exited()? {
             return Ok(());
@@ -643,7 +642,9 @@ async fn wait_for_shutdown_progress(
                 let snapshot: ShutdownProgressSnapshot = serde_json::from_slice(&bytes)
                     .context("invalid shutdown progress observation")?;
                 if let Some(metadata) = metadata {
-                    observations
+                    // Report only observations from the selected instance: the
+                    // previous server's file stays until this one replaces it.
+                    let accepted = observations
                         .observe(
                             &snapshot,
                             metadata.pid,
@@ -651,14 +652,13 @@ async fn wait_for_shutdown_progress(
                             std::time::Instant::now(),
                         )
                         .map_err(anyhow::Error::msg)?;
-                    if snapshot.revision > reported_revision {
+                    if accepted {
                         let step: String = observations
                             .last_step()
                             .chars()
                             .map(|ch| if ch.is_control() { ' ' } else { ch })
                             .collect();
                         eprintln!("Shutdown: {step}");
-                        reported_revision = snapshot.revision;
                     }
                 }
             }

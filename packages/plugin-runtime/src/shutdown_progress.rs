@@ -129,6 +129,8 @@ impl ShutdownIdleTimer {
         }
     }
     /// Only a newer, supported observation from the captured instance counts.
+    /// Returns whether it counted, so callers report only accepted steps (a
+    /// previous instance's file outlives it and must stay silent).
     ///
     /// # Errors
     /// Rejects unsupported matching schemas and malformed steps.
@@ -138,9 +140,9 @@ impl ShutdownIdleTimer {
         pid: u32,
         started_at_epoch_ms: u64,
         now: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if value.pid != pid || value.started_at_epoch_ms != started_at_epoch_ms {
-            return Ok(());
+            return Ok(false);
         }
         if value.version != 1 {
             return Err(format!(
@@ -151,12 +153,13 @@ impl ShutdownIdleTimer {
         if value.current_step.len() > 1024 {
             return Err("oversized shutdown progress step".into());
         }
-        if value.revision > self.revision {
-            self.revision = value.revision;
-            self.last_progress = now;
-            self.step = Some(value.current_step.clone());
+        if value.revision <= self.revision {
+            return Ok(false);
         }
-        Ok(())
+        self.revision = value.revision;
+        self.last_progress = now;
+        self.step = Some(value.current_step.clone());
+        Ok(true)
     }
     #[must_use]
     pub fn expired(&self, now: Instant) -> bool {
@@ -192,12 +195,12 @@ mod tests {
             assert!(!timer.expired(now));
         }
         let now = start + Duration::from_secs(230);
-        timer.observe(&snapshot(10), 42, 99, now).unwrap();
-        timer.observe(&snapshot(11), 42, 100, now).unwrap();
-        timer.observe(&snapshot(11), 43, 99, now).unwrap();
-        timer.observe(&snapshot(9), 42, 99, now).unwrap();
+        assert!(!timer.observe(&snapshot(10), 42, 99, now).unwrap());
+        assert!(!timer.observe(&snapshot(11), 42, 100, now).unwrap());
+        assert!(!timer.observe(&snapshot(11), 43, 99, now).unwrap());
+        assert!(!timer.observe(&snapshot(9), 42, 99, now).unwrap());
         assert!(timer.expired(now));
-        timer.observe(&snapshot(11), 42, 99, now).unwrap();
+        assert!(timer.observe(&snapshot(11), 42, 99, now).unwrap());
         assert!(!timer.expired(now));
     }
     #[test]
@@ -209,5 +212,16 @@ mod tests {
         let mut value = snapshot(1);
         value.version = 2;
         assert!(timer.observe(&value, 42, 99, start).is_err());
+    }
+    #[test]
+    fn previous_instance_progress_is_not_accepted() {
+        let start = Instant::now();
+        let mut timer = ShutdownIdleTimer::new(start, Duration::from_secs(30));
+        // A finished server's file outlives it; the next stop must ignore it.
+        assert!(!timer.observe(&snapshot(7), 41, 99, start).unwrap());
+        assert!(!timer.observe(&snapshot(7), 42, 98, start).unwrap());
+        assert!(timer.last_step().contains("unavailable"));
+        assert!(timer.observe(&snapshot(1), 42, 99, start).unwrap());
+        assert_eq!(timer.last_step(), "work completed");
     }
 }
