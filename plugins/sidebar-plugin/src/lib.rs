@@ -113,6 +113,10 @@ enum Density {
 
 /// The default description: the tab's detail, rendered with its parts styled.
 const DEFAULT_DESCRIPTION: &str = "{detail}";
+
+const BRANCH_ICON: &str = "\u{e0a0} ";
+const FOLDER_ICON: &str = "\u{f07b} ";
+
 /// Below this width, cards are one line whatever the density, and their
 /// state shows only in their glyph.
 const COMPACT_BELOW_WIDTH: u16 = 20;
@@ -1022,12 +1026,31 @@ impl CompanionState {
             // Without git, the directory keeps its end, cut from the left.
             git.is_empty().then(|| activity::shorten_left(cwd, room))
         });
+        let mut spare = room.saturating_sub(git_width);
+        if let Some(cwd) = &cwd {
+            spare = spare.saturating_sub(bmux_cell_geometry::display_width(cwd));
+            if !git.is_empty() {
+                spare = spare.saturating_sub(bmux_cell_geometry::display_width(separator));
+            }
+        }
+        let branch_icon_width = bmux_cell_geometry::display_width(BRANCH_ICON);
+        let show_branch_icon = !git.is_empty() && spare >= branch_icon_width;
+        if show_branch_icon {
+            spare -= branch_icon_width;
+        }
+
         let mut spans = Vec::new();
         if let Some(cwd) = cwd {
+            if spare >= bmux_cell_geometry::display_width(FOLDER_ICON) {
+                spans.push(Span::styled(FOLDER_ICON, tui_style(palette.muted)));
+            }
             spans.push(Span::styled(cwd, tui_style(palette.muted)));
             if !git.is_empty() {
                 spans.push(Span::styled(separator, tui_style(palette.faint)));
             }
+        }
+        if show_branch_icon {
+            spans.push(Span::styled(BRANCH_ICON, tui_style(palette.muted)));
         }
         spans.extend(git);
         if spans.is_empty() {
@@ -4476,9 +4499,9 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        assert_eq!(detail(32), "/work/bmux · main*");
-        assert_eq!(detail(23), "bmux · main*");
-        assert_eq!(detail(20), "bmux · main*");
+        assert_eq!(detail(32), "\u{f07b} /work/bmux · \u{e0a0} main*");
+        assert_eq!(detail(23), "\u{f07b} bmux · \u{e0a0} main*");
+        assert_eq!(detail(20), "bmux · \u{e0a0} main*");
     }
 
     /// Workspaces take their configured colors, others one from their name.
@@ -5644,11 +5667,11 @@ mod tests {
             [
                 " TABS                  ◆1 ▲1 ◉1",
                 "▎ ○ editor                 nvim",
-                "▎   /work/bmux · main* ↑2",
+                "▎   \u{f07b} /work/bmux · \u{e0a0} main* ↑2",
                 "  ◉ claude           working 5s",
-                "    /work/bmux/plugins",
+                "    \u{f07b} /work/bmux/plugins",
                 "  ▲ build             exit 101",
-                "    /work/build",
+                "    \u{f07b} /work/build",
                 "  ◆ review         needs input",
                 "    approve edit?",
                 "",
