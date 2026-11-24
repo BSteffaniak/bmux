@@ -160,6 +160,12 @@ pub trait AttachTerminal: Write {
         Ok(())
     }
 
+    /// Ring the bell and show notifications on the host terminal, as the
+    /// alert gate admitted them. Hosts with no terminal ignore them.
+    fn alert(&mut self, _admitted: &bmux_attach_pipeline::alerts::AdmittedAlerts) -> Result<()> {
+        Ok(())
+    }
+
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
@@ -250,6 +256,12 @@ trait AttachHost {
         Ok(())
     }
 
+    /// Ring the bell and show notifications on the host terminal, as the
+    /// alert gate admitted them. Hosts with no terminal ignore them.
+    fn alert(&mut self, _admitted: &bmux_attach_pipeline::alerts::AdmittedAlerts) -> Result<()> {
+        Ok(())
+    }
+
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
@@ -318,6 +330,9 @@ impl<T: AttachTerminal + ?Sized> AttachHost for TerminalAttachHost<'_, T> {
         shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     ) -> Result<()> {
         self.0.present_pointer_shape(shape)
+    }
+    fn alert(&mut self, admitted: &bmux_attach_pipeline::alerts::AdmittedAlerts) -> Result<()> {
+        self.0.alert(admitted)
     }
     fn restore_after_attach_ui(&mut self) -> Result<()> {
         self.0.restore_after_attach_ui()
@@ -1687,6 +1702,28 @@ impl AttachTerminal for HeadlessAttachTerminal {
             .map_err(Into::into)
     }
 
+    fn alert(&mut self, admitted: &bmux_attach_pipeline::alerts::AdmittedAlerts) -> Result<()> {
+        use bmux_terminal_protocol::notification_output::{
+            NOTIFICATIONS_ENV, NotificationCapability, encode_alerts,
+        };
+        // Headless output names its notification sequence explicitly, never
+        // the coordinator's terminal.
+        let capability = NotificationCapability::from_environment(
+            "",
+            "",
+            false,
+            std::env::var(NOTIFICATIONS_ENV).ok().as_deref(),
+        );
+        let notifications = admitted
+            .notifications
+            .iter()
+            .map(|notification| (notification.title.as_str(), notification.body.as_str()))
+            .collect::<Vec<_>>();
+        let bytes = encode_alerts(admitted.bell, &notifications, capability);
+        self.write_all(&bytes)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn observe_scrollback(&self, active: bool) {
         *self
@@ -1816,6 +1853,15 @@ impl AttachTerminal for RealAttachTerminal {
                 shape,
             )
             .context("failed presenting host pointer shape")
+    }
+
+    fn alert(&mut self, admitted: &bmux_attach_pipeline::alerts::AdmittedAlerts) -> Result<()> {
+        self.terminal
+            .alert(
+                admitted,
+                bmux_terminal_protocol::notification_output::NotificationCapability::detect(),
+            )
+            .context("failed alerting the host terminal")
     }
 
     fn geometry(&self) -> TerminalGeometry {
@@ -5455,6 +5501,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             context_id: view_state.attached_context_id,
         },
     );
+    // What plugins post for this terminal, and which panes' bells reach it.
+    let attach_alerts = bmux_plugin::attach_alerts(&attach_states);
+    let alert_wake = {
+        let mut alerts = attach_alerts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alerts.set_bell_policy(attach_bell_policy(attach_config.behavior.bell_action));
+        alerts.wake()
+    };
+    let mut alert_gate = bmux_attach_pipeline::alerts::AlertGate::default();
     let presentation_resources = bmux_plugin::AttachPresentationResources {
         layouts: view_state.presentation_layouts.clone(),
         allocations: view_state.presentation_allocations.clone(),
@@ -5735,6 +5791,19 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     view_state
                         .dirty
                         .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+                }
+            }
+            // Alerts plugins posted: shown on this terminal, bursts limited.
+            () = alert_wake.notified() => {
+                let posted = attach_alerts
+                    .write()
+                    .map(|mut alerts| alerts.take())
+                    .unwrap_or_default();
+                let admitted = alert_gate.admit(posted, Instant::now());
+                if !admitted.is_empty()
+                    && let Err(error) = terminal.alert(&admitted)
+                {
+                    tracing::warn!(%error, "attach alert failed");
                 }
             }
             // Server-pushed events (layout changes, session events, pane output)
@@ -15327,6 +15396,16 @@ async fn try_handle_plugin_surface_key(
         return Ok(execute_surface_action(client, view_state, result.consumed, invocation).await);
     }
     Ok(result.consumed)
+}
+
+/// Which panes' bells reach the terminal, from `behavior.bell_action`.
+const fn attach_bell_policy(action: bmux_config::BellAction) -> bmux_plugin::AttachBellPolicy {
+    match action {
+        bmux_config::BellAction::None => bmux_plugin::AttachBellPolicy::None,
+        bmux_config::BellAction::Any => bmux_plugin::AttachBellPolicy::Any,
+        bmux_config::BellAction::Current => bmux_plugin::AttachBellPolicy::Current,
+        bmux_config::BellAction::Other => bmux_plugin::AttachBellPolicy::Other,
+    }
 }
 
 fn decode_surface_action_response(

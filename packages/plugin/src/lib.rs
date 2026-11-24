@@ -17,6 +17,7 @@
 pub type StreamOrigin = bmux_ipc::StreamProvenance;
 
 pub mod action_dispatch;
+mod attach_alerts;
 #[cfg(feature = "tui")]
 mod attach_companion;
 mod attach_presentation_input;
@@ -54,6 +55,9 @@ mod text_transform;
 mod typed_dispatch_bridge;
 mod typed_service_caller;
 
+pub use attach_alerts::{
+    AttachAlert, AttachAlerts, AttachBellPolicy, AttachNotification, attach_alerts,
+};
 #[cfg(feature = "tui")]
 pub use attach_companion::{
     AttachCompanion, AttachCompanionCallback, AttachCompanionFactory, AttachCompanionRegistry,

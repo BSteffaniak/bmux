@@ -284,6 +284,33 @@ impl<W: Write> TerminalIo<W> {
             .present(&mut self.writer, capability, shape)
     }
 
+    /// Ring the bell and show notifications as `admitted` says, in the way
+    /// the terminal supports (`capability`).
+    ///
+    /// # Errors
+    /// Reports failed output.
+    pub fn alert(
+        &mut self,
+        admitted: &crate::alerts::AdmittedAlerts,
+        capability: bmux_terminal_protocol::notification_output::NotificationCapability,
+    ) -> io::Result<()> {
+        let notifications = admitted
+            .notifications
+            .iter()
+            .map(|notification| (notification.title.as_str(), notification.body.as_str()))
+            .collect::<Vec<_>>();
+        let bytes = bmux_terminal_protocol::notification_output::encode_alerts(
+            admitted.bell,
+            &notifications,
+            capability,
+        );
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()
+    }
+
     /// Release only this lease's pointer state. Uncertain stack operations are
     /// deliberately not replayed by explicit cleanup or Drop.
     ///

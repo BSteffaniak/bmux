@@ -1,5 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
+pub mod notification_output;
 pub mod pointer_output;
 pub mod pointer_shape;
 
