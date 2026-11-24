@@ -788,6 +788,24 @@ mod tests {
     }
 
     #[test]
+    fn bundled_bcode_rules_recognize_path_and_development_launches() {
+        let knowledge = Knowledge::load(&Settings::parse(None).unwrap(), &[]);
+        assert!(knowledge.rules_for("bcode").is_some());
+        for command in [
+            "bcode",
+            "/home/me/GitHub/bcode/target/aarch64-apple-darwin/release/bcode",
+        ] {
+            assert_eq!(
+                knowledge
+                    .catalog
+                    .identify(&[command.to_string()])
+                    .as_deref(),
+                Some("bcode")
+            );
+        }
+    }
+
+    #[test]
     fn configured_aliases_name_agents_with_or_without_rules() {
         let value = toml::from_str::<toml::Value>(
             "[aliases]\nclaude = ['work-claude', '/opt/ai/bin/run-agent']\nmybot = ['mb']",

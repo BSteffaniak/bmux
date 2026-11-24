@@ -5,8 +5,7 @@
 //! and the progress report (OSC 9;4). The highest-priority rule that matches
 //! decides the state. The format and regions are those of herdr's detection
 //! manifests (<https://github.com/herdrdev/herdr>, Apache-2.0), so its
-//! rule files run unchanged; the bundled ones in `rules/` are its (see
-//! `rules/NOTICE`).
+//! rule files run unchanged. See `rules/NOTICE` for bundled rule provenance.
 
 use std::collections::HashMap;
 
@@ -607,6 +606,7 @@ fn last_non_empty_line(content: &str) -> &str {
 pub const BUNDLED: &[(&str, &str)] = &[
     ("amp", include_str!("../rules/amp.toml")),
     ("antigravity", include_str!("../rules/antigravity.toml")),
+    ("bcode", include_str!("../rules/bcode.toml")),
     ("claude", include_str!("../rules/claude.toml")),
     ("cline", include_str!("../rules/cline.toml")),
     ("codex", include_str!("../rules/codex.toml")),
@@ -660,6 +660,55 @@ mod tests {
             let agent = Agent::parse(source).unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(!agent.rules.is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn bcode_reads_live_activity_and_ignores_stale_transcript_status() {
+        let bcode = agent("bcode");
+        let composer = "┌ Message ─────┐\n│ Ask Bcode…   │\n└──────────────┘";
+        for (body, expected) in [
+            (
+                "⠋ waiting for astra response · 1.2s · round 1 · New draft",
+                RuleState::Working,
+            ),
+            ("◐ Building… (12s)", RuleState::Working),
+            (
+                "⠙ rate limit; retrying in 30s · cancel to exit",
+                RuleState::Working,
+            ),
+            (
+                "⠹ waiting for permission · running shell · 3.2s",
+                RuleState::Blocked,
+            ),
+            (
+                "Permission requested: shell.run\n  1. Approve once\n  2. Deny once",
+                RuleState::Blocked,
+            ),
+            (
+                "Question\nWhich file should I use?\n  [ Submit ]  [ Cancel ]",
+                RuleState::Blocked,
+            ),
+            (
+                "⠋ waiting for astra response · 1.2s\n⠹ waiting for permission · running shell · 3.2s\nready · —/272k —% · New draft",
+                RuleState::Idle,
+            ),
+        ] {
+            let rendered = format!("{body}\n{composer}");
+            assert_eq!(
+                screen(&bcode, &rendered).map(|(state, _)| state),
+                Some(expected),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            screen(
+                &bcode,
+                &format!(
+                    "Example: Permission requested: shell.run\nMentioning Question and Submit\n{composer}"
+                )
+            ),
+            None
+        );
     }
 
     #[test]

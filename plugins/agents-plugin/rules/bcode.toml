@@ -1,0 +1,62 @@
+id = "bcode"
+
+# The live activity row can still animate while a tool awaits approval.
+[[rules]]
+id              = "waiting_for_permission"
+line_regex      = ['^\s*[\x{2800}-\x{28ff}]\s+waiting for permission\s+·\s+\S']
+priority        = 1020
+region          = "bottom_non_empty_lines(12)"
+state           = "blocked"
+visible_blocker = true
+
+[[rules]]
+id = "permission_dialog"
+line_regex = [
+    '^[\s│╭┌─]*Permission requested:',
+    '^\s*(?:[❯ ]\s*)?(?:[0-9]+\.\s+|\[\s*)Approve\b',
+    '(?:^[\s❯]*[0-9]+\.\s+|\[\s*)Deny\b',
+]
+priority = 1090
+region = "bottom_non_empty_lines(18)"
+state = "blocked"
+visible_blocker = true
+
+[[rules]]
+id = "question_form"
+line_regex = [
+    '^\s*(?:[│╭┌]\s*)?Question\s*(?:[─│╮┐].*)?$',
+    '^[\s│\[❯]*Submit[\] \t│]+\[?[ \t]*Cancel\b',
+]
+priority = 1090
+region = "bottom_non_empty_lines(16)"
+state = "blocked"
+visible_blocker = true
+
+# Require the ready footer next to the composer so an old transcript line
+# cannot override live activity. An empty idle pane also needs no signal.
+[[rules]]
+id           = "ready_composer"
+priority     = 1050
+regex        = ['(?m)^\s*ready(?:\s+·[^\n]*)?\s*\n\s*[┌╭]\s+Message\b']
+region       = "bottom_non_empty_lines(12)"
+state        = "idle"
+visible_idle = true
+
+[[rules]]
+any = [
+    { line_regex = [
+        '^\s*[\x{2800}-\x{28ff}]\s+\S.*\s+·\s+[0-9]+(?:\.[0-9]+)?(?:ms|s)(?:\s+·|\s*$)',
+    ] },
+    # The dedicated activity row can use theme-supplied spinner frames and verbs.
+    { line_regex = [
+        '^\s*[^\w\s│]\s+\S.*…\s+\([0-9]+s\)\s*$',
+    ] },
+    { line_regex = [
+        '^\s*[\x{2800}-\x{28ff}]\s+\S.*; retrying in .+ · cancel to exit(?:\s+·|\s*$)',
+    ] },
+]
+id = "live_activity"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+state = "working"
+visible_working = true

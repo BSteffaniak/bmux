@@ -1,6 +1,7 @@
 # bmux Agents
 
-Recognizes coding agents (Claude Code, Codex, Gemini, Cursor, OpenCode and
+Recognizes coding agents (Bcode, Claude Code, Codex, Gemini, Cursor, OpenCode
+and
 others) running in panes and tells what each is doing: **working**,
 **blocked** (it needs you to answer or approve something) or **idle**. The
 tabs plugin folds each tab's most pressing agent into its status, which the
@@ -75,7 +76,7 @@ state; the hooks make it exact and carry its messages.
 
 ## Rules
 
-The bundled rule files in `rules/` are herdr's agent detection manifests
+Most bundled rule files in `rules/` are herdr's agent detection manifests
 (Apache-2.0, see `rules/NOTICE`), read by a compatible engine: regions of the
 screen (`bottom_non_empty_lines(N)`, `prompt_box_body`,
 `after_last_horizontal_rule`, `osc_title`, `osc_progress`, …) matched with
