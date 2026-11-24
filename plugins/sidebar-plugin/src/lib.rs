@@ -373,6 +373,23 @@ enum ColumnGesture {
     Scroll,
 }
 
+/// The scrollbar thumb's pointer: a hand that grabs it, closed while it is
+/// dragged to scroll, and the resize arrows once a press on it became a resize.
+const fn thumb_cursor(drag: Option<ColumnGesture>) -> bmux_plugin::surface::PluginSurfaceCursor {
+    use bmux_plugin::surface::PluginSurfaceCursor;
+    use bmux_tui::hit::HitRole;
+    use bmux_tui::pointer::{PointerIntent, PointerShape};
+    let shape = match drag {
+        Some(ColumnGesture::Resize) => return PluginSurfaceCursor::ResizeHorizontal,
+        Some(ColumnGesture::Scroll) => PointerShape::Grabbing,
+        Some(ColumnGesture::Undecided) | None => PointerShape::Grab,
+    };
+    PluginSurfaceCursor::Tui {
+        intent: PointerIntent::Shape(shape),
+        role: HitRole::DragHandle,
+    }
+}
+
 /// Cells `widen` and `narrow` move the edge by.
 const WIDTH_STEP: u16 = 2;
 /// The file in the local state directory that remembers the width.
@@ -1904,6 +1921,7 @@ fn sidebar_regions(
     painted: Vec<PluginSurfaceRegion>,
     hits: &mut HitTable<SidebarHit>,
     placed: &mut std::collections::BTreeSet<SidebarHit>,
+    drag: Option<ColumnGesture>,
 ) -> Vec<PluginSurfaceRegion> {
     let mut regions = Vec::new();
     for hit in painted {
@@ -1931,7 +1949,7 @@ fn sidebar_regions(
         };
         let cursor = match item {
             SidebarHit::ResizeEdge => bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal,
-            SidebarHit::Scrollbar => bmux_plugin::surface::PluginSurfaceCursor::ResizeVertical,
+            SidebarHit::Scrollbar => thumb_cursor(drag),
             SidebarHit::Tab(_) | SidebarHit::Group(_) => {
                 bmux_plugin::surface::PluginSurfaceCursor::Pointer
             }
@@ -2065,7 +2083,8 @@ fn build_surface_with_hits(
     )
     .opaque(true);
     let mut placed = std::collections::BTreeSet::new();
-    for region in sidebar_regions(painted.hits, &mut hits, &mut placed) {
+    let drag = state.resize.map(|drag| drag.mode);
+    for region in sidebar_regions(painted.hits, &mut hits, &mut placed, drag) {
         surface = surface.interactive_region(region);
     }
     let text = visible_field_text(&rows, &placed, width);
@@ -4118,6 +4137,25 @@ mod tests {
         let offset =
             |owner: &CompanionHandle| owner.lock().unwrap().as_ref().unwrap().scroll_offset();
         let width = |owner: &CompanionHandle| owner.lock().unwrap().as_ref().unwrap().width;
+        // The thumb shows a hand that grabs it, closed while it scrolls.
+        let thumb_cursor = |owner: &CompanionHandle| {
+            let guard = owner.lock().unwrap();
+            build_surface(guard.as_ref().unwrap(), 9)
+                .interactive_regions
+                .into_iter()
+                .find(|region| region.local_id == view::SCROLLBAR)
+                .map(|region| region.cursor)
+        };
+        let hand = |shape| {
+            Some(bmux_plugin::surface::PluginSurfaceCursor::Tui {
+                intent: bmux_tui::pointer::PointerIntent::Shape(shape),
+                role: bmux_tui::hit::HitRole::DragHandle,
+            })
+        };
+        assert_eq!(
+            thumb_cursor(&owner),
+            hand(bmux_tui::pointer::PointerShape::Grab)
+        );
         // Grab the thumb at its top and drag it to the bottom of the track.
         let grabbed =
             super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "down", 31, thumb.y))
@@ -4126,7 +4164,15 @@ mod tests {
         super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "drag", 31, 6)).unwrap();
         let bottom = offset(&owner);
         assert!(bottom > 0, "dragging the thumb down scrolls down");
+        assert_eq!(
+            thumb_cursor(&owner),
+            hand(bmux_tui::pointer::PointerShape::Grabbing)
+        );
         super::handle_local_input(&owner, &pointer(view::SCROLLBAR, "up", 31, 6)).unwrap();
+        assert_eq!(
+            thumb_cursor(&owner),
+            hand(bmux_tui::pointer::PointerShape::Grab)
+        );
         // A click on the track near the top jumps there, and resizes nothing.
         let before = width(&owner);
         super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "down", 31, 1)).unwrap();
