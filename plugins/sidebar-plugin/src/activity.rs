@@ -11,7 +11,7 @@
 //!   `failed_clears` setting);
 //! - **done**: its agent finished since anyone looked at the tab;
 //! - **working**: its agent works, or a command runs and prints;
-//! - **stopped**: its agent finished or waits at its prompt, and that was seen;
+//! - **stopped**: its agent returned to idle after observed work;
 //! - **idle**: otherwise.
 //!
 //! This turns that into what a card says: its summary, detail and ages.
@@ -251,6 +251,7 @@ impl ActivityView {
             TabState::Done => Some("done".to_string()),
             TabState::Working if agent.is_some() => Some("working".to_string()),
             TabState::Stopped => Some("stopped".to_string()),
+            TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
             TabState::Working | TabState::Idle => program.clone(),
         };
         let message = (state == TabState::Blocked)

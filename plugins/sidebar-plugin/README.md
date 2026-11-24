@@ -47,7 +47,7 @@ States, most urgent first, as the tabs plugin decides them for every view
 | `▲` red    | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
 | `✓` cyan   | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
 | `◉` green  | working     | its agent is working (a spinner by default), or another command is running and produced output in the last few seconds                                                               |
-| `■` blue   | stopped     | its agent finished or waits at its prompt, and someone has looked since                                                                                                              |
+| `■` blue   | stopped     | its agent returned to idle after observed work                                                                                                                                       |
 | `○` dim    | idle        | otherwise                                                                                                                                                                            |
 
 Looking at a tab means some attach client shows it while its terminal has

@@ -18,7 +18,7 @@
 //! The tab's state, most pressing first: needs input (its agent asks, or an
 //! unseen bell or notification), failed (an unseen failure, or any while the
 //! failed command's output stands, by [`FailedClears`]), done (an unseen
-//! finish while the agent stays idle), working, stopped, idle.
+//! finish while the agent stays idle), working, stopped after observed work, idle.
 
 use std::collections::{HashMap, HashSet};
 
@@ -290,10 +290,11 @@ impl AttentionBook {
             Some(agent) if agent.activity == AgentActivity::Working => {
                 (TabState::Working, Some(agent.changed_at_ms))
             }
-            Some(agent) => (
-                TabState::Stopped,
-                Some(agent.finished_at_ms.unwrap_or(agent.changed_at_ms)),
-            ),
+            Some(agent) => agent
+                .finished_at_ms
+                .map_or((TabState::Idle, None), |finished| {
+                    (TabState::Stopped, Some(finished))
+                }),
             None if observation.running
                 && observation
                     .output_at_ms
@@ -357,6 +358,16 @@ mod tests {
         let mut viewed = AttentionBook::default();
         viewed.observe(TAB, &idle, true, 6_600);
         assert_eq!(state(&viewed, &idle, 6_600), TabState::Stopped);
+    }
+
+    #[test]
+    fn an_agent_asking_before_any_work_still_needs_input() {
+        let book = AttentionBook::default();
+        let asking = agent(AgentActivity::Blocked, 1_000, None);
+        assert_eq!(
+            book.state(TAB, &asking, FailedClears::WhenSeen, 1_000),
+            (TabState::NeedsInput, Some(1_000))
+        );
     }
 
     /// A pause shorter than the settle, such as before the agent asks a

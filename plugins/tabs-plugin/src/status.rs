@@ -703,7 +703,7 @@ mod tests {
         use bmux_tabs_plugin_api::tabs_status::TabState;
         let tabs = [tab(1, &[(11, true, Some("claude"))])];
         let tab_id = Uuid::from_u128(1);
-        let idle = AgentSnapshot {
+        let mut idle = AgentSnapshot {
             panes: vec![PaneAgent {
                 session_id: Uuid::from_u128(9),
                 pane_id: Uuid::from_u128(11),
@@ -713,7 +713,7 @@ mod tests {
                 rule: None,
                 message: None,
                 changed_at_ms: 10_000,
-                finished_at_ms: Some(10_000),
+                finished_at_ms: None,
             }],
             revision: 1,
         };
@@ -723,6 +723,13 @@ mod tests {
         board.load_attention(Loaded::Nothing, FailedClears::WhenSeen);
         board.set_agents(&idle);
         let state = |built: Vec<TabStatus>| (built[0].state, built[0].state_since_ms);
+        assert_eq!(
+            state(board.build(&tabs, &nobody, 10_000, &mut |_| None)),
+            (TabState::Idle, None),
+            "an idle agent with no observed work"
+        );
+        idle.panes[0].finished_at_ms = Some(10_000);
+        board.set_agents(&idle);
         assert_eq!(
             state(board.build(&tabs, &nobody, 12_000, &mut |_| None)),
             (TabState::Done, Some(10_000))
@@ -752,6 +759,16 @@ mod tests {
             "looked at"
         );
         assert!(restarted.take_changed_attention().is_some());
+
+        let mut relaunched = idle.clone();
+        relaunched.panes[0].finished_at_ms = None;
+        relaunched.panes[0].changed_at_ms = 43_000;
+        restarted.set_agents(&relaunched);
+        assert_eq!(
+            state(restarted.build(&tabs, &nobody, 43_000, &mut |_| None)),
+            (TabState::Idle, None),
+            "an earlier job's completion does not make the new agent stopped"
+        );
 
         // Missing for long enough, it is forgotten.
         let other = [tab(2, &[(12, true, None)])];

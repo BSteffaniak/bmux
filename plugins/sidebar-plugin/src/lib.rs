@@ -3596,17 +3596,17 @@ mod tests {
         }
     }
 
-    /// The state the tabs plugin publishes for a tab whose only signal is
-    /// its agent's activity.
+    /// The state the tabs plugin publishes from agent activity and any seen finish.
     fn published(
         activity: Option<bmux_tabs_plugin_api::tabs_status::AgentActivity>,
+        finished_at_ms: Option<u64>,
     ) -> bmux_tabs_plugin_api::tabs_status::TabState {
         use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabState};
         match activity {
             Some(AgentActivity::Working) => TabState::Working,
             Some(AgentActivity::Blocked) => TabState::NeedsInput,
-            Some(AgentActivity::Idle) => TabState::Stopped,
-            None => TabState::Idle,
+            Some(AgentActivity::Idle) if finished_at_ms.is_some() => TabState::Stopped,
+            Some(AgentActivity::Idle) | None => TabState::Idle,
         }
     }
 
@@ -4490,26 +4490,29 @@ mod tests {
         let mut state = CompanionState::new(settings, state_dir);
         state.allocation = Some(ExtensionRect::new(0, 0, 32, 14));
         let now = 600_000;
-        let status = |index: u128, activity: Option<AgentActivity>| TabStatus {
-            tab_id: Uuid::from_u128(index),
-            state: published(activity),
-            state_since_ms: activity.map(|_| now - 5_000),
-            panes: 1,
-            running_command: None,
-            cwd: None,
-            title: None,
-            git: None,
-            last_exit: None,
-            output_at_ms: None,
-            attention_at_ms: None,
-            attention: None,
-            agent: activity.map(|activity| TabAgent {
-                name: "claude".into(),
-                activity,
-                message: None,
-                changed_at_ms: now - 5_000,
-                finished_at_ms: None,
-            }),
+        let status = |index: u128, activity: Option<AgentActivity>| {
+            let finished_at_ms = (activity == Some(AgentActivity::Idle)).then_some(now - 5_000);
+            TabStatus {
+                tab_id: Uuid::from_u128(index),
+                state: published(activity, finished_at_ms),
+                state_since_ms: activity.map(|_| now - 5_000),
+                panes: 1,
+                running_command: None,
+                cwd: None,
+                title: None,
+                git: None,
+                last_exit: None,
+                output_at_ms: None,
+                attention_at_ms: None,
+                attention: None,
+                agent: activity.map(|activity| TabAgent {
+                    name: "claude".into(),
+                    activity,
+                    message: None,
+                    changed_at_ms: now - 5_000,
+                    finished_at_ms,
+                }),
+            }
         };
         state.activity.replace(TabStatusSnapshot {
             tabs: vec![
@@ -4742,7 +4745,7 @@ mod tests {
         let now = 600_000;
         let status = |index: u128, activity, message: Option<&str>| TabStatus {
             tab_id: Uuid::from_u128(index),
-            state: published(Some(activity)),
+            state: published(Some(activity), None),
             state_since_ms: Some(now - 5_000),
             panes: 1,
             running_command: Some("claude".into()),
@@ -4842,6 +4845,25 @@ mod tests {
             })))
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_fresh_idle_agent_shows_its_name_without_a_stopped_count() {
+        let mut state = grouped_state(grouped(), None);
+        let mut snapshot = state.activity.snapshot().unwrap().clone();
+        let docs = &mut snapshot.tabs[2];
+        docs.state = tabs_status::TabState::Idle;
+        docs.state_since_ms = None;
+        docs.agent.as_mut().unwrap().finished_at_ms = None;
+        docs.running_command = None;
+        state.activity.replace(snapshot);
+        let text = surface_text(&build_surface(&state, 1), 32, 6);
+        let row = text.iter().find(|line| line.contains("docs")).unwrap();
+        assert!(
+            row.contains("○ docs") && row.ends_with("claude"),
+            "{text:?}"
+        );
+        assert!(!text[0].contains('■') && !text[1].contains('■'), "{text:?}");
     }
 
     /// A finished unseen tab shows a check mark, a filled done badge, and
@@ -6256,7 +6278,7 @@ mod tests {
                 .zip(&agents)
                 .map(|(index, (_, activity, finished_at_ms))| TabStatus {
                     tab_id: Uuid::from_u128(index),
-                    state: published(Some(*activity)),
+                    state: published(Some(*activity), *finished_at_ms),
                     state_since_ms: Some(now - 60_000),
                     panes: 1,
                     running_command: Some("claude".into()),
