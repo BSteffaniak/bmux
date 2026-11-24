@@ -28,6 +28,9 @@ toml                      = { workspace = true }
 tracing                   = { workspace = true }
 uuid                      = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [features]
 # Package this crate as a dynamic library for one component. Only the
 # plugin packager enables these, together with `--cfg bmux_plugin_dylib`.

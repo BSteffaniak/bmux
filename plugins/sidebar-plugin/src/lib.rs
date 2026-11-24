@@ -11,6 +11,9 @@ pub mod declaration {
 }
 
 mod activity;
+mod look;
+#[cfg(test)]
+mod preview;
 mod view;
 
 use bmux_plugin::layout::{
@@ -83,6 +86,45 @@ struct Settings {
     collapsed_width: u16,
     visibility: VisibilitySettings,
     remember: Remember,
+    working_indicator: WorkingIndicator,
+    density: Density,
+    /// Colors chosen for workspaces by name; others get one from their name.
+    workspace_colors: std::collections::BTreeMap<String, RenderColor>,
+}
+
+/// How a working tab's glyph shows that it works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingIndicator {
+    /// A spinning glyph.
+    Spinner,
+    /// The still `◉`.
+    Static,
+}
+
+/// How much each card shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Density {
+    /// The title line, then what the tab asks or where it is.
+    Comfortable,
+    /// The title line only.
+    Compact,
+}
+
+/// The default description: the tab's detail, rendered with its parts styled.
+const DEFAULT_DESCRIPTION: &str = "{detail}";
+/// Below this width, cards are one line whatever the density, and their
+/// state shows only in their glyph.
+const COMPACT_BELOW_WIDTH: u16 = 20;
+/// Below this width, state pills and ages say less.
+const PILL_SHORT_BELOW_WIDTH: u16 = 28;
+
+/// Milliseconds on this client's clock, for animation frames.
+fn clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// What the sidebar remembers on this machine between starts.
@@ -105,7 +147,7 @@ impl Default for Settings {
             show_index: true,
             heading: "Tabs".to_string(),
             title_template: "{state_icon} {name}".to_string(),
-            description_template: "{detail}".to_string(),
+            description_template: DEFAULT_DESCRIPTION.to_string(),
             status_template: String::new(),
             maximum_visible_items: 20,
             content_height: false,
@@ -123,6 +165,9 @@ impl Default for Settings {
             },
             grouping: Grouping::None,
             scope: Scope::AllWorkspaces,
+            working_indicator: WorkingIndicator::Spinner,
+            density: Density::Comfortable,
+            workspace_colors: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -145,6 +190,7 @@ impl Settings {
             };
         }
         parse_organization(table, &mut settings)?;
+        parse_look(table, &mut settings)?;
         for (key, target) in [
             ("width", &mut settings.width),
             ("minimum_width", &mut settings.minimum_width),
@@ -228,6 +274,55 @@ impl Settings {
         }
         Ok(settings)
     }
+}
+
+/// `working_indicator`, `density` and `workspace_colors`: how the sidebar looks.
+fn parse_look(
+    table: &toml::map::Map<String, toml::Value>,
+    settings: &mut Settings,
+) -> Result<(), PluginCommandError> {
+    if let Some(indicator) = table.get("working_indicator") {
+        settings.working_indicator = match indicator.as_str() {
+            Some("spinner") => WorkingIndicator::Spinner,
+            Some("static") => WorkingIndicator::Static,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(format!(
+                    "bmux.sidebar working_indicator must be 'spinner' or 'static', got {indicator}"
+                )));
+            }
+        };
+    }
+    if let Some(density) = table.get("density") {
+        settings.density = match density.as_str() {
+            Some("comfortable") => Density::Comfortable,
+            Some("compact") => Density::Compact,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(format!(
+                    "bmux.sidebar density must be 'comfortable' or 'compact', got {density}"
+                )));
+            }
+        };
+    }
+    if let Some(colors) = table.get("workspace_colors") {
+        let colors = colors.as_table().ok_or_else(|| {
+            PluginCommandError::invalid_arguments(
+                "bmux.sidebar workspace_colors must map workspace names to colors",
+            )
+        })?;
+        for (name, color) in colors {
+            let color = color
+                .as_str()
+                .ok_or_else(|| "not a string".to_string())
+                .and_then(look::parse_color)
+                .map_err(|error| {
+                    PluginCommandError::invalid_arguments(format!(
+                        "bmux.sidebar workspace_colors.{name}: {error}"
+                    ))
+                })?;
+            settings.workspace_colors.insert(name.clone(), color);
+        }
+    }
+    Ok(())
 }
 
 /// `grouping` and `scope`: how the sidebar organizes its tabs and which it lists.
@@ -339,6 +434,8 @@ struct CompanionState {
     engaged: Engagement,
     /// The colors of the column facing the panes, from the appearance.
     edge_colors: EdgeColors,
+    /// The sidebar's colors, from the runtime's theme.
+    palette: look::Palette,
 }
 
 /// How the pointer and keyboard are engaged with the sidebar's chrome.
@@ -522,6 +619,7 @@ impl CompanionState {
             resize: None,
             engaged: Engagement::default(),
             edge_colors: EdgeColors::default(),
+            palette: look::Palette::default(),
             surfaces: None,
             layouts: None,
             facts: None,
@@ -654,41 +752,49 @@ impl CompanionState {
 
     /// Every listed row as a component, keyed by what it shows.
     fn row_views(&self, revision: u64) -> Vec<(SidebarHit, view::RowView)> {
-        let palette = SidebarPalette::default();
-        self.rows()
-            .iter()
+        let palette = self.palette;
+        let rows = self.rows();
+        rows.iter()
             .enumerate()
             .map(|(index, row)| {
                 let item = row.item(&self.snapshot.tabs);
                 let hovered = self.cursor.hovered() == Some(&item);
+                // The last row of a group sets it off from the next group.
+                let spacer = matches!(rows.get(index + 1), Some(SidebarRow::Group { .. }));
                 let row = match row {
                     SidebarRow::Tab(tab) => {
-                        view::RowView::Card(self.card(*tab, index, hovered, revision, &palette))
+                        let mut card = self.card(*tab, index, hovered, revision, &palette);
+                        card.spacer = spacer;
+                        view::RowView::Card(card)
                     }
                     SidebarRow::Group {
                         name,
                         tabs,
                         collapsed,
                         ..
-                    } => view::RowView::Header(
-                        self.header(name, tabs, *collapsed, hovered, &palette),
-                    ),
+                    } => {
+                        let mut header = self.header(name, tabs, *collapsed, hovered, &palette);
+                        header.spacer = spacer;
+                        view::RowView::Header(header)
+                    }
                 };
                 (item, row)
             })
             .collect()
     }
 
-    /// A tab's card: its title (the state glyph in its state's color when the
-    /// title starts with it) with the state summary at the right, its
-    /// description and status, tinted when shown or hovered.
+    /// A tab's card: its state glyph (a spinner while it works) and name, its
+    /// state at the right (a solid pill when it needs the user or failed),
+    /// and below, what it asks or where it is and its git status. The shown
+    /// tab is tinted with a bar; under a workspace header, a rail in the
+    /// workspace's color runs down the first column.
     fn card(
         &self,
         tab_index: usize,
         row: usize,
         hovered: bool,
         revision: u64,
-        palette: &SidebarPalette,
+        palette: &look::Palette,
     ) -> view::CardRow {
         use bmux_plugin::render_paint::tui_style;
         let tab = &self.snapshot.tabs[tab_index];
@@ -718,20 +824,28 @@ impl CompanionState {
         let title_style = fact.as_ref().map_or_else(
             || {
                 if tab.active {
-                    palette.active_title
+                    palette.strong
                 } else {
-                    palette.title
+                    palette.text
                 }
             },
-            |fact| fact_style(fact.role, palette.title),
+            |fact| fact_style(fact.role, palette.text),
         );
         let title = render(&self.settings.title_template);
         let (glyph, color) = state_glyph(activity.as_ref());
+        let shown_glyph = match activity.as_ref().map(|activity| activity.state) {
+            Some(activity::TabState::Working)
+                if self.settings.working_indicator == WorkingIndicator::Spinner =>
+            {
+                look::spinner_frame(clock_ms())
+            }
+            _ => glyph,
+        };
         let mut spans = Vec::new();
         let rest = match (&activity, title.strip_prefix(glyph)) {
             (Some(_), Some(rest)) => {
                 spans.push(bmux_tui::text::Span::styled(
-                    glyph.to_string(),
+                    shown_glyph.to_string(),
                     tui_style(RenderStyle::new().foreground(color)),
                 ));
                 rest.to_string()
@@ -739,81 +853,240 @@ impl CompanionState {
             _ => title,
         };
         spans.push(bmux_tui::text::Span::styled(rest, tui_style(title_style)));
-        let trailing = activity.as_ref().and_then(|activity| {
-            let style = match activity.state {
-                activity::TabState::Idle => palette.muted,
-                state => RenderStyle::new().foreground(state.color()),
-            };
-            activity
-                .summary
-                .clone()
-                .map(|summary| view::styled(summary, tui_style(style)))
-        });
+        let trailing = activity
+            .as_ref()
+            .and_then(|activity| self.card_state(activity, palette));
         let field = |name: &str| view::FieldId {
             id: selection_id(row, name),
             revision,
         };
+        let workspace = (self.settings.grouping == Grouping::Workspace)
+            .then(|| look::workspace_color(&tab.workspace, &self.settings.workspace_colors));
+        let bar = if tab.active {
+            Some((
+                "▎",
+                tui_style(RenderStyle::new().foreground(workspace.unwrap_or(palette.accent))),
+            ))
+        } else {
+            workspace.map(|color| ("▏", tui_style(RenderStyle::new().foreground(color))))
+        };
         view::CardRow {
             title: bmux_tui::text::Line::from_spans(spans),
             trailing,
-            description: render(&self.settings.description_template),
+            description: self.card_detail(activity.as_ref(), &render, palette),
             status: render(&self.settings.status_template),
             muted: tui_style(palette.muted),
             chrome: view::RowChrome {
                 card: card.map(tui_style),
-                accent: tab.active.then(|| tui_style(palette.accent)),
+                bar,
                 base: tui_style(palette.base),
             },
             fields: [field("title"), field("description"), field("status")],
+            spacer: false,
         }
     }
 
-    /// A workspace's header: its marker and name, and at the right what its
-    /// tabs are doing, most pressing first, or how many it holds. A collapsed
-    /// header that hides the shown tab is marked as the shown row.
+    /// Whether cards are one line: by choice, or when the sidebar is too
+    /// narrow for a useful second line.
+    fn compact(&self) -> bool {
+        self.settings.density == Density::Compact || self.allocated_width() < COMPACT_BELOW_WIDTH
+    }
+
+    /// A card's state at the right of its title: a solid pill when the tab
+    /// needs the user or failed, otherwise the state (or program) in its
+    /// color and how long it has been so.
+    fn card_state(
+        &self,
+        activity: &activity::TabActivity,
+        palette: &look::Palette,
+    ) -> Option<bmux_tui::text::Line> {
+        use bmux_plugin::render_paint::tui_style;
+        use bmux_tui::text::Span;
+        // Too narrow for the name and a summary: the glyph says the state.
+        if self.allocated_width() < COMPACT_BELOW_WIDTH {
+            return None;
+        }
+        let summary = activity.summary.clone()?;
+        let narrow = self.allocated_width() < PILL_SHORT_BELOW_WIDTH;
+        let state_style = RenderStyle::new().foreground(activity.state.color());
+        let line = match activity.state {
+            activity::TabState::Blocked | activity::TabState::Failed => {
+                let text = if narrow && activity.state == activity::TabState::Blocked {
+                    "input".to_string()
+                } else {
+                    summary
+                };
+                let pill = RenderStyle::new()
+                    .background(activity.state.color())
+                    .foreground(palette.on_pill)
+                    .bold();
+                bmux_tui::text::Line::from_spans(vec![Span::styled(
+                    format!(" {text} "),
+                    tui_style(pill),
+                )])
+            }
+            activity::TabState::Idle => view::styled(summary, tui_style(palette.muted)),
+            activity::TabState::Working | activity::TabState::Stopped => {
+                let mut spans = vec![Span::styled(summary, tui_style(state_style))];
+                if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
+                    spans.push(Span::styled(format!(" {since}"), tui_style(palette.muted)));
+                }
+                bmux_tui::text::Line::from_spans(spans)
+            }
+        };
+        Some(line)
+    }
+
+    /// A card's second line. With the default description, what a blocked
+    /// tab asks (wrapped), or its directory and git status, fitted to one
+    /// line: the directory shortens to its last part, then gives way to git.
+    /// Other descriptions render their template.
+    fn card_detail(
+        &self,
+        activity: Option<&activity::TabActivity>,
+        render: &dyn Fn(&str) -> String,
+        palette: &look::Palette,
+    ) -> view::Detail {
+        use bmux_plugin::render_paint::tui_style;
+        use bmux_tui::text::{Line, Span};
+        if self.compact() {
+            return view::Detail::None;
+        }
+        let wrapped = |text: String| {
+            if text.trim().is_empty() {
+                view::Detail::None
+            } else {
+                view::Detail::Wrapped(view::styled(text, tui_style(palette.muted)))
+            }
+        };
+        if self.settings.description_template != DEFAULT_DESCRIPTION {
+            return wrapped(render(&self.settings.description_template));
+        }
+        let Some(activity) = activity else {
+            return wrapped(render(&self.settings.description_template));
+        };
+        if let Some(message) = &activity.message {
+            return view::Detail::Wrapped(view::styled(message.clone(), tui_style(palette.text)));
+        }
+        let room = usize::from(self.allocated_width()).saturating_sub(6);
+        let mut git = Vec::new();
+        if let Some(status) = &activity.git {
+            git.push(Span::styled(
+                status.branch.clone(),
+                tui_style(palette.muted),
+            ));
+            if status.dirty {
+                git.push(Span::styled(
+                    "*",
+                    tui_style(RenderStyle::new().named_foreground(RenderNamedColor::Yellow)),
+                ));
+            }
+            if status.ahead > 0 {
+                git.push(Span::styled(
+                    format!(" ↑{}", status.ahead),
+                    tui_style(RenderStyle::new().named_foreground(RenderNamedColor::Green)),
+                ));
+            }
+            if status.behind > 0 {
+                git.push(Span::styled(
+                    format!(" ↓{}", status.behind),
+                    tui_style(RenderStyle::new().named_foreground(RenderNamedColor::Red)),
+                ));
+            }
+        }
+        let git_width = Line::from_spans(git.clone()).width();
+        let separator = " · ";
+        let cwd = activity.cwd.as_deref().and_then(|cwd| {
+            let needed = |cwd: &str| {
+                bmux_cell_geometry::display_width(cwd)
+                    + if git.is_empty() {
+                        0
+                    } else {
+                        bmux_cell_geometry::display_width(separator) + git_width
+                    }
+            };
+            if needed(cwd) <= room {
+                return Some(cwd.to_string());
+            }
+            let last = cwd.rsplit('/').find(|part| !part.is_empty()).unwrap_or(cwd);
+            if needed(last) <= room {
+                return Some(last.to_string());
+            }
+            // Without git, the directory keeps its end, cut from the left.
+            git.is_empty().then(|| activity::shorten_left(cwd, room))
+        });
+        let mut spans = Vec::new();
+        if let Some(cwd) = cwd {
+            spans.push(Span::styled(cwd, tui_style(palette.muted)));
+            if !git.is_empty() {
+                spans.push(Span::styled(separator, tui_style(palette.faint)));
+            }
+        }
+        spans.extend(git);
+        if spans.is_empty() {
+            view::Detail::None
+        } else {
+            view::Detail::Line(Line::from_spans(spans))
+        }
+    }
+
+    /// A workspace's header: a band in the workspace's color with its name,
+    /// and at the right what its tabs are doing, most pressing first (or how
+    /// many it holds), then whether it is collapsed. A collapsed header that
+    /// hides the shown tab has its marker in the accent color.
     fn header(
         &self,
         name: &str,
         tabs: &[usize],
         collapsed: bool,
         hovered: bool,
-        palette: &SidebarPalette,
+        palette: &look::Palette,
     ) -> view::HeaderRow {
         use bmux_plugin::render_paint::{tui_color, tui_style};
+        use bmux_tui::text::Span;
         let holds_active = collapsed && tabs.iter().any(|index| self.snapshot.tabs[*index].active);
-        let card = if holds_active {
-            Some(palette.active_card)
-        } else if hovered {
-            Some(palette.hover_card)
-        } else {
-            None
-        };
-        let marker = if collapsed { '▸' } else { '▾' };
-        let title = format!("{marker} {name}");
-        // The title keeps at least a few cells; the counts take the rest, the
+        let marker = if collapsed { "▸" } else { "▾" };
+        // The name keeps at least a few cells; the counts take the rest, the
         // least pressing dropped first when they do not fit.
-        let title_room = bmux_cell_geometry::display_width(&title).min(8);
+        let title_room = bmux_cell_geometry::display_width(name).min(8);
         let room =
-            usize::from(self.allocated_width().saturating_sub(4)).saturating_sub(title_room + 1);
+            usize::from(self.allocated_width().saturating_sub(4)).saturating_sub(title_room + 3);
         let mut spans = Vec::new();
         for (index, (text, color)) in group_summary(self, tabs, room).into_iter().enumerate() {
             if index > 0 {
-                spans.push(bmux_tui::text::Span::raw(" "));
+                spans.push(Span::raw(" "));
             }
             let style = color.map_or_else(
                 || tui_style(palette.muted),
-                |color| bmux_tui::style::Style::new().fg(tui_color(color)),
+                |color| {
+                    bmux_tui::style::Style::new()
+                        .fg(tui_color(color))
+                        .add_modifier(bmux_tui::style::Modifier::BOLD)
+                },
             );
-            spans.push(bmux_tui::text::Span::styled(text, style));
+            spans.push(Span::styled(text, style));
         }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            marker,
+            tui_style(if holds_active {
+                RenderStyle::new().foreground(palette.accent).bold()
+            } else {
+                palette.muted
+            }),
+        ));
+        let color = look::workspace_color(name, &self.settings.workspace_colors);
         view::HeaderRow {
-            title: view::styled(title, tui_style(palette.heading)),
+            title: view::styled(name.to_string(), tui_style(palette.strong)),
             trailing: bmux_tui::text::Line::from_spans(spans),
-            chrome: view::RowChrome {
-                card: card.map(tui_style),
-                accent: holds_active.then(|| tui_style(palette.accent)),
-                base: tui_style(palette.base),
-            },
+            band: tui_style(if hovered {
+                palette.band_hover
+            } else {
+                palette.band
+            }),
+            swatch: Some(tui_style(RenderStyle::new().foreground(color))),
+            spacer: false,
+            base: tui_style(palette.base),
         }
     }
 
@@ -939,25 +1212,6 @@ impl CompanionState {
         self.list.borrow().scroll.vertical_offset()
     }
 
-    /// Tabs in scope, including those under collapsed headers.
-    fn tabs_in_scope(&self) -> usize {
-        self.rows()
-            .iter()
-            .map(|row| match row {
-                SidebarRow::Tab(_) => 1,
-                SidebarRow::Group {
-                    tabs, collapsed, ..
-                } => {
-                    if *collapsed {
-                        tabs.len()
-                    } else {
-                        0
-                    }
-                }
-            })
-            .sum()
-    }
-
     /// The row showing this client's tab.
     fn active_item(&self) -> Option<SidebarHit> {
         self.active_row().map(|row| self.item_keys()[row])
@@ -1024,6 +1278,21 @@ impl CompanionState {
 
     /// Collapse or expand `workspace`'s group and remember it. Returns a
     /// description of a failure to remember it.
+    /// Whether a working spinner can be on screen: the sidebar is shown, uses
+    /// the spinner, and a tab may be working.
+    fn animates(&self) -> bool {
+        self.visible()
+            && self.settings.working_indicator == WorkingIndicator::Spinner
+            && self.activity.any_working()
+    }
+
+    /// Take the runtime's appearance (the theme) for everything the sidebar
+    /// paints.
+    fn apply_appearance(&mut self, appearance: &bmux_appearance::RuntimeAppearance) {
+        self.edge_colors = EdgeColors::from_appearance(appearance);
+        self.palette = look::Palette::from_appearance(Some(appearance));
+    }
+
     fn toggle_group(&mut self, workspace: Uuid) -> Option<String> {
         if !self.collapsed.remove(&workspace) {
             self.collapsed.insert(workspace);
@@ -1249,7 +1518,7 @@ impl SidebarPresentation {
             companion.facts = Some(facts);
             companion.activity.replace(initial_status.as_ref().clone());
             if let Some(appearance) = &initial_appearance {
-                companion.edge_colors = EdgeColors::from_appearance(appearance);
+                companion.apply_appearance(appearance);
             }
             companion.selected_context_id = initial_selection;
             companion.replace_tabs(initial.as_ref().clone());
@@ -1259,9 +1528,13 @@ impl SidebarPresentation {
                 // Ages and working/done states change with time alone.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // The working spinner's frames, only while one can be on screen.
+                let mut frame = spinner_frames();
                 loop {
+                    let animating = animating(&owner);
                     let mut status = None;
                     let mut ticked = false;
+                    let mut animated = false;
                     let mut selection = None;
                     let mut appearance = None;
                     let tabs = tokio::select! {
@@ -1291,27 +1564,21 @@ impl SidebarPresentation {
                             ticked = true;
                             None
                         }
+                        _ = frame.tick(), if animating => {
+                            animated = true;
+                            None
+                        }
                     };
-                    let Some(owner) = owner.upgrade() else {
-                        break;
-                    };
-                    let Ok(mut guard) = owner.lock() else {
-                        break;
-                    };
-                    let Some(companion) = guard.as_mut() else {
-                        break;
-                    };
-                    if !companion.apply_changes(Changes {
+                    let changes = Changes {
                         tabs,
                         selection: selection.map(SelectionChange),
                         status,
                         appearance,
                         ticked,
-                    }) {
-                        continue;
-                    }
-                    if let Err(error) = publish_companion(companion) {
-                        tracing::warn!(%error, "sidebar publication failed");
+                        animated,
+                    };
+                    if !apply_and_publish(&owner, changes) {
+                        break;
                     }
                 }
             }));
@@ -1793,45 +2060,6 @@ fn state_glyph(activity: Option<&activity::TabActivity>) -> (char, RenderColor) 
     (state.glyph(), state.color())
 }
 
-/// The sidebar's colors: the terminal's own background, a tinted card for
-/// the active and hovered tabs, muted secondary text and an accent bar.
-#[derive(Debug, Clone, Copy)]
-struct SidebarPalette {
-    base: RenderStyle,
-    heading: RenderStyle,
-    /// The heading while the sidebar has the keyboard.
-    focused_heading: RenderStyle,
-    title: RenderStyle,
-    active_title: RenderStyle,
-    muted: RenderStyle,
-    accent: RenderStyle,
-    active_card: RenderStyle,
-    hover_card: RenderStyle,
-}
-
-impl Default for SidebarPalette {
-    fn default() -> Self {
-        Self {
-            base: RenderStyle::new(),
-            heading: RenderStyle::new()
-                .named_foreground(RenderNamedColor::BrightBlack)
-                .bold(),
-            focused_heading: RenderStyle::new()
-                .named_foreground(RenderNamedColor::Blue)
-                .bold()
-                .underline(),
-            title: RenderStyle::new().named_foreground(RenderNamedColor::White),
-            active_title: RenderStyle::new()
-                .named_foreground(RenderNamedColor::BrightWhite)
-                .bold(),
-            muted: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlack),
-            accent: RenderStyle::new().named_foreground(RenderNamedColor::Blue),
-            active_card: RenderStyle::new().background(RenderColor::Indexed(236)),
-            hover_card: RenderStyle::new().background(RenderColor::Indexed(235)),
-        }
-    }
-}
-
 /// Paint text over a card: its background, keeping the text's own colors.
 trait OverCard {
     fn background_of(self, card: RenderStyle) -> Self;
@@ -1874,6 +2102,43 @@ fn resize_edge(state: &CompanionState, content_rows: u16) -> Option<ExtensionRec
 /// What a group's tabs are doing, as `◆1 ◉2 ■3`-style counts in their
 /// states' colors, most pressing first, within `room` cells; the tab count
 /// when none is doing anything.
+/// The heading's right side: what every listed tab is doing, most pressing
+/// first, or how many tabs there are when none is doing anything.
+fn sidebar_summary(state: &CompanionState, palette: &look::Palette) -> bmux_tui::text::Line {
+    use bmux_plugin::render_paint::{tui_color, tui_style};
+    use bmux_tui::text::Span;
+    let tabs = state
+        .rows()
+        .iter()
+        .flat_map(|row| match row {
+            SidebarRow::Tab(index) => vec![*index],
+            SidebarRow::Group { tabs, .. } => tabs.clone(),
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let heading = bmux_cell_geometry::display_width(&state.settings.heading);
+    let room = usize::from(state.allocated_width()).saturating_sub(heading + 4);
+    let mut spans = Vec::new();
+    for (index, (text, color)) in group_summary(state, &tabs, room).into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            text,
+            color.map_or_else(
+                || tui_style(palette.muted),
+                |color| {
+                    bmux_tui::style::Style::new()
+                        .fg(tui_color(color))
+                        .add_modifier(bmux_tui::style::Modifier::BOLD)
+                },
+            ),
+        ));
+    }
+    bmux_tui::text::Line::from_spans(spans)
+}
+
 fn group_summary(
     state: &CompanionState,
     tabs: &[usize],
@@ -2002,7 +2267,7 @@ fn build_surface_with_hits(
     use bmux_plugin::render_paint::tui_style;
     let mut hits = HitTable::new();
     let width = state.allocated_width();
-    let palette = SidebarPalette::default();
+    let palette = state.palette;
     let rows = state.row_views(revision);
     let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
     let list = state.synced_list(&rows);
@@ -2026,7 +2291,7 @@ fn build_surface_with_hits(
             .map_or_else(|| list_height.saturating_add(2), |rect| rect.h)
     }
     .max(1);
-    let count = state.tabs_in_scope();
+    let summary = sidebar_summary(state, &palette);
     let edge = resize_edge(state, shown_rows).map(|edge| view::Edge {
         x: edge.x,
         height: edge.h.min(height),
@@ -2040,12 +2305,15 @@ fn build_surface_with_hits(
             state.settings.heading.to_uppercase(),
             // Lit while the sidebar has the keyboard.
             tui_style(if state.engaged.focused {
-                palette.focused_heading
+                RenderStyle::new()
+                    .foreground(palette.accent)
+                    .bold()
+                    .underline()
             } else {
-                palette.heading
+                palette.muted.bold()
             }),
         ),
-        count: view::styled(count.to_string(), tui_style(palette.muted)),
+        count: summary,
         list,
         state: &state.list,
         list_height,
@@ -2087,7 +2355,9 @@ fn build_surface_with_hits(
     for region in sidebar_regions(painted.hits, &mut hits, &mut placed, drag) {
         surface = surface.interactive_region(region);
     }
-    let text = visible_field_text(&rows, &placed, width);
+    // Fields are laid out at the list's width, one column short of the
+    // sidebar's while the scrollbar shows.
+    let text = visible_field_text(&rows, &placed, list_columns.1);
     surface.metadata = Some(bmux_plugin::surface::PluginSurfaceMetadata {
         selection: Some(painted.selection),
         semantics: Some(painted.semantics),
@@ -2107,6 +2377,8 @@ struct Changes {
     status: Option<tabs_status::TabStatusSnapshot>,
     appearance: Option<bmux_appearance::RuntimeAppearance>,
     ticked: bool,
+    /// The working spinner's next frame is due.
+    animated: bool,
 }
 
 impl CompanionState {
@@ -2118,15 +2390,24 @@ impl CompanionState {
             status,
             appearance,
             ticked,
+            animated,
         } = changes;
         if let Some(active) = self.snapshot.tabs.iter().find(|tab| tab.active) {
             self.activity.mark_viewed(active.id);
         }
         if let Some(appearance) = &appearance {
-            self.edge_colors = EdgeColors::from_appearance(appearance);
+            self.apply_appearance(appearance);
         }
         if ticked && !self.activity.time_sensitive() {
             return false;
+        }
+        if animated && tabs.is_none() && selection.is_none() && status.is_none() {
+            // Only the spinner's glyph changes; nothing needs measuring.
+            if !self.animates() {
+                return false;
+            }
+            self.presentation_pending.set(true);
+            return true;
         }
         let status_changed = status.is_some();
         if let Some(status) = status {
@@ -2144,6 +2425,48 @@ impl CompanionState {
         self.presentation_pending.set(true);
         true
     }
+}
+
+/// Apply `changes` to the sidebar `owner` holds and republish it when they
+/// change what it shows. Returns `false` once the sidebar is gone.
+fn apply_and_publish(
+    owner: &std::sync::Weak<Mutex<Option<CompanionState>>>,
+    changes: Changes,
+) -> bool {
+    let Some(owner) = owner.upgrade() else {
+        return false;
+    };
+    let Ok(mut guard) = owner.lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    if companion.apply_changes(changes)
+        && let Err(error) = publish_companion(companion)
+    {
+        tracing::warn!(%error, "sidebar publication failed");
+    }
+    true
+}
+
+/// Ticks for the working spinner's frames.
+fn spinner_frames() -> tokio::time::Interval {
+    let mut frames =
+        tokio::time::interval(std::time::Duration::from_millis(look::SPINNER_FRAME_MS));
+    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    frames
+}
+
+/// Whether the sidebar `owner` holds shows a working spinner.
+fn animating(owner: &std::sync::Weak<Mutex<Option<CompanionState>>>) -> bool {
+    owner.upgrade().is_some_and(|owner| {
+        owner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(CompanionState::animates))
+            .unwrap_or(false)
+    })
 }
 
 /// Follow the tabs plugin's forwarded `tabs-status` state on this runtime's
@@ -2265,7 +2588,7 @@ fn scrollbar_view(
     state: &CompanionState,
     x: u16,
     list_height: u16,
-    _palette: &SidebarPalette,
+    _palette: &look::Palette,
 ) -> view::ScrollbarView {
     use bmux_plugin::render_paint::tui_style;
     let colors = state.edge_colors;
@@ -2877,12 +3200,15 @@ mod tests {
         toml::Value::Table(toml::toml! { visible = true })
     }
 
+    /// Shown, with the still working glyph: a spinner's frame depends on the
+    /// time a test runs.
     fn shown_settings() -> Settings {
         Settings {
             visibility: VisibilitySettings {
                 visible: true,
                 ..VisibilitySettings::default()
             },
+            working_indicator: WorkingIndicator::Static,
             ..Settings::default()
         }
     }
@@ -3767,32 +4093,301 @@ mod tests {
         }
     }
 
-    /// Grouped, each workspace's tabs sit under its header, which says what
-    /// they are doing: how many need input, are working and have stopped.
+    /// Grouped, each workspace's tabs sit under its header, a band set off
+    /// from the group above by a blank row, which says what they are doing:
+    /// how many need input, are working and have stopped. A rail in the
+    /// workspace's color runs down its tabs.
     #[test]
     fn grouped_tabs_sit_under_headers_that_sum_up_their_work() {
         let state = grouped_state(grouped(), None);
-        let text = surface_text(&build_surface(&state, 1), 32, 8);
+        let surface = build_surface(&state, 1);
+        let text = surface_text(&surface, 32, 8);
         assert_eq!(
             text,
             [
-                " TABS                         4",
-                "  ▾ bmux               ◆1 ◉1 ■1",
-                "▎ ◉ build               working",
-                "  ◆ review          needs input",
-                "  ■ docs                stopped",
-                "    5s",
-                "  ▾ notes                     1",
-                "  ○ todo",
+                " TABS                  ◆1 ◉1 ■1",
+                "▌ bmux               ◆1 ◉1 ■1 ▾",
+                "▎ ◉ build            working 5s",
+                "▏ ◆ review         needs input",
+                "▏ ■ docs             stopped 5s",
+                "",
+                "▌ notes                     1 ▾",
+                "▏ ○ todo",
             ],
             "{}",
             text.join("\n")
         );
-        // Flat is unchanged: no headers.
+        // The band spans the row; the swatch and rails take the workspace's color.
+        let band = painted_row(&surface, 1);
+        assert!(
+            band.iter().all(|(_, _, style)| style.bg.is_some()),
+            "{band:?}"
+        );
+        let swatch = band
+            .iter()
+            .find(|(x, ..)| *x == 0)
+            .map(|(.., style)| style.fg);
+        let rail = painted_row(&surface, 3)
+            .into_iter()
+            .find(|(x, ..)| *x == 0)
+            .map(|(.., style)| style.fg);
+        assert_eq!(swatch, rail);
+        let notes = painted_row(&surface, 6)
+            .into_iter()
+            .find(|(x, ..)| *x == 0)
+            .map(|(.., style)| style.fg);
+        assert_ne!(swatch, notes, "workspaces have their own colors");
+        // Flat: no headers and no rails.
         let flat = grouped_state(shown_settings(), None);
         let text = surface_text(&build_surface(&flat, 1), 32, 6);
-        assert_eq!(text[1], "▎ ◉ build               working");
-        assert_eq!(text[5], "  ○ todo");
+        assert_eq!(text[1], "▎ ◉ build            working 5s");
+        assert_eq!(text[4], "  ○ todo");
+    }
+
+    /// A tab that needs the user, or failed, shows a solid pill in its
+    /// state's color; other states are plain colored text.
+    #[test]
+    fn attention_states_show_solid_pills() {
+        let state = grouped_state(grouped(), None);
+        let surface = build_surface(&state, 1);
+        let text = surface_text(&surface, 32, 4);
+        let row = u16::try_from(
+            text.iter()
+                .position(|line| line.contains("review"))
+                .unwrap(),
+        )
+        .unwrap();
+        let pill = painted_row(&surface, row)
+            .into_iter()
+            .find(|(_, text, _)| text.contains("needs input"))
+            .expect("pill");
+        assert_eq!(pill.1, " needs input ");
+        assert_eq!(pill.2.bg, Some(activity::TabState::Blocked.color()));
+        assert!(pill.2.bold);
+        let working = painted_row(&surface, 2)
+            .into_iter()
+            .find(|(_, text, _)| text.contains("working"))
+            .expect("working");
+        assert_eq!(working.2.fg, Some(activity::TabState::Working.color()));
+        assert_eq!(
+            working.2.bg, state.palette.active_card.bg,
+            "on the shown tab's card"
+        );
+    }
+
+    /// By default a working tab's glyph spins, one frame per tick for every
+    /// working tab alike; `working_indicator = "static"` keeps `◉`.
+    #[test]
+    fn working_tabs_spin_unless_set_still() {
+        let glyph = |settings: Settings| {
+            let state = grouped_state(settings, None);
+            let surface = build_surface(&state, 1);
+            painted_row(&surface, 2)
+                .into_iter()
+                .find(|(x, ..)| *x == 2)
+                .map(|(_, text, _)| text.chars().next().unwrap())
+                .unwrap()
+        };
+        let spinning = glyph(Settings {
+            working_indicator: WorkingIndicator::Spinner,
+            ..grouped()
+        });
+        assert!(('⠀'..='⣿').contains(&spinning), "{spinning:?}");
+        assert_eq!(glyph(grouped()), '◉');
+        let parsed = Settings::parse(Some(&toml::Value::Table(toml::toml! {
+            working_indicator = "static"
+        })))
+        .unwrap();
+        assert_eq!(parsed.working_indicator, WorkingIndicator::Static);
+        assert_eq!(
+            Settings::default().working_indicator,
+            WorkingIndicator::Spinner
+        );
+        assert!(
+            Settings::parse(Some(&toml::Value::Table(toml::toml! {
+                working_indicator = "blink"
+            })))
+            .is_err()
+        );
+        // The spinner animates only while a working tab can be on screen.
+        let mut state = grouped_state(
+            Settings {
+                working_indicator: WorkingIndicator::Spinner,
+                ..grouped()
+            },
+            None,
+        );
+        assert!(state.animates());
+        state.settings.working_indicator = WorkingIndicator::Static;
+        assert!(!state.animates());
+    }
+
+    /// `density = "compact"` shows one line per tab; below the compact width
+    /// cards are one line anyway, and their state is their glyph alone.
+    #[test]
+    fn compact_cards_are_one_line() {
+        let card_rows = |state: &CompanionState| {
+            surface_text(&build_surface(state, 1), state.allocated_width(), 14)
+                .into_iter()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        };
+        let mut state = fixture_with_details(Settings {
+            density: Density::Compact,
+            ..shown_settings()
+        });
+        assert_eq!(card_rows(&state), 1 + 2, "the heading and one row per tab");
+        state.settings.density = Density::Comfortable;
+        assert_eq!(card_rows(&state), 1 + 4);
+        state.allocation = Some(ExtensionRect::new(0, 0, 16, 14));
+        assert_eq!(card_rows(&state), 1 + 2);
+        let text = surface_text(&build_surface(&state, 1), 16, 3);
+        assert_eq!(text[2], "  ◆ review", "no summary beside the name");
+        let parsed = Settings::parse(Some(&toml::Value::Table(toml::toml! {
+            density = "compact"
+        })))
+        .unwrap();
+        assert_eq!(parsed.density, Density::Compact);
+    }
+
+    /// Two tabs with a second line each: one working in a repository, one
+    /// asking the user something.
+    fn fixture_with_details(settings: Settings) -> CompanionState {
+        use bmux_tabs_plugin_api::tabs_status::{
+            AgentActivity, GitStatus, TabAgent, TabStatus, TabStatusSnapshot,
+        };
+        let mut state = CompanionState::new(settings, None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 14));
+        let now = 600_000;
+        let status = |index: u128, activity, message: Option<&str>| TabStatus {
+            tab_id: Uuid::from_u128(index),
+            panes: 1,
+            running_command: Some("claude".into()),
+            cwd: Some("/work/bmux".into()),
+            title: None,
+            git: Some(GitStatus {
+                branch: "main".into(),
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+            }),
+            last_exit: None,
+            output_at_ms: None,
+            attention_at_ms: None,
+            attention: None,
+            agent: Some(TabAgent {
+                name: "claude".into(),
+                activity,
+                message: message.map(Into::into),
+                changed_at_ms: now - 5_000,
+                finished_at_ms: None,
+            }),
+        };
+        state.activity.replace(TabStatusSnapshot {
+            tabs: vec![
+                status(1, AgentActivity::Working, None),
+                status(2, AgentActivity::Blocked, Some("approve?")),
+            ],
+            now_ms: now,
+            revision: 1,
+        });
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: [(1, "build"), (2, "review")]
+                .into_iter()
+                .map(|(index, name)| tabs_list::TabListEntry {
+                    id: Uuid::from_u128(index),
+                    name: name.into(),
+                    active: false,
+                    workspace: "default".into(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        state
+    }
+
+    /// The second line fits on one row: the directory gives way to its last
+    /// part, then to the git status, whose parts keep their colors.
+    #[test]
+    fn the_detail_line_shortens_the_directory_before_git() {
+        let detail = |width: u16| {
+            let mut state = fixture_with_details(shown_settings());
+            state.allocation = Some(ExtensionRect::new(0, 0, width, 14));
+            surface_text(&build_surface(&state, 1), width, 3)[2]
+                .trim()
+                .to_string()
+        };
+        assert_eq!(detail(32), "/work/bmux · main*");
+        assert_eq!(detail(23), "bmux · main*");
+        assert_eq!(detail(20), "bmux · main*");
+    }
+
+    /// Workspaces take their configured colors, others one from their name.
+    #[test]
+    fn workspace_colors_can_be_configured() {
+        let parsed = Settings::parse(Some(&toml::Value::Table(toml::toml! {
+            [workspace_colors]
+            bmux = "bright-green"
+            notes = "#ff8800"
+        })))
+        .unwrap();
+        assert_eq!(
+            parsed.workspace_colors.get("bmux"),
+            Some(&RenderColor::Named(RenderNamedColor::BrightGreen))
+        );
+        let state = grouped_state(
+            Settings {
+                workspace_colors: parsed.workspace_colors,
+                ..grouped()
+            },
+            None,
+        );
+        let surface = build_surface(&state, 1);
+        let swatch = painted_row(&surface, 1)
+            .into_iter()
+            .find(|(x, ..)| *x == 0)
+            .and_then(|(.., style)| style.fg);
+        assert_eq!(
+            swatch,
+            Some(RenderColor::Named(RenderNamedColor::BrightGreen))
+        );
+        assert!(
+            Settings::parse(Some(&toml::Value::Table(toml::toml! {
+                [workspace_colors]
+                bmux = "teal"
+            })))
+            .is_err()
+        );
+    }
+
+    /// Scrolled into a group, its header stays pinned at the top of the list,
+    /// and only it can be clicked there.
+    #[test]
+    fn a_groups_header_stays_pinned_while_its_tabs_scroll() {
+        let mut state = grouped_state(grouped(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 5));
+        let header_row = |state: &CompanionState| {
+            let surface = build_surface(state, 1);
+            let text = surface_text(&surface, 32, 5);
+            let regions = surface
+                .interactive_regions
+                .iter()
+                .filter(|region| region.rect.y == 1)
+                .map(|region| region.local_id.clone())
+                .collect::<Vec<_>>();
+            (text[1].clone(), regions)
+        };
+        assert!(state.scroll_rows(2));
+        let (text, regions) = header_row(&state);
+        assert!(text.contains("bmux"), "{text:?}");
+        assert_eq!(regions, [format!("group:{}", Uuid::from_u128(100))]);
+        // Scrolled as far as it goes, the last tabs of the group are on
+        // screen and its header still is.
+        assert!(state.scroll_rows(10));
+        let (text, regions) = header_row(&state);
+        assert!(text.contains("bmux"), "{text:?}");
+        assert_eq!(regions, [format!("group:{}", Uuid::from_u128(100))]);
     }
 
     /// Clicking a header collapses its group, and the next start remembers
@@ -3815,10 +4410,10 @@ mod tests {
         assert_eq!(
             text,
             [
-                " TABS                         4",
-                "▎ ▸ bmux               ◆1 ◉1 ■1",
-                "  ▾ notes                     1",
-                "  ○ todo",
+                " TABS                  ◆1 ◉1 ■1",
+                "▌ bmux               ◆1 ◉1 ■1 ▸",
+                "",
+                "▌ notes                     1 ▾",
             ],
             "{}",
             text.join("\n")
@@ -3883,9 +4478,10 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(names(&state), ["build", "review", "docs"], "{grouping:?}");
+            // The heading sums up only the listed tabs.
             assert_eq!(
                 surface_text(&build_surface(&state, 1), 32, 1)[0],
-                " TABS                         3"
+                " TABS                  ◆1 ◉1 ■1"
             );
             state.select(Some(Uuid::from_u128(4)));
             assert_eq!(names(&state), ["todo"], "{grouping:?}");
@@ -3898,7 +4494,7 @@ mod tests {
         let mut state = grouped_state(grouped(), None);
         state.allocation = Some(ExtensionRect::new(0, 0, 16, 14));
         let header = surface_text(&build_surface(&state, 1), 16, 2)[1].clone();
-        assert!(header.ends_with("◆1 ◉1"), "{header:?}");
+        assert!(header.ends_with("◆1 ◉1 ▾"), "{header:?}");
         assert!(header.contains("bmux"), "{header:?}");
     }
 
@@ -3972,7 +4568,7 @@ mod tests {
                 // The overflowing list's scrollbar sits after the summary.
                 let content = line.trim_end_matches(['▐', '▕']).trim_end();
                 assert!(
-                    content.ends_with("working"),
+                    content.ends_with("working now"),
                     "offset {offset}, row {row}: {line:?}"
                 );
                 let runs = painted_row(&surface, row);
@@ -4856,14 +5452,14 @@ mod tests {
         assert_eq!(
             text,
             [
-                " TABS                         4",
+                " TABS                  ◆1 ▲1 ◉1",
                 "▎ ○ editor                 nvim",
                 "▎   /work/bmux · main* ↑2",
-                "  ◉ claude              working",
+                "  ◉ claude           working 5s",
                 "    /work/bmux/plugins",
-                "  ▲ build              exit 101",
+                "  ▲ build             exit 101",
                 "    /work/build",
-                "  ◆ review          needs input",
+                "  ◆ review         needs input",
                 "    approve edit?",
                 "",
             ],
@@ -4875,8 +5471,8 @@ mod tests {
     /// A card's painted state glyph with its color, and its summary.
     type PaintedCard = (Option<(String, Option<RenderColor>)>, String);
 
-    /// Each named card's painted state glyph with its color, and the last
-    /// word of its first line (its summary).
+    /// Each named card's painted state glyph with its color, and what its
+    /// first line says after the name (its summary).
     fn painted_cards(state: &CompanionState, names: &[&str]) -> Vec<PaintedCard> {
         let surface = build_surface(state, 1);
         let text = surface_text(&surface, 32, 10);
@@ -4899,9 +5495,9 @@ mod tests {
                     _ => None,
                 });
                 let summary = text[usize::from(row)]
-                    .split_whitespace()
-                    .last()
-                    .unwrap_or_default()
+                    .split_once(*name)
+                    .map_or("", |(_, rest)| rest)
+                    .trim()
                     .to_string();
                 (glyph, summary)
             })
@@ -4976,7 +5572,7 @@ mod tests {
             .iter()
             .map(|(_, summary)| summary.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(summaries, ["working", "input", "stopped"]);
+        assert_eq!(summaries, ["working 1m", "needs input", "stopped 1m"]);
         let glyphs = first
             .iter()
             .map(|(glyph, _)| glyph.clone().unwrap())
@@ -5174,12 +5770,15 @@ mod tests {
         state.reveal_item(SidebarHit::Tab(Uuid::from_u128(2)));
         assert_eq!(state.scroll_offset(), 4);
         assert_eq!(tab_regions(&build_surface(&state, 2)).len(), 1);
-        assert!(state.resize(ExtensionRect::new(0, 0, 12, 5)));
+        assert!(state.resize(ExtensionRect::new(0, 0, 20, 5)));
         assert_eq!(state.list_height(&state.item_keys()), 3);
-        assert_eq!(state.allocated_width(), 12);
-        // Narrower, the descriptions wrap to two rows: the offset still fits.
-        assert_eq!(state.scroll_offset(), 4);
-        assert!(!state.resize(ExtensionRect::new(0, 0, 12, 5)));
+        assert_eq!(state.allocated_width(), 20);
+        // Taller, the offset shrinks so the last card still ends the list.
+        assert_eq!(state.scroll_offset(), 3);
+        assert!(!state.resize(ExtensionRect::new(0, 0, 20, 5)));
+        // Narrow, cards are one row and all of them fit.
+        assert!(state.resize(ExtensionRect::new(0, 0, 12, 5)));
+        assert_eq!(state.scroll_offset(), 0);
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 1)));
         assert_eq!(
             tab_regions(&build_surface(&state, 3)),

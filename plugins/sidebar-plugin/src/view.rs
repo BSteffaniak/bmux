@@ -50,8 +50,9 @@ pub struct FieldId {
 pub struct RowChrome {
     /// The row's background, when it is tinted (active or hovered).
     pub card: Option<Style>,
-    /// The bar marking the row this client shows, when it is that row.
-    pub accent: Option<Style>,
+    /// The bar down the row's first column: thick for the row this client
+    /// shows, a thin rail in its workspace's color under a workspace header.
+    pub bar: Option<(&'static str, Style)>,
     /// The style everything else is painted on.
     pub base: Style,
 }
@@ -65,45 +66,81 @@ impl RowChrome {
         if let Some(card) = self.card {
             cx.fill(LocalRect::new(0, 0, width, height), " ", card);
         }
-        if let Some(accent) = self.accent {
+        if let Some((glyph, style)) = self.bar {
             for row in 0..height {
-                cx.set_cell(0, i64::from(row), "▎", self.fill().patch(accent));
+                cx.set_cell(0, i64::from(row), glyph, self.fill().patch(style));
             }
         }
     }
 }
 
-/// A tab's card: its title with the state summary at the right, then up to
-/// two wrapped description rows and an optional status row.
+/// What a card shows below its title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detail {
+    /// Nothing: a one-line card.
+    None,
+    /// One line, cut to fit, such as the directory and git status.
+    Line(Line),
+    /// Text wrapped to at most [`DESCRIPTION_ROWS`] rows, such as what an
+    /// agent asks.
+    Wrapped(Line),
+}
+
+/// A tab's card: its title with the state summary at the right, then its
+/// detail and an optional status row.
 #[derive(Debug, Clone)]
 pub struct CardRow {
     pub title: Line,
     pub trailing: Option<Line>,
-    pub description: String,
+    pub description: Detail,
     pub status: String,
     pub muted: Style,
     pub chrome: RowChrome,
     pub fields: [FieldId; 3],
+    /// A blank row below the card, setting its group off from the next.
+    pub spacer: bool,
 }
 
 impl CardRow {
-    fn detail(&self, text: &str, rows: u64, id: &str) -> Option<TextBlock> {
-        let text = text.trim();
-        (!text.is_empty() && rows > 0).then(|| {
-            TextBlock::new(Text::from(text.to_string()))
+    fn block(&self, line: Line, id: &str, wrap: TextWrap) -> Option<TextBlock> {
+        (!line.plain_text().trim().is_empty()).then(|| {
+            TextBlock::new(Text::from_lines(vec![line]))
                 .id(id.to_string())
                 .style(self.chrome.fill().patch(self.muted))
-                .wrap(TextWrap::Word)
+                .wrap(wrap)
         })
     }
 
-    fn description(&self) -> Option<TextBlock> {
-        self.detail(&self.description, DESCRIPTION_ROWS, "description")
+    /// The detail as laid out `width` cells wide: one line is cut to fit,
+    /// keeping the cut visible.
+    fn description(&self, width: u64) -> Option<TextBlock> {
+        match &self.description {
+            Detail::None => None,
+            Detail::Line(line) => self.block(
+                bmux_tui::text::truncate_line_to_display_width(
+                    line,
+                    usize::try_from(width).unwrap_or(usize::MAX),
+                ),
+                "description",
+                TextWrap::None,
+            ),
+            Detail::Wrapped(line) => self.block(line.clone(), "description", TextWrap::Word),
+        }
+    }
+
+    const fn description_rows(&self) -> u64 {
+        match self.description {
+            Detail::Wrapped(_) => DESCRIPTION_ROWS,
+            _ => 1,
+        }
     }
 
     fn status(&self) -> Option<TextBlock> {
-        self.detail(&self.status, 1, "status")
-            .map(|block| block.wrap(TextWrap::None))
+        self.block(
+            Line::from(self.status.trim().to_string()),
+            "status",
+            TextWrap::None,
+        )
     }
 
     /// The source text of each field as painted in a row `width` cells wide:
@@ -113,7 +150,19 @@ impl CardRow {
         [
             self.title_line(usize::try_from(content_width(width)).unwrap_or(usize::MAX))
                 .plain_text(),
-            self.description.trim().to_string(),
+            self.description(detail_width(width))
+                .map(|block| {
+                    block
+                        .text()
+                        .lines
+                        .iter()
+                        .map(Line::plain_text)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_default(),
             self.status.trim().to_string(),
         ]
     }
@@ -151,9 +200,12 @@ impl Component for CardRow {
         let width = constraints.max_width();
         let mut node = LayoutNode::leaf(LayoutId::new("card"), LogicalSize::new(width, 1));
         let mut y = 1;
-        for (block, rows) in [(self.description(), DESCRIPTION_ROWS), (self.status(), 1)] {
+        let detail = detail_width(width);
+        for (block, rows) in [
+            (self.description(detail), self.description_rows()),
+            (self.status(), 1),
+        ] {
             let Some(block) = block else { continue };
-            let detail = detail_width(width);
             if detail == 0 {
                 continue;
             }
@@ -163,14 +215,23 @@ impl Component for CardRow {
                 .push(ChildLayout::new(u64::from(DETAIL_X), y, child));
             y += height;
         }
-        node.size.height = y;
+        node.size.height = y + u64::from(self.spacer);
         node
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let height = u16::try_from(layout.size.height)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(u16::from(self.spacer));
         self.chrome.paint(cx, width, height);
+        if self.spacer {
+            cx.fill(
+                LocalRect::new(0, i64::from(height), width, 1),
+                " ",
+                self.chrome.base,
+            );
+        }
         let content = content_width(layout.size.width);
         let title = TextBlock::new(Text::from_lines(vec![
             self.title_line(usize::try_from(content).unwrap_or(usize::MAX)),
@@ -188,7 +249,10 @@ impl Component for CardRow {
                 ),
             ),
         )];
-        let blocks = [self.description(), self.status()];
+        let blocks = [
+            self.description(detail_width(layout.size.width)),
+            self.status(),
+        ];
         for (child, block) in layout.children.iter().zip(blocks.into_iter().flatten()) {
             fields.push((block, child.clone()));
         }
@@ -236,26 +300,41 @@ impl Component for CardRow {
     }
 }
 
-/// A workspace's header: its marker and name, and at the right what its
-/// tabs are doing.
+/// A workspace's header: a band across the sidebar with the workspace's
+/// color, its name, and at the right what its tabs are doing and whether it
+/// is collapsed. It is a sticky section header: while its tabs scroll under
+/// the top, it stays pinned there.
 #[derive(Debug, Clone)]
 pub struct HeaderRow {
     pub title: Line,
     pub trailing: Line,
-    pub chrome: RowChrome,
+    /// The band's background.
+    pub band: Style,
+    /// The swatch at the band's start, in the workspace's color.
+    pub swatch: Option<Style>,
+    /// A blank row below a collapsed header, setting it off from the next.
+    pub spacer: bool,
+    pub base: Style,
 }
 
 impl Component for HeaderRow {
     fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
         LayoutNode::leaf(
             LayoutId::new("header"),
-            LogicalSize::new(constraints.max_width(), 1),
+            LogicalSize::new(constraints.max_width(), 1 + u64::from(self.spacer)),
         )
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
-        self.chrome.paint(cx, width, 1);
+        let y = 0;
+        cx.fill(LocalRect::new(0, y, width, 1), " ", self.band);
+        if self.spacer {
+            cx.fill(LocalRect::new(0, 1, width, 1), " ", self.base);
+        }
+        if let Some(swatch) = self.swatch {
+            cx.set_cell(0, y, "▌", self.band.patch(swatch));
+        }
         let content = content_width(layout.size.width);
         let content_cells = usize::try_from(content).unwrap_or(usize::MAX);
         let line = bmux_tui::text::truncate_line_to_display_width(
@@ -270,12 +349,12 @@ impl Component for HeaderRow {
         cx.write_line_with_fallback_style(
             LocalRect::new(
                 i32::from(CONTENT_X),
-                0,
+                y,
                 u16::try_from(content).unwrap_or(u16::MAX),
                 1,
             ),
             &line,
-            self.chrome.fill(),
+            self.band,
         );
     }
 }
@@ -294,10 +373,24 @@ impl RowView {
         match self {
             Self::Card(card) => {
                 0_u8.hash(&mut hasher);
-                card.description.hash(&mut hasher);
+                match &card.description {
+                    Detail::None => 0_u8.hash(&mut hasher),
+                    Detail::Line(line) => {
+                        1_u8.hash(&mut hasher);
+                        line.plain_text().hash(&mut hasher);
+                    }
+                    Detail::Wrapped(line) => {
+                        2_u8.hash(&mut hasher);
+                        line.plain_text().hash(&mut hasher);
+                    }
+                }
                 card.status.hash(&mut hasher);
+                card.spacer.hash(&mut hasher);
             }
-            Self::Header(_) => 1_u8.hash(&mut hasher),
+            Self::Header(header) => {
+                1_u8.hash(&mut hasher);
+                header.spacer.hash(&mut hasher);
+            }
         }
         hasher.finish()
     }
@@ -325,8 +418,11 @@ where
     K: Clone + Ord + ToString,
 {
     rows.iter()
-        .fold(VirtualList::new(LIST_ID), |list, (key, row)| {
-            list.item(key.clone(), row.layout_revision(), row.clone())
+        .fold(VirtualList::new(LIST_ID), |list, (key, row)| match row {
+            RowView::Header(_) => {
+                list.section_header(key.clone(), 0, row.layout_revision(), row.clone())
+            }
+            RowView::Card(_) => list.item(key.clone(), row.layout_revision(), row.clone()),
         })
 }
 
@@ -414,11 +510,18 @@ where
             1,
             LogicalSize::new(u64::from(list_width), u64::from(self.list_height)),
             |cx| {
-                self.list.paint(
-                    Rect::new(0, 0, list_width, self.list_height),
-                    &self.state.borrow(),
-                    cx,
+                // The list's own component pins each group's header at the
+                // top while its tabs scroll under it; the sidebar draws its
+                // own scrollbar and handles its own input.
+                let list = bmux_tui_components::virtual_list::VirtualListComponent::new(
+                    LIST_ID, &self.list, self.state,
+                )
+                .chrome(bmux_tui_components::virtual_list::VirtualListChrome::bare());
+                let node = list.layout(
+                    Constraints::tight(bmux_tui::geometry::Size::new(list_width, self.list_height)),
+                    &mut LayoutCx::new(),
                 );
+                list.paint(&node, cx);
             },
         );
         // One column faces the panes: the resize edge, carrying the

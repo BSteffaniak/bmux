@@ -6384,6 +6384,7 @@ dependencies = [
  "bmux_tui_components",
  "bmux_unicode_segmentation",
  "bmux_workspaces_plugin_api",
+ "serde_json",
  "tokio",
  "toml 1.2.2+spec-1.1.0",
  "tracing",

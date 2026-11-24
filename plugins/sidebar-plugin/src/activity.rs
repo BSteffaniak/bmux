@@ -25,7 +25,9 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use bmux_plugin::{RenderColor, RenderNamedColor};
-use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabAgent, TabStatus, TabStatusSnapshot};
+use bmux_tabs_plugin_api::tabs_status::{
+    AgentActivity, GitStatus, TabAgent, TabStatus, TabStatusSnapshot,
+};
 use uuid::Uuid;
 
 /// Output within this long counts as working.
@@ -89,6 +91,13 @@ pub struct TabActivity {
     pub branch: Option<String>,
     /// The agent running in the tab, if any.
     pub agent: Option<String>,
+    /// The focused pane's git status, when it is in a repository.
+    pub git: Option<GitStatus>,
+    /// What needs the user, when the tab is blocked and says.
+    pub message: Option<String>,
+    /// How long the tab has been in its state, when that is known: since its
+    /// agent started working or stopped.
+    pub since: Option<String>,
 }
 
 impl TabActivity {
@@ -96,12 +105,14 @@ impl TabActivity {
     /// directory from the left (its end says more than its start).
     #[must_use]
     pub fn fitted(mut self, width: usize) -> Self {
-        let length = self.detail.chars().count();
+        let length = bmux_cell_geometry::display_width(&self.detail);
         if length > width
             && let Some(cwd) = &self.cwd
             && let Some(rest) = self.detail.strip_prefix(cwd.as_str())
         {
-            let room = width.saturating_sub(rest.chars().count()).max(4);
+            let room = width
+                .saturating_sub(bmux_cell_geometry::display_width(rest))
+                .max(4);
             self.detail = format!("{}{rest}", shorten_left(cwd, room));
         }
         self
@@ -187,11 +198,19 @@ impl ActivityView {
             }
             branch
         });
-        let detail = if state == TabState::Blocked
-            && let Some(message) = message.or_else(|| status.attention.clone())
-        {
-            message
-        } else {
+        let message = (state == TabState::Blocked)
+            .then(|| message.or_else(|| status.attention.clone()))
+            .flatten();
+        let since = status.agent.as_ref().map(|agent| {
+            let at = match state {
+                TabState::Stopped | TabState::Idle => {
+                    agent.finished_at_ms.unwrap_or(agent.changed_at_ms)
+                }
+                _ => agent.changed_at_ms,
+            };
+            format_age(now.saturating_sub(at))
+        });
+        let detail = message.clone().unwrap_or_else(|| {
             let mut parts = Vec::new();
             if let Some(cwd) = &cwd {
                 parts.push(cwd.clone());
@@ -209,7 +228,7 @@ impl ActivityView {
                 parts.push(format_age(now.saturating_sub(at)));
             }
             parts.join(" · ")
-        };
+        });
         Some(TabActivity {
             state,
             summary,
@@ -218,6 +237,9 @@ impl ActivityView {
             cwd,
             branch,
             agent: status.agent.as_ref().map(|agent| agent.name.clone()),
+            git: status.git.clone(),
+            message,
+            since,
         })
     }
 
@@ -260,6 +282,29 @@ impl ActivityView {
         }
     }
 
+    /// Whether any tab may show as working, so a working spinner may be on
+    /// screen.
+    #[must_use]
+    pub fn any_working(&self) -> bool {
+        let Some(now) = self.now_ms() else {
+            return false;
+        };
+        let window = u64::try_from(WORKING_WINDOW.as_millis()).unwrap_or(u64::MAX);
+        self.snapshot.as_ref().is_some_and(|(snapshot, _)| {
+            snapshot.tabs.iter().any(|tab| {
+                tab.agent.as_ref().map_or_else(
+                    || {
+                        tab.running_command.is_some()
+                            && tab
+                                .output_at_ms
+                                .is_some_and(|at| now.saturating_sub(at) < window)
+                    },
+                    |agent| agent.activity == AgentActivity::Working,
+                )
+            })
+        })
+    }
+
     /// Whether any tab's shown state can change with time alone (output
     /// stopping, ages ticking), so the view should be refreshed.
     #[must_use]
@@ -297,20 +342,28 @@ pub fn format_age(ms: u64) -> String {
     }
 }
 
-/// Shorten a path from the left to `width` cells, keeping its end.
+/// Shorten a path from the left to `width` terminal cells, keeping its end
+/// whole graphemes at a time.
 #[must_use]
 pub fn shorten_left(text: &str, width: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= width {
+    if bmux_cell_geometry::display_width(text) <= width {
         return text.to_string();
     }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
+    if width == 0 {
+        return String::new();
     }
-    let keep = chars.len() - (width - 1);
-    std::iter::once('…')
-        .chain(chars[keep..].iter().copied())
-        .collect()
+    let mut kept = Vec::new();
+    let mut used = 1; // The ellipsis.
+    for grapheme in bmux_unicode_segmentation::graphemes(text).rev() {
+        let cells = bmux_cell_geometry::display_width(grapheme);
+        if used + cells > width {
+            break;
+        }
+        used += cells;
+        kept.push(grapheme);
+    }
+    kept.reverse();
+    format!("…{}", kept.concat())
 }
 
 #[cfg(test)]
@@ -477,5 +530,8 @@ mod tests {
         assert_eq!(format_age(7_200_000), "2h");
         assert_eq!(shorten_left("~/a/long/path", 8), "…ng/path");
         assert_eq!(shorten_left("short", 8), "short");
+        // Wide characters take two cells; none is split.
+        assert_eq!(shorten_left("~/日本語/path", 9), "…語/path");
+        assert_eq!(shorten_left("~/日本語", 4), "…語");
     }
 }

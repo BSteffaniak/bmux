@@ -3,23 +3,33 @@
 Bundled vertical status board of the tabs: what each one is running, where,
 on which git branch, and whether it needs you.
 
-Each tab is a card: a state glyph, the tab's name and, at the right, its
-running command or state; below it, dimmed, the focused pane's directory and
-git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you
-are
-looking at has an accent bar and a tinted background.
+Each tab is a card: a state glyph (a spinner while it works), the tab's name
+and, at the right, its state: a solid pill when it needs you or failed,
+otherwise the state or running command and how long it has been so. Below it,
+dimmed, what it asks you, or its directory and git status (branch, `*` when
+dirty, `↑`/`↓` ahead and behind); when space is short the directory shortens
+to its last part, then gives way to git. The tab you are looking at has a bar
+and a tinted background. The heading sums up what every listed tab is doing.
 
 ```text
- TABS                         4
-▎ ● editor                 nvim
-▎   ~/bmux · main* ↑2
-  ◉ claude              working
-    ~/bmux/plugins
-  ▲ build              exit 101
-    ~/build
-  ◆ review          needs input
-    approve edit?
+ TABS                ◆1 ▲1 ⠹2 ■1
+▌ bmux                ◆1 ▲1 ⠹1 ▾
+▎ ⠹ sidebar         working 3m
+▏   sidebar-plugin · main* ↑2
+▏ ◆ review         [needs input]
+▏   approve edit to lib.rs?
+▏ ▲ tests            [exit 101]
+▏   ~/bmux · main ↓3
+
+▌ bcode                   ■1  ▾
+▏ ■ triage          stopped 12m
+▏   ~/bcode · feedback-triage
 ```
+
+Every color comes from your theme: cards and header bands are blends of its
+background toward its foreground or accent, so they read the same on light
+and dark themes, and states and workspaces use your terminal's own colors.
+Below 20 columns cards are one line and their state is their glyph.
 
 States, most urgent first:
 
@@ -78,6 +88,11 @@ visible = false            # closed when a client attaches
 remember_visibility = true  # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
 remember_groups = true      # start with the groups last collapsed collapsed
+working_indicator = "spinner" # or "static": a still ◉
+density = "comfortable"     # or "compact": one line per tab
+
+[plugins.settings."bmux.sidebar".workspace_colors]
+bmux = "magenta"            # a terminal color name, or "#rrggbb"
 ```
 
 Templates support `{state_icon}`, `{state}`, `{name}`, `{command}`, `{cwd}`,
@@ -98,8 +113,12 @@ Show or hide it in one attach client with `plugin:bmux.sidebar:toggle`
 Click a tab, or press Enter on it, to show it, in whichever workspace it is
 (through the workspaces plugin's `activate-tab`).
 
-With `grouping = "workspace"`, each workspace's tabs sit under a header that
-sums up what they are doing: how many need input (`◆`), failed (`▲`), are
+With `grouping = "workspace"`, each workspace's tabs sit under a header, a
+band across the sidebar marked with the workspace's color (one picked from
+its name unless `workspace_colors` sets it), which also runs down its tabs as
+a thin rail; a blank row sets each group off from the next. While a group's
+tabs scroll under the top, its header stays pinned there. The header sums up
+what its tabs are doing: how many need input (`◆`), failed (`▲`), are
 working (`◉`) and have stopped (`■`), most pressing first, or how many tabs it
 holds when none is doing anything. Click a header (or press Enter or space on
 it) to collapse or expand its group; left and right collapse and expand. A
