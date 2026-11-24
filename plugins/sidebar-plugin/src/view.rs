@@ -584,7 +584,7 @@ impl<K: Clone + Ord + ToString> SidebarView<'_, K> {
             .scrollbar
             .map(|scrollbar| Rect::new(scrollbar.x, 1, 1, self.list_height));
         if let Some(edge) = self.edge {
-            if edge.highlighted {
+            if edge.highlighted || self.strip_summary.is_some() {
                 for row in 0..edge.height {
                     let on_track =
                         track.is_some_and(|track| row >= track.y && row < track.y + track.height);

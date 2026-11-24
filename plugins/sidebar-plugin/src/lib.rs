@@ -172,7 +172,7 @@ impl Default for Settings {
             maximum_visible_items: 20,
             content_height: false,
             collapse_below_width: 80,
-            collapsed_width: 8,
+            collapsed_width: 2,
             // Enabled by default but closed until a client opens it; the tab
             // bar is the default visible tab presentation.
             visibility: VisibilitySettings {
@@ -231,12 +231,12 @@ impl Settings {
                     })?;
             }
         }
-        if settings.collapsed_width < 3
+        if settings.collapsed_width < 2
             || settings.collapsed_width >= settings.width
             || settings.width > settings.maximum_width
         {
             return Err(PluginCommandError::invalid_arguments(
-                "bmux.sidebar requires 3 <= collapsed_width < width <= maximum_width",
+                "bmux.sidebar requires 2 <= collapsed_width < width <= maximum_width",
             ));
         }
         if let Some(order) = table.get("order").and_then(toml::Value::as_integer) {
@@ -2292,7 +2292,7 @@ const RESIZE_EDGE_REGION: &str = "resize-edge";
 /// narrow to spare one.
 fn resize_edge(state: &CompanionState, content_rows: u16) -> Option<ExtensionRect> {
     let width = state.allocated_width();
-    if width < 3 {
+    if width < 2 {
         return None;
     }
     let height = if state.settings.content_height && !state.is_strip() {
@@ -2393,19 +2393,27 @@ fn strip_summary(state: &CompanionState) -> Vec<bmux_tui::text::Line> {
     use bmux_plugin::render_paint::{tui_color, tui_style};
     use bmux_tui::style::{Modifier, Style};
 
+    let room = usize::from(state.allocated_width().saturating_sub(1).max(1));
     let total = state.snapshot.tabs.len();
     let counts = status_counts(state, 0..total);
     if counts.is_empty() {
-        return vec![view::styled(
-            total.to_string(),
-            tui_style(state.palette.muted),
-        )];
+        let label = total.to_string();
+        return if label.len() <= room {
+            vec![view::styled(label, tui_style(state.palette.muted))]
+        } else {
+            Vec::new()
+        };
     }
     counts
         .into_iter()
         .map(|(status, count)| {
+            let label = format!("{}{count}", status.glyph());
             view::styled(
-                format!("{}{count}", status.glyph()),
+                if bmux_cell_geometry::display_width(&label) <= room {
+                    label
+                } else {
+                    status.glyph().to_string()
+                },
                 Style::new()
                     .fg(tui_color(status.color()))
                     .add_modifier(Modifier::BOLD),
@@ -2551,14 +2559,19 @@ fn sidebar_view<'a>(
         PanelShape::Normal
     })
     .maximizable(false)
-    .close_in_strip(true)
     .style(tui_style(palette.muted.background_of(palette.base)))
     .hovered(state.engaged.control_hovered);
+    let highlighted = state.engaged.edge_hovered || state.resize.is_some();
+    let edge_color = if highlighted {
+        state.edge_colors.hover
+    } else {
+        state.edge_colors.track
+    };
     let edge = resize_edge(state, shown_rows).map(|edge| view::Edge {
         x: edge.x,
         height: edge.h.min(height),
-        highlighted: state.engaged.edge_hovered || state.resize.is_some(),
-        style: tui_style(state.edge_colors.hover.background_of(palette.base)),
+        highlighted,
+        style: tui_style(edge_color.background_of(palette.base)),
     });
     view::SidebarView {
         size: (width, height),
@@ -5670,9 +5683,9 @@ mod tests {
         sidebar.handled("drag", 500);
         assert_eq!(sidebar.requested_width(), 60);
         sidebar.handled("drag", 0);
-        assert_eq!(sidebar.requested_width(), 8);
-        sidebar.reallocate(ExtensionRect::new(0, 0, 8, 20));
-        assert_eq!(sidebar.edge().rect.x, 7);
+        assert_eq!(sidebar.requested_width(), 2);
+        sidebar.reallocate(ExtensionRect::new(0, 0, 2, 20));
+        assert_eq!(sidebar.edge().rect.x, 1);
         sidebar.handled("drag", 33);
         assert_eq!(sidebar.requested_width(), 34);
         let released = sidebar.handled("up", 33);
@@ -5702,8 +5715,8 @@ mod tests {
         sidebar.handled("drag", 62);
         assert_eq!(sidebar.requested_width(), 38);
         sidebar.handled("drag", 99);
-        assert_eq!(sidebar.requested_width(), 8);
-        sidebar.reallocate(ExtensionRect::new(92, 0, 8, 20));
+        assert_eq!(sidebar.requested_width(), 2);
+        sidebar.reallocate(ExtensionRect::new(98, 0, 2, 20));
         assert_eq!(sidebar.edge().rect.x, 0);
         sidebar.handled("drag", 80);
         assert_eq!(sidebar.requested_width(), 20);
@@ -5753,21 +5766,26 @@ mod tests {
         };
         assert!(surface_text(&surface(), 28, 1)[0].ends_with("▾ ×"));
         click(WindowControl::Minimize);
-        assert_eq!(sidebar.requested_width(), 8);
-        assert_eq!(allocate(100), 92);
-        assert!(surface_text(&surface(), 8, 1)[0].ends_with("▸ ×"));
+        assert_eq!(sidebar.requested_width(), 2);
+        assert_eq!(allocate(100), 98);
+        assert_eq!(surface_text(&surface(), 2, 1)[0], "▸│");
+        assert!(
+            surface()
+                .interactive_regions
+                .iter()
+                .all(|region| region.local_id
+                    != item_region_id(SidebarHit::Control(WindowControl::Close)))
+        );
         click(WindowControl::Minimize);
         assert_eq!(sidebar.requested_width(), 28);
         assert_eq!(allocate(100), 72);
 
         // The host can allocate the strip in responsive mode too.
-        assert_eq!(allocate(60), 52);
-        assert!(surface_text(&surface(), 8, 1)[0].ends_with("▸ ×"));
+        assert_eq!(allocate(60), 58);
+        assert_eq!(surface_text(&surface(), 2, 1)[0], "▸│");
         assert_eq!(allocate(100), 72);
         assert!(surface_text(&surface(), 28, 1)[0].ends_with("▾ ×"));
 
-        click(WindowControl::Minimize);
-        assert_eq!(allocate(100), 92);
         click(WindowControl::Close);
         assert_eq!(allocate(60), 60);
         assert!(matches!(
@@ -5797,9 +5815,9 @@ mod tests {
             None,
         );
         state.select(Some(Uuid::from_u128(4)));
-        state.resize(ExtensionRect::new(0, 0, 8, 4));
-        let text = |state: &CompanionState| surface_text(&build_surface(state, 1), 8, 4);
-        assert_eq!(text(&state), ["    ▸ ×", "◆1", "◉1", "■1"]);
+        state.resize(ExtensionRect::new(0, 0, 2, 4));
+        let text = |state: &CompanionState| surface_text(&build_surface(state, 1), 2, 4);
+        assert_eq!(text(&state), ["▸│", "◆│", "◉│", "■│"]);
         state.apply_changes(Changes {
             tabs: None,
             personal: None,
@@ -5817,7 +5835,7 @@ mod tests {
             ticked: false,
             animated: false,
         });
-        assert_eq!(text(&state), ["    ▸ ×", "▲1", "", ""]);
+        assert_eq!(text(&state), ["▸│", "▲│", " │", " │"]);
     }
 
     /// `widen` and `narrow` step the width within its bounds and remember it.
@@ -5834,13 +5852,13 @@ mod tests {
         for _ in 0..20 {
             run("narrow");
         }
-        assert_eq!(sidebar.requested_width(), 8);
+        assert_eq!(sidebar.requested_width(), 2);
         drop(sidebar);
         assert_eq!(
             std::fs::read_to_string(dir.join(WIDTH_FILE))
                 .unwrap()
                 .trim(),
-            "10"
+            "4"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

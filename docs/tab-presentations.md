@@ -205,7 +205,7 @@ status_template = ""
 maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
-collapsed_width = 8
+collapsed_width = 2
 visible = false
 remember_visibility = true
 ```

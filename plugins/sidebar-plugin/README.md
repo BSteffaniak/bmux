@@ -94,7 +94,7 @@ status_template = ""
 maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
-collapsed_width = 8
+collapsed_width = 2
 visible = false            # closed when a client attaches
 remember_visibility = true  # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
@@ -180,12 +180,12 @@ cursor there, on terminals that support OSC 22 pointer shapes), or with
 the floor, and dragging outward brings the tabs back. Its last expanded width
 is remembered on this machine unless `remember_width = false`.
 
-Use ▾ to minimize and ▸ to restore. The strip shows live status counts
-across
-all workspaces on the attached server, even when the full sidebar is scoped to
-the current workspace. The strip also appears automatically below
-`collapse_below_width` and expands again when space returns. You can restore it
-explicitly while the terminal is narrow.
+Use ▾ to minimize and ▸ to restore. The default strip has one column for
+restore and live status glyphs across all workspaces, plus a resize rail.
+Set a larger `collapsed_width` to show status counts as space allows.
+The strip also appears automatically below `collapse_below_width` and
+expands when space returns. You can restore it explicitly on a narrow terminal.
 
-Use × to close the sidebar and return its space to the terminal. Reopen it
+Use × in the expanded header to close the sidebar and return its space to the
+terminal. Reopen it
 with the usual sidebar toggle (`ctrl+alt+s` by default).

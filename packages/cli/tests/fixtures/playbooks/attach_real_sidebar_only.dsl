@@ -22,7 +22,7 @@ send-attach key='ctrl+a c'
 send-attach key='ctrl+s'
 # Regression: the host must resolve plugin allocations on a viewport-only resize.
 resize-viewport cols=60 rows=24
-wait-rendered contains='▸ ×'
+wait-rendered contains='▸│'
 resize-viewport cols=120 rows=36
 wait-rendered contains=' TABS '
 assert-rendered matches='(?m)^ TABS .*▾ ×'
