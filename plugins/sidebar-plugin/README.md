@@ -110,6 +110,17 @@ are looking at. Collapsed groups are remembered on this machine unless
 `scope = "current_workspace"` lists only the workspace of the tab you are
 looking at, grouped or not, and follows you as you switch tabs.
 
+Clicking a tab (or pressing Enter on it) shows it and leaves the keyboard with
+that tab's pane. The sidebar has the keyboard only while you work in it: with
+`behavior.mouse.focus_on_hover`, when the pointer enters it, and otherwise when
+you click a header; its heading lights up and the row the keyboard is on is
+highlighted, and the panes are drawn unfocused. Up, Down, Home and End move
+through the rows; Escape, a key the sidebar does not use (typing), or moving the
+pointer onto a pane hands the keyboard back to the pane.
+
+When the tabs do not fit, a scrollbar appears just inside the edge facing the
+panes; drag it or click its track to scroll.
+
 Resize it by dragging the edge that faces the panes (the pointer shows a resize
 cursor there, on terminals that support OSC 22 pointer shapes), or with
 `plugin:bmux.sidebar:widen` and `plugin:bmux.sidebar:narrow` (`ctrl+a >` and

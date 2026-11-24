@@ -335,8 +335,20 @@ struct CompanionState {
     width_memory: Option<std::path::PathBuf>,
     /// A drag of the resize edge in progress.
     resize: Option<ResizeDrag>,
+    /// How the pointer and keyboard are engaged with the sidebar.
+    engaged: Engagement,
+}
+
+/// How the pointer and keyboard are engaged with the sidebar's chrome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent pointer and focus states.
+struct Engagement {
     /// The pointer is over the resize edge.
     edge_hovered: bool,
+    /// The sidebar has keyboard focus in this client.
+    focused: bool,
+    /// The scrollbar is being dragged.
+    scrollbar_drag: bool,
 }
 
 /// A drag of the sidebar's resize edge: where the pointer pressed, on the
@@ -360,6 +372,8 @@ enum SidebarHit {
     Group(Uuid),
     /// The edge facing the panes, dragged to resize the sidebar.
     ResizeEdge,
+    /// The list's scrollbar.
+    Scrollbar,
 }
 
 /// One row of the sidebar's list.
@@ -399,12 +413,16 @@ fn item_region_id(item: SidebarHit) -> String {
         SidebarHit::Tab(id) => tab_region_id(id),
         SidebarHit::Group(id) => format!("group:{id}"),
         SidebarHit::ResizeEdge => RESIZE_EDGE_REGION.to_string(),
+        SidebarHit::Scrollbar => view::SCROLLBAR.to_string(),
     }
 }
 
 fn region_item(region: &str) -> Option<SidebarHit> {
     if region == RESIZE_EDGE_REGION {
         return Some(SidebarHit::ResizeEdge);
+    }
+    if region == view::SCROLLBAR {
+        return Some(SidebarHit::Scrollbar);
     }
     if let Some(id) = region.strip_prefix("group:") {
         return Uuid::parse_str(id).ok().map(SidebarHit::Group);
@@ -471,7 +489,7 @@ impl CompanionState {
             width,
             width_memory,
             resize: None,
-            edge_hovered: false,
+            engaged: Engagement::default(),
             surfaces: None,
             layouts: None,
             facts: None,
@@ -509,6 +527,33 @@ impl CompanionState {
             Some(rect) => rect.w,
             None => self.width,
         }
+    }
+
+    /// Take a focus change for the region `hook` names: the focused row is
+    /// the keyboard's, and is highlighted. Returns whether anything changed
+    /// (and republishes it).
+    fn set_focus(&mut self, hook: &str, focused: bool) -> bool {
+        // `owner:surface:region`, where the region id has colons of its own.
+        let row = hook
+            .splitn(3, ':')
+            .nth(2)
+            .and_then(region_item)
+            .filter(|item| matches!(item, SidebarHit::Tab(_) | SidebarHit::Group(_)));
+        let previous = (self.engaged.focused, self.cursor.clone());
+        self.engaged.focused = focused;
+        if focused {
+            if let Some(row) = row {
+                self.cursor.set_cursor(Some(row));
+                self.cursor.set_hovered(Some(row));
+            }
+        } else {
+            self.cursor.set_hovered(None);
+        }
+        if previous == (self.engaged.focused, self.cursor.clone()) {
+            return false;
+        }
+        self.revision = self.revision.saturating_add(1).max(1);
+        publish_companion(self).is_ok()
     }
 
     /// Ask for `width`, kept within the minimum and maximum. Returns whether
@@ -747,12 +792,29 @@ impl CompanionState {
         rows: &'a [(SidebarHit, view::RowView)],
     ) -> bmux_tui_components::virtual_list::VirtualList<'a, SidebarHit> {
         let list = view::list(rows);
+        let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let ((_, width), _) = self.list_columns(self.list_height(&keys));
         list.sync(
-            u64::from(self.allocated_width()),
+            u64::from(width),
             &mut self.list.borrow_mut(),
             &mut bmux_tui::component::LayoutCx::new(),
         );
         list
+    }
+
+    /// The list's first column and width, and the scrollbar's column: the
+    /// whole width while the rows fit; while they overflow, the scrollbar
+    /// takes the column inside the resize edge and the list the rest.
+    fn list_columns(&self, list_height: u16) -> ((u16, u16), Option<u16>) {
+        let width = self.allocated_width();
+        let overflows = self.list.borrow().total_height() > u64::from(list_height);
+        if !overflows || width < 6 {
+            return ((0, width), None);
+        }
+        match self.settings.placement {
+            Placement::Left => ((0, width - 2), Some(width - 2)),
+            Placement::Right => ((2, width - 2), Some(1)),
+        }
     }
 
     /// Rows the list may use below the heading: the allocation's, or the
@@ -1231,6 +1293,7 @@ impl SidebarPresentation {
         );
         register_visibility_commands(&owner, &input);
         register_width_commands(&owner, &input);
+        register_focus_observer(&owner, &input);
         Ok(Self {
             owner,
             layouts,
@@ -1289,6 +1352,29 @@ fn register_input_callbacks(
     );
 }
 
+/// Follow the sidebar's keyboard focus in this client, to show it: the
+/// heading lights up and the focused row is highlighted.
+fn register_focus_observer(
+    owner: &CompanionHandle,
+    input: &bmux_plugin::AttachPresentationInputRegistry,
+) {
+    let owner = std::sync::Arc::downgrade(owner);
+    input.register_focus_changed(
+        input_endpoint(),
+        std::sync::Arc::new(move |hook, focused| {
+            let Some(owner) = owner.upgrade() else {
+                return false;
+            };
+            let Ok(mut guard) = owner.lock() else {
+                return false;
+            };
+            guard
+                .as_mut()
+                .is_some_and(|companion| companion.set_focus(hook, focused))
+        }),
+    );
+}
+
 /// Commands that step the sidebar's width in this runtime.
 const WIDTH_COMMANDS: [&str; 2] = ["widen", "narrow"];
 
@@ -1330,7 +1416,7 @@ fn step_width(companion: &mut CompanionState, widen: bool) -> AttachInputResult 
     let changed = companion.set_width(width);
     if changed {
         // The edge moved out from under the pointer; the next move re-hovers it.
-        companion.edge_hovered = false;
+        companion.engaged.edge_hovered = false;
     }
     let dirty = changed && companion.visible() && republish_width(companion, true);
     let status_message = if changed {
@@ -1647,6 +1733,8 @@ fn state_glyph(activity: Option<&activity::TabActivity>) -> (char, RenderColor) 
 struct SidebarPalette {
     base: RenderStyle,
     heading: RenderStyle,
+    /// The heading while the sidebar has the keyboard.
+    focused_heading: RenderStyle,
     title: RenderStyle,
     active_title: RenderStyle,
     muted: RenderStyle,
@@ -1662,6 +1750,10 @@ impl Default for SidebarPalette {
             heading: RenderStyle::new()
                 .named_foreground(RenderNamedColor::BrightBlack)
                 .bold(),
+            focused_heading: RenderStyle::new()
+                .named_foreground(RenderNamedColor::Blue)
+                .bold()
+                .underline(),
             title: RenderStyle::new().named_foreground(RenderNamedColor::White),
             active_title: RenderStyle::new()
                 .named_foreground(RenderNamedColor::BrightWhite)
@@ -1777,6 +1869,8 @@ fn sidebar_regions(
         }
         let item = if hit.local_id == view::RESIZE_EDGE {
             Some(SidebarHit::ResizeEdge)
+        } else if hit.local_id == view::SCROLLBAR {
+            Some(SidebarHit::Scrollbar)
         } else {
             hit.local_id
                 .strip_prefix(view::LIST_ID)
@@ -1786,17 +1880,23 @@ fn sidebar_regions(
         let Some(item) = item.filter(|item| placed.insert(*item)) else {
             continue;
         };
-        let cursor = if item == SidebarHit::ResizeEdge {
-            bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal
-        } else {
-            bmux_plugin::surface::PluginSurfaceCursor::Pointer
+        let cursor = match item {
+            SidebarHit::ResizeEdge => bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal,
+            SidebarHit::Scrollbar => bmux_plugin::surface::PluginSurfaceCursor::Default,
+            SidebarHit::Tab(_) | SidebarHit::Group(_) => {
+                bmux_plugin::surface::PluginSurfaceCursor::Pointer
+            }
         };
-        regions.push(
-            PluginSurfaceRegion::new(item_region_id(item), hit.rect)
-                .endpoint(input_endpoint())
-                .focusable(cursor)
-                .key(hits.key(item)),
-        );
+        let region = PluginSurfaceRegion::new(item_region_id(item), hit.rect)
+            .endpoint(input_endpoint())
+            .focusable(cursor)
+            .key(hits.key(item));
+        // Rows take the keyboard under the pointer, like panes, where the
+        // user has focus-on-hover; the resize edge never does.
+        regions.push(match item {
+            SidebarHit::ResizeEdge | SidebarHit::Scrollbar => region,
+            SidebarHit::Tab(_) | SidebarHit::Group(_) => region.focus_on_hover(),
+        });
     }
     regions
 }
@@ -1840,6 +1940,7 @@ fn build_surface_with_hits(
     let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
     let list = state.synced_list(&rows);
     let list_height = state.list_height(&keys);
+    let (list_columns, scrollbar_x) = state.list_columns(list_height);
     let shown_rows = {
         let list_state = state.list.borrow();
         u16::try_from(
@@ -1862,7 +1963,7 @@ fn build_surface_with_hits(
     let edge = resize_edge(state, shown_rows).map(|edge| view::Edge {
         x: edge.x,
         height: edge.h.min(height),
-        highlighted: state.edge_hovered || state.resize.is_some(),
+        highlighted: state.engaged.edge_hovered || state.resize.is_some(),
         style: tui_style(palette.accent.background_of(palette.base)),
     });
     let component = view::SidebarView {
@@ -1870,12 +1971,19 @@ fn build_surface_with_hits(
         base: tui_style(palette.base),
         heading: view::styled(
             state.settings.heading.to_uppercase(),
-            tui_style(palette.heading),
+            // Lit while the sidebar has the keyboard.
+            tui_style(if state.engaged.focused {
+                palette.focused_heading
+            } else {
+                palette.heading
+            }),
         ),
         count: view::styled(count.to_string(), tui_style(palette.muted)),
         list,
         state: &state.list,
         list_height,
+        list_columns,
+        scrollbar: scrollbar_x.map(|x| scrollbar_view(state, x, list_height, &palette)),
         edge,
     };
     let size = bmux_tui::geometry::Size::new(width, height);
@@ -1985,6 +2093,121 @@ fn hit(companion: &CompanionState, event: &AttachInputEvent) -> Option<SidebarHi
     )
 }
 
+/// The list's scrollbar at column `x`: muted, its thumb lit while dragged.
+fn scrollbar_view(
+    state: &CompanionState,
+    x: u16,
+    list_height: u16,
+    palette: &SidebarPalette,
+) -> view::ScrollbarView {
+    use bmux_plugin::render_paint::tui_style;
+    view::ScrollbarView {
+        x,
+        state: state.list.borrow().scrollbar_state(u64::from(list_height)),
+        styles: bmux_tui_components::scrollbar::ScrollbarStyles {
+            begin: tui_style(palette.muted),
+            track: tui_style(palette.muted),
+            thumb: tui_style(if state.engaged.scrollbar_drag {
+                palette.accent
+            } else {
+                palette.title
+            }),
+            end: tui_style(palette.muted),
+        },
+    }
+}
+
+/// Drag the scrollbar: a left press on it jumps there and captures the
+/// pointer, dragging follows the pointer, and releasing lets go. The
+/// scrollbar's own geometry decides the position, as the list's.
+fn update_scrollbar(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui_components::scrollbar::ScrollbarOutcome;
+    use bmux_tui_components::virtual_list::VirtualListAction;
+    if event.event_kind != "pointer" {
+        return None;
+    }
+    let mut guard = owner.lock().ok()?;
+    let companion = guard.as_mut()?;
+    match (event.phase.as_str(), companion.engaged.scrollbar_drag) {
+        ("down", false)
+            if event.button.as_deref() == Some("left")
+                && hit(companion, event) == Some(SidebarHit::Scrollbar) => {}
+        ("drag", true) => {}
+        ("up", true) => {
+            companion.engaged.scrollbar_drag = false;
+            companion.revision = companion.revision.saturating_add(1).max(1);
+            let dirty = publish_companion(companion).is_ok();
+            return Some(AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                release_capture: true,
+                dirty,
+                ..AttachInputResult::default()
+            });
+        }
+        // The drag owns the pointer until it is released.
+        (_, true) => {
+            return Some(AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                ..AttachInputResult::default()
+            });
+        }
+        _ => return None,
+    }
+    let keys = companion.item_keys();
+    let list_height = companion.list_height(&keys);
+    // The pointer's row on the track, which starts below the heading.
+    let top = companion
+        .allocation
+        .map_or(0, |rect| rect.y)
+        .saturating_add(1);
+    let row = event
+        .screen_row
+        .map(|row| row.saturating_sub(top))
+        .or_else(|| event.row.map(|row| row.saturating_sub(1)))?;
+    let track = bmux_tui::geometry::Rect::new(0, 0, 1, list_height);
+    let mut scrollbar_state = companion
+        .list
+        .borrow()
+        .scrollbar_state(u64::from(list_height));
+    // Every step is positioned as a press there: the scrollbar's own
+    // mapping from track position to offset, for the press and the drag.
+    let outcome = bmux_tui_components::scrollbar::Scrollbar::new().handle_event(
+        track,
+        &mut scrollbar_state,
+        &Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            bmux_tui::geometry::Point::new(0, row),
+        )),
+    );
+    companion.engaged.scrollbar_drag = true;
+    if let ScrollbarOutcome::Changed { offset } = outcome {
+        let maximum = scrollbar_state.max_offset().max(1);
+        companion
+            .list
+            .borrow_mut()
+            .apply_action(&VirtualListAction::ScrollbarDrag(
+                f64::from(offset) / f64::from(maximum),
+            ));
+    }
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let dirty = publish_companion(companion).is_ok();
+    drop(guard);
+    Some(AttachInputResult {
+        consumed: true,
+        preserve_focus: true,
+        capture_pointer: true,
+        preserve_capture_across_revisions: true,
+        dirty,
+        ..AttachInputResult::default()
+    })
+}
+
 /// Drag the resize edge: a left press on it captures the pointer, dragging
 /// moves it (the sidebar's width follows the pointer, within its minimum and
 /// maximum), and releasing remembers the width.
@@ -2089,16 +2312,16 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
         hit(companion, event)
     };
     let previous = companion.cursor.clone();
-    let previous_edge = companion.edge_hovered;
-    companion.edge_hovered = hovered == Some(SidebarHit::ResizeEdge);
+    let previous_edge = companion.engaged.edge_hovered;
+    companion.engaged.edge_hovered = hovered == Some(SidebarHit::ResizeEdge);
     let row = hovered.filter(|hit| *hit != SidebarHit::ResizeEdge);
-    if !companion.cursor.set_hovered(row) && previous_edge == companion.edge_hovered {
+    if !companion.cursor.set_hovered(row) && previous_edge == companion.engaged.edge_hovered {
         return false;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
     if publish_companion(companion).is_err() {
         companion.cursor = previous;
-        companion.edge_hovered = previous_edge;
+        companion.engaged.edge_hovered = previous_edge;
         return false;
     }
     true
@@ -2138,6 +2361,15 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
         "down" => CursorInput::Down,
         "home" => CursorInput::Home,
         "end" => CursorInput::End,
+        // Escape hands the keyboard back to the panes.
+        "esc" => {
+            drop(guard);
+            return Some(AttachInputResult {
+                consumed: true,
+                release_capture: true,
+                ..AttachInputResult::default()
+            });
+        }
         // On a header, left collapses, right expands and space toggles.
         key @ ("left" | "right" | "space") => {
             let SidebarHit::Group(workspace) = target else {
@@ -2200,10 +2432,13 @@ fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<Att
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     match hit(companion, event)? {
+        // The tab shown takes the keyboard: activating it leaves the sidebar.
         SidebarHit::Tab(target) => {
             drop(guard);
             Some(AttachInputResult {
                 consumed: true,
+                preserve_focus: true,
+                release_capture: true,
                 service_invocation: activate_tab_invocation(target),
                 ..AttachInputResult::default()
             })
@@ -2220,7 +2455,7 @@ fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<Att
                 ..AttachInputResult::default()
             })
         }
-        SidebarHit::ResizeEdge => None,
+        SidebarHit::ResizeEdge | SidebarHit::Scrollbar => None,
     }
 }
 
@@ -2280,6 +2515,9 @@ fn handle_local_input(
         });
     }
     if let Some(result) = update_resize(owner, event) {
+        return Some(result);
+    }
+    if let Some(result) = update_scrollbar(owner, event) {
         return Some(result);
     }
     if let Some(result) = activate_tab(owner, event) {
@@ -3521,8 +3759,10 @@ mod tests {
             assert!(titles.len() >= 2, "offset {offset}: {text:?}");
             for row in titles {
                 let line = &text[usize::from(row)];
+                // The overflowing list's scrollbar sits after the summary.
+                let content = line.trim_end_matches(['█', '│']).trim_end();
                 assert!(
-                    line.ends_with("working"),
+                    content.ends_with("working"),
                     "offset {offset}, row {row}: {line:?}"
                 );
                 let runs = painted_row(&surface, row);
@@ -3598,8 +3838,124 @@ mod tests {
         for event in [press(&region), key(&region, "enter")] {
             let result = super::handle_local_input(&owner, &event).unwrap();
             assert!(result.consumed);
+            // The tab shown takes the keyboard, not the sidebar.
+            assert!(result.preserve_focus && result.release_capture);
             assert_activates(&result.service_invocation.unwrap(), other);
         }
+    }
+
+    /// While the sidebar has the keyboard its heading lights up and the
+    /// focused row is highlighted; Escape hands the keyboard back.
+    #[test]
+    fn the_sidebar_shows_when_it_has_the_keyboard() {
+        let owner =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(grouped_state(grouped(), None))));
+        let heading_style = |owner: &CompanionHandle| {
+            let guard = owner.lock().unwrap();
+            let surface = build_surface(guard.as_ref().unwrap(), 1);
+            drop(guard);
+            painted_row(&surface, 0)
+                .into_iter()
+                .find(|(_, text, _)| text.contains("TABS"))
+                .map(|(_, _, style)| style)
+                .unwrap()
+        };
+        let unfocused = heading_style(&owner);
+        let review = Uuid::from_u128(2);
+        let hook = format!("{OWNER}:{SURFACE_ID}:{}", tab_region_id(review));
+        {
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert!(state.set_focus(&hook, true));
+            assert_eq!(state.cursor.hovered(), Some(&SidebarHit::Tab(review)));
+            drop(guard);
+        }
+        let focused = heading_style(&owner);
+        assert_ne!(focused, unfocused);
+        assert!(focused.underline);
+        // Losing focus puts it back.
+        {
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert!(state.set_focus(&hook, false));
+            assert_eq!(state.cursor.hovered(), None);
+            assert!(!state.set_focus(&hook, false));
+            drop(guard);
+        }
+        assert_eq!(heading_style(&owner), unfocused);
+        let escape =
+            super::handle_local_input(&owner, &key(&tab_region_id(review), "esc")).unwrap();
+        assert!(escape.consumed && escape.release_capture);
+    }
+
+    /// Rows take the keyboard under the pointer where focus-on-hover is on;
+    /// the resize edge and the scrollbar never do.
+    #[test]
+    fn rows_take_focus_by_hover_and_the_edge_and_scrollbar_do_not() {
+        let state = working_cards();
+        let surface = build_surface(&state, 1);
+        let hover = |id: &str| {
+            surface
+                .interactive_regions
+                .iter()
+                .find(|region| region.local_id == id)
+                .map(|region| region.focus_on_hover)
+        };
+        assert_eq!(hover(&tab_region_id(Uuid::from_u128(1))), Some(true));
+        assert_eq!(hover(RESIZE_EDGE_REGION), Some(false));
+        assert_eq!(hover(view::SCROLLBAR), Some(false));
+    }
+
+    /// Rows that overflow show a scrollbar inside the edge, and dragging it
+    /// scrolls the list; rows that fit show none.
+    #[test]
+    fn overflowing_rows_get_a_draggable_scrollbar() {
+        let state = working_cards();
+        let surface = build_surface(&state, 1);
+        let scrollbar = surface
+            .interactive_regions
+            .iter()
+            .find(|region| region.local_id == view::SCROLLBAR)
+            .map(|region| region.rect)
+            .expect("a scrollbar while the rows overflow");
+        assert_eq!(scrollbar, ExtensionRect::new(30, 1, 1, 6));
+        assert!(
+            painted_row(&surface, 1)
+                .iter()
+                .any(|(x, text, _)| *x == 30 && text == "█")
+        );
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+        let drag = |phase: &str, row: u16| AttachInputEvent {
+            screen_row: Some(row),
+            ..AttachInputEvent {
+                phase: phase.to_string(),
+                ..press(view::SCROLLBAR)
+            }
+        };
+        let offset =
+            |owner: &CompanionHandle| owner.lock().unwrap().as_ref().unwrap().scroll_offset();
+        let pressed = super::handle_local_input(&owner, &drag("down", 6)).unwrap();
+        assert!(pressed.capture_pointer && pressed.preserve_focus);
+        let bottom = offset(&owner);
+        assert!(bottom > 0, "pressing the bottom of the track scrolls down");
+        super::handle_local_input(&owner, &drag("drag", 1)).unwrap();
+        assert_eq!(offset(&owner), 0, "dragging to the top scrolls to the top");
+        let released = super::handle_local_input(&owner, &drag("up", 1)).unwrap();
+        assert!(released.release_capture);
+        // After release, a drag is not the scrollbar's.
+        assert!(
+            super::handle_local_input(&owner, &drag("drag", 6))
+                .is_none_or(|result| !result.consumed)
+        );
+
+        // Rows that fit: no scrollbar.
+        let fitting = grouped_state(grouped(), None);
+        assert!(
+            !build_surface(&fitting, 1)
+                .interactive_regions
+                .iter()
+                .any(|region| region.local_id == view::SCROLLBAR)
+        );
     }
 
     /// A sidebar installed like an attach client's, shown at `placement`
@@ -4461,13 +4817,14 @@ mod tests {
         assert_eq!(state.list.borrow().total_height(), 6);
         let surface = build_surface(&state, 1);
         assert_eq!(tab_regions(&surface).len(), 2);
+        // The rows overflow, so the scrollbar and the edge take two columns.
         assert_eq!(
             tab_regions(&surface)[0].rect,
-            ExtensionRect::new(0, 1, state.settings.width, 1)
+            ExtensionRect::new(0, 1, state.settings.width - 2, 1)
         );
         assert_eq!(
             tab_regions(&surface)[1].rect,
-            ExtensionRect::new(0, 2, state.settings.width, 1)
+            ExtensionRect::new(0, 2, state.settings.width - 2, 1)
         );
         assert!(
             surface

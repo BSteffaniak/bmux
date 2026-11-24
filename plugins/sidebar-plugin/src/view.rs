@@ -28,6 +28,8 @@ use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
 pub const LIST_ID: &str = "sidebar.rows";
 /// The id of the resize edge's hit region.
 pub const RESIZE_EDGE: &str = "resize-edge";
+/// The scrollbar's hit region.
+pub const SCROLLBAR: &str = "scrollbar";
 
 /// Columns a row's content starts after: the active bar and a space.
 const CONTENT_X: u16 = 2;
@@ -348,7 +350,28 @@ pub struct SidebarView<'a, K> {
     pub state: &'a RefCell<VirtualListState<K>>,
     /// The rows the list may use, below the heading.
     pub list_height: u16,
+    /// The columns the list occupies: all of them, or all but the
+    /// scrollbar's and the edge's while it overflows.
+    pub list_columns: (u16, u16),
+    pub scrollbar: Option<ScrollbarView>,
     pub edge: Option<Edge>,
+}
+
+/// The list's scrollbar, shown while the rows overflow: its column, its
+/// state, and how it looks.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollbarView {
+    pub x: u16,
+    pub state: bmux_tui_components::scrollbar::ScrollbarState,
+    pub styles: bmux_tui_components::scrollbar::ScrollbarStyles,
+}
+
+impl ScrollbarView {
+    /// The scrollbar its view describes.
+    #[must_use]
+    pub const fn scrollbar(&self) -> bmux_tui_components::scrollbar::Scrollbar {
+        bmux_tui_components::scrollbar::Scrollbar::new().styles(self.styles)
+    }
 }
 
 impl<K> Component for SidebarView<'_, K>
@@ -382,18 +405,28 @@ where
             self.base,
         );
         // The list paints at its own origin; place it below the heading.
+        let (list_x, list_width) = self.list_columns;
         cx.with_child_size(
-            0,
+            i32::from(list_x),
             1,
-            LogicalSize::new(u64::from(width), u64::from(self.list_height)),
+            LogicalSize::new(u64::from(list_width), u64::from(self.list_height)),
             |cx| {
                 self.list.paint(
-                    Rect::new(0, 0, width, self.list_height),
+                    Rect::new(0, 0, list_width, self.list_height),
                     &self.state.borrow(),
                     cx,
                 );
             },
         );
+        if let Some(scrollbar) = self.scrollbar {
+            let track = Rect::new(scrollbar.x, 1, 1, self.list_height);
+            scrollbar.scrollbar().paint(track, &scrollbar.state, cx);
+            cx.push_hit(
+                HitRegion::new(SCROLLBAR, track)
+                    .role(HitRole::Scroll)
+                    .pointer_intent(PointerIntent::Auto),
+            );
+        }
         if let Some(edge) = self.edge {
             if edge.highlighted {
                 for row in 0..edge.height {
