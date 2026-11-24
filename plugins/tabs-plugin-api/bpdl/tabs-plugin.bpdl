@@ -628,6 +628,23 @@ interface tabs-status {
     @state events tab-status-snapshot;
 }
 
+// How many times each tab's panes have rung the bell, counted from what the
+// pane runtime retains, so a client notices every bell, including those it
+// missed seeing happen. A count that goes down belongs to a restarted program.
+interface tabs-bells {
+    record tab-bells {
+        tab-id: uuid,
+        bells: u64,
+    }
+
+    record tab-bells-snapshot {
+        tabs: list<tab-bells>,
+        revision: u64,
+    }
+
+    @state events tab-bells-snapshot;
+}
+
 /// What `bmux.tabs` provides to and requires from the host and other plugins.
 world tabs {
     provide tabs-catalog-v1;

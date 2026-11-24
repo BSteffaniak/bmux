@@ -4474,6 +4474,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "bmux_tabs_plugin_api",
  "regex",
  "serde",
  "serde_json",

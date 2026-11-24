@@ -102,6 +102,28 @@ region = "whole_recent"
 line_regex = ['^\s*Allow .*\? \[y/n\]']
 ```
 
+## Alerts
+
+Each attach client alerts its own terminal when an agent starts waiting for
+an answer or finishes its work: a bell, a desktop notification (OSC 777 or
+OSC 9, whichever the terminal takes), or both. By default an agent that needs
+input rings and notifies, one that finished notifies, and the tab you are
+looking at stays quiet, since its screen already shows what happened.
+Finishing alerts only once the agent has stayed idle for a moment, so an agent
+stopping to ask for permission alerts only as needing input. States agents were
+already in when you attached do not alert.
+
+```toml
+[plugins.settings."bmux.agents".notify]
+on = ["needs_input", "finished"]   # which changes alert
+via = ["bell", "notification"]     # how, for all of them (default: as above)
+when = "not_viewing"               # or "always"
+```
+
+Set `BMUX_NOTIFICATIONS` to `osc777`, `osc9` or `off` to override which
+notification sequence your terminal gets. Inside tmux only the bell rings.
+Pane bells reach the terminal by `behavior.bell_action`.
+
 ## Settings
 
 ```toml

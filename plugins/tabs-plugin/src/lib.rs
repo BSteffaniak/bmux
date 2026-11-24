@@ -14,11 +14,14 @@ pub mod declaration {
 }
 
 mod arrangements;
+mod bells;
 mod cwd;
 mod durable_storage;
 mod personal_views;
 mod status;
 mod storage_migration;
+
+pub use bells::BellAlerts;
 
 use api_contexts_state::{ContextSelector, ContextSummary};
 use bmux_clients_plugin_api::clients_state as api_clients_state;
@@ -1388,6 +1391,13 @@ impl TabsPlugin {
             bmux_tabs_plugin_api::tabs_status::TabStatusSnapshot {
                 tabs: Vec::new(),
                 now_ms: status::now_ms(),
+                revision: 0,
+            },
+        );
+        events.register_state_channel::<bmux_tabs_plugin_api::tabs_bells::TabBellsSnapshot>(
+            bmux_tabs_plugin_api::tabs_bells::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_bells::TabBellsSnapshot {
+                tabs: Vec::new(),
                 revision: 0,
             },
         );
@@ -2830,6 +2840,18 @@ fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoar
     };
     board.apply_signals(&signals, status::now_ms());
     let statuses = board.build(&tabs, &mut status::git_status);
+    if let Some(bells) = board.changed_bells(&tabs)
+        && let Some(events) = tab_events(&shared.runtime_state)
+    {
+        let _ = events.publish_state(
+            &bmux_tabs_plugin_api::tabs_bells::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_bells::TabBellsSnapshot {
+                tabs: bells,
+                revision: TAB_STATUS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1,
+            },
+        );
+    }
     if !board.changed(&statuses) {
         return;
     }

@@ -12,9 +12,10 @@ version     = { workspace = true }
 [dependencies]
 bmux_agents_plugin_api       = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
-bmux_plugin                  = { workspace = true }
+bmux_plugin                  = { workspace = true, features = ["tui"] }
 bmux_plugin_schema_macros    = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
+bmux_tabs_plugin_api         = { workspace = true }
 # Screen rules use Unicode classes, case folding and code point ranges.
 regex      = { workspace = true, features = ["perf", "unicode"] }
 serde      = { workspace = true, features = ["derive", "std"] }
@@ -38,4 +39,5 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_tabs_plugin_api/fail-on-warnings",
 ]

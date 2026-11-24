@@ -23,10 +23,13 @@ pub mod declaration {
     }
 }
 
+mod alerts;
 mod identify;
 mod integration;
 mod rules;
 mod tracker;
+
+pub use alerts::AgentAlerts;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -98,6 +101,10 @@ impl Settings {
                 }
                 "aliases" => {
                     (settings.aliases, settings.patterns) = parse_aliases(value)?;
+                }
+                // Read by each attach client (see [`alerts`]); checked here.
+                "notify" => {
+                    alerts::NotifySettings::parse(Some(value))?;
                 }
                 "screen_rules" => {
                     settings.screen_rules = value

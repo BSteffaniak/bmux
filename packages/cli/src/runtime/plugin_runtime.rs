@@ -261,6 +261,30 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
             bmux_cluster_plugin_client::attach_provider(),
         );
     }
+    #[cfg(feature = "bundled-plugin-agents")]
+    if plugin_id == "bmux.agents" {
+        // Each client alerts its own terminal when an agent needs an answer
+        // or finishes, by the invoking runtime's `bmux.agents` settings.
+        host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
+            plugin_id,
+            std::sync::Arc::new(|resources| {
+                Ok(Box::new(bmux_agents_plugin::AgentAlerts::install(
+                    resources.settings_for("bmux.agents"),
+                    resources,
+                )?))
+            }),
+        ));
+    }
+    #[cfg(feature = "bundled-plugin-windows")]
+    if plugin_id == "bmux.tabs" {
+        // Each client rings its own terminal for pane bells.
+        host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
+            plugin_id,
+            std::sync::Arc::new(|resources| {
+                Ok(Box::new(bmux_tabs_plugin::BellAlerts::install(resources)?))
+            }),
+        ));
+    }
     #[cfg(feature = "bundled-plugin-tab-bar")]
     if plugin_id == "bmux.tab_bar" {
         // Settings come from the invoking attach runtime's config, not the
@@ -4237,36 +4261,38 @@ enabled_by_default = false
             tokio::task::spawn_blocking(move || {
                 let _selected = SelectedCommandStateGuard::enter(&state);
                 with_activated_local_plugin("bmux.clipboard", |loaded| {
-                    Ok(loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
-                        host_service_port: None,
-                        plugin_id: "bmux.clipboard".to_string(),
-                        request: bmux_plugin_sdk::ServiceRequest {
-                            caller_plugin_id: "bmux.core".to_string(),
-                            service,
-                            // Unknown, so nothing touches the real clipboard.
-                            operation: "no_such_operation".to_string(),
-                            payload: Vec::new(),
-                        },
-                        required_capabilities: Vec::new(),
-                        provided_capabilities: Vec::new(),
-                        services: Vec::new(),
-                        available_capabilities: Vec::new(),
-                        enabled_plugins: Vec::new(),
-                        plugin_search_roots: Vec::new(),
-                        host: plugin_host_metadata(),
-                        connection: bmux_plugin_sdk::HostConnectionInfo {
-                            config_dir: String::new(),
-                            config_dir_candidates: Vec::new(),
-                            runtime_dir: String::new(),
-                            data_dir: String::new(),
-                            state_dir: String::new(),
-                        },
-                        settings: None,
-                        plugin_settings_map: BTreeMap::new(),
-                        caller_client_id: None,
-                        cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                        host_kernel_bridge: None,
-                    })?)
+                    Ok(
+                        loaded.invoke_service_sync(&bmux_plugin_sdk::NativeServiceContext {
+                            host_service_port: None,
+                            plugin_id: "bmux.clipboard".to_string(),
+                            request: bmux_plugin_sdk::ServiceRequest {
+                                caller_plugin_id: "bmux.core".to_string(),
+                                service,
+                                // Unknown, so nothing touches the real clipboard.
+                                operation: "no_such_operation".to_string(),
+                                payload: Vec::new(),
+                            },
+                            required_capabilities: Vec::new(),
+                            provided_capabilities: Vec::new(),
+                            services: Vec::new(),
+                            available_capabilities: Vec::new(),
+                            enabled_plugins: Vec::new(),
+                            plugin_search_roots: Vec::new(),
+                            host: plugin_host_metadata(),
+                            connection: bmux_plugin_sdk::HostConnectionInfo {
+                                config_dir: String::new(),
+                                config_dir_candidates: Vec::new(),
+                                runtime_dir: String::new(),
+                                data_dir: String::new(),
+                                state_dir: String::new(),
+                            },
+                            settings: None,
+                            plugin_settings_map: BTreeMap::new(),
+                            caller_client_id: None,
+                            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                            host_kernel_bridge: None,
+                        })?,
+                    )
                 })
             })
             .await

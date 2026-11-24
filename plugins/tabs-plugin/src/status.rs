@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmux_agents_plugin_api::agent_states::{AgentSnapshot, AgentState, PaneAgent};
+use bmux_tabs_plugin_api::tabs_bells::TabBells;
 use bmux_tabs_plugin_api::tabs_status::{AgentActivity, GitStatus, TabAgent, TabStatus};
 use uuid::Uuid;
 
@@ -126,6 +127,7 @@ pub struct StatusBoard {
     agents: HashMap<Uuid, PaneAgent>,
     git: HashMap<String, (Instant, Option<GitStatus>)>,
     published: Option<Vec<TabStatus>>,
+    published_bells: Option<Vec<TabBells>>,
 }
 
 impl StatusBoard {
@@ -300,6 +302,28 @@ impl StatusBoard {
                 }
             })
             .collect()
+    }
+
+    /// Each tab's bells, summed over its panes, when they differ from what was
+    /// last published; records them when so.
+    pub fn changed_bells(&mut self, tabs: &[TabPanes]) -> Option<Vec<TabBells>> {
+        let bells = tabs
+            .iter()
+            .map(|tab| TabBells {
+                tab_id: tab.tab_id,
+                bells: tab
+                    .panes
+                    .iter()
+                    .filter_map(|pane| self.seen.get(&pane.id))
+                    .map(|signals| signals.bells)
+                    .sum(),
+            })
+            .collect::<Vec<_>>();
+        if self.published_bells.as_ref() == Some(&bells) {
+            return None;
+        }
+        self.published_bells = Some(bells.clone());
+        Some(bells)
     }
 
     /// Whether `tabs` differs from what was last published; records it when so.
@@ -533,6 +557,30 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Each tab's bells are its panes' retained counts summed, published
+    /// only when they change.
+    #[test]
+    fn tabs_count_their_panes_bells() {
+        let mut board = StatusBoard::default();
+        let tabs = [
+            tab(1, &[(11, true, None), (12, false, None)]),
+            tab(2, &[(13, true, None)]),
+        ];
+        let bells = |pane: u128, bells: u64| RetainedSignals {
+            pane_id: Uuid::from_u128(pane),
+            bells,
+            ..RetainedSignals::default()
+        };
+        board.apply_signals(&[bells(11, 2), bells(12, 3), bells(13, 0)], 0);
+        let counts = |published: Option<Vec<TabBells>>| {
+            published.map(|tabs| tabs.iter().map(|tab| tab.bells).collect::<Vec<_>>())
+        };
+        assert_eq!(counts(board.changed_bells(&tabs)), Some(vec![5, 0]));
+        assert_eq!(counts(board.changed_bells(&tabs)), None);
+        board.apply_signals(&[bells(11, 2), bells(12, 3), bells(13, 1)], 1);
+        assert_eq!(counts(board.changed_bells(&tabs)), Some(vec![5, 1]));
     }
 
     #[test]

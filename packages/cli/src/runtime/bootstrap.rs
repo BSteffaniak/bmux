@@ -855,6 +855,13 @@ async fn run_server_start_inner(
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_tabs_plugin_api::tabs_bells::STATE_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_state_forwarder::<
+                        bmux_tabs_plugin_api::tabs_bells::TabBellsSnapshot,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
                     if k == bmux_tab_bar_plugin_api::status_items_list::STATE_KIND.as_str() =>
                 {
                     server.spawn_plugin_bus_state_forwarder::<

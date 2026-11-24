@@ -2264,9 +2264,10 @@ pub struct BehaviorConfig {
     /// Highlight panes in the status bar when they produce output while
     /// unfocused, so you can tell which panes have new activity
     pub visual_activity: bool,
-    /// How to handle terminal bell signals from panes. NONE ignores bells
-    /// entirely. ANY notifies on bells from any pane. CURRENT only notifies
-    /// from the focused pane. OTHER only notifies from unfocused panes.
+    /// Which panes' bells ring this client's terminal. NONE ignores bells
+    /// entirely. ANY rings for bells from any pane. CURRENT only rings for
+    /// panes of the tab this client shows. OTHER only rings for panes of
+    /// tabs it does not show.
     pub bell_action: BellAction,
     /// Automatically rename windows based on the currently running command
     /// in the focused pane
