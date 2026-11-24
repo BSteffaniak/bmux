@@ -2273,6 +2273,7 @@ fn scrollbar_view(
     view::ScrollbarView {
         x,
         state: state.list.borrow().scrollbar_state(u64::from(list_height)),
+        policy: scrollbar_policy(state.settings.placement, state.engaged.focused || lit),
         styles: bmux_tui_components::scrollbar::ScrollbarStyles {
             begin: tui_style(if lit { colors.hover } else { colors.track }),
             track: tui_style(if lit { colors.hover } else { colors.track }),
@@ -2289,6 +2290,25 @@ fn scrollbar_view(
             end: tui_style(if lit { colors.hover } else { colors.track }),
         },
     }
+}
+
+/// The scrollbar's glyphs: a full-width thumb on a centered track while the
+/// sidebar has the keyboard or the pointer is on its column, otherwise a slim
+/// bar against the panes that stays out of the way.
+const fn scrollbar_policy(
+    placement: Placement,
+    wide: bool,
+) -> bmux_tui_components::scrollbar::ScrollbarPolicy {
+    use bmux_tui_components::scrollbar::ScrollbarPolicy;
+    if wide {
+        return ScrollbarPolicy::vertical();
+    }
+    // The column faces the panes on the sidebar's far side.
+    let (track, thumb) = match placement {
+        Placement::Left => ("▕", "▐"),
+        Placement::Right => ("▏", "▌"),
+    };
+    ScrollbarPolicy::vertical().symbols(track, track, thumb, track)
 }
 
 /// The colors of the column facing the panes: the scrollbar's track and
@@ -3950,7 +3970,7 @@ mod tests {
             for row in titles {
                 let line = &text[usize::from(row)];
                 // The overflowing list's scrollbar sits after the summary.
-                let content = line.trim_end_matches(['█', '│']).trim_end();
+                let content = line.trim_end_matches(['▐', '▕']).trim_end();
                 assert!(
                     content.ends_with("working"),
                     "offset {offset}, row {row}: {line:?}"
@@ -4096,6 +4116,32 @@ mod tests {
         assert_eq!(hover(view::SCROLLBAR), Some(false));
     }
 
+    /// The scrollbar is a slim bar against the panes while the sidebar is not
+    /// in use, and the full-width thumb while it has the keyboard or the
+    /// pointer is on its column.
+    #[test]
+    fn the_scrollbar_is_slim_until_the_sidebar_is_in_use() {
+        let mut state = working_cards();
+        let thumb = build_surface(&state, 1)
+            .interactive_regions
+            .into_iter()
+            .find(|region| region.local_id == view::SCROLLBAR)
+            .expect("a thumb while the rows overflow")
+            .rect;
+        let thumb_glyph = |state: &CompanionState| {
+            painted_row(&build_surface(state, 2), thumb.y)
+                .into_iter()
+                .find(|(x, _, _)| *x == thumb.x)
+                .map(|(_, text, _)| text)
+        };
+        assert_eq!(thumb_glyph(&state).as_deref(), Some("▐"));
+        state.engaged.focused = true;
+        assert_eq!(thumb_glyph(&state).as_deref(), Some("█"));
+        state.engaged.focused = false;
+        state.engaged.edge_hovered = true;
+        assert_eq!(thumb_glyph(&state).as_deref(), Some("█"));
+    }
+
     /// Rows that overflow put a scrollbar in the resize edge's own column:
     /// one column faces the panes. Grabbing the thumb scrolls from where it
     /// was grabbed, a click on the track jumps there, and pressing the track
@@ -4118,11 +4164,6 @@ mod tests {
             tab_regions(&surface)[0].rect.w,
             31,
             "the list gives up only that column"
-        );
-        assert!(
-            painted_row(&surface, thumb.y)
-                .iter()
-                .any(|(x, text, _)| *x == 31 && text == "█")
         );
 
         let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
@@ -4235,7 +4276,7 @@ mod tests {
                 .and_then(|(_, _, style)| style.fg)
         };
         assert_eq!(
-            color("█"),
+            color("▐"),
             Some(RenderColor::Rgb {
                 r: 0xff,
                 g: 0x88,
@@ -4243,7 +4284,7 @@ mod tests {
             })
         );
         assert_eq!(
-            color("│"),
+            color("▕"),
             Some(RenderColor::Rgb {
                 r: 0x33,
                 g: 0x44,

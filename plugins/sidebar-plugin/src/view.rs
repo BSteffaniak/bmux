@@ -358,11 +358,12 @@ pub struct SidebarView<'a, K> {
 }
 
 /// The list's scrollbar, shown in the edge's column while the rows
-/// overflow: its column, its state, and how it looks.
+/// overflow: its column, its state, its glyphs, and how it looks.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarView {
     pub x: u16,
     pub state: bmux_tui_components::scrollbar::ScrollbarState,
+    pub policy: bmux_tui_components::scrollbar::ScrollbarPolicy,
     pub styles: bmux_tui_components::scrollbar::ScrollbarStyles,
 }
 
@@ -370,7 +371,9 @@ impl ScrollbarView {
     /// The scrollbar its view describes.
     #[must_use]
     pub const fn scrollbar(&self) -> bmux_tui_components::scrollbar::Scrollbar {
-        bmux_tui_components::scrollbar::Scrollbar::new().styles(self.styles)
+        bmux_tui_components::scrollbar::Scrollbar::new()
+            .policy(self.policy)
+            .styles(self.styles)
     }
 }
 

@@ -120,8 +120,10 @@ pointer onto a pane hands the keyboard back to the pane.
 
 One column faces the panes. Drag it sideways to resize the sidebar. When the
 tabs do not fit, it also carries the scrollbar, colored from your theme (its
-track in the inactive border color, its thumb in the cursor color): drag the
-thumb to scroll, or click the track to jump there.
+track in the inactive border color, its thumb in the cursor color). It stays a
+slim bar against the panes until the sidebar has the keyboard or the pointer is
+on that column, where it widens: drag the thumb (a grab hand) to scroll, or
+click the track to jump there.
 
 Resize it by dragging the edge that faces the panes (the pointer shows a resize
 cursor there, on terminals that support OSC 22 pointer shapes), or with
