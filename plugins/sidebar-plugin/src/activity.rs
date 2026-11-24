@@ -32,6 +32,7 @@ pub enum TabState {
     Failed,
     Done,
     Working,
+    Shell,
     Stopped,
     Idle,
 }
@@ -50,6 +51,18 @@ impl From<tabs_status::TabState> for TabState {
 }
 
 impl TabState {
+    fn displayed(status: &TabStatus) -> Self {
+        let state = Self::from(status.state);
+        if status.shell_command.is_some()
+            && (matches!(state, Self::Idle | Self::Stopped)
+                || (state == Self::Working && status.agent.is_none()))
+        {
+            Self::Shell
+        } else {
+            state
+        }
+    }
+
     #[must_use]
     pub const fn glyph(self) -> char {
         match self {
@@ -57,6 +70,7 @@ impl TabState {
             Self::Failed => '▲',
             Self::Done => '✓',
             Self::Working => '◉',
+            Self::Shell => '›',
             Self::Stopped => '■',
             Self::Idle => '○',
         }
@@ -69,6 +83,7 @@ impl TabState {
             Self::Failed => RenderNamedColor::Red,
             Self::Done => RenderNamedColor::Cyan,
             Self::Working => RenderNamedColor::Green,
+            Self::Shell => RenderNamedColor::Magenta,
             Self::Stopped => RenderNamedColor::Blue,
             Self::Idle => RenderNamedColor::BrightBlack,
         })
@@ -81,6 +96,7 @@ impl TabState {
             Self::Failed => "failed",
             Self::Done => "done",
             Self::Working => "working",
+            Self::Shell => "shell",
             Self::Stopped => "stopped",
             Self::Idle => "idle",
         }
@@ -234,15 +250,20 @@ impl ActivityView {
     }
 
     pub fn state(&self, tab: Uuid) -> Option<TabState> {
-        self.status(tab).map(|status| TabState::from(status.state))
+        self.status(tab).map(TabState::displayed)
     }
 
-    /// `tab`'s activity: its published state, and what its card says.
+    pub fn status_summary(&self, tab: Uuid) -> Option<(TabState, bool)> {
+        self.status(tab)
+            .map(|status| (TabState::displayed(status), status.shell_command.is_some()))
+    }
+
+    /// `tab`'s activity: its displayed state and card text.
     #[must_use]
     pub fn activity(&self, tab: Uuid) -> Option<TabActivity> {
         let status = self.status(tab)?;
         let now = self.now_ms()?;
-        let state = TabState::from(status.state);
+        let state = TabState::displayed(status);
         let program = status.running_command.as_deref().and_then(command_program);
         let agent = status.agent.as_ref();
         let summary = match state {
@@ -250,6 +271,11 @@ impl ActivityView {
             TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
             TabState::Done => Some("done".to_string()),
             TabState::Working if agent.is_some() => Some("working".to_string()),
+            TabState::Shell => status
+                .shell_command
+                .as_deref()
+                .and_then(command_program)
+                .or_else(|| Some("shell".to_string())),
             TabState::Stopped => Some("stopped".to_string()),
             TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
             TabState::Working | TabState::Idle => program.clone(),
@@ -321,7 +347,7 @@ impl ActivityView {
             snapshot
                 .tabs
                 .iter()
-                .any(|tab| tab.state == tabs_status::TabState::Working)
+                .any(|tab| TabState::displayed(tab) == TabState::Working)
         })
     }
 
@@ -394,6 +420,7 @@ mod tests {
             state,
             state_since_ms: None,
             panes: 1,
+            shell_command: None,
             running_command: None,
             cwd: None,
             title: None,

@@ -38,17 +38,17 @@ background toward its foreground or accent, so they read the same on light
 and dark themes, and states and workspaces use your terminal's own colors.
 Below 20 columns cards are one line and their state is their glyph.
 
-States, most urgent first, as the tabs plugin decides them for every view
-(see its README):
+Sidebar states, most urgent first (see also the tabs plugin README):
 
-| Glyph      | State       | When                                                                                                                                                                                 |
-| ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `◆` yellow | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
-| `▲` red    | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
-| `✓` cyan   | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
-| `◉` green  | working     | its agent is working (a spinner by default), or another command is running and produced output in the last few seconds                                                               |
-| `■` blue   | stopped     | its agent returned to idle after observed work                                                                                                                                       |
-| `○` dim    | idle        | otherwise                                                                                                                                                                            |
+| Glyph       | State       | When                                                                                                                                                                                 |
+| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
+| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
+| `◉` green   | working     | its agent is working (a spinner by default)                                                                                                                                          |
+| `›` magenta | shell       | a pane is running a foreground command, including quiet commands                                                                                                                     |
+| `■` blue    | stopped     | its agent returned to idle after observed work                                                                                                                                       |
+| `○` dim     | idle        | otherwise                                                                                                                                                                            |
 
 Looking at a tab means some attach client shows it while its terminal has
 focus; it counts for every client, and what was not yet seen is kept across
@@ -113,10 +113,10 @@ and collapse the other workspaces to their headers.
 also opens background workspaces with a blocked or failed tab. Add workspace
 names to `pinned_workspaces` to keep those groups open by default.
 
-`other_workspace_tabs = "active"` limits open background groups to working,
-blocked, and failed tabs. Every workspace keeps its header and full status
-counts,
-and the focused workspace shows every tab. Click a header to expand or collapse
+`other_workspace_tabs = "active"` limits open background groups to tabs with
+working agents, foreground shell commands, blocked activity, or failures.
+Every workspace keeps its header and full status counts, and the focused
+workspace shows every tab. Click a header to expand or collapse
 it manually. In follow modes, manual overrides last until focus switches
 workspaces. With `remember_groups = true`, the sidebar reloads the manual
 choices
@@ -179,6 +179,10 @@ cursor there, on terminals that support OSC 22 pointer shapes), or with
 `collapsed_width` and `maximum_width`. The sidebar becomes a status strip at
 the floor, and dragging outward brings the tabs back. Its last expanded width
 is remembered on this machine unless `remember_width = false`.
+
+Workspace and sidebar headers count each tab with a foreground shell command
+once. A split tab can also contribute to an agent count when the agent runs in
+a different pane.
 
 Use ▾ to minimize and ▸ to restore. The default strip has one column for
 restore and live status glyphs across all workspaces, plus a resize rail.

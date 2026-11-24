@@ -806,6 +806,8 @@ interface tabs-status {
         state: tab-state,
         // When the tab entered its state, when that is known.
         state-since-ms: u64?,
+        // A foreground command in a non-agent pane, preferring the focused pane.
+        shell-command: string?,
     }
 
     record tab-status-snapshot {

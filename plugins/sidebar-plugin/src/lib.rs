@@ -1032,9 +1032,9 @@ impl CompanionState {
                 Span::styled(format!(" {text} "), tui_style(pill))
             }
             activity::TabState::Idle => Span::styled(summary, tui_style(palette.muted)),
-            activity::TabState::Working | activity::TabState::Stopped => {
-                Span::styled(summary, tui_style(state_style))
-            }
+            activity::TabState::Working
+            | activity::TabState::Shell
+            | activity::TabState::Stopped => Span::styled(summary, tui_style(state_style)),
         };
         let mut spans = vec![label];
         if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
@@ -1399,11 +1399,15 @@ impl CompanionState {
                             !background
                                 || self.settings.other_workspace_tabs == OtherWorkspaceTabs::All
                                 || matches!(
-                                    self.activity.state(tabs[*index].id),
+                                    self.activity.status_summary(tabs[*index].id),
                                     Some(
-                                        activity::TabState::Working
-                                            | activity::TabState::Blocked
-                                            | activity::TabState::Failed
+                                        (_, true)
+                                            | (
+                                                activity::TabState::Working
+                                                    | activity::TabState::Blocked
+                                                    | activity::TabState::Failed,
+                                                _,
+                                            )
                                     )
                                 )
                         })
@@ -2380,10 +2384,13 @@ fn status_counts(
     let mut counts = std::collections::BTreeMap::<activity::TabState, usize>::new();
     for index in tabs {
         let tab = &state.snapshot.tabs[index];
-        if let Some(status) = state.activity.state(tab.id)
-            && status != activity::TabState::Idle
-        {
-            *counts.entry(status).or_default() += 1;
+        if let Some((status, has_shell_job)) = state.activity.status_summary(tab.id) {
+            if status != activity::TabState::Idle {
+                *counts.entry(status).or_default() += 1;
+            }
+            if status != activity::TabState::Shell && has_shell_job {
+                *counts.entry(activity::TabState::Shell).or_default() += 1;
+            }
         }
     }
     counts
@@ -3597,6 +3604,7 @@ mod tests {
             state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
             state_since_ms: None,
             panes: 1,
+            shell_command: None,
             running_command: None,
             cwd: None,
             title: None,
@@ -4510,6 +4518,7 @@ mod tests {
                 state: published(activity, finished_at_ms),
                 state_since_ms: activity.map(|_| now - 5_000),
                 panes: 1,
+                shell_command: None,
                 running_command: None,
                 cwd: None,
                 title: None,
@@ -4761,6 +4770,7 @@ mod tests {
             state: published(Some(activity), None),
             state_since_ms: Some(now - 5_000),
             panes: 1,
+            shell_command: None,
             running_command: Some("claude".into()),
             cwd: Some("/work/bmux".into()),
             title: None,
@@ -5163,6 +5173,7 @@ mod tests {
                     state: bmux_tabs_plugin_api::tabs_status::TabState::Working,
                     state_since_ms: Some(now - 1_000),
                     panes: 1,
+                    shell_command: None,
                     running_command: Some("claude".into()),
                     cwd: Some(format!("/work/repo-{index}")),
                     title: None,
@@ -5815,9 +5826,36 @@ mod tests {
             None,
         );
         state.select(Some(Uuid::from_u128(4)));
-        state.resize(ExtensionRect::new(0, 0, 2, 4));
-        let text = |state: &CompanionState| surface_text(&build_surface(state, 1), 2, 4);
-        assert_eq!(text(&state), ["▸│", "◆│", "◉│", "■│"]);
+        let mut statuses = state.activity.snapshot().unwrap().tabs.clone();
+        statuses
+            .iter_mut()
+            .find(|tab| tab.tab_id == Uuid::from_u128(1))
+            .unwrap()
+            .shell_command = Some("cargo build".into());
+        statuses
+            .iter_mut()
+            .find(|tab| tab.tab_id == Uuid::from_u128(4))
+            .unwrap()
+            .shell_command = Some("sleep 30".into());
+        state.activity.replace(tabs_status::TabStatusSnapshot {
+            tabs: statuses,
+            now_ms: 600_000,
+            revision: 2,
+        });
+        let card = state.activity.activity(Uuid::from_u128(4)).unwrap();
+        assert_eq!(card.state, activity::TabState::Shell);
+        assert_eq!(card.summary.as_deref(), Some("sleep"));
+        let labels = |indices: &[usize]| {
+            group_summary(&state, indices, 30)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&[0, 1, 2]), ["◆1", "◉1", "›1", "■1"]);
+        assert_eq!(labels(&[0, 1, 2, 3]), ["◆1", "◉1", "›2", "■1"]);
+        state.resize(ExtensionRect::new(0, 0, 2, 5));
+        let text = |state: &CompanionState| surface_text(&build_surface(state, 1), 2, 5);
+        assert_eq!(text(&state), ["▸│", "◆│", "◉│", "›│", "■│"]);
         state.apply_changes(Changes {
             tabs: None,
             personal: None,
@@ -5829,13 +5867,13 @@ mod tests {
                     ..idle_status()
                 }],
                 now_ms: 600_001,
-                revision: 2,
+                revision: 3,
             }),
             appearance: None,
             ticked: false,
             animated: false,
         });
-        assert_eq!(text(&state), ["▸│", "▲│", " │", " │"]);
+        assert_eq!(text(&state), ["▸│", "▲│", " │", " │", " │"]);
     }
 
     /// `widen` and `narrow` step the width within its bounds and remember it.
@@ -6057,6 +6095,7 @@ mod tests {
                         state: bmux_tabs_plugin_api::tabs_status::TabState::Working,
                         state_since_ms: None,
                         panes: 2,
+                        shell_command: None,
                         running_command: Some("cargo nextest run".into()),
                         cwd: Some("/Users/someone/GitHub/project/plugins/sidebar".into()),
                         title: None,
@@ -6299,6 +6338,7 @@ mod tests {
                     state: published(Some(*activity), *finished_at_ms),
                     state_since_ms: Some(now - 60_000),
                     panes: 1,
+                    shell_command: None,
                     running_command: Some("claude".into()),
                     cwd: None,
                     title: None,

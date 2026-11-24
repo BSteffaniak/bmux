@@ -439,6 +439,7 @@ mod tests {
                     state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
                     state_since_ms: None,
                     panes: 1,
+                    shell_command: None,
                     running_command: None,
                     cwd: None,
                     title: None,

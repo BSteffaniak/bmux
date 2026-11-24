@@ -252,6 +252,22 @@ impl StatusBoard {
             })
     }
 
+    fn shell_command(&self, tab: &TabPanes) -> Option<String> {
+        let mut first = None;
+        for pane in &tab.panes {
+            if let Some(command) = pane.running_command.as_deref()
+                && !command.trim().is_empty()
+                && !self.agents.contains_key(&pane.id)
+            {
+                if pane.focused {
+                    return Some(command.to_owned());
+                }
+                first.get_or_insert(command);
+            }
+        }
+        first.map(str::to_owned)
+    }
+
     /// Take every pane's retained signals at `now_ms`. What changed since the
     /// board last looked is new: a reported directory, a notification or
     /// bell (attention), a finished command's status, or the screen's
@@ -401,6 +417,7 @@ impl StatusBoard {
                     tab_id: tab.tab_id,
                     panes: u32::try_from(tab.panes.len()).unwrap_or(u32::MAX),
                     running_command,
+                    shell_command: self.shell_command(tab),
                     cwd,
                     title: signals.and_then(|signals| signals.title),
                     git,
@@ -861,6 +878,52 @@ mod tests {
             &mut |_| None,
         );
         assert_eq!(focused_agent[0].agent.as_ref().unwrap().name, "agent11");
+    }
+
+    #[test]
+    fn quiet_foreground_jobs_are_reported_separately_from_agents() {
+        use bmux_agents_plugin_api::agent_states::AgentSource;
+
+        let mut board = StatusBoard::default();
+        board.set_agents(&AgentSnapshot {
+            panes: vec![PaneAgent {
+                session_id: Uuid::from_u128(9),
+                pane_id: Uuid::from_u128(11),
+                agent: "claude".into(),
+                state: AgentState::Working,
+                source: AgentSource::Report,
+                rule: None,
+                message: None,
+                changed_at_ms: 1,
+                finished_at_ms: None,
+            }],
+            revision: 1,
+        });
+        let tabs = [
+            tab(
+                1,
+                &[(11, true, Some("claude")), (12, false, Some("sleep 30"))],
+            ),
+            tab(
+                2,
+                &[(21, false, Some("nvim")), (22, true, Some("cargo build"))],
+            ),
+            tab(3, &[(31, true, None)]),
+        ];
+        let looked_at = std::collections::HashSet::new();
+        let status = board.build(&tabs, &looked_at, 30_000, &mut |_| None);
+        assert_eq!(status[0].running_command.as_deref(), Some("claude"));
+        assert_eq!(status[0].shell_command.as_deref(), Some("sleep 30"));
+        assert_eq!(
+            status[0].agent.as_ref().unwrap().activity,
+            AgentActivity::Working
+        );
+        assert_eq!(status[1].shell_command.as_deref(), Some("cargo build"));
+        assert_eq!(status[2].shell_command, None);
+
+        let tabs = [tab(1, &[(11, true, Some("claude")), (12, false, None)])];
+        let status = board.build(&tabs, &looked_at, 31_000, &mut |_| None);
+        assert_eq!(status[0].shell_command, None);
     }
 
     #[test]

@@ -150,6 +150,7 @@ fn statuses() -> TabStatusSnapshot {
         state: bmux_tabs_plugin_api::tabs_status::TabState::Idle,
         state_since_ms: None,
         panes: 1,
+        shell_command: command.filter(|_| agent.is_none()).map(Into::into),
         running_command: command.map(Into::into),
         cwd: Some(cwd.into()),
         title: None,
