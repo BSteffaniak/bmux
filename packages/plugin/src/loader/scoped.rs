@@ -1698,7 +1698,7 @@ impl LoadedExecution {
         // before later cleanup preconditions can mask it.
         self.activation()?;
         reject_executable_context(native.host_kernel_bridge.is_some())?;
-        let _control = self.control()?;
+        let _control = self.lifecycle_control().await?;
         self.ensure_previous_lifecycle_settled()?;
         if let Some(port) = self.registration_port()? {
             port.withdraw().map_err(|e| failure(e.to_string()))?;
@@ -2272,6 +2272,28 @@ impl LoadedExecution {
             return Err(failure(
                 "ordinary operation admission in progress; lifecycle not admitted",
             ));
+        }
+        Ok(guard)
+    }
+
+    /// Lifecycle control for an asynchronous transition. Once claimed, control
+    /// refuses every new ordinary admission, so only those already in flight
+    /// remain: wait (bounded by the teardown timeout) for them to leave rather
+    /// than refuse the transition. Work an activation starts, or a caller of
+    /// its newly reachable services, routinely races its acknowledgement.
+    async fn lifecycle_control(&self) -> Result<ControlGuard<'_>> {
+        self.control
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| failure("execution lifecycle control busy; operation not admitted"))?;
+        let guard = ControlGuard(&self.control);
+        let deadline = bmux_plugin_runtime::teardown_deadline();
+        while self.operation_admissions.load(Ordering::SeqCst) != 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure(
+                    "ordinary operation admission in progress; lifecycle not admitted",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         Ok(guard)
     }
@@ -3033,7 +3055,7 @@ impl LoadedExecution {
         // Ordinary outcomes retire independently; lifecycle acknowledgement still
         // excludes all admission while it changes activation ownership.
         let _lifecycle = if call.lifecycle.is_some() {
-            Some(self.control()?)
+            Some(self.lifecycle_control().await?)
         } else {
             None
         };
@@ -3136,7 +3158,7 @@ impl LoadedExecution {
     /// # Errors
     /// Successful deactivation or retirement of all retained work cannot be established.
     pub async fn acknowledge_repaired_cleanup(&self, deactivation: u64) -> Result<()> {
-        let _control = self.control()?;
+        let _control = self.lifecycle_control().await?;
         let calls = self
             .state
             .lock()
@@ -3937,6 +3959,27 @@ mod tests {
             .unwrap();
         assert!(execution.verified_artifact().is_none());
         execution.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_lifecycle_waits_for_in_flight_admission_and_fences_new_ones() {
+        let execution = fixture();
+        let in_flight = execution.operation_control().unwrap();
+        let lifecycle = execution.lifecycle_control();
+        tokio::pin!(lifecycle);
+        // An admission that raced the transition delays it; it is not refused.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut lifecycle)
+                .await
+                .is_err()
+        );
+        // The claimed control already fences every new ordinary admission.
+        assert!(execution.operation_control().is_err());
+        drop(in_flight);
+        let control = lifecycle.await.unwrap();
+        assert!(execution.operation_control().is_err());
+        drop(control);
+        assert!(execution.operation_control().is_ok());
     }
 
     #[test]

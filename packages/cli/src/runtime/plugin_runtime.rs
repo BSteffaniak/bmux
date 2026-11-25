@@ -2116,17 +2116,32 @@ pub(super) async fn activate_loaded_plugins(
         );
         drop(activation_connection_guard);
         if let Err(error) = activate_result {
-            plugin.cancel_background_tasks()?;
+            // The activation error is the primary diagnostic: log it before
+            // cleanup, and keep it on every cleanup failure reported instead.
+            let plugin_id = plugin.declaration.id.as_str();
+            tracing::error!(plugin_id, %error, "server.startup.plugin.activate.failed");
+            let cleanup_context = || {
+                format!(
+                    "activation failed for '{plugin_id}' ({error}); rolling back startup failed"
+                )
+            };
+            plugin
+                .cancel_background_tasks()
+                .with_context(cleanup_context)?;
             for activated_plugin in &activated {
-                activated_plugin.cancel_background_tasks()?;
+                activated_plugin
+                    .cancel_background_tasks()
+                    .with_context(cleanup_context)?;
             }
-            if let Err(cleanup_error) = plugin.drain_background_tasks().await {
-                return Err(cleanup_error).context(format!(
-                    "activation failed ({error}); failed draining partial activation"
-                ));
-            }
+            plugin
+                .drain_background_tasks()
+                .await
+                .with_context(cleanup_context)?;
             for activated_plugin in &activated {
-                activated_plugin.drain_background_tasks().await?;
+                activated_plugin
+                    .drain_background_tasks()
+                    .await
+                    .with_context(cleanup_context)?;
             }
             {
                 let _connection = enter_host_kernel_connection(connection_info.clone());
@@ -2158,7 +2173,10 @@ pub(super) async fn activate_loaded_plugins(
                         registered_plugins: registered_plugins.clone(),
                     },
                 );
-                activated_plugin.drain_background_tasks().await?;
+                activated_plugin
+                    .drain_background_tasks()
+                    .await
+                    .with_context(cleanup_context)?;
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
                 let deactivate_result = activated_plugin.deactivate_async(&context).await;
