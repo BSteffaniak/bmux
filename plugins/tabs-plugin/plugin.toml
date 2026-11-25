@@ -20,6 +20,7 @@ owns_namespaces = [
     "goto-tab",
     "close-current-tab",
     "remove-from-view",
+    "undo-remove-from-view",
     "open-tab",
     "add-tab-to-view",
     "reset-order",
@@ -349,6 +350,13 @@ expose_in_cli = true
 name          = "remove-from-view"
 path          = ["remove-from-view"]
 summary       = "Remove the current tab from this attachment's tab view (it keeps running)"
+
+[[commands]]
+aliases       = [["tab", "undo-remove"]]
+expose_in_cli = true
+name          = "undo-remove-from-view"
+path          = ["undo-remove-from-view"]
+summary       = "Put the tab this attachment last removed from its view back, if it still exists"
 
 [[commands]]
 aliases       = [["tab", "open"]]
@@ -793,6 +801,10 @@ c   = "plugin:bmux.tabs:new-tab"
 n   = "plugin:bmux.tabs:next-tab"
 p   = "plugin:bmux.tabs:prev-tab"
 w   = "plugin:bmux.tabs:last-tab"
+# Personal tab view: remove the current tab from it (the tab keeps running),
+# and undo that removal.
+"shift+x" = "plugin:bmux.tabs:remove-from-view"
+u         = "plugin:bmux.tabs:undo-remove-from-view"
 # Pane focus (hjkl + arrows) — repeat-safe via accepts_repeat on focus-pane-in-direction
 arrow_down  = "plugin:bmux.tabs:focus-pane-in-direction --direction down"
 arrow_left  = "plugin:bmux.tabs:focus-pane-in-direction --direction left"

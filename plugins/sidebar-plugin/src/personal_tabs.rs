@@ -125,6 +125,7 @@ mod tests {
             active: false,
         };
         let view = PersonalViewProjection {
+            last_removed: None,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 7,

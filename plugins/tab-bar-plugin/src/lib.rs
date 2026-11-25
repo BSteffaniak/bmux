@@ -346,6 +346,9 @@ struct CompanionState {
     last_workspace_click: Option<(Uuid, u16, u16, Instant)>,
     /// Plugin-contributed status items, in provider render order.
     status_items: Vec<status_items_list::StatusItem>,
+    /// What the bar shows on the right: the personal view's hints, then the
+    /// contributed status items. Recomposed before every publication.
+    shown_status_items: Vec<status_items_list::StatusItem>,
     /// Plugin-raised toasts retained by the provider, oldest first.
     notifications: Vec<notifications_list::Notification>,
     /// Whether this runtime shows the bar. Toasts stay visible either way.
@@ -419,6 +422,7 @@ impl CompanionState {
             editing_workspace_id: None,
             last_workspace_click: None,
             status_items: Vec::new(),
+            shown_status_items: Vec::new(),
             notifications: Vec::new(),
             visibility,
         }
@@ -544,6 +548,16 @@ impl CompanionState {
                 self.editing_tab_id = None;
                 self.edit_buffer.clear();
             }
+            // Hover and a press in progress on a tab that left the strip
+            // (closed for everyone, removed from the view) are dropped too.
+            let shown = |id: &Uuid| self.snapshot.tabs.iter().any(|tab| tab.id == *id);
+            if !self.hovered_tab_id.as_ref().is_none_or(shown) {
+                self.hovered_tab_id = None;
+            }
+            if !self.pointer_source.as_ref().is_none_or(shown) {
+                self.pointer_source = None;
+                self.drag_target = None;
+            }
             // A missing anchor requests automatic active-tab reveal.
             self.revision = self.revision.saturating_add(1).max(1);
         }
@@ -657,6 +671,53 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
+/// Where the runtime hands the answer to a tab action this bar requested,
+/// so a refusal reaches the user: `close` (close for everyone) or `remove`
+/// (remove from view).
+fn outcome_endpoint(action: &str) -> bmux_plugin::AttachInputEndpoint {
+    bmux_plugin::AttachInputEndpoint {
+        operation: format!("{action}-outcome"),
+        ..input_endpoint()
+    }
+}
+
+/// The status line for the answer to close for everyone: nothing on
+/// success (the deletion reaches every attachment through the tabs plugin's
+/// own feeds), the reason on refusal or failure.
+fn close_outcome_status(payload: &[u8]) -> Option<String> {
+    match bmux_plugin_sdk::decode_service_message::<
+        Result<tabs_commands::TabAck, tabs_commands::TabError>,
+    >(payload)
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(tabs_commands::TabError::NotFound)) => {
+            Some("Close for everyone: the tab no longer exists".into())
+        }
+        Ok(Err(tabs_commands::TabError::Denied { reason })) => {
+            Some(format!("Close for everyone was not allowed: {reason}"))
+        }
+        Ok(Err(tabs_commands::TabError::Failed { reason })) => {
+            Some(format!("Close for everyone failed: {reason}"))
+        }
+        Err(error) => Some(format!("Close for everyone: unreadable answer ({error})")),
+    }
+}
+
+/// The status line for the answer to remove from view.
+fn remove_outcome_status(payload: &[u8]) -> Option<String> {
+    match bmux_plugin_sdk::decode_service_message::<
+        Result<
+            bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck,
+            bmux_tabs_plugin_api::tabs_personal_attachment::PersonalAttachmentError,
+        >,
+    >(payload)
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(format!("Remove from view failed: {error:?}")),
+        Err(error) => Some(format!("Remove from view: unreadable answer ({error})")),
+    }
+}
+
 /// A test-owned companion installed into its own presentation resources,
 /// standing in for an attach runtime.
 #[cfg(test)]
@@ -763,6 +824,20 @@ fn register_presentation_input(
             }
         })
     });
+    registry.register_response(
+        outcome_endpoint("close"),
+        std::sync::Arc::new(|payload| AttachInputResult {
+            status_message: close_outcome_status(payload),
+            ..Default::default()
+        }),
+    );
+    registry.register_response(
+        outcome_endpoint("remove"),
+        std::sync::Arc::new(|payload| AttachInputResult {
+            status_message: remove_outcome_status(payload),
+            ..Default::default()
+        }),
+    );
     let input_owner = owner.clone();
     registry.register(
         input_endpoint(),
@@ -1153,15 +1228,19 @@ impl ExternalFeeds {
     }
 }
 
-/// Delay until the next visible toast expires, if any.
+/// Delay until the next visible toast or undo hint expires, if any.
 fn next_toast_wake(owner: &CompanionHandle) -> Option<Duration> {
     let guard = owner.lock().ok()?;
     let companion = guard.as_ref()?;
-    if !companion.settings.notifications.enabled {
-        return None;
-    }
     let now = external::now_unix_ms();
-    let expiry = toasts::next_expiry_ms(&companion.notifications, now)?;
+    let toast = companion
+        .settings
+        .notifications
+        .enabled
+        .then(|| toasts::next_expiry_ms(&companion.notifications, now))
+        .flatten();
+    let hint = personal_tabs::undo_hint_expiry_ms(companion.personal.as_ref(), now);
+    let expiry = toast.into_iter().chain(hint).min()?;
     drop(guard);
     Some(Duration::from_millis(expiry.saturating_sub(now).max(1)))
 }
@@ -1293,6 +1372,14 @@ fn publish_layout_request(
 }
 
 fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
+    companion.shown_status_items = personal_tabs::view_hints(
+        companion.personal.as_ref(),
+        companion.snapshot.tabs.is_empty(),
+        external::now_unix_ms(),
+    )
+    .into_iter()
+    .chain(companion.status_items.iter().cloned())
+    .collect();
     let revision = companion.revision.max(1);
     if !companion.visible() {
         // Only toasts remain; they are not part of the bar's rows.
@@ -1603,7 +1690,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
         editing_workspace: state.editing_workspace_id.is_some(),
-        status_items: &state.status_items,
+        status_items: &state.shown_status_items,
     }
 }
 
@@ -1973,7 +2060,7 @@ fn projection_interaction_without_marker(
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
         editing_workspace: state.editing_workspace_id.is_some(),
-        status_items: &state.status_items,
+        status_items: &state.shown_status_items,
     }
 }
 
@@ -2502,6 +2589,46 @@ mod tests {
             revision: 0,
             key: None,
         })
+    }
+
+    #[test]
+    fn close_and_remove_answers_report_only_refusals() {
+        let ok = bmux_plugin_sdk::encode_service_message(&Ok::<_, tabs_commands::TabError>(
+            tabs_commands::TabAck { ok: true, id: None },
+        ))
+        .unwrap();
+        assert_eq!(close_outcome_status(&ok), None);
+        let denied = bmux_plugin_sdk::encode_service_message(&Err::<tabs_commands::TabAck, _>(
+            tabs_commands::TabError::Denied {
+                reason: "not yours".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            close_outcome_status(&denied).as_deref(),
+            Some("Close for everyone was not allowed: not yours")
+        );
+        let failed = bmux_plugin_sdk::encode_service_message(&Err::<tabs_commands::TabAck, _>(
+            tabs_commands::TabError::Failed {
+                reason: "session refused to stop".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            close_outcome_status(&failed).as_deref(),
+            Some("Close for everyone failed: session refused to stop")
+        );
+        let refused = bmux_plugin_sdk::encode_service_message(&Err::<
+            bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck,
+            _,
+        >(
+            bmux_tabs_plugin_api::tabs_personal_attachment::PersonalAttachmentError::NoAttachment,
+        ))
+        .unwrap();
+        assert_eq!(
+            remove_outcome_status(&refused).as_deref(),
+            Some("Remove from view failed: NoAttachment")
+        );
     }
 
     #[test]
@@ -4326,6 +4453,7 @@ bar_bg = "#112233"
         members: &[(Uuid, &str, bool)],
     ) -> personal_view::PersonalViewProjection {
         personal_view::PersonalViewProjection {
+            last_removed: None,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 3,

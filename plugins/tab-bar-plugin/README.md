@@ -84,7 +84,11 @@ for everyone… (asks for confirmation, Cancel first, then terminates the tab
 for
 every user). Drag reorder and the selection menu's Move left/right reorder the
 personal view, never the shared order; the selection menu also offers Remove
-selected from view next to the confirmed Close selected tabs…. Rename and menu
+selected from view next to the confirmed Close selected tabs…. A refused or
+failed close (or removal) is shown on the status line. After a removal the bar
+offers to undo it for a few seconds ("Removed NAME (prefix u: undo)"), and a
+view whose workspace has no tab left says "View empty: open the finder to add
+tabs" (that attachment has no input target meanwhile). Rename and menu
 keyboard input is captured by the plugin and mutations go through generated
 `bmux.tabs` clients.
 

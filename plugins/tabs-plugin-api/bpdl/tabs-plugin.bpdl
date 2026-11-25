@@ -555,8 +555,10 @@ interface tabs-personal-actions {
     command open-tab(context-id: uuid)
         -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
     // Remove a tab from the view. The tab keeps running and stays
-    // discoverable. When it was this attachment's selected tab, the next
-    // member (else the previous one) of the arrangement is selected.
+    // discoverable. Every attachment bound to the view whose selected tab it
+    // was moves to the next live member (else the previous one) of the
+    // arrangement, or is left with no selection when none remains. The
+    // removal is this attachment's last removal, which undo restores.
     command remove-tab(context-id: uuid)
         -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
     // Move a member tab before another member tab of the same arrangement,
@@ -571,6 +573,9 @@ interface tabs-personal-actions {
 // live, or no longer in the arrangement's workspace, are omitted, and names
 // already prefer the personal label. `active` reflects this attachment's own
 // selection. A projection with the nil `view-id` means none is available.
+//
+// v2: `last-removed` carries the attachment's last removal for undo.
+@interface-version(2)
 interface personal-view {
     record personal-view-member {
         member-id: uuid,
@@ -585,6 +590,15 @@ interface personal-view {
         members: list<personal-view-member>,
     }
 
+    // The attachment's last removal of a tab from this view, which
+    // `undo-remove-from-view` restores. Presentations show it as a transient
+    // hint, timed from `removed-at-ms` (Unix milliseconds).
+    record personal-view-removal {
+        context-id: uuid,
+        name: string,
+        removed-at-ms: u64,
+    }
+
     record personal-view-projection {
         view-id: uuid,
         name: string,
@@ -594,7 +608,10 @@ interface personal-view {
         // workspace).
         active-workspace-id: uuid,
         // Every initialized arrangement of the view, in the view's order.
+        // While the attachment has no selection (its arrangement lost its
+        // last live tab), `active-workspace-id` is the workspace it was in.
         workspaces: list<personal-view-workspace>,
+        last-removed: personal-view-removal?,
     }
 
     @state events personal-view-projection;

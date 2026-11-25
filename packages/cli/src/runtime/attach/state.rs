@@ -309,6 +309,12 @@ pub struct AttachViewState {
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
     pub can_write: bool,
+    /// The attachment has no input target: its selection was cleared. The
+    /// attach keeps running (presentations, key bindings, prompts and plugin
+    /// commands), but nothing is sent to panes and input already queued for
+    /// them is dropped. `attached_id` only names the last stream target.
+    /// Retargeting to a context resumes.
+    pub input_suspended: bool,
     pub outer_paste_capture_enabled: bool,
     pub ui_mode: AttachUiMode,
     /// Last client-local presentation snapshot published by this attach. The
@@ -751,6 +757,7 @@ impl AttachViewState {
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,
+            input_suspended: false,
             outer_paste_capture_enabled: false,
             ui_mode: AttachUiMode::Normal,
             local_presentation: None,

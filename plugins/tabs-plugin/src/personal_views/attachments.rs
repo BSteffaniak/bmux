@@ -43,7 +43,8 @@ use bmux_contexts_plugin_api::contexts_state::ContextSummary;
 use bmux_plugin::{HostRuntimeApi, PluginStateRegistry};
 use bmux_plugin_sdk::WireEventSink;
 use bmux_tabs_plugin_api::personal_view::{
-    PersonalViewMember, PersonalViewProjection, PersonalViewWorkspace, STATE_KIND,
+    PersonalViewMember, PersonalViewProjection, PersonalViewRemoval, PersonalViewWorkspace,
+    STATE_KIND,
 };
 use bmux_tabs_plugin_api::tabs_personal_attachment::{PersonalAttachmentError, PersonalBinding};
 use bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck;
@@ -131,6 +132,23 @@ impl AttachmentHost for RegistryHost<'_> {
     }
 }
 
+/// Selection of attached clients on their behalf, through the selection
+/// authority (`contexts-client-selection-v1`): used when the tab an
+/// attachment shows leaves what it arranges.
+pub trait ClientSelection {
+    /// Select `context` for `client`; its attach retargets to it.
+    ///
+    /// # Errors
+    /// The selection authority refused or was unreachable.
+    fn select_for(&self, client: Uuid, context: Uuid) -> std::result::Result<(), String>;
+    /// Leave `client` with no selection; its attach stays connected with no
+    /// input target until something selects a tab for it.
+    ///
+    /// # Errors
+    /// The selection authority refused or was unreachable.
+    fn clear_for(&self, client: Uuid) -> std::result::Result<(), String>;
+}
+
 /// The host wire sink published on an activation's registry, if any.
 pub fn host_wire_sink(states: &PluginStateRegistry) -> Option<std::sync::Arc<dyn WireEventSink>> {
     states
@@ -144,8 +162,25 @@ pub struct Env<'a, C: ?Sized> {
     pub caller: &'a C,
     pub states: Option<&'a PluginStateRegistry>,
     pub host: &'a dyn AttachmentHost,
+    pub selection: &'a dyn ClientSelection,
     pub sink: Option<&'a dyn WireEventSink>,
     pub now_ms: u64,
+}
+
+/// An attachment's last removal of a tab from its bound view, which
+/// `undo-remove-from-view` restores. Attachment-local and transient.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removal {
+    pub context_id: Uuid,
+    pub view_id: Uuid,
+    /// The name the attachment saw: its personal label, else the tab's name.
+    pub name: String,
+    /// The live tab that followed it in the arrangement, so undo restores
+    /// its place.
+    pub before: Option<Uuid>,
+    /// Whether it was the attachment's selected tab, so undo selects it again.
+    pub was_selected: bool,
+    pub removed_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +189,10 @@ struct Binding {
     view_id: Uuid,
     revision: u64,
     selected_member: Option<Uuid>,
+    /// The workspace the attachment shows while it has no selection, after
+    /// its arrangement there lost its last live tab.
+    held_workspace: Option<Uuid>,
+    last_removed: Option<Removal>,
     /// The last payload published to this client.
     published: Option<Vec<u8>>,
 }
@@ -232,8 +271,16 @@ fn project(
     live: &BTreeMap<Uuid, &ContextSummary>,
     active_workspace: Uuid,
     selected: Option<Uuid>,
+    last_removed: Option<&Removal>,
 ) -> PersonalViewProjection {
     PersonalViewProjection {
+        last_removed: last_removed
+            .filter(|removal| removal.view_id == view.view_id)
+            .map(|removal| PersonalViewRemoval {
+                context_id: removal.context_id,
+                name: removal.name.clone(),
+                removed_at_ms: removal.removed_at_ms,
+            }),
         view_id: view.view_id,
         name: view.name.clone(),
         view_revision: view.revision,
@@ -328,6 +375,8 @@ impl Attachments {
             view_id: ack.view_id,
             revision: 1,
             selected_member: None,
+            held_workspace: None,
+            last_removed: None,
             published: None,
         })
     }
@@ -649,9 +698,12 @@ impl Attachments {
             .host
             .selected_context(client)
             .filter(|id| live.contains_key(id));
-        let active_workspace = selected
-            .and_then(|id| live.get(&id))
-            .map_or_else(Uuid::nil, |context| workspace_of(context));
+        // Without a selection the attachment keeps showing the workspace it
+        // was emptied in.
+        let active_workspace = selected.and_then(|id| live.get(&id)).map_or_else(
+            || binding.held_workspace.unwrap_or_else(Uuid::nil),
+            |context| workspace_of(context),
+        );
         // Seed the attachment's active workspace once, from the canonical
         // order, on first access. Only a live selection names a workspace.
         if selected.is_some()
@@ -671,6 +723,7 @@ impl Attachments {
             &live,
             active_workspace,
             selected,
+            binding.last_removed.as_ref(),
         ))?;
         let mut bindings = self
             .bindings
@@ -687,6 +740,9 @@ impl Attachments {
             return Ok(());
         }
         current.update(updated.view_id, updated.selected_member);
+        if selected.is_some() {
+            current.held_workspace = None;
+        }
         if current.published.as_deref() == Some(payload.as_slice()) {
             return Ok(());
         }
@@ -749,6 +805,9 @@ pub enum ViewEdit {
     Remove,
     /// Move the member tab before the member tab `before`, or to the end.
     Move { before: Option<Uuid> },
+    /// Add the tab when absent, before the member tab `before` when it is
+    /// still one, else at the end (undoing a removal).
+    Restore { before: Option<Uuid> },
 }
 
 /// Personal navigation (`next-tab`, `goto-tab`, ...) and tab-addressed view
@@ -827,8 +886,15 @@ impl Attachments {
 
     /// Apply `edit` for `context` to the invoking attachment's bound view,
     /// resolving members and the current revision, and retrying when another
-    /// attachment edited the view meanwhile. When the edit removes this
-    /// attachment's selected tab, `select` selects its neighbour.
+    /// attachment edited the view meanwhile.
+    ///
+    /// A removal is remembered as the invoking attachment's last removal
+    /// (for undo), and every attachment bound to the view whose selected tab
+    /// it was moves to the tab's neighbour in the arrangement (the next live
+    /// member, else the previous one): `select` selects it for the invoking
+    /// attachment, the selection authority for the others. When no live
+    /// member remains, those attachments are left with no selection (no
+    /// input target) while still showing that workspace.
     ///
     /// # Errors
     /// `no-attachment`, `no-principal`, `invalid-reference` (the tab is not
@@ -844,11 +910,11 @@ impl Attachments {
     ) -> Result<PersonalAck> {
         let (client, binding) = self.invoking_binding(env, client)?;
         let contexts = crate::list_contexts(env.caller).map_err(unavailable)?;
-        let workspace = contexts
+        let summary = contexts
             .iter()
             .find(|candidate| candidate.id == context)
-            .map(workspace_of)
             .ok_or(PersonalAttachmentError::InvalidReference)?;
+        let workspace = workspace_of(summary);
         let live: BTreeSet<Uuid> = contexts
             .iter()
             .filter(|candidate| workspace_of(candidate) == workspace)
@@ -859,7 +925,7 @@ impl Attachments {
         for _ in 0..4 {
             let view = self.arranged_view(env, &binding, workspace)?;
             let order = arrangement_order(&view, workspace).unwrap_or_default();
-            let member = |tab: Uuid| {
+            let arranged = |tab: Uuid| {
                 view.workspaces
                     .iter()
                     .find(|arrangement| arrangement.workspace_id == workspace)
@@ -869,60 +935,32 @@ impl Attachments {
                             .iter()
                             .find(|member| member.context_id == tab)
                     })
-                    .map(|member| member.member_id)
             };
+            let member = |tab: Uuid| arranged(tab).map(|member| member.member_id);
             let unchanged = PersonalAck {
                 view_id: view.view_id,
                 revision: view.revision,
                 member_id: member(context),
             };
-            let command = match edit {
-                ViewEdit::Add => {
-                    if unchanged.member_id.is_some() {
-                        return Ok(unchanged);
-                    }
-                    Command::AddTab {
-                        view_id: view.view_id,
-                        expected_revision: view.revision,
-                        context_id: context,
-                        before: None,
-                    }
-                }
-                ViewEdit::Remove => {
-                    let Some(member_id) = unchanged.member_id else {
-                        return Ok(unchanged);
-                    };
-                    Command::RemoveTab {
-                        view_id: view.view_id,
-                        expected_revision: view.revision,
-                        member_id,
-                    }
-                }
-                ViewEdit::Move { before } => {
-                    let member_id = unchanged
-                        .member_id
-                        .ok_or(PersonalAttachmentError::InvalidReference)?;
-                    let before = match before {
-                        Some(tab) if tab == context => return Ok(unchanged),
-                        Some(tab) => {
-                            Some(member(tab).ok_or(PersonalAttachmentError::InvalidReference)?)
-                        }
-                        None => None,
-                    };
-                    Command::MoveTab {
-                        view_id: view.view_id,
-                        expected_revision: view.revision,
-                        member_id,
-                        before,
-                    }
-                }
+            let Some(command) = edit_command(edit, context, &view, &unchanged, member)? else {
+                return Ok(unchanged);
             };
-            // When this attachment's own tab leaves the view, it moves to
-            // the next live member, else the previous one.
-            let neighbour = (edit == ViewEdit::Remove
-                && env.host.selected_context(client) == Some(context))
-            .then(|| removal_neighbour(&order, &live, context))
-            .flatten();
+            let removal = (edit == ViewEdit::Remove).then(|| Removal {
+                context_id: context,
+                view_id: view.view_id,
+                name: arranged(context)
+                    .and_then(|member| member.label.clone())
+                    .or_else(|| summary.name.clone())
+                    .unwrap_or_else(|| "tab".into()),
+                before: order
+                    .iter()
+                    .skip_while(|tab| **tab != context)
+                    .skip(1)
+                    .copied()
+                    .find(|tab| live.contains(tab)),
+                was_selected: env.host.selected_context(client) == Some(context),
+                removed_at_ms: env.now_ms,
+            });
             match repository.apply(
                 binding.owner,
                 Uuid::new_v4(),
@@ -931,10 +969,20 @@ impl Attachments {
                 env.now_ms,
             ) {
                 Ok(ack) => {
-                    self.schedule();
-                    if let Some(neighbour) = neighbour {
-                        select(neighbour).map_err(unavailable)?;
+                    if let Some(removal) = removal {
+                        self.with_binding(client, |current| {
+                            current.last_removed = Some(removal);
+                        });
+                        let removed = Displacement {
+                            owner: binding.owner,
+                            view_id: view.view_id,
+                            workspace,
+                            removed: context,
+                            neighbour: removal_neighbour(&order, &live, context),
+                        };
+                        self.reselect_displaced(env, client, &removed, select)?;
                     }
+                    self.schedule();
                     return Ok(ack);
                 }
                 Err(PersonalViewError::RevisionConflict { .. }) => {}
@@ -943,6 +991,273 @@ impl Attachments {
         }
         Err(unavailable("the view kept changing; try again"))
     }
+
+    /// Apply `change` to `client`'s binding, when it has one.
+    fn with_binding(&self, client: Uuid, change: impl FnOnce(&mut Binding)) {
+        if let Ok(mut bindings) = self.bindings.lock()
+            && let Some(binding) = bindings.get_mut(&client)
+        {
+            change(binding);
+        }
+    }
+
+    /// Move every attachment bound to the displacement's view whose selected
+    /// tab was removed: to the neighbour, or to no selection. The invoking
+    /// attachment selects through `select`; a failure there is returned,
+    /// failures for other attachments are logged.
+    fn reselect_displaced<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        invoker: Uuid,
+        displacement: &Displacement,
+        select: impl FnOnce(Uuid) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        let displaced: Vec<Uuid> = self
+            .bindings
+            .lock()
+            .map_err(|_| unavailable("attachment bindings poisoned"))?
+            .iter()
+            .filter(|(_, binding)| {
+                binding.owner == displacement.owner && binding.view_id == displacement.view_id
+            })
+            .map(|(client, _)| *client)
+            .filter(|client| env.host.selected_context(*client) == Some(displacement.removed))
+            .collect();
+        let mut select = Some(select);
+        let mut outcome = Ok(());
+        for client in displaced {
+            let own = if client == invoker {
+                select.take()
+            } else {
+                None
+            };
+            let result = self.move_displaced(env, client, displacement, own);
+            match result {
+                Err(reason) if client == invoker => outcome = Err(unavailable(reason)),
+                Err(reason) => {
+                    tracing::warn!(%client, %reason, "moving an attachment off a removed tab failed");
+                }
+                Ok(()) => {}
+            }
+        }
+        outcome
+    }
+
+    /// Move one displaced attachment to the neighbour (through `own` when
+    /// given), or leave it with no selection while it keeps showing the
+    /// workspace.
+    fn move_displaced<C: ?Sized>(
+        &self,
+        env: &Env<'_, C>,
+        client: Uuid,
+        displacement: &Displacement,
+        own: Option<impl FnOnce(Uuid) -> std::result::Result<(), String>>,
+    ) -> std::result::Result<(), String> {
+        if let Some(neighbour) = displacement.neighbour {
+            return own.map_or_else(
+                || env.selection.select_for(client, neighbour),
+                |select| select(neighbour),
+            );
+        }
+        self.with_binding(client, |binding| {
+            binding.held_workspace = Some(displacement.workspace);
+        });
+        env.selection.clear_for(client)
+    }
+
+    /// Before a deleted tab is pruned from the views: move every attachment
+    /// that showed it to its neighbour in its own view, or leave it with no
+    /// selection when that arrangement has no other live tab. An attachment
+    /// already on another tab of its view stays there. Returns what failed.
+    pub fn reconcile_deleted<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        deleted: Uuid,
+    ) -> Vec<String> {
+        let bindings: Vec<(Uuid, Binding)> = match self.bindings.lock() {
+            Ok(bindings) => bindings
+                .iter()
+                .map(|(client, binding)| (*client, binding.clone()))
+                .collect(),
+            Err(_) => return vec!["attachment bindings poisoned".into()],
+        };
+        if bindings.is_empty() {
+            return Vec::new();
+        }
+        let contexts = match crate::list_contexts(env.caller) {
+            Ok(contexts) => contexts,
+            Err(error) => return vec![format!("listing tabs: {error}")],
+        };
+        let repository = Repository::new(env.caller, env.states);
+        let mut failures = Vec::new();
+        for (client, binding) in bindings {
+            let Ok(view) = repository.get_view(binding.owner, binding.view_id) else {
+                continue;
+            };
+            let Some((workspace, member)) = view.workspaces.iter().find_map(|arrangement| {
+                arrangement
+                    .members
+                    .iter()
+                    .find(|member| member.context_id == deleted)
+                    .map(|member| (arrangement.workspace_id, member.member_id))
+            }) else {
+                continue;
+            };
+            if binding.selected_member != Some(member) {
+                continue;
+            }
+            let current = env.host.selected_context(client);
+            let arranged_live = |tab: Uuid| {
+                contexts.iter().any(|context| context.id == tab)
+                    && view.workspaces.iter().any(|arrangement| {
+                        arrangement
+                            .members
+                            .iter()
+                            .any(|member| member.context_id == tab)
+                    })
+            };
+            if current.is_some_and(|tab| tab != deleted && arranged_live(tab)) {
+                continue;
+            }
+            let order = arrangement_order(&view, workspace).unwrap_or_default();
+            let live: BTreeSet<Uuid> = contexts
+                .iter()
+                .filter(|context| workspace_of(context) == workspace)
+                .map(|context| context.id)
+                .collect();
+            let displacement = Displacement {
+                owner: binding.owner,
+                view_id: binding.view_id,
+                workspace,
+                removed: deleted,
+                neighbour: removal_neighbour(&order, &live, deleted),
+            };
+            if let Err(reason) = self.move_displaced(
+                env,
+                client,
+                &displacement,
+                None::<fn(Uuid) -> std::result::Result<(), String>>,
+            ) {
+                failures.push(format!(
+                    "moving {client} off deleted tab {deleted}: {reason}"
+                ));
+            }
+        }
+        self.schedule();
+        failures
+    }
+
+    /// Undo the invoking attachment's last removal: add the tab back where it
+    /// was (before the tab that followed it, when that is still a member),
+    /// after checking it still exists. Returns the removal undone; the caller
+    /// selects the tab again when it was selected.
+    ///
+    /// # Errors
+    /// `invalid-reference` when the tab no longer exists (the removal is
+    /// forgotten), `unavailable` when there is nothing to undo in the bound
+    /// view, or the edit failed.
+    pub fn undo_removal<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+    ) -> Result<(Removal, PersonalAck)> {
+        let (client, binding) = self.invoking_binding(env, client)?;
+        let removal = binding
+            .last_removed
+            .filter(|removal| removal.view_id == binding.view_id)
+            .ok_or_else(|| unavailable("nothing to undo in this view"))?;
+        let forget = |this: &Self| {
+            this.with_binding(client, |current| {
+                if current.last_removed.as_ref() == Some(&removal) {
+                    current.last_removed = None;
+                }
+            });
+            this.schedule();
+        };
+        let exists = crate::list_contexts(env.caller)
+            .map_err(unavailable)?
+            .iter()
+            .any(|context| context.id == removal.context_id);
+        if !exists {
+            forget(self);
+            return Err(PersonalAttachmentError::InvalidReference);
+        }
+        let ack = self.edit_view(
+            env,
+            Some(client),
+            removal.context_id,
+            ViewEdit::Restore {
+                before: removal.before,
+            },
+            |_| Ok(()),
+        )?;
+        forget(self);
+        Ok((removal, ack))
+    }
+}
+
+/// A tab leaving one view's arrangement, and where attachments showing it go.
+struct Displacement {
+    owner: Owner,
+    view_id: Uuid,
+    workspace: Uuid,
+    removed: Uuid,
+    neighbour: Option<Uuid>,
+}
+
+/// The repository command for `edit` of `context` in `view`, or `None` when
+/// the view already has the outcome.
+fn edit_command(
+    edit: ViewEdit,
+    context: Uuid,
+    view: &PersonalView,
+    unchanged: &PersonalAck,
+    member: impl Fn(Uuid) -> Option<Uuid>,
+) -> Result<Option<Command>> {
+    let command = match edit {
+        ViewEdit::Add | ViewEdit::Restore { .. } => {
+            if unchanged.member_id.is_some() {
+                return Ok(None);
+            }
+            let before = match edit {
+                ViewEdit::Restore { before } => before.and_then(member),
+                _ => None,
+            };
+            Command::AddTab {
+                view_id: view.view_id,
+                expected_revision: view.revision,
+                context_id: context,
+                before,
+            }
+        }
+        ViewEdit::Remove => {
+            let Some(member_id) = unchanged.member_id else {
+                return Ok(None);
+            };
+            Command::RemoveTab {
+                view_id: view.view_id,
+                expected_revision: view.revision,
+                member_id,
+            }
+        }
+        ViewEdit::Move { before } => {
+            let member_id = unchanged
+                .member_id
+                .ok_or(PersonalAttachmentError::InvalidReference)?;
+            let before = match before {
+                Some(tab) if tab == context => return Ok(None),
+                Some(tab) => Some(member(tab).ok_or(PersonalAttachmentError::InvalidReference)?),
+                None => None,
+            };
+            Command::MoveTab {
+                view_id: view.view_id,
+                expected_revision: view.revision,
+                member_id,
+                before,
+            }
+        }
+    };
+    Ok(Some(command))
 }
 
 /// The context ids of `view`'s arrangement of `workspace`, in view order, or

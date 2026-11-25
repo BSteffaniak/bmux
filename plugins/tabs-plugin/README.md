@@ -21,14 +21,27 @@ client can navigate tabs independently.
   walk the caller's personal tab view in the active workspace (an attachment's
   bound view; a CLI caller's default view where it already arranges the
   workspace). Callers without one (no principal, or acting for no client) walk
-  the shared order. `close-current-tab` closes the tab for everyone.
-- `tab remove-from-view` -- remove the current tab from this attachment's view;
-  it keeps running and stays discoverable (no default key binding; use the
-  command palette, the tab bar menu or bind it yourself)
+  the shared order. `close-current-tab` closes the tab for everyone, without
+  asking (it has no default key binding; the tab bar's Close for everyone…
+  asks first).
+- `tab remove-from-view` (prefix `X`) -- remove the current tab from this
+  attachment's view; it keeps running and stays discoverable. Every attachment
+  bound to the same view that showed the tab moves to its neighbour (next,
+  else previous). When the view of that workspace has no tab left, those
+  attachments stay connected with no input target (nothing typed reaches any
+  tab) until a tab is opened, created or restored.
+- `tab undo-remove` / `undo-remove-from-view` (prefix `u`) -- put this
+  attachment's last removed tab back in its place, and select it again when it
+  was selected, if the tab still exists.
 - `tab open <TAB_ID>` -- add a tab to this attachment's view if absent, then
   switch to it (the finder's choice)
 - `tab add-to-view <TAB_ID>` -- add a tab to this attachment's view without
   switching
+
+A tab is never terminated because no view references it: removing a reference
+only changes that view. Closing a tab for everyone (`kill-tab`, the tab bar's
+confirmed Close for everyone…) terminates it; every view then drops it and
+each attachment that showed it moves to the neighbour in its own view.
 
 ## Spawn-directory inspection (in development)
 

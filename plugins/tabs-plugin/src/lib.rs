@@ -284,6 +284,36 @@ fn close_context(
         .map_err(|err| format!("close-context failed: {err:?}"))
 }
 
+/// The contexts selection authority, acting for attachments other than the
+/// invoking one (`contexts-client-selection-v1`).
+struct ContextsClientSelection<'a, C: ?Sized>(&'a C);
+
+impl<C: ServiceCaller + Sync + ?Sized> personal_views::attachments::ClientSelection
+    for ContextsClientSelection<'_, C>
+{
+    fn select_for(&self, client: Uuid, context: Uuid) -> Result<(), String> {
+        use bmux_contexts_plugin_api::contexts_client_selection_v1::client::select_for_client;
+        let mut dispatch = dispatch_client(self.0);
+        bmux_plugin::block_on_typed_dispatch(select_for_client(&mut dispatch, client, context))
+            .map_err(|err| {
+                typed_service_error("contexts-client-selection-v1/select-for-client", err)
+            })?
+            .map(|_| ())
+            .map_err(|err| format!("select-for-client failed: {err:?}"))
+    }
+
+    fn clear_for(&self, client: Uuid) -> Result<(), String> {
+        use bmux_contexts_plugin_api::contexts_client_selection_v1::client::clear_for_client;
+        let mut dispatch = dispatch_client(self.0);
+        bmux_plugin::block_on_typed_dispatch(clear_for_client(&mut dispatch, client))
+            .map_err(|err| {
+                typed_service_error("contexts-client-selection-v1/clear-for-client", err)
+            })?
+            .map(|_| ())
+            .map_err(|err| format!("clear-for-client failed: {err:?}"))
+    }
+}
+
 fn resolve_session_id(
     caller: &(impl ServiceCaller + Sync),
     selector: Option<&Selector>,
@@ -1309,6 +1339,7 @@ impl Plugin for TabsPlugin {
             .blocking_command("goto-tab", Self::run_command)
             .blocking_command("close-current-tab", Self::run_command)
             .blocking_command("remove-from-view", Self::run_command)
+            .blocking_command("undo-remove-from-view", Self::run_command)
             .blocking_command("open-tab", Self::run_command)
             .blocking_command("add-tab-to-view", Self::run_command)
             .blocking_command("reset-order", Self::run_command)
@@ -1665,10 +1696,12 @@ impl TabsPlugin {
         let states = tab_states(&self.runtime_state);
         let sink = personal_views::attachments::host_wire_sink(&states);
         let host = personal_views::attachments::RegistryHost(&states);
+        let selection = ContextsClientSelection(context);
         operation(&personal_views::attachments::Env {
             caller: context,
             states: Some(&states),
             host: &host,
+            selection: &selection,
             sink: sink.as_deref(),
             now_ms: status::now_ms(),
         })
@@ -1729,6 +1762,25 @@ impl TabsPlugin {
             self.attachments.schedule();
         }
         Ok(ack)
+    }
+
+    /// Undo the invoking attachment's last removal from its view, selecting
+    /// the tab again when it was the attachment's selected tab.
+    fn undo_removal<C: HostRuntimeApi + Sync>(
+        &self,
+        context: &C,
+        client: Option<Uuid>,
+    ) -> Result<personal_views::attachments::Removal, personal_attachment::PersonalAttachmentError>
+    {
+        let (removal, _) =
+            self.with_attachment_env(context, |env| self.attachments.undo_removal(env, client))?;
+        if removal.was_selected {
+            activate_tab_anywhere(context, removal.context_id).map_err(|reason| {
+                personal_attachment::PersonalAttachmentError::Unavailable { reason }
+            })?;
+            self.attachments.schedule();
+        }
+        Ok(removal)
     }
 
     fn activate_with_async(
@@ -1930,6 +1982,13 @@ fn handle_context_event(
                 caller,
                 *context_id,
             );
+            // Attachments that showed the deleted tab move to their own
+            // view's neighbour (or to no selection) before it is pruned.
+            for failure in with_shared_attachment_env(shared, |env| {
+                shared.attachments.reconcile_deleted(env, *context_id)
+            }) {
+                tracing::warn!(%failure, "reconciling attachments after a tab closed");
+            }
             // Confirmed deletion prunes every owner's personal views.
             if let Err(error) = personal_views::prune_deleted_context(
                 caller,
@@ -2531,6 +2590,27 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             }
             Ok(())
         }
+        "undo-remove-from-view" => {
+            let removal = plugin
+                .undo_removal(context, context.caller_client_id)
+                .map_err(|error| match error {
+                    personal_attachment::PersonalAttachmentError::InvalidReference => {
+                        "the removed tab no longer exists".to_string()
+                    }
+                    personal_attachment::PersonalAttachmentError::Unavailable { reason } => reason,
+                    other => format!("undo-remove-from-view failed: {other:?}"),
+                })?;
+            if removal.was_selected {
+                bmux_plugin_sdk::record_command_outcome_metadata(
+                    COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
+                    serde_json::json!(removal.context_id),
+                );
+            }
+            if emit_to_stdout {
+                println!("restored tab context {} to the view", removal.context_id);
+            }
+            Ok(())
+        }
         "open-tab" | "add-tab-to-view" => {
             let target = positional_value(&context.arguments)
                 .ok_or_else(|| "missing required TAB_ID argument".to_string())?;
@@ -3046,21 +3126,29 @@ fn spawn_attachment_refresher(
 }
 
 fn refresh_attachments(shared: &TabsSharedState) {
-    let states = tab_states(&shared.runtime_state);
-    let sink = personal_views::attachments::host_wire_sink(&states);
-    let host = personal_views::attachments::RegistryHost(&states);
-    let failures = shared
-        .attachments
-        .refresh(&personal_views::attachments::Env {
-            caller: shared.caller.as_ref(),
-            states: Some(&states),
-            host: &host,
-            sink: sink.as_deref(),
-            now_ms: status::now_ms(),
-        });
+    let failures = with_shared_attachment_env(shared, |env| shared.attachments.refresh(env));
     for failure in failures {
         tracing::warn!(%failure, "personal view projection not delivered");
     }
+}
+
+/// The attachment environment of a background task (no invocation).
+fn with_shared_attachment_env<T>(
+    shared: &TabsSharedState,
+    operation: impl FnOnce(&personal_views::attachments::Env<'_, TypedServiceCaller>) -> T,
+) -> T {
+    let states = tab_states(&shared.runtime_state);
+    let sink = personal_views::attachments::host_wire_sink(&states);
+    let host = personal_views::attachments::RegistryHost(&states);
+    let selection = ContextsClientSelection(shared.caller.as_ref());
+    operation(&personal_views::attachments::Env {
+        caller: shared.caller.as_ref(),
+        states: Some(&states),
+        host: &host,
+        selection: &selection,
+        sink: sink.as_deref(),
+        now_ms: status::now_ms(),
+    })
 }
 
 /// Every tab with its session's panes, as the pane runtime lists them.

@@ -865,6 +865,56 @@ async fn native_paste_reaches_shared_reducer_without_outer_capture() {
 }
 
 #[tokio::test]
+async fn a_suspended_attachment_sends_nothing_to_panes_until_retargeted() {
+    let mut view = attach_view_state_with_scrollback_fixture();
+    view.can_write = true;
+    view.attached_context_id = Some(Uuid::from_u128(7));
+    let attached = view.attached_id;
+    let mut client = disconnected_focus_test_client().await;
+    // Before: a send is attempted (and fails on the disconnected sink).
+    assert!(
+        reduce_paste(&mut view, &mut client, "typed", true)
+            .await
+            .is_err()
+    );
+
+    suspend_attach_input_target(&mut view);
+    assert!(view.input_suspended);
+    assert_eq!(view.attached_context_id, None);
+    // No pane is shown any more, and no server view event targets it.
+    assert!(view.cached_layout_state.as_ref().is_some_and(|layout| {
+        layout
+            .scene
+            .surfaces
+            .iter()
+            .all(|surface| surface.pane_id.is_none())
+    }));
+    assert!(!attach_view_event_matches_target(&view, None, attached));
+    // Typed, pasted and committed text, queued or new, is dropped without a
+    // send attempt.
+    assert!(
+        reduce_paste(&mut view, &mut client, "typed", true)
+            .await
+            .is_ok()
+    );
+    assert!(
+        send_attach_bytes_to_focused(&mut client, &view, b"queued".to_vec())
+            .await
+            .is_ok()
+    );
+    assert!(
+        native_committed_text(&mut client, &mut view, "ime", true)
+            .await
+            .is_ok()
+    );
+    // Dropped input is not reported as a failure.
+    assert_eq!(view.transient_status.as_deref(), Some("no input target"));
+    // Suspending again changes nothing.
+    suspend_attach_input_target(&mut view);
+    assert!(view.input_suspended);
+}
+
+#[tokio::test]
 async fn native_text_plugin_capture_has_one_owner_and_never_falls_through_to_pty() {
     use bmux_plugin::surface::{
         PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,

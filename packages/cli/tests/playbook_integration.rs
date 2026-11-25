@@ -332,6 +332,24 @@ fn playbook_real_attach_feedback_without_bcode_is_reported() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_remove_undo_and_empty_view_block_hidden_input() {
+    let (json, pass) = run_playbook_fixture("personal_view_remove_real_attach.dsl");
+    assert!(
+        pass,
+        "remove, undo and the empty view should keep input off hidden tabs: {json:#}"
+    );
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step["action"] == "assert-screen")
+            .count(),
+        3
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_keyboard_and_finder_follow_the_personal_view() {
     let (json, pass) = run_playbook_fixture("personal_view_navigation_real_attach.dsl");
     assert!(

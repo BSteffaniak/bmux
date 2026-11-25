@@ -25,6 +25,9 @@ struct FakeHost {
     attached: Mutex<BTreeSet<Uuid>>,
     principals: Mutex<BTreeMap<Uuid, Uuid>>,
     selected: Mutex<BTreeMap<Uuid, Uuid>>,
+    /// Selections made on attachments' behalf: `(client, tab)`, `None` for
+    /// a cleared selection.
+    moved: Mutex<Vec<(Uuid, Option<Uuid>)>>,
 }
 
 impl FakeHost {
@@ -42,6 +45,28 @@ impl FakeHost {
 
     fn select(&self, client: Uuid, context: Uuid) {
         self.selected.lock().unwrap().insert(client, context);
+    }
+}
+
+impl FakeHost {
+    fn take_moved(&self) -> Vec<(Uuid, Option<Uuid>)> {
+        let mut moved = std::mem::take(&mut *self.moved.lock().unwrap());
+        moved.sort();
+        moved
+    }
+}
+
+impl ClientSelection for FakeHost {
+    fn select_for(&self, client: Uuid, context: Uuid) -> std::result::Result<(), String> {
+        self.moved.lock().unwrap().push((client, Some(context)));
+        self.select(client, context);
+        Ok(())
+    }
+
+    fn clear_for(&self, client: Uuid) -> std::result::Result<(), String> {
+        self.moved.lock().unwrap().push((client, None));
+        self.selected.lock().unwrap().remove(&client);
+        Ok(())
     }
 }
 
@@ -183,6 +208,7 @@ impl Fixture {
             caller,
             states: None,
             host: &self.host,
+            selection: &self.host,
             sink: Some(&self.sink),
             now_ms: NOW,
         }
@@ -818,4 +844,220 @@ fn tab_addressed_edits_change_only_the_bound_view_and_move_the_editor_off_a_remo
         ),
         Err(PersonalAttachmentError::NoAttachment)
     );
+}
+
+/// The projection most recently published to `client`, after a refresh.
+fn projection_for(fixture: &Fixture, client: Uuid) -> PersonalViewProjection {
+    fixture.refresh();
+    fixture
+        .sink
+        .take()
+        .into_iter()
+        .rev()
+        .find(|(recipient, _)| *recipient == client)
+        .map(|(_, projection)| projection)
+        .expect("a projection for the client")
+}
+
+#[test]
+fn removal_moves_every_attachment_of_the_view_off_the_tab_and_empties_to_no_selection() {
+    // Three tabs in a non-default workspace, so the held workspace shows.
+    let fixture = Fixture::new(0);
+    for n in 1..=3 {
+        fixture.add_tab(tab(n), Some(&format!("t{n}")), OTHER_WS);
+    }
+    // Two attachments of one owner share its default view; another owner's
+    // attachment shows the same tab in its own view.
+    fixture.host.attach(client(1), Some(principal(1)), tab(2));
+    fixture.host.attach(client(2), Some(principal(1)), tab(2));
+    fixture.host.attach(client(3), Some(principal(2)), tab(2));
+    fixture.refresh();
+    fixture.sink.take();
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    let remove = |context, selected: &mut Vec<Uuid>| {
+        fixture
+            .attachments
+            .edit_view(&env, Some(client(1)), context, ViewEdit::Remove, |tab| {
+                selected.push(tab);
+                fixture.host.select(client(1), tab);
+                Ok(())
+            })
+            .unwrap()
+    };
+    let mut selected = Vec::new();
+
+    // The invoker selects the next member itself; the other attachment of
+    // the view is moved there through the selection authority; the other
+    // owner's attachment is untouched.
+    remove(tab(2), &mut selected);
+    assert_eq!(selected, [tab(3)]);
+    assert_eq!(fixture.host.take_moved(), [(client(2), Some(tab(3)))]);
+    assert_eq!(fixture.host.selected_context(client(3)), Some(tab(2)));
+
+    // The last member's neighbour is the previous one.
+    selected.clear();
+    remove(tab(3), &mut selected);
+    assert_eq!(selected, [tab(1)]);
+    assert_eq!(fixture.host.take_moved(), [(client(2), Some(tab(1)))]);
+
+    // Removing the last live member leaves both with no selection.
+    selected.clear();
+    remove(tab(1), &mut selected);
+    assert_eq!(selected, Vec::<Uuid>::new());
+    assert_eq!(
+        fixture.host.take_moved(),
+        [(client(1), None), (client(2), None)]
+    );
+    // Removing a reference never terminates the tab.
+    let live: Vec<Uuid> = crate::list_contexts(&fixture.storage)
+        .unwrap()
+        .iter()
+        .map(|context| context.id)
+        .collect();
+    assert_eq!(live, [tab(1), tab(2), tab(3)]);
+
+    // The emptied attachments keep showing that workspace, with the
+    // invoker's last removal for undo; the other attachment has none.
+    fixture.refresh();
+    let published = fixture.sink.take();
+    let latest = |client| {
+        published
+            .iter()
+            .rev()
+            .find(|(recipient, _)| *recipient == client)
+            .map(|(_, projection)| projection.clone())
+            .expect("a projection for the client")
+    };
+    let first = latest(client(1));
+    assert_eq!(first.active_workspace_id, OTHER_WS);
+    assert_eq!(members(&first, OTHER_WS), Vec::new());
+    let removal = first.last_removed.expect("last removal");
+    assert_eq!(
+        (
+            removal.context_id,
+            removal.name.as_str(),
+            removal.removed_at_ms
+        ),
+        (tab(1), "t1", NOW)
+    );
+    let second = latest(client(2));
+    assert_eq!(second.active_workspace_id, OTHER_WS);
+    assert_eq!(second.last_removed, None);
+}
+
+#[test]
+fn undo_restores_the_last_removal_in_place_once_and_only_for_a_live_tab() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(2));
+    fixture.refresh();
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    let order = || {
+        fixture
+            .attachments
+            .navigation_order(&env, Some(client(1)), WS)
+            .unwrap()
+            .unwrap()
+    };
+    let remove = |context| {
+        fixture
+            .attachments
+            .edit_view(&env, Some(client(1)), context, ViewEdit::Remove, |tab| {
+                fixture.host.select(client(1), tab);
+                Ok(())
+            })
+            .unwrap()
+    };
+
+    // Nothing to undo yet.
+    assert!(matches!(
+        fixture.attachments.undo_removal(&env, Some(client(1))),
+        Err(PersonalAttachmentError::Unavailable { .. })
+    ));
+
+    remove(tab(2));
+    assert_eq!(order(), [tab(1), tab(3)]);
+    let (removal, _) = fixture
+        .attachments
+        .undo_removal(&env, Some(client(1)))
+        .unwrap();
+    // Back in its place, and it was the selected tab (the caller reselects).
+    assert_eq!(order(), [tab(1), tab(2), tab(3)]);
+    assert_eq!((removal.context_id, removal.was_selected), (tab(2), true));
+    assert_eq!(projection_for(&fixture, client(1)).last_removed, None);
+    // Only the last removal, once.
+    assert!(
+        fixture
+            .attachments
+            .undo_removal(&env, Some(client(1)))
+            .is_err()
+    );
+
+    // A removed tab that was not selected, then closed: undo refuses and
+    // forgets it.
+    fixture.host.select(client(1), tab(1));
+    remove(tab(3));
+    fixture.remove_tab(tab(3));
+    assert_eq!(
+        fixture
+            .attachments
+            .undo_removal(&env, Some(client(1)))
+            .map(|_| ()),
+        Err(PersonalAttachmentError::InvalidReference)
+    );
+    assert!(matches!(
+        fixture.attachments.undo_removal(&env, Some(client(1))),
+        Err(PersonalAttachmentError::Unavailable { .. })
+    ));
+}
+
+#[test]
+fn deletion_moves_attachments_that_showed_the_tab_within_their_own_views() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(2));
+    fixture.host.attach(client(2), Some(principal(1)), tab(2));
+    fixture.host.attach(client(3), Some(principal(2)), tab(2));
+    fixture.host.attach(client(4), Some(principal(2)), tab(1));
+    fixture.refresh();
+    // Owner 2 orders its view t2, t1, t3: its neighbour of t2 is t1.
+    let b = fixture.repo().default_view(owner(2)).unwrap();
+    fixture.apply(
+        owner(2),
+        &Command::MoveTab {
+            view_id: b.view_id,
+            expected_revision: b.revision,
+            member_id: fixture.member(owner(2), b.view_id, tab(2)),
+            before: Some(fixture.member(owner(2), b.view_id, tab(1))),
+        },
+    );
+    fixture.refresh();
+    fixture.sink.take();
+
+    // The tab is closed for everyone. The contexts authority already moved
+    // client 1 to another tab of its view (it stays); client 2 still names
+    // the deleted tab, client 3 lost its selection.
+    fixture.remove_tab(tab(2));
+    fixture.host.select(client(1), tab(1));
+    fixture.host.selected.lock().unwrap().remove(&client(3));
+    let failures = fixture
+        .attachments
+        .reconcile_deleted(&fixture.env(&fixture.storage), tab(2));
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        fixture.host.take_moved(),
+        [(client(2), Some(tab(3))), (client(3), Some(tab(1)))]
+    );
+
+    // A deletion that leaves an attachment's arrangement without live tabs
+    // leaves it with no selection; attachments on other tabs stay.
+    fixture.refresh();
+    fixture.sink.take();
+    fixture.remove_tab(tab(1));
+    fixture.remove_tab(tab(3));
+    let failures = fixture
+        .attachments
+        .reconcile_deleted(&fixture.env(&fixture.storage), tab(3));
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fixture.host.take_moved(), [(client(2), None)]);
 }

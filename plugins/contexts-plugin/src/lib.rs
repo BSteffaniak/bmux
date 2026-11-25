@@ -32,11 +32,15 @@ use bmux_context_state::{
     RuntimeContext,
 };
 use bmux_contexts_plugin_api::contexts_activation_v1::{self, ContextsActivationV1Service};
+use bmux_contexts_plugin_api::contexts_client_selection_v1::{
+    self, ContextsClientSelectionV1Service,
+};
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextsCommandsService, CreateContextError,
     RenameContextError, SelectContextError, SetContextAttributesError,
 };
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
+use bmux_contexts_plugin_api::contexts_selection_events::{self, ClientSelectionEvent};
 use bmux_contexts_plugin_api::contexts_state::{
     self, ContextQueryError, ContextSelector as StateContextSelector, ContextSummary,
     ContextsStateService,
@@ -425,6 +429,12 @@ impl ContextEvents {
         }
     }
 
+    fn emit_selection(&self, event: ClientSelectionEvent) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.emit(&contexts_selection_events::EVENT_KIND, event);
+        }
+    }
+
     /// Retrieve the plugin-owned `ContextState` handle.
     ///
     /// Returns `Err` rather than panicking when no state has been
@@ -533,6 +543,7 @@ impl ContextsPlugin {
         // activation's bus; consumers subscribe through their own views.
         if let Some(bus) = &self.events().bus {
             bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+            bus.register_channel::<ClientSelectionEvent>(contexts_selection_events::EVENT_KIND);
         }
         Ok(())
     }
@@ -565,6 +576,12 @@ impl ContextsPlugin {
             },
             "contexts-activation-v1", "activate" => |req: contexts_activation_v1::client::ActivateRequest, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(&self.events(), ctx, ctx.caller_client_id, req.context_id))
+            },
+            "contexts-client-selection-v1", "select-for-client" => |req: contexts_client_selection_v1::client::SelectForClientRequest, _ctx| {
+                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(select_context_for_client(&self.events(), ClientId(req.client_id), req.context_id))
+            },
+            "contexts-client-selection-v1", "clear-for-client" => |req: contexts_client_selection_v1::client::ClearForClientRequest, _ctx| {
+                Ok::<Result<bool, SelectContextError>, ServiceResponse>(clear_selection_for_client(&self.events(), ClientId(req.client_id)))
             },
             "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
@@ -606,6 +623,9 @@ impl ContextsPlugin {
         let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller.clone(), self.events()));
         let _ = contexts_activation_v1::register_provider(registry, activation);
+        let client_selection: Arc<dyn ContextsClientSelectionV1Service + Send + Sync> =
+            Arc::new(ContextsCommandsHandle::new(caller.clone(), self.events()));
+        let _ = contexts_client_selection_v1::register_provider(registry, client_selection);
         let spawn: Arc<
             dyn bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service + Send + Sync,
         > = Arc::new(ContextsCommandsHandle::new(
@@ -957,6 +977,75 @@ fn activate_context_exact_in_state(
         id: context_id,
         session_id: Some(session_id.0),
     })
+}
+
+/// `contexts-client-selection-v1.select-for-client`: select a context that
+/// has an execution for another client, announcing it with that client as
+/// the initiator so its attach retargets as after its own selection. The
+/// client's session selection follows when its attach retargets; nothing is
+/// allocated or repaired here.
+fn select_context_for_client(
+    events: &ContextEvents,
+    client_id: ClientId,
+    context_id: Uuid,
+) -> Result<ContextAck, SelectContextError> {
+    let state = events
+        .local_state()
+        .map_err(|reason| SelectContextError::Denied { reason })?;
+    let session_id = {
+        let mut guard = state.write().map_err(|_| SelectContextError::Denied {
+            reason: "context state lock poisoned".into(),
+        })?;
+        if !guard.contexts.contains_key(&context_id) {
+            return Err(SelectContextError::NotFound);
+        }
+        let session_id = guard
+            .session_by_context
+            .get(&context_id)
+            .copied()
+            .ok_or_else(|| SelectContextError::Denied {
+                reason: "context execution unavailable; explicit recovery required".into(),
+            })?;
+        guard
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
+            .map_err(|_| SelectContextError::NotFound)?;
+        drop(guard);
+        session_id
+    };
+    events.emit(ContextEvent::Selected { context_id });
+    events.emit(ContextEvent::SessionActiveContextChanged {
+        session_id: session_id.0,
+        context_id,
+        initiator_client_id: Some(client_id.0),
+    });
+    Ok(ContextAck {
+        id: context_id,
+        session_id: Some(session_id.0),
+    })
+}
+
+/// `contexts-client-selection-v1.clear-for-client`: leave a client with no
+/// selection and announce it on `contexts-selection-events` (always, so a
+/// repeated clear still reaches an attach that missed the first). Returns whether it had a selection.
+fn clear_selection_for_client(
+    events: &ContextEvents,
+    client_id: ClientId,
+) -> Result<bool, SelectContextError> {
+    let state = events
+        .local_state()
+        .map_err(|reason| SelectContextError::Denied { reason })?;
+    let had_selection = state
+        .write()
+        .map_err(|_| SelectContextError::Denied {
+            reason: "context state lock poisoned".into(),
+        })?
+        .selected_by_client
+        .remove(&client_id)
+        .is_some();
+    events.emit_selection(ClientSelectionEvent::Cleared {
+        client_id: client_id.0,
+    });
+    Ok(had_selection)
 }
 
 fn select_context_local(
@@ -1616,6 +1705,25 @@ impl ContextsActivationV1Service for ContextsCommandsHandle {
         Box::pin(async move {
             activate_context_exact(&self.events, self.caller.as_ref(), None, context_id)
         })
+    }
+}
+
+impl ContextsClientSelectionV1Service for ContextsCommandsHandle {
+    fn select_for_client<'a>(
+        &'a self,
+        client_id: Uuid,
+        context_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<ContextAck, SelectContextError>> + Send + 'a>> {
+        Box::pin(
+            async move { select_context_for_client(&self.events, ClientId(client_id), context_id) },
+        )
+    }
+
+    fn clear_for_client<'a>(
+        &'a self,
+        client_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SelectContextError>> + Send + 'a>> {
+        Box::pin(async move { clear_selection_for_client(&self.events, ClientId(client_id)) })
     }
 }
 
@@ -2547,6 +2655,97 @@ mod tests {
             close_context_local(&events, &ctx, Some(client.0), &target, false),
             Err(CloseContextError::NotFound)
         ));
+    }
+
+    #[test]
+    fn another_clients_selection_is_set_or_cleared_and_announced_for_that_client() {
+        let invoker = ClientId::new();
+        let other = ClientId::new();
+        let session = SessionId::new();
+        let state_handle = Arc::new(RwLock::new(ContextState::default()));
+        let (bound, unbound) = {
+            let mut state = state_handle.write().unwrap();
+            let bound = state
+                .create_bound(invoker, Some("bound".into()), BTreeMap::new(), session)
+                .id;
+            let unbound = state
+                .create(invoker, Some("unbound".into()), BTreeMap::new())
+                .id;
+            drop(state);
+            (bound, unbound)
+        };
+        let states = Arc::new(PluginStateRegistry::new());
+        let _existing = states.register::<ContextState>(&state_handle);
+        let bus = Arc::new(EventBus::new());
+        bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        let events = ContextEvents::new(Some(Arc::clone(&bus)), states);
+        bus.register_channel::<ClientSelectionEvent>(contexts_selection_events::EVENT_KIND);
+        let events_rx = subscribe_events(&bus);
+
+        // Selecting for another client names that client as the initiator,
+        // so only its attach retargets; the invoker's selection is untouched.
+        let invoker_before = state_handle
+            .read()
+            .unwrap()
+            .selected_by_client
+            .get(&invoker)
+            .copied();
+        let ack = select_context_for_client(&events, other, bound).unwrap();
+        assert_eq!((ack.id, ack.session_id), (bound, Some(session.0)));
+        {
+            let state = state_handle.read().unwrap();
+            assert_eq!(state.selected_by_client.get(&other), Some(&bound));
+            assert_eq!(
+                state.selected_by_client.get(&invoker).copied(),
+                invoker_before
+            );
+            drop(state);
+        }
+        assert_eq!(
+            drain_events_after_short_wait(&events_rx),
+            vec![
+                ContextEvent::Selected { context_id: bound },
+                ContextEvent::SessionActiveContextChanged {
+                    session_id: session.0,
+                    context_id: bound,
+                    initiator_client_id: Some(other.0),
+                },
+            ]
+        );
+
+        // No execution, or no context: refused, nothing announced.
+        assert!(matches!(
+            select_context_for_client(&events, other, unbound),
+            Err(SelectContextError::Denied { .. })
+        ));
+        assert!(matches!(
+            select_context_for_client(&events, other, Uuid::new_v4()),
+            Err(SelectContextError::NotFound)
+        ));
+        assert_eq!(drain_events_after_short_wait(&events_rx), Vec::new());
+
+        // Clearing leaves the client with no selection, every time announced.
+        let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+        let mut selection_rx = bus
+            .subscribe::<ClientSelectionEvent>(&contexts_selection_events::EVENT_KIND)
+            .expect("selection channel should be registered");
+        assert_eq!(clear_selection_for_client(&events, other), Ok(true));
+        assert_eq!(clear_selection_for_client(&events, other), Ok(false));
+        while let Ok(event) = selection_rx.try_recv() {
+            cleared_tx.send((*event).clone()).unwrap();
+        }
+        assert!(
+            !state_handle
+                .read()
+                .unwrap()
+                .selected_by_client
+                .contains_key(&other)
+        );
+        assert_eq!(
+            cleared_rx.try_iter().collect::<Vec<_>>(),
+            vec![ClientSelectionEvent::Cleared { client_id: other.0 }; 2]
+        );
+        assert_eq!(drain_events_after_short_wait(&events_rx), Vec::new());
     }
 
     #[test]

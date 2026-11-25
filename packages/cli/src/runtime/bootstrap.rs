@@ -801,6 +801,13 @@ async fn run_server_start_inner(
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
+                    if k == bmux_contexts_plugin_api::contexts_selection_events::EVENT_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_forwarder::<
+                        bmux_contexts_plugin_api::contexts_selection_events::ClientSelectionEvent,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
                     if k == bmux_sessions_plugin_api::sessions_events::EVENT_KIND.as_str() =>
                 {
                     server.spawn_plugin_bus_forwarder::<

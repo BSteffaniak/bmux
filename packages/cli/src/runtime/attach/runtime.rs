@@ -6364,8 +6364,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             );
         }
 
-        let dirty_layout_frame =
-            view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
+        // A suspended attachment has no target to lay out.
+        let dirty_layout_frame = !view_state.input_suspended
+            && (view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none());
         // Hover, capture release and protocol-only updates can change pointer
         // presentation without cell damage (including while stationary).
         let pointer_shape = super::pointer_shape::resolve(&view_state);
@@ -7355,6 +7356,29 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if kind.as_str()
+            == bmux_contexts_plugin_api::contexts_selection_events::EVENT_KIND.as_str()
+        {
+            // This client's selection was cleared: it stays attached with no
+            // input target until a retarget (`suspend_attach_input_target`).
+            match serde_json::from_slice::<
+                bmux_contexts_plugin_api::contexts_selection_events::ClientSelectionEvent,
+            >(payload)
+            {
+                Ok(
+                    bmux_contexts_plugin_api::contexts_selection_events::ClientSelectionEvent::Cleared {
+                        client_id,
+                    },
+                ) if client_id == self_client_id => suspend_attach_input_target(view_state),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded contexts-selection-events payload",
+                    );
+                }
+            }
         } else if kind.as_str() == bmux_tabs_plugin_api::tabs_list::STATE_KIND.as_str() {
             match serde_json::from_slice::<bmux_tabs_plugin_api::tabs_list::TabListSnapshot>(
                 payload,
@@ -7796,6 +7820,34 @@ async fn handle_context_event_forwarded(
     Ok(())
 }
 
+/// Enter the suspended state: this attachment has no input target. Nothing
+/// is sent to panes from now on (input already queued is dropped at the
+/// send gates), panes are no longer shown, and the server layout is not
+/// refetched. Presentations, key bindings, prompts and plugin commands keep
+/// running; a retarget to a context resumes.
+pub fn suspend_attach_input_target(view_state: &mut AttachViewState) {
+    if view_state.input_suspended {
+        return;
+    }
+    view_state.input_suspended = true;
+    view_state.attached_context_id = None;
+    view_state.mouse.last_focused_pane_id = None;
+    if let Some(layout) = view_state.cached_layout_state.as_mut() {
+        layout
+            .scene
+            .surfaces
+            .retain(|surface| surface.pane_id.is_none());
+    }
+    view_state.set_transient_status(
+        "no input target".to_string(),
+        Instant::now(),
+        ATTACH_TRANSIENT_STATUS_TTL,
+    );
+    view_state
+        .dirty
+        .mark_full_frame(AttachDirtySource::SceneChanged);
+}
+
 pub async fn retarget_attach_to_context(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -7835,6 +7887,7 @@ pub async fn retarget_attach_to_context(
     let select_us = 0_u128;
     let open_us = retarget_service_us;
     view_state.attached_id = attach_info.session_id;
+    view_state.input_suspended = false;
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
@@ -11902,6 +11955,7 @@ pub async fn reconcile_attached_session_from_catalog(
 
     let attach_info = open_attach_for_context(client, context_id).await?;
     view_state.attached_id = attach_info.session_id;
+    view_state.input_suspended = false;
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
@@ -13643,6 +13697,15 @@ async fn handle_attached_session_removed(
         return Ok(None);
     }
 
+    if view_state.input_suspended {
+        // A suspended attachment already showed nothing of that session;
+        // resume only on this client's own selection, never by picking
+        // another target.
+        if let Ok(Some(context)) = typed_current_context_attach(client).await {
+            let _ = retarget_attach_to_context(client, view_state, context.id).await;
+        }
+        return Ok(Some(AttachLoopControl::Continue));
+    }
     let removed_session_id = view_state.attached_id;
     if recover_attach_after_session_removed(client, view_state).await? {
         view_state.set_transient_status(
@@ -13718,6 +13781,7 @@ async fn handle_clients_plugin_event(
                 return Ok(());
             };
             view_state.attached_id = attach_info.session_id;
+            view_state.input_suspended = false;
             view_state.last_attach_view_revision = None;
             view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
@@ -13818,6 +13882,7 @@ pub async fn recover_attach_after_session_removed(
             continue;
         };
         view_state.attached_id = attach_info.session_id;
+        view_state.input_suspended = false;
         view_state.last_attach_view_revision = None;
         view_state.attached_context_id = attach_info.context_id;
         view_state.can_write = attach_info.can_write;
@@ -13836,6 +13901,9 @@ pub fn attach_view_event_matches_target(
     event_context_id: Option<Uuid>,
     event_session_id: Uuid,
 ) -> bool {
+    if view_state.input_suspended {
+        return false;
+    }
     if let Some(attached_context_id) = view_state.attached_context_id {
         return event_context_id == Some(attached_context_id);
     }
@@ -14589,6 +14657,7 @@ async fn retarget_attach_to_session(
 ) -> std::result::Result<(), ClientError> {
     let attach_info = open_attach_for_session(client, session_id).await?;
     view_state.attached_id = attach_info.session_id;
+    view_state.input_suspended = false;
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
@@ -16989,7 +17058,7 @@ pub async fn maybe_forward_attach_mouse_event(
     in_focused: bool,
     focus_before_forward: bool,
 ) -> std::result::Result<bool, ClientError> {
-    let Some(focus_target) = focus_target else {
+    let Some(focus_target) = focus_target.filter(|_| !view_state.input_suspended) else {
         return Ok(false);
     };
 
@@ -17619,6 +17688,9 @@ async fn send_attach_bytes_to_focused(
     view_state: &AttachViewState,
     bytes: Vec<u8>,
 ) -> std::result::Result<(), ClientError> {
+    if view_state.input_suspended {
+        return Ok(());
+    }
     if let Some(pane_id) = focused_attach_pane_id(view_state) {
         client
             .send_one_way_pane_direct_input(view_state.attached_id, pane_id, bytes)

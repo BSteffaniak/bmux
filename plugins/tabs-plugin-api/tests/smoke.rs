@@ -98,6 +98,7 @@ fn personal_attachment_contracts_take_no_client_and_round_trip() {
         );
     }
     let projection = PersonalViewProjection {
+        last_removed: None,
         view_id: uuid::Uuid::from_u128(1),
         name: "default".into(),
         view_revision: 4,

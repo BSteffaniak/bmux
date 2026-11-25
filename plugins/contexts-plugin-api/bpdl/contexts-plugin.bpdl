@@ -132,6 +132,24 @@ interface contexts-commands {
     ) -> result<context-ack, set-context-attributes-error>;
 }
 
+// Selection of another client, made by a plugin acting on that client's
+// behalf: for example when the tab an attachment shows leaves what that
+// attachment arranges. The client's attach reacts exactly as it does to its
+// own selection. Neither operation allocates or replaces an execution.
+@capability(CONTEXTS_WRITE)
+interface contexts-client-selection-v1 {
+    // Select a context that has an execution for `client-id`. Emits
+    // `selected` and `session-active-context-changed` naming the client as
+    // initiator, so its attach retargets.
+    command select-for-client(client-id: uuid, context-id: uuid)
+        -> result<contexts-commands.context-ack, contexts-commands.select-context-error>;
+    // Leave `client-id` with no selection and announce it on
+    // `contexts-selection-events`. Returns whether the client had a
+    // selection.
+    command clear-for-client(client-id: uuid)
+        -> result<bool, contexts-commands.select-context-error>;
+}
+
 @capability(CONTEXTS_WRITE)
 interface contexts-activation-v1 {
     // Exact activation never allocates or replaces a missing execution.
@@ -167,12 +185,27 @@ interface contexts-events {
 }
 
 /// What `bmux.contexts` provides to and requires from the host and other plugins.
+// Per-client selection changes that `contexts-events` does not carry.
+@interface-version(1)
+interface contexts-selection-events {
+    variant client-selection-event {
+        // A client was explicitly left with no selected context. Its attach
+        // stays connected with no input target until something selects a
+        // context for it again.
+        cleared { client-id: uuid },
+    }
+
+    events client-selection-event;
+}
+
 world contexts {
     provide contexts-visits-v1;
     provide contexts-state;
     provide contexts-commands;
     provide contexts-activation-v1;
+    provide contexts-client-selection-v1;
     provide contexts-events capability bmux.contexts.read;
+    provide contexts-selection-events capability bmux.contexts.read;
     provide contexts-spawn-v1;
     require capability bmux.clients.read;
     require capability bmux.sessions.write;

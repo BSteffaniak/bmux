@@ -457,6 +457,15 @@ fn transition(
 
 /// Ask the tab bar's server-side group workflow to apply `action` to the
 /// selection.
+/// Ask for the action's answer, so a refusal is shown rather than lost.
+fn reporting_outcome(
+    mut invocation: bmux_plugin::AttachInputServiceInvocation,
+    action: &str,
+) -> bmux_plugin::AttachInputServiceInvocation {
+    invocation.response_endpoint = Some(Box::new(super::outcome_endpoint(action)));
+    invocation
+}
+
 fn move_selection(
     companion: &CompanionState,
     action: &str,
@@ -599,12 +608,14 @@ fn activate_selection(
     if companion.menu.confirming {
         // "Cancel" is first so a hurried Enter never terminates anything.
         if index == 1 {
-            result.service_invocation = command_invocation::<tabs_commands::client::KillTabEndpoint>(
-                &tabs_commands::client::KillTabRequest {
-                    target: target.to_string(),
-                    force_local: false,
-                },
-            );
+            result.service_invocation =
+                command_invocation::<tabs_commands::client::KillTabEndpoint>(
+                    &tabs_commands::client::KillTabRequest {
+                        target: target.to_string(),
+                        force_local: false,
+                    },
+                )
+                .map(|invocation| reporting_outcome(invocation, "close"));
         }
         return;
     }
@@ -629,6 +640,7 @@ fn activate_selection(
             command_invocation::<super::tabs_personal_actions::client::RemoveTabEndpoint>(
                 &super::tabs_personal_actions::client::RemoveTabRequest { context_id: target },
             )
+            .map(|invocation| reporting_outcome(invocation, "remove"))
         }
         Some(TabAction::CloseForEveryone) => {
             companion.menu_tab_id = Some(target);
@@ -828,6 +840,11 @@ mod tests {
                         crate::decode_action_payload(&invocation).unwrap();
                     assert_eq!(request.target, Uuid::from_u128(7).to_string());
                     assert!(!request.force_local);
+                    // Its answer comes back, so a refusal is shown.
+                    assert_eq!(
+                        invocation.response_endpoint.as_deref(),
+                        Some(&crate::outcome_endpoint("close"))
+                    );
                 }
             }
         }
@@ -1091,6 +1108,7 @@ mod tests {
             })
             .collect();
         companion.replace_personal(crate::personal_view::PersonalViewProjection {
+            last_removed: None,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 1,

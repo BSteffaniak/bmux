@@ -81,6 +81,14 @@ view when it is absent, then switches to it. `bmux finder add-to-view` (or
 the chosen one without switching. Without a personal view (no attachment or
 principal) the finder switches as it always did.
 
+Removing a tab from your view (`remove-from-view`, prefix `X`, or the tab
+bar's Remove from view) never closes it; `undo-remove-from-view` (prefix `u`)
+puts your last removal back. Attachments sharing that view move off the
+removed tab to its neighbour. When your view of a workspace has no tab left,
+the attachment stays connected with no input target: nothing you type reaches
+a tab until you open one from the finder, create one or undo. Closing a tab
+for everyone terminates it and removes it from every view.
+
 Visit history belongs to the invoking client, not other attachments. It is
 transient, cleared on disconnect, and not restored across server restarts.
 Unvisited tabs follow visited tabs in arrangement order. Opening or cancelling
