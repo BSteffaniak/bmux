@@ -5014,6 +5014,7 @@ dependencies = [
 name = "bmux_color"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "libm",
  "serde",
  "serde_json",
 ]
@@ -6155,6 +6156,7 @@ name = "bmux_raster"
 version = "0.0.1-alpha.4"
 dependencies = [
  "gif",
+ "libm",
  "png",
  "zune-core",
  "zune-jpeg",

@@ -227,7 +227,7 @@ fn resample(
     fn kernel(x: f32) -> f32 {
         fn sinc(x: f32) -> f32 {
             let a = x * std::f32::consts::PI;
-            if x == 0.0 { 1.0 } else { a.sin() / a }
+            if x == 0.0 { 1.0 } else { libm::sinf(a) / a }
         }
         if x.abs() < 3.0 {
             sinc(x) * sinc(x / 3.0)

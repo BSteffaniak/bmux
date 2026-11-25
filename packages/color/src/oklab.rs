@@ -49,7 +49,7 @@ impl Oklab {
         let long = 0.412_221_470_8 * red + 0.536_332_536_3 * green + 0.051_445_992_9 * blue;
         let medium = 0.211_903_498_2 * red + 0.680_699_545_1 * green + 0.107_396_956_6 * blue;
         let short = 0.088_302_461_9 * red + 0.281_718_837_6 * green + 0.629_978_700_5 * blue;
-        let (long, medium, short) = (long.cbrt(), medium.cbrt(), short.cbrt());
+        let (long, medium, short) = (libm::cbrt(long), libm::cbrt(medium), libm::cbrt(short));
         Self {
             l: 0.210_454_255_3 * long + 0.793_617_785_0 * medium - 0.004_072_046_8 * short,
             a: 1.977_998_495_1 * long - 2.428_592_205_0 * medium + 0.450_593_709_9 * short,
@@ -154,11 +154,11 @@ impl Oklch {
 
 impl From<Oklab> for Oklch {
     fn from(color: Oklab) -> Self {
-        let c = color.a.hypot(color.b);
+        let c = libm::hypot(color.a, color.b);
         let h = if c < ACHROMATIC_CHROMA {
             0.0
         } else {
-            color.b.atan2(color.a).to_degrees().rem_euclid(360.0)
+            libm::atan2(color.b, color.a).to_degrees().rem_euclid(360.0)
         };
         Self { l: color.l, c, h }
     }
@@ -166,7 +166,7 @@ impl From<Oklab> for Oklch {
 
 impl From<Oklch> for Oklab {
     fn from(color: Oklch) -> Self {
-        let (sin, cos) = color.h.to_radians().sin_cos();
+        let (sin, cos) = libm::sincos(color.h.to_radians());
         Self {
             l: color.l,
             a: color.c * cos,

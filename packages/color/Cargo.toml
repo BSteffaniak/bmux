@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+libm  = { workspace = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]

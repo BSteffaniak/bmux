@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 gif       = { workspace = true, optional = true }
+libm      = { workspace = true }
 png       = { workspace = true }
 zune-core = { workspace = true, optional = true }
 zune-jpeg = { workspace = true, optional = true }

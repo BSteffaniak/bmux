@@ -191,7 +191,7 @@ fn srgb_to_linear(channel: f64) -> f64 {
     if channel <= 0.040_45 {
         channel / 12.92
     } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
+        libm::pow((channel + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -199,7 +199,7 @@ fn linear_to_srgb(channel: f64) -> f64 {
     if channel <= 0.003_130_8 {
         channel * 12.92
     } else {
-        1.055_f64.mul_add(channel.powf(1.0 / 2.4), -0.055)
+        1.055_f64.mul_add(libm::pow(channel, 1.0 / 2.4), -0.055)
     }
 }
 
