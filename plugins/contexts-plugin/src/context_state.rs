@@ -18,7 +18,7 @@ use bmux_context_state::{
     CONTEXT_SESSION_ID_ATTRIBUTE, ContextSelector, ContextSummary, RuntimeContext,
 };
 use bmux_session_models::{ClientId, SessionId};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -32,6 +32,9 @@ pub struct ContextState {
     pub mru_contexts: VecDeque<Uuid>,
     /// Transient, caller-local navigation history; never persisted as arrangement state.
     pub visited_by_client: BTreeMap<ClientId, VecDeque<Uuid>>,
+    /// Clients whose selection was explicitly cleared (see
+    /// [`ContextState::clear_selection`]). Transient: never persisted.
+    pub cleared_clients: BTreeSet<ClientId>,
 }
 
 impl ContextState {
@@ -67,7 +70,7 @@ impl ContextState {
         };
         let id = context.id;
         self.contexts.insert(id, context.clone());
-        self.selected_by_client.insert(client_id, id);
+        self.set_selection(client_id, id);
         self.touch_mru(id);
         self.record_visit(client_id, id);
         // Authoritative diagnostic signal: exactly one emission per
@@ -161,7 +164,7 @@ impl ContextState {
         selector: &ContextSelector,
     ) -> core::result::Result<ContextSummary, &'static str> {
         let id = self.resolve_id(selector)?;
-        self.selected_by_client.insert(client_id, id);
+        self.set_selection(client_id, id);
         self.touch_mru(id);
         self.record_visit(client_id, id);
         self.contexts
@@ -292,6 +295,31 @@ impl ContextState {
     pub fn disconnect_client(&mut self, client_id: ClientId) {
         self.selected_by_client.remove(&client_id);
         self.visited_by_client.remove(&client_id);
+        self.cleared_clients.remove(&client_id);
+    }
+
+    /// Record `id` as the client's selection. Any selection ends an
+    /// explicit clear.
+    fn set_selection(&mut self, client_id: ClientId, id: Uuid) {
+        self.selected_by_client.insert(client_id, id);
+        self.cleared_clients.remove(&client_id);
+    }
+
+    /// Leave the client with no selection on purpose: unlike a client
+    /// that was never selected, it does not fall back to the MRU context as
+    /// an input target until something selects a context for it again.
+    /// Returns whether it had a selection.
+    pub fn clear_selection(&mut self, client_id: ClientId) -> bool {
+        self.cleared_clients.insert(client_id);
+        self.selected_by_client.remove(&client_id).is_some()
+    }
+
+    /// Whether the client's selection was explicitly cleared and nothing
+    /// has selected a context for it since.
+    #[must_use]
+    pub fn selection_cleared(&self, client_id: ClientId) -> bool {
+        self.cleared_clients.contains(&client_id)
+            && !self.selected_by_client.contains_key(&client_id)
     }
 
     /// Resolve a selector to a single context id.
@@ -363,7 +391,7 @@ impl ContextState {
             .collect::<Vec<_>>();
         for impacted_client in impacted {
             if let Some(next_id) = replacement {
-                self.selected_by_client.insert(impacted_client, next_id);
+                self.set_selection(impacted_client, next_id);
             } else {
                 self.selected_by_client.remove(&impacted_client);
             }
@@ -373,7 +401,7 @@ impl ContextState {
             && !self.selected_by_client.contains_key(&client_id)
             && let Some(next_id) = replacement
         {
-            self.selected_by_client.insert(client_id, next_id);
+            self.set_selection(client_id, next_id);
         }
 
         Some((removed.id, removed_session))

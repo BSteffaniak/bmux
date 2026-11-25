@@ -137,6 +137,9 @@ const REPLY_WIRE_BUDGET: usize = {
 
 // Published pin payload across this manager, independent of client/session count.
 const RETAINED_PIN_BUDGET: usize = 64 * 1024 * 1024;
+/// Why pane input from a client without an input target is refused.
+pub(crate) const NO_INPUT_TARGET: &str =
+    "no input target: this client's selection was cleared; select a target to resume input";
 
 fn admit_retained_pin(
     manager: &SessionRuntimeManager,
@@ -303,6 +306,31 @@ impl PaneRuntimeHost {
     fn context_handle(&self) -> ContextStateHandle {
         self.handle::<ContextStateHandle>()
             .unwrap_or_else(ContextStateHandle::noop)
+    }
+
+    /// Refuse pane input from a client left without an input target: its
+    /// selection was explicitly cleared and nothing has selected a target
+    /// for it since. Its attach stream stays bound to the last session, so
+    /// without this a stale or misbehaving client could still write to the
+    /// pane it no longer shows. Clients that were never cleared, and hosts
+    /// with no selection provider at all, always pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason reported to the client when it has no input target.
+    pub(crate) fn ensure_client_has_input_target(
+        &self,
+        client_id: ClientId,
+    ) -> Result<(), &'static str> {
+        if self
+            .context_handle()
+            .0
+            .selection_cleared_for_client(client_id)
+        {
+            Err(NO_INPUT_TARGET)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn session_handle(&self) -> SessionManagerHandle {
@@ -18604,6 +18632,122 @@ exit 7"#
             Ok(_) => panic!("expected direct pane input command, got another command"),
             Err(error) => panic!("expected direct pane input command: {error}"),
         }
+    }
+
+    /// A selection provider whose only cleared client is `self.0`.
+    struct ClearedSelection(ClientId);
+
+    impl bmux_context_state::ContextStateReader for ClearedSelection {
+        fn list(&self) -> Vec<bmux_context_state::ContextSummary> {
+            Vec::new()
+        }
+        fn current_for_client(
+            &self,
+            _client_id: ClientId,
+        ) -> Option<bmux_context_state::ContextSummary> {
+            None
+        }
+        fn current_session_for_client(&self, _client_id: ClientId) -> Option<SessionId> {
+            None
+        }
+        fn context_for_session(&self, _session_id: SessionId) -> Option<Uuid> {
+            None
+        }
+        fn resolve_id(
+            &self,
+            _selector: &bmux_context_state::ContextSelector,
+        ) -> Result<Uuid, &'static str> {
+            Err("not under test")
+        }
+        fn selection_cleared_for_client(&self, client_id: ClientId) -> bool {
+            client_id == self.0
+        }
+    }
+
+    impl bmux_context_state::ContextStateWriter for ClearedSelection {
+        fn create(
+            &self,
+            _client_id: ClientId,
+            _name: Option<String>,
+            _attributes: BTreeMap<String, String>,
+        ) -> bmux_context_state::ContextSummary {
+            unreachable!("not under test")
+        }
+        fn select_for_client(
+            &self,
+            _client_id: ClientId,
+            _selector: &bmux_context_state::ContextSelector,
+        ) -> Result<bmux_context_state::ContextSummary, &'static str> {
+            Err("not under test")
+        }
+        fn rename(
+            &self,
+            _selector: &bmux_context_state::ContextSelector,
+            _name: String,
+        ) -> Result<bmux_context_state::ContextSummary, &'static str> {
+            Err("not under test")
+        }
+        fn set_attributes(
+            &self,
+            _selector: &bmux_context_state::ContextSelector,
+            _attributes: BTreeMap<String, String>,
+        ) -> Result<bmux_context_state::ContextSummary, &'static str> {
+            Err("not under test")
+        }
+        fn close(
+            &self,
+            _client_id: ClientId,
+            _selector: &bmux_context_state::ContextSelector,
+            _force: bool,
+        ) -> Result<(Uuid, Option<SessionId>), &'static str> {
+            Err("not under test")
+        }
+        fn remove_contexts_for_session(&self, _session_id: SessionId) -> Vec<Uuid> {
+            Vec::new()
+        }
+        fn bind_session(
+            &self,
+            _context_id: Uuid,
+            _session_id: SessionId,
+        ) -> Result<(), &'static str> {
+            Err("not under test")
+        }
+        fn disconnect_client(&self, _client_id: ClientId) {}
+        fn remove_context_by_id(
+            &self,
+            _context_id: Uuid,
+            _preferred_client: Option<ClientId>,
+        ) -> Option<(Uuid, Option<SessionId>)> {
+            None
+        }
+        fn snapshot(&self) -> bmux_context_state::ContextStateSnapshot {
+            bmux_context_state::ContextStateSnapshot::default()
+        }
+        fn restore_snapshot(&self, _snapshot: bmux_context_state::ContextStateSnapshot) {}
+    }
+
+    #[test]
+    fn only_a_client_whose_selection_was_cleared_has_no_input_target() {
+        let cleared = ClientId(crate::ids::new_uuid());
+        let other = ClientId(crate::ids::new_uuid());
+
+        // No selection provider (baseline, missing contexts plugin): no gate.
+        let host = PaneRuntimeHost::detached();
+        assert_eq!(host.ensure_client_has_input_target(cleared), Ok(()));
+
+        let handle = Arc::new(switchy_thread::sync::RwLock::new(ContextStateHandle::new(
+            ClearedSelection(cleared),
+        )));
+        host.states().register(&handle);
+        assert_eq!(
+            host.ensure_client_has_input_target(cleared),
+            Err(NO_INPUT_TARGET)
+        );
+        assert_eq!(host.ensure_client_has_input_target(other), Ok(()));
+
+        // A selection provider with no notion of clearing never gates.
+        *handle.write().unwrap() = ContextStateHandle::noop();
+        assert_eq!(host.ensure_client_has_input_target(cleared), Ok(()));
     }
 
     #[switchy_async::test]

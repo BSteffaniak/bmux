@@ -907,6 +907,13 @@ pub fn pane_direct_input(
             warn!(session_id = %req.session_id, pane_id = %req.pane_id, "pane direct input rejected: missing caller client id");
             failed_command("pane direct input requires a caller client id")
         })?;
+    if let Err(reason) = host.ensure_client_has_input_target(client_id) {
+        // Debug, not warn: a stale client may keep typing while suspended.
+        tracing::debug!(session_id = %req.session_id, pane_id = %req.pane_id, client_id = %client_id.0, "pane direct input rejected: client has no input target");
+        return Err(PaneCommandError::Denied {
+            reason: reason.to_string(),
+        });
+    }
     if !handle.0.client_can_write(session_id, client_id) {
         warn!(session_id = %req.session_id, pane_id = %req.pane_id, client_id = %client_id.0, "pane direct input rejected: client lacks write permission");
         return Err(PaneCommandError::Denied {

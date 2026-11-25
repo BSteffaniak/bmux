@@ -909,6 +909,10 @@ pub fn attach_input(
         follow_state(host)?.0.selected_session(client_id),
         session_id,
     )?;
+    host.ensure_client_has_input_target(client_id)
+        .map_err(|reason| AttachCommandError::Denied {
+            reason: reason.to_string(),
+        })?;
     if !runtime.0.client_can_write(session_id, client_id) {
         return Err(AttachCommandError::Denied {
             reason: "client does not have write permission for this attach stream".to_string(),
@@ -1035,16 +1039,23 @@ pub fn attach_set_viewport(
     })
 }
 
+/// The client's selection before a retarget attempt: its context, or
+/// whether it had been cleared (no input target).
+type PreviousSelection = (Option<Uuid>, bool);
+
 fn restore_context_selection(
     contexts: &bmux_context_state::ContextStateHandle,
     client_id: ClientId,
-    previous_context_id: Option<Uuid>,
+    (previous_context_id, previously_cleared): PreviousSelection,
 ) {
     if let Some(previous_context_id) = previous_context_id {
         let _ = contexts.0.select_for_client(
             client_id,
             &PrimitiveContextSelector::ById(previous_context_id),
         );
+    } else if previously_cleared {
+        // A failed retarget must not hand a cleared client an input target.
+        contexts.0.clear_selection_for_client(client_id);
     } else {
         contexts.0.disconnect_client(client_id);
     }
@@ -1065,12 +1076,15 @@ pub fn attach_retarget_context(
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
 
     let selected_target = follow.0.selected_target(client_id);
-    let previous_context_id = contexts
-        .0
-        .snapshot()
-        .selected_by_client
-        .get(&client_id)
-        .copied();
+    let previous_selection = (
+        contexts
+            .0
+            .snapshot()
+            .selected_by_client
+            .get(&client_id)
+            .copied(),
+        contexts.0.selection_cleared_for_client(client_id),
+    );
     let (context_id, next_session_id, selection_already_applied) =
         if let Some((Some(selected_context_id), Some(selected_session_id))) = selected_target
             && selected_context_id == req.context_id
@@ -1082,7 +1096,7 @@ pub fn attach_retarget_context(
                 .select_for_client(client_id, &PrimitiveContextSelector::ById(req.context_id))
                 .map_err(|_| AttachCommandError::ContextNotFound)?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
-                restore_context_selection(&contexts, client_id, previous_context_id);
+                restore_context_selection(&contexts, client_id, previous_selection);
                 return Err(failed("context has no attached runtime"));
             };
             (context.id, selected_session_id, false)
@@ -1091,7 +1105,7 @@ pub fn attach_retarget_context(
     // Validate the session exists in the manager.
     if !manager.0.contains(next_session_id) {
         if !selection_already_applied {
-            restore_context_selection(&contexts, client_id, previous_context_id);
+            restore_context_selection(&contexts, client_id, previous_selection);
         }
         return Err(AttachCommandError::SessionNotFound);
     }
@@ -1101,7 +1115,7 @@ pub fn attach_retarget_context(
         Ok(allowed) => req.can_write && allowed,
         Err(error) => {
             if !selection_already_applied {
-                restore_context_selection(&contexts, client_id, previous_context_id);
+                restore_context_selection(&contexts, client_id, previous_selection);
             }
             return Err(error);
         }
@@ -1126,7 +1140,7 @@ pub fn attach_retarget_context(
         Ok(viewport) => viewport,
         Err(error) => {
             if !selection_already_applied {
-                restore_context_selection(&contexts, client_id, previous_context_id);
+                restore_context_selection(&contexts, client_id, previous_selection);
             }
             return resolve_failed_selection(ctx, reservation.revision, Err(error));
         }

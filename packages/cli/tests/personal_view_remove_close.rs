@@ -4,6 +4,8 @@
 //! removes it from another principal's view and moves its attachments within
 //! their own views, and an attachment whose view lost its last tab stays
 //! connected with no input target: typing never reaches the hidden tab.
+//! The server enforces that too: a raw pane-input request from a client whose
+//! selection was cleared is refused until something selects for it again.
 #![cfg(unix)]
 
 #[allow(dead_code)] // Shared process/path fixture supports other integration targets too.
@@ -236,6 +238,63 @@ async fn wait_bar(frame: &Frame, label: &str, names: &[&str], hidden: &[&str]) -
     }
 }
 
+/// A raw (non-native) attachment of `session` that can write, and that
+/// session's pane.
+async fn raw_attach(paths: &ConfigPaths, session: Uuid) -> Result<(BmuxClient, Uuid, Uuid)> {
+    use bmux_pane_runtime_plugin_api::attach_runtime_commands::{self, client as attach};
+    let mut raw = connect_as(paths, Uuid::new_v4()).await?;
+    let client_id = bmux_clients_plugin_api::clients_state::client::current_client(&mut raw)
+        .await?
+        .map_err(|error| anyhow::anyhow!("current client: {error:?}"))?
+        .id;
+    let grant = attach::attach_session(
+        &mut raw,
+        attach_runtime_commands::SessionSelector {
+            id: Some(session),
+            name: None,
+        },
+        true,
+    )
+    .await?
+    .map_err(|error| anyhow::anyhow!("raw attach grant: {error:?}"))?;
+    attach::attach_open(&mut raw, session, grant.token)
+        .await?
+        .map_err(|error| anyhow::anyhow!("raw attach open: {error:?}"))?;
+    let pane = bmux_pane_runtime_plugin_api::pane_runtime_state::client::list_panes(
+        &mut raw,
+        Some(session),
+    )
+    .await?
+    .map_err(|error| anyhow::anyhow!("list panes: {error:?}"))?
+    .panes
+    .first()
+    .context("attached session has no pane")?
+    .id;
+    Ok((raw, client_id, pane))
+}
+
+async fn raw_input(
+    raw: &mut BmuxClient,
+    session: Uuid,
+    pane: Uuid,
+    line: &str,
+) -> Result<
+    std::result::Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+    >,
+> {
+    Ok(
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::client::pane_direct_input(
+            raw,
+            session,
+            pane,
+            format!("{line}\r").into_bytes(),
+        )
+        .await?,
+    )
+}
+
 async fn create_tab(control: &mut BmuxClient, name: &str) -> Result<(Uuid, Uuid)> {
     let ack = bmux_contexts_plugin_api::contexts_commands::client::create_context(
         control,
@@ -448,6 +507,47 @@ async fn exercise() -> Result<()> {
                 !frame_contains(&frame_b, "secret-from"),
                 "a hidden tab received input from an emptied view"
             );
+
+            // The server refuses pane input itself, whatever a client sends:
+            // a raw attachment of gamma writes until its selection is
+            // cleared, is refused (not disconnected) while cleared, and
+            // writes again once something selects for it.
+            let (mut raw, raw_client, raw_pane) = raw_attach(&paths, gamma_session).await?;
+            raw_input(&mut raw, gamma_session, raw_pane, "raw-before")
+                .await?
+                .map_err(|error| anyhow::anyhow!("raw input before clear: {error:?}"))?;
+            wait_text(&frame_b, "b", "got:raw-before").await?;
+            bmux_contexts_plugin_api::contexts_client_selection_v1::client::clear_for_client(
+                &mut control,
+                raw_client,
+            )
+            .await?
+            .map_err(|error| anyhow::anyhow!("clear raw selection: {error:?}"))?;
+            match raw_input(&mut raw, gamma_session, raw_pane, "raw-cleared").await? {
+                Err(
+                    bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError::Denied {
+                        reason,
+                    },
+                ) if reason.contains("no input target") => {}
+                other => anyhow::bail!("cleared client's pane input was not refused: {other:?}"),
+            }
+            bmux_contexts_plugin_api::contexts_client_selection_v1::client::select_for_client(
+                &mut control,
+                raw_client,
+                gamma,
+            )
+            .await?
+            .map_err(|error| anyhow::anyhow!("reselect raw client: {error:?}"))?;
+            raw_input(&mut raw, gamma_session, raw_pane, "raw-resumed")
+                .await?
+                .map_err(|error| anyhow::anyhow!("raw input after reselect: {error:?}"))?;
+            wait_text(&frame_b, "b", "got:raw-resumed").await?;
+            ensure!(
+                !frame_contains(&frame_b, "raw-cleared"),
+                "the server wrote a cleared client's input"
+            );
+            drop(raw);
+
             let live =
                 bmux_contexts_plugin_api::contexts_state::client::list_contexts(&mut control)
                     .await?;

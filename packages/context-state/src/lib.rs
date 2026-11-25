@@ -67,6 +67,14 @@ pub trait ContextStateReader: Send + Sync {
     ///
     /// Returns a static error message when the selector doesn't match.
     fn resolve_id(&self, selector: &ContextSelector) -> Result<Uuid, &'static str>;
+    /// Whether the client's selection was explicitly cleared and nothing
+    /// has selected a context for it since: the client has no input
+    /// target. A client that was never cleared (including one that simply
+    /// has no selection yet) is not cleared, so implementations without a
+    /// selection concept keep the default `false`.
+    fn selection_cleared_for_client(&self, _client_id: ClientId) -> bool {
+        false
+    }
 }
 
 /// Mutation surface over context-state.
@@ -82,7 +90,10 @@ pub trait ContextStateWriter: ContextStateReader {
     ///
     /// # Errors
     ///
-    /// Returns a static error message when the selector doesn't resolve.
+    /// Returns a static error message when the selector doesn't resolve,
+    /// or when the client's selection was explicitly cleared (see
+    /// [`ContextStateReader::selection_cleared_for_client`]): only the
+    /// selection provider's own service ends a clear.
     fn select_for_client(
         &self,
         client_id: ClientId,
@@ -132,6 +143,15 @@ pub trait ContextStateWriter: ContextStateReader {
     fn bind_session(&self, context_id: Uuid, session_id: SessionId) -> Result<(), &'static str>;
     /// Forget the client's selected-context.
     fn disconnect_client(&self, client_id: ClientId);
+    /// Leave the client with no selection on purpose, so
+    /// [`ContextStateReader::selection_cleared_for_client`] reports it until
+    /// something selects for it again. Announces nothing: this restores
+    /// state, for example after a failed selection attempt. Returns whether
+    /// it had a selection. Providers without a selection concept keep the
+    /// default, which does nothing.
+    fn clear_selection_for_client(&self, _client_id: ClientId) -> bool {
+        false
+    }
     /// Remove a context by id, re-selecting replacement contexts for
     /// impacted clients. `preferred_client` is favoured as the
     /// destination of the replacement selection (used by close-flows

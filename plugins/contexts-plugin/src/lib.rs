@@ -68,6 +68,11 @@ use std::sync::{Arc, RwLock};
 use tracing::instrument;
 use uuid::Uuid;
 
+/// Why the neutral writer refuses to select for a client whose selection
+/// was explicitly cleared.
+const SELECTION_CLEARED: &str =
+    "client selection was cleared; select through the contexts service to resume";
+
 /// Adapter wrapping the plugin's `Arc<RwLock<ContextState>>` and
 /// implementing the domain-agnostic [`ContextStateReader`] +
 /// [`ContextStateWriter`] traits from `bmux_context_state`.
@@ -124,6 +129,10 @@ impl ContextStateReader for ContextStateAdapter {
             Err("context-state lock poisoned"),
         )
     }
+
+    fn selection_cleared_for_client(&self, client_id: ClientId) -> bool {
+        self.with_read(|state| state.selection_cleared(client_id), false)
+    }
 }
 
 impl ContextStateAdapter {
@@ -150,13 +159,23 @@ impl ContextStateWriter for ContextStateAdapter {
         self.with_write(|state| state.create(client_id, name, attributes), fallback)
     }
 
+    /// Other components use this neutral writer to re-assert a client's
+    /// selection on its behalf (the server mirrors the client's remembered
+    /// target on every request), so it never ends an explicit clear: only
+    /// the contexts service's own selection operations do. Refused while
+    /// the client's selection is cleared.
     fn select_for_client(
         &self,
         client_id: ClientId,
         selector: &PrimitiveContextSelector,
     ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
         self.with_write(
-            |state| state.select_for_client(client_id, selector),
+            |state| {
+                if state.selection_cleared(client_id) {
+                    return Err(SELECTION_CLEARED);
+                }
+                state.select_for_client(client_id, selector)
+            },
             Err("context-state lock poisoned"),
         )
     }
@@ -223,6 +242,10 @@ impl ContextStateWriter for ContextStateAdapter {
         self.with_write(|state| state.disconnect_client(client_id), ());
     }
 
+    fn clear_selection_for_client(&self, client_id: ClientId) -> bool {
+        self.with_write(|state| state.clear_selection(client_id), false)
+    }
+
     fn remove_context_by_id(
         &self,
         context_id: Uuid,
@@ -274,6 +297,7 @@ impl ContextStateWriter for ContextStateAdapter {
                 state.selected_by_client = snapshot.selected_by_client;
                 state.mru_contexts = snapshot.mru_contexts;
                 state.visited_by_client.clear();
+                state.cleared_clients.clear();
             },
             (),
         );
@@ -1039,9 +1063,7 @@ fn clear_selection_for_client(
         .map_err(|_| SelectContextError::Denied {
             reason: "context state lock poisoned".into(),
         })?
-        .selected_by_client
-        .remove(&client_id)
-        .is_some();
+        .clear_selection(client_id);
     events.emit_selection(ClientSelectionEvent::Cleared {
         client_id: client_id.0,
     });
@@ -2746,6 +2768,91 @@ mod tests {
             vec![ClientSelectionEvent::Cleared { client_id: other.0 }; 2]
         );
         assert_eq!(drain_events_after_short_wait(&events_rx), Vec::new());
+    }
+
+    #[test]
+    fn only_an_explicit_clear_leaves_a_client_without_an_input_target_until_reselected() {
+        let cleared = ClientId::new();
+        let never_selected = ClientId::new();
+        let state_handle = Arc::new(RwLock::new(ContextState::default()));
+        let states = Arc::new(PluginStateRegistry::new());
+        let _existing = states.register::<ContextState>(&state_handle);
+        let events = ContextEvents::new(None, states);
+        let adapter = ContextStateAdapter {
+            inner: Arc::clone(&state_handle),
+            events: events.clone(),
+        };
+        let first = adapter.create(cleared, Some("first".into()), BTreeMap::new());
+        // The replacement a closer of `first` receives.
+        let _second = adapter.create(cleared, Some("second".into()), BTreeMap::new());
+        // The neutral reader surface pane-runtime gates input with.
+        let handle = ContextStateHandle::new(adapter);
+
+        // No selection yet is not a clear: the MRU fallback still applies.
+        assert!(!handle.0.selection_cleared_for_client(never_selected));
+        assert!(!handle.0.selection_cleared_for_client(cleared));
+
+        assert_eq!(clear_selection_for_client(&events, cleared), Ok(true));
+        assert!(handle.0.selection_cleared_for_client(cleared));
+        assert!(!handle.0.selection_cleared_for_client(never_selected));
+
+        // The neutral writer only re-asserts selections for others (the
+        // server mirrors each request's remembered target through it), so it
+        // never ends a clear: the hidden tab stays unselected.
+        assert_eq!(
+            handle
+                .0
+                .select_for_client(cleared, &PrimitiveContextSelector::ById(first.id)),
+            Err(SELECTION_CLEARED)
+        );
+        assert!(handle.0.selection_cleared_for_client(cleared));
+        assert_eq!(
+            state_handle
+                .read()
+                .unwrap()
+                .selected_by_client
+                .get(&cleared),
+            None
+        );
+
+        // A selection through the contexts service ends the clear.
+        state_handle
+            .write()
+            .unwrap()
+            .select_for_client(cleared, &PrimitiveContextSelector::ById(first.id))
+            .unwrap();
+        assert!(!handle.0.selection_cleared_for_client(cleared));
+        handle
+            .0
+            .select_for_client(cleared, &PrimitiveContextSelector::ById(first.id))
+            .unwrap();
+
+        // So does the replacement a closer receives, and a new context.
+        assert_eq!(clear_selection_for_client(&events, cleared), Ok(true));
+        assert!(
+            handle
+                .0
+                .remove_context_by_id(first.id, Some(cleared))
+                .is_some()
+        );
+        assert!(!handle.0.selection_cleared_for_client(cleared));
+        assert_eq!(clear_selection_for_client(&events, cleared), Ok(true));
+        handle.0.create(cleared, None, BTreeMap::new());
+        assert!(!handle.0.selection_cleared_for_client(cleared));
+
+        // The silent writer clear (restoring after a failed selection) gates
+        // just the same.
+        assert!(handle.0.clear_selection_for_client(cleared));
+        assert!(handle.0.selection_cleared_for_client(cleared));
+
+        // Disconnect forgets it; restoring a snapshot starts with no clears.
+        assert_eq!(clear_selection_for_client(&events, cleared), Ok(false));
+        handle.0.disconnect_client(cleared);
+        assert!(!handle.0.selection_cleared_for_client(cleared));
+        assert_eq!(clear_selection_for_client(&events, cleared), Ok(false));
+        let snapshot = handle.0.snapshot();
+        handle.0.restore_snapshot(snapshot);
+        assert!(!handle.0.selection_cleared_for_client(cleared));
     }
 
     #[test]
