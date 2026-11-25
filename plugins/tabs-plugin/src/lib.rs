@@ -3236,6 +3236,20 @@ fn list_tabs(
         .collect())
 }
 
+/// Publish the tab status on a blocking worker, off the observer's task.
+async fn publish_on_worker(
+    worker: &bmux_plugin_sdk::HostAsyncHandle,
+    shared: &TabsSharedState,
+    board: &Arc<Mutex<status::StatusBoard>>,
+) -> std::result::Result<(), String> {
+    let shared = shared.clone();
+    let board = Arc::clone(board);
+    worker
+        .spawn_blocking(move || publish_tab_status(&shared, &board))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Follow pane signals and publish each tab's status once a second when it
 /// changed (`tabs-status`).
 fn spawn_status_observer(
@@ -3307,12 +3321,7 @@ fn spawn_status_observer(
                             board.set_agents(&snapshot);
                         }
                         // Agent states change at their own pace: show them now.
-                        let shared = shared.clone();
-                        let board = Arc::clone(&board);
-                        worker
-                            .spawn_blocking(move || publish_tab_status(&shared, &board))
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        publish_on_worker(&worker, &shared, &board).await?;
                     }
                     // Events only say a pane may have changed: the status
                     // reads each pane's retained signals, so missing some
@@ -3337,20 +3346,10 @@ fn spawn_status_observer(
                     },
                     _ = refresh.tick(), if dirty => {
                         dirty = false;
-                        let shared = shared.clone();
-                        let board = Arc::clone(&board);
-                        worker
-                            .spawn_blocking(move || publish_tab_status(&shared, &board))
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        publish_on_worker(&worker, &shared, &board).await?;
                     }
                     _ = tick.tick() => {
-                        let shared = shared.clone();
-                        let board = Arc::clone(&board);
-                        worker
-                            .spawn_blocking(move || publish_tab_status(&shared, &board))
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        publish_on_worker(&worker, &shared, &board).await?;
                     }
                 }
             }
