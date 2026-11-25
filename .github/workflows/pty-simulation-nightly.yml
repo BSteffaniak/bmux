@@ -83,11 +83,12 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/findings
 
-  # Crates marked `runs = false` are not scanned by `cargo sim NAME --check`, on their word that
-  # simulations never run them. Coverage-instrumented fleets check that word: any line of such
-  # a crate that runs fails the job.
+  # Local crates marked `runs = false` are not scanned by `cargo sim NAME --check`, and external
+  # crates audited `not-run` are not read, on their word that simulations never run them.
+  # Coverage-instrumented fleets check that word: any line of such a crate that runs fails the
+  # job.
   run-claims:
-    name: runs = false (${{ matrix.simulation }})
+    name: never-run claims (${{ matrix.simulation }})
     runs-on: ubuntu-latest
     needs: [rust-version]
     strategy:

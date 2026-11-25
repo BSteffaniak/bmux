@@ -178,11 +178,16 @@ links, found from its dependency graph:
   whole. A line using a std primitive on purpose says why: `// simulation-safe: <reason>`.
 - Every crate from a registry or git must be on `simulation/determinism.toml`'s audit list,
   with a verdict and a reason; a new crate or version fails the check until it is audited.
-  Patterns forbidden everywhere are listed there too.
+  `not-run` (linked, never run) is the verdict for most: find which crates run from coverage
+  (`cargo sim NAME --coverage` writes `target/sim-coverage/coverage.json`) and read only
+  those. A `restricted` crate's uncontrolled entry points (macros too) go in its `forbid`
+  list, so the scan enforces them. Patterns forbidden everywhere are listed there too.
+- The shared rules also forbid the platform's math library (`powf`, `exp`, `ln`, trigonometry:
+  their last bits differ between systems; use `libm`), and `libc` and `extern` blocks.
 
-Before a simulation starts running a crate marked `runs = false`, remove its table so the
-check scans it; `cargo sim NAME --coverage` (nightly) runs NAME instrumented and fails if a
-line of such a crate ran. A std lock must never be held across a switch point: simulations
+Before a simulation starts running a crate marked `runs = false` (or an external crate audited
+`not-run`), remove that claim so the check scans it (or audit it for real); `cargo sim NAME
+--coverage` (nightly) runs NAME instrumented and fails if a line of such a crate ran. A std lock must never be held across a switch point: simulations
 poll tasks on several workers.
 
 Simulation builds (cargo run in `simulation/`, as `cargo sim` does) read

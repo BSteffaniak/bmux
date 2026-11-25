@@ -301,14 +301,12 @@ exemption.
   whose macros put state in the calling crate. The first external scan hung on `dispatch2`:
   objc2's generated module and the crate root glob-import each other, and the resolver
   expanded globs through globs exponentially. It now expands a glob once per path.
-- **Not yet.**
-  - Foreign functions and `libc` calls are invisible to the scan; for local crates they sit
-    in native-only files, but an external crate's clean scan says nothing about them.
+- **Not yet** (all since done; see "Follow-ups" below).
+  - Foreign functions and `libc` calls were invisible to the scan.
   - Macros are scanned as tokens, not expanded: a macro from another crate that reaches a
-    primitive (`lazy_static!`, `scoped_thread_local!`) is seen only through its audit.
+    primitive (`lazy_static!`, `scoped_thread_local!`) is caught through its audit's `forbid`.
   - `runs = false` claims are now checked by a nightly coverage run (20.4 below).
-  - The 97 remaining baseline crates are still to be audited; most of their findings are
-    patterns (ordering by address, OS `cfg`s, `HashMap`) that need reading, not rules.
+  - The 97 baseline crates were not audited.
 
 ### 20.3 (MoosicBox `db9119472`, `974999fa7`, `fade23050`)
 
@@ -381,3 +379,35 @@ exemption.
 - **API differences** from tokio, none used by bmux or MoosicBox: `Semaphore`'s `Debug` text;
   mapped guards accept unsized targets; `Notified` and the cancellation futures are `Unpin`
   (and the latter `FusedFuture`); `Mutex::new` and `RwLock::new` are `const`.
+
+### Follow-ups (2026-11-25; MoosicBox `23c66f735`..`16c560e99`)
+
+- **The audit list has no `unaudited` entry left.** Coverage of 300 guided runs of each
+  simulation, on Linux and on macOS, showed which crates run at all: of the 97, ten.
+  - `futures-core` and `futures-channel` are `pure`.
+  - The other eight are `restricted`, with their uncontrolled entry points now in `forbid`:
+    `futures`' unseeded `select!`, simvar's Ctrl-C handler (`ctrlc`, and the `nix` and
+    `dispatch2` it reaches), `rustix`, `scoped_thread_local!`, and `log`'s and `tracing`'s
+    enabled-level checks.
+  - The rest are `not-run`, a new verdict: like a local `runs = false`, a claim
+    `cargo sim NAME --coverage` checks nightly. FFI bindings (`libc` and three `-sys` crates)
+    are `restricted` instead, since coverage cannot see calls into C.
+  - Four entries were stale (`crossbeam-*`, `symlink`, `tracing-appender`) and are gone.
+- **Foreign functions.** switchy_cargo reports `libc` paths and `extern` blocks, so an external
+  crate's scan now shows them too.
+- **Macros.** Covered by the audits: a crate whose macro reaches a primitive has that macro in
+  `forbid` (`scoped_thread_local`, `log_enabled`).
+- **Floating point.** `f64::powf` and the like call the platform's math library, which rounds
+  differently between systems. `switchy_random::gen_range_dist` used it, so a seed drew
+  different values on Linux and macOS (`historical_seeded_replay` had failed on macOS since it
+  was recorded on Linux); it now uses `libm`. bmux's OKLab and sRGB conversions and Lanczos
+  kernel moved to `libm` too, and switchy_cargo now forbids those methods.
+- **`--coverage`, run end to end**, including a false claim (`bmux_terminal_grid` marked
+  `runs = false`), which it caught.
+- **The dashboard** now starts a verify job (simvar's `control().verify`) when a failure's
+  confirming replay passes. The job runs the seed recording what it observes, replays it in a
+  fresh process, and the failure's page shows where the two part (or that they agree, which
+  points at state left by earlier runs in the fleet's process).
+- **Found on the way.** `bmux_terminal_protocol`'s new `notification_output.rs` read the
+  environment, which made every simulation's `--check` fail on master; it is client side and
+  now exempt, as `pointer_output.rs` is.

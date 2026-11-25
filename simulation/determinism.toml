@@ -19,14 +19,19 @@ forbid = [
     "log::max_level",
     "tracing::enabled",
     "level_enabled",
+    "core_foundation_sys",
+    "security_framework_sys",
+    "libsqlite3_sys",
 ]
 
 # Every crate the simulations link from a registry or git repository, as with `cargo vet`: a
 # crate (or version) not covered here fails the check until it is audited.
 #
 # Verdicts: `controlled` (the simulators), `pure` (deterministic in itself), `restricted` (its
-# non-deterministic entry points are forbidden by the rules; the reason names them), and
-# `unaudited` (accepted as it was on the baseline's date, pinned to that version).
+# non-deterministic entry points are forbidden by the rules; the reason names them), `not-run`
+# (linked, but no run runs it: checked against coverage by `cargo sim NAME --coverage`, so it
+# never applies to FFI bindings, whose calls coverage cannot see), and `unaudited` (accepted
+# as it is, to audit later; none are left).
 
 [[audit]]
 name = "adler2"
@@ -84,9 +89,9 @@ reason = "Hash block buffering."
 
 [[audit]]
 name = "block2"
-version = "=0.6.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.6"
+verdict = "not-run"
+reason = "Linked through dispatch2, netdev, objc2-core-foundation; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "btparse"
@@ -108,33 +113,33 @@ reason = "Conditional compilation macro."
 
 [[audit]]
 name = "chrono"
-version = "=0.4.45"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.4"
+verdict = "not-run"
+reason = "Linked through netwatch, switchy_database, switchy_time and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "color-backtrace"
-version = "=0.7.4"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.7"
+verdict = "not-run"
+reason = "Linked through simvar_harness; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "colored"
-version = "=3.1.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^3"
+verdict = "not-run"
+reason = "Linked through moosicbox_assert; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "core-foundation"
-version = "=0.10.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.10"
+verdict = "not-run"
+reason = "Linked through rustls-platform-verifier, security-framework, system-configuration; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "core-foundation-sys"
-version = "=0.8.7"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.8"
+verdict = "restricted"
+reason = "FFI declarations for macOS's Core Foundation (coverage cannot see calls into them), reached only through core-foundation and security-framework, which never run. Forbidden in scanned crates (`core_foundation_sys`)."
 
 [[audit]]
 name = "cpufeatures"
@@ -192,9 +197,9 @@ reason = "Comparison traits."
 
 [[audit]]
 name = "errno"
-version = "=0.3.15"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "not-run"
+reason = "Linked through rustix, signal-hook-registry; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "fallible-iterator"
@@ -222,15 +227,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "flate2"
-version = "=1.1.11"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through png; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "flume"
-version = "=0.12.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.12"
+verdict = "not-run"
+reason = "Linked through mdns-sd, switchy_async, switchy_tcp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "fnv"
@@ -270,9 +275,9 @@ reason = "Future, Stream and task traits, and AtomicWaker: no clocks, threads, r
 
 [[audit]]
 name = "futures-executor"
-version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "not-run"
+reason = "Linked through futures, opentelemetry_sdk; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "futures-io"
@@ -300,9 +305,9 @@ reason = "Combinators, deterministic in themselves, except `select!` (not `selec
 
 [[audit]]
 name = "genawaiter"
-version = "=0.99.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.99"
+verdict = "not-run"
+reason = "Linked through rupnp, ssdp-client; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "genawaiter-macro"
@@ -330,9 +335,9 @@ reason = "Simulation builds (`--cfg getrandom_backend=\"custom\"`, simulation/.c
 
 [[audit]]
 name = "h2"
-version = "=0.4.20"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.4"
+verdict = "not-run"
+reason = "Linked through hyper, tonic; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hashbrown"
@@ -348,21 +353,21 @@ reason = "Iteration order follows a random seed; HashMap and HashSet are forbidd
 
 [[audit]]
 name = "hashlink"
-version = "=0.9.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.9"
+verdict = "not-run"
+reason = "Linked through rusqlite; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hostname"
-version = "=0.4.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean, but reads the host's name through libc, which the scan does not see: not pure."
+version = "^0.4"
+verdict = "not-run"
+reason = "Linked through switchy_mdns; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "http"
-version = "=1.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through h2, http-body, http-body-util and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "http-body"
@@ -378,15 +383,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "httparse"
-version = "=1.10.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through hyper, hyper-util, tokio-websockets; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "httpdate"
-version = "=1.0.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through hyper, opentelemetry-otlp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hybrid-array"
@@ -396,9 +401,9 @@ reason = "Fixed-size arrays."
 
 [[audit]]
 name = "hyper"
-version = "=1.12.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through hyper-rustls, hyper-timeout, hyper-util and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hyper-rustls"
@@ -408,15 +413,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "hyper-timeout"
-version = "=0.5.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.5"
+verdict = "not-run"
+reason = "Linked through tonic; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hyper-util"
-version = "=0.1.21"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.1"
+verdict = "not-run"
+reason = "Linked through hyper-rustls, hyper-timeout, igd-next and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "hyperchad_docs_config"
@@ -426,9 +431,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "iana-time-zone"
-version = "=0.1.65"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.1"
+verdict = "not-run"
+reason = "Linked through chrono; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "icu_collections"
@@ -444,9 +449,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "icu_normalizer"
-version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^2"
+verdict = "not-run"
+reason = "Linked through idna_adapter; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "icu_normalizer_data"
@@ -468,9 +473,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "icu_provider"
-version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^2"
+verdict = "not-run"
+reason = "Linked through icu_normalizer, icu_properties; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "idna"
@@ -486,15 +491,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "if-addrs"
-version = "=0.13.4"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.13"
+verdict = "not-run"
+reason = "Linked through rupnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "if-addrs"
-version = "=0.15.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.15"
+verdict = "not-run"
+reason = "Linked through mdns-sd; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "indexmap"
@@ -510,9 +515,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "itertools"
-version = "=0.15.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.15"
+verdict = "not-run"
+reason = "Linked through prost-derive, switchy_upnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "itoa"
@@ -522,9 +527,9 @@ reason = "Integer formatting."
 
 [[audit]]
 name = "lazy_static"
-version = "=1.5.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean itself, but its macro puts a process-wide lazy static into the calling crate."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through sharded-slab; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "lexical"
@@ -570,15 +575,15 @@ reason = "Number formatting."
 
 [[audit]]
 name = "libc"
-version = "=0.2.191"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.2"
+verdict = "restricted"
+reason = "FFI declarations for the C library: calls into them run no Rust code, so coverage cannot see them. Forbidden in scanned crates (switchy_cargo's shared rules, with `extern` blocks); native backends name it in their native-only files."
 
 [[audit]]
 name = "libloading"
-version = "=0.9.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.9"
+verdict = "not-run"
+reason = "Linked through bmux_plugin; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "libm"
@@ -588,9 +593,9 @@ reason = "Floating-point functions in portable Rust (a port of musl's): the same
 
 [[audit]]
 name = "libsqlite3-sys"
-version = "=0.30.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean, but its work (files included) is in SQLite's C code, which the scan does not see."
+version = "^0.30"
+verdict = "restricted"
+reason = "SQLite's C library and its FFI declarations (coverage cannot see calls into them), reached only through rusqlite, which never runs. Forbidden in scanned crates (`libsqlite3_sys`)."
 
 [[audit]]
 name = "litemap"
@@ -618,9 +623,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "mdns-sd"
-version = "=0.21.7"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.21"
+verdict = "not-run"
+reason = "Linked through switchy_mdns; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "memchr"
@@ -642,9 +647,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "mio"
-version = "=1.2.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through mdns-sd, tokio; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "moosicbox_assert"
@@ -660,15 +665,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "moosicbox_log_runtime"
-version = "=0.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.5"
+verdict = "not-run"
+reason = "Linked through switchy_telemetry; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "moosicbox_profiles"
-version = "=0.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.5"
+verdict = "not-run"
+reason = "Linked through switchy_database; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "nix"
@@ -678,9 +683,9 @@ reason = "System calls, reached only through ctrlc's handler (signals, a pipe). 
 
 [[audit]]
 name = "nu-ansi-term"
-version = "=0.50.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.50"
+verdict = "not-run"
+reason = "Linked through tracing-subscriber; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "num-conv"
@@ -696,9 +701,9 @@ reason = "Numeric traits."
 
 [[audit]]
 name = "objc2"
-version = "=0.6.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.6"
+verdict = "not-run"
+reason = "Linked through block2, dispatch2, objc2-core-foundation and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "objc2-encode"
@@ -708,15 +713,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "once_cell"
-version = "=1.21.4"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through ahash, dlopen2, netdev and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "opentelemetry"
-version = "=0.33.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.33"
+verdict = "not-run"
+reason = "Linked through opentelemetry-http, opentelemetry-otlp, opentelemetry-proto and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "opentelemetry-http"
@@ -726,21 +731,21 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "opentelemetry-otlp"
-version = "=0.33.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.33"
+verdict = "not-run"
+reason = "Linked through switchy_telemetry; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "opentelemetry-proto"
-version = "=0.33.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.33"
+verdict = "not-run"
+reason = "Linked through opentelemetry-otlp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "opentelemetry_sdk"
-version = "=0.33.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.33"
+verdict = "not-run"
+reason = "Linked through opentelemetry-otlp, opentelemetry-proto, switchy_telemetry; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "percent-encoding"
@@ -780,27 +785,27 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "powerfmt"
-version = "=0.2.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.2"
+verdict = "not-run"
+reason = "Linked through time; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "ppv-lite86"
-version = "=0.2.21"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.2"
+verdict = "not-run"
+reason = "Linked through rand_chacha; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "prost"
-version = "=0.14.6"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.14"
+verdict = "not-run"
+reason = "Linked through opentelemetry-otlp, opentelemetry-proto, prost-types and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "prost-types"
-version = "=0.14.6"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.14"
+verdict = "not-run"
+reason = "Linked through tonic-types; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rand"
@@ -864,39 +869,39 @@ reason = "Regular expression parsing."
 
 [[audit]]
 name = "reqwest"
-version = "=0.13.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.13"
+verdict = "not-run"
+reason = "Linked through iroh, iroh-relay, n0-dns-resolver and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "ring"
-version = "=0.17.14"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.17"
+verdict = "not-run"
+reason = "Linked through noq-proto, rustls, rustls-webpki and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "roxmltree"
-version = "=0.20.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.20"
+verdict = "not-run"
+reason = "Linked through rupnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "roxmltree"
-version = "=0.21.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.21"
+verdict = "not-run"
+reason = "Linked through switchy_upnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rupnp"
-version = "=3.0.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^3"
+verdict = "not-run"
+reason = "Linked through switchy_upnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rusqlite"
-version = "=0.32.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.32"
+verdict = "not-run"
+reason = "Linked through switchy_database; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rustc-demangle"
@@ -912,21 +917,21 @@ reason = "System calls, from switchy_fs's native backend and tempfile; in simula
 
 [[audit]]
 name = "rustls"
-version = "=0.23.46"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.23"
+verdict = "not-run"
+reason = "Linked through hyper-rustls, iroh, iroh-dns and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rustls-pki-types"
-version = "=1.16.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through iroh, iroh-relay, noq-proto and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rustls-platform-verifier"
-version = "=0.7.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.7"
+verdict = "not-run"
+reason = "Linked through reqwest; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "rustls-webpki"
@@ -948,15 +953,15 @@ reason = "Scope guards."
 
 [[audit]]
 name = "security-framework"
-version = "=3.7.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^3"
+verdict = "not-run"
+reason = "Linked through rustls-native-certs, rustls-platform-verifier; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "security-framework-sys"
-version = "=2.17.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^2"
+verdict = "restricted"
+reason = "FFI declarations for macOS's Security framework (coverage cannot see calls into them), reached only through security-framework and rustls-platform-verifier, which never run. Forbidden in scanned crates (`security_framework_sys`)."
 
 [[audit]]
 name = "serde"
@@ -996,9 +1001,9 @@ reason = "SHA-2 hashing."
 
 [[audit]]
 name = "sharded-slab"
-version = "=0.1.7"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.1"
+verdict = "not-run"
+reason = "Linked through tracing-subscriber; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "shell-words"
@@ -1008,9 +1013,9 @@ reason = "Shell word splitting."
 
 [[audit]]
 name = "signal-hook-registry"
-version = "=1.4.8"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through tokio; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "simd-adler32"
@@ -1050,9 +1055,9 @@ reason = "The switchy simulators and the simvar harness: they provide the contro
 
 [[audit]]
 name = "slab"
-version = "=0.4.12"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.4"
+verdict = "not-run"
+reason = "Linked through futures-util, h2, noq-proto and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "smallvec"
@@ -1062,27 +1067,27 @@ reason = "Inline vectors."
 
 [[audit]]
 name = "socket-pktinfo"
-version = "=0.4.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.4"
+verdict = "not-run"
+reason = "Linked through mdns-sd; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "socket2"
-version = "=0.6.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.6"
+verdict = "not-run"
+reason = "Linked through hyper-util, ipconfig, mdns-sd and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "spin"
-version = "=0.9.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.9"
+verdict = "not-run"
+reason = "Linked through flume; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "ssdp-client"
-version = "=2.1.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^2"
+verdict = "not-run"
+reason = "Linked through rupnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "stable_deref_trait"
@@ -1242,9 +1247,9 @@ reason = "Creates host files; tempfile:: is forbidden by the shared rules (switc
 
 [[audit]]
 name = "termcolor"
-version = "=1.4.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through color-backtrace; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "thiserror"
@@ -1254,15 +1259,15 @@ reason = "Error derive support."
 
 [[audit]]
 name = "thread_local"
-version = "=1.1.10"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through tracing-subscriber; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "time"
-version = "=0.3.55"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "not-run"
+reason = "Linked through iroh, moosicbox_log_runtime, plist; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "time-core"
@@ -1272,9 +1277,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "tinystr"
-version = "=0.8.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.8"
+verdict = "not-run"
+reason = "Linked through icu_locale_core; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tokio"
@@ -1284,21 +1289,21 @@ reason = "The simulator re-exports parts of it; its runtime, spawn, time, task, 
 
 [[audit]]
 name = "tokio-rustls"
-version = "=0.26.6"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.26"
+verdict = "not-run"
+reason = "Linked through hyper-rustls, iroh-relay, n0-dns-resolver and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tokio-stream"
-version = "=0.1.19"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.1"
+verdict = "not-run"
+reason = "Linked through iroh, noq, opentelemetry_sdk and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tokio-util"
-version = "=0.7.20"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.7"
+verdict = "not-run"
+reason = "Linked through h2, iroh, iroh-relay and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "toml"
@@ -1332,9 +1337,9 @@ reason = "TOML writing."
 
 [[audit]]
 name = "tonic"
-version = "=0.14.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.14"
+verdict = "not-run"
+reason = "Linked through opentelemetry-otlp, opentelemetry-proto, tonic-prost and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tonic-prost"
@@ -1344,15 +1349,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "tonic-types"
-version = "=0.14.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.14"
+verdict = "not-run"
+reason = "Linked through opentelemetry-otlp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tower"
-version = "=0.5.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.5"
+verdict = "not-run"
+reason = "Linked through reqwest, tonic, tower-http; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tower-http"
@@ -1386,21 +1391,21 @@ reason = "tracing's core: events go to the process's subscriber and nothing come
 
 [[audit]]
 name = "tracing-log"
-version = "=0.2.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.2"
+verdict = "not-run"
+reason = "Linked through moosicbox_log_runtime, tracing-opentelemetry, tracing-subscriber; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tracing-opentelemetry"
-version = "=0.34.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.34"
+verdict = "not-run"
+reason = "Linked through switchy_telemetry; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "tracing-subscriber"
-version = "=0.3.23"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "not-run"
+reason = "Linked through loom, moosicbox_log_runtime, switchy_telemetry and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "try-lock"
@@ -1422,9 +1427,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "url"
-version = "=2.5.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^2"
+verdict = "not-run"
+reason = "Linked through igd-next, iroh, iroh-base and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "urlencoding"
@@ -1452,9 +1457,9 @@ reason = "Uuid::new_v4 draws from getrandom, which simulation builds redirect to
 
 [[audit]]
 name = "want"
-version = "=0.3.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "not-run"
+reason = "Linked through hyper; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "winnow"
@@ -1464,15 +1469,15 @@ reason = "Parser combinators."
 
 [[audit]]
 name = "writeable"
-version = "=0.6.4"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.6"
+verdict = "not-run"
+reason = "Linked through icu_locale_core, icu_provider; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "xml"
-version = "=1.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "not-run"
+reason = "Linked through switchy_upnp; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "yoke"
@@ -1482,9 +1487,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "zerocopy"
-version = "=0.8.64"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.8"
+verdict = "not-run"
+reason = "Linked through ahash, netlink-packet-route, ppv-lite86; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "zerofrom"
@@ -1506,15 +1511,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "zerovec"
-version = "=0.11.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.11"
+verdict = "not-run"
+reason = "Linked through icu_collections, icu_locale_core, icu_normalizer and others; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "zlib-rs"
-version = "=0.6.8"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.6"
+verdict = "not-run"
+reason = "Linked through flate2; none of it runs in a run: no line ran in 300 guided runs of each simulation on Linux and macOS (2026-11-25), and `cargo sim NAME --coverage` checks that nightly."
 
 [[audit]]
 name = "zmij"
