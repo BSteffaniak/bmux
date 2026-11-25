@@ -20,7 +20,7 @@ use bmux_plugin_sdk::{
     PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
 use bmux_tabs_plugin_api::tabs_list::TabListEntry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
@@ -76,9 +76,81 @@ impl FinderPlugin {
         }
     }
 
-    fn show(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn show(
+        &self,
+        context: &NativeCommandContext,
+        mode: FinderMode,
+    ) -> Result<i32, PluginCommandError> {
         let (prompt, actions) = self.binding.ports()?;
-        show_finder(context, &self.tasks, &prompt, actions)
+        show_finder(context, &self.tasks, &prompt, actions, mode)
+    }
+}
+
+/// What the finder is opened for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinderMode {
+    /// `show`: discover any tab and switch to it, adding it to this
+    /// attachment's view first when it is not in it.
+    Open,
+    /// `add-to-view`: add a tab that is not in the view, without switching.
+    AddToView,
+}
+
+/// Which tabs this attachment's personal view holds.
+///
+/// A workspace the view has not arranged yet counts as holding all of its
+/// tabs: the view is seeded with them when the attachment first visits it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ViewMembership {
+    arranged: BTreeSet<Uuid>,
+    members: BTreeSet<Uuid>,
+}
+
+impl ViewMembership {
+    fn contains(&self, tab: &TabListEntry) -> bool {
+        !self.arranged.contains(&tab.workspace_id) || self.members.contains(&tab.id)
+    }
+}
+
+/// The invoking attachment's view membership, or `None` when it has no
+/// personal view (no attachment or principal, or a tabs plugin without
+/// personal views); the finder then works on shared tabs alone.
+fn load_view(context: &NativeCommandContext) -> Option<ViewMembership> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let binding = bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_personal_attachment::client::current_binding(&mut client),
+    )
+    .ok()?
+    .ok()?;
+    let view = bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_personal_views::client::get_view(&mut client, binding.view_id),
+    )
+    .ok()?
+    .ok()?;
+    let arranged = view
+        .workspaces
+        .iter()
+        .filter(|arrangement| arrangement.initialized);
+    Some(ViewMembership {
+        arranged: arranged
+            .clone()
+            .map(|arrangement| arrangement.workspace_id)
+            .collect(),
+        members: arranged
+            .flat_map(|arrangement| &arrangement.members)
+            .map(|member| member.context_id)
+            .collect(),
+    })
+}
+
+/// The action a chosen tab dispatches. Opening and adding go through the
+/// tabs plugin, which owns the view; without a view the finder switches
+/// through the workspaces authority as before personal views.
+fn finder_action(mode: FinderMode, view: bool, context_id: Uuid) -> String {
+    match (mode, view) {
+        (FinderMode::Open, true) => format!("plugin:bmux.tabs:open-tab {context_id}"),
+        (FinderMode::Open, false) => format!("plugin:bmux.workspaces:activate-tab {context_id}"),
+        (FinderMode::AddToView, _) => format!("plugin:bmux.tabs:add-tab-to-view {context_id}"),
     }
 }
 
@@ -106,11 +178,13 @@ fn load_windows(context: &NativeCommandContext) -> Result<Vec<TabListEntry>, Plu
         .collect()
 }
 
+#[allow(clippy::too_many_lines)] // One prompt request assembled from settings, catalog, view and visits.
 fn show_finder(
     context: &NativeCommandContext,
     tasks: &FinderTasks,
     prompt: &prompt::PromptPort,
     actions: action_dispatch::ActionDispatchPort,
+    mode: FinderMode,
 ) -> Result<i32, PluginCommandError> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| PluginCommandError::unavailable("finder requires a frontend async runtime"))?;
@@ -122,7 +196,16 @@ fn show_finder(
         .iter()
         .find(|tab| tab.active)
         .map(|tab| tab.workspace_id);
-    let entries = build_entries(&tabs, &settings, active_workspace_id);
+    let view = load_view(context);
+    if mode == FinderMode::AddToView && view.is_none() {
+        return Err(PluginCommandError::unavailable(
+            "this attachment has no personal tab view to add to",
+        ));
+    }
+    let mut entries = build_entries(&tabs, &settings, active_workspace_id, view.as_ref());
+    if mode == FinderMode::AddToView {
+        entries.retain(|entry| entry.in_view == Some(false));
+    }
     if entries.is_empty() {
         warn!("finder: no tabs available");
         return Ok(EXIT_OK);
@@ -142,11 +225,15 @@ fn show_finder(
         Vec::new()
     };
     let options = ordered_options(&entries, &tabs, &visits, &settings);
-    let request = PromptRequest::search_select("Find Tab", options)
+    let (title, submit) = match mode {
+        FinderMode::Open => ("Find Tab", "Switch"),
+        FinderMode::AddToView => ("Add Tab to View", "Add"),
+    };
+    let request = PromptRequest::search_select(title, options)
         .width_range(90, 90)
         .max_height(30)
         .message(settings.message())
-        .submit_label("Switch")
+        .submit_label(submit)
         .search_match_mode(PromptSearchMatchMode::OrderedV1 {
             matching: match settings.match_mode {
                 MatchMode::Fuzzy => PromptOrderedMatchMode::Fuzzy,
@@ -170,7 +257,8 @@ fn show_finder(
     let response = prompt.submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
     })?;
-    running.push(handle.spawn(handle_response(entries, response, actions, open)));
+    let action = move |context_id| finder_action(mode, view.is_some(), context_id);
+    running.push(handle.spawn(handle_response(entries, response, actions, open, action)));
     drop(running);
     Ok(EXIT_OK)
 }
@@ -401,10 +489,12 @@ fn ordered_options(
                 .iter()
                 .find(|tab| tab.id == entry.context_id)
                 .map(|tab| tab.name.clone());
+            // Tabs in this attachment's view come first, then the other
+            // shared tabs, then (when placed last) the current tab.
             option.search_order = Some(PromptSearchOrder {
-                group: u8::from(
+                group: 2 * u8::from(
                     settings.current_tab == CurrentTab::Last && active == Some(entry.context_id),
-                ),
+                ) + u8::from(entry.in_view == Some(false)),
                 initial: initial[index],
                 filtered: filtered[index],
             });
@@ -427,12 +517,15 @@ struct FinderEntry {
     label: String,
     detail: String,
     search_text: String,
+    /// Whether this attachment's view holds the tab; `None` without a view.
+    in_view: Option<bool>,
 }
 
 fn build_entries(
     tabs: &[TabListEntry],
     settings: &FinderSettings,
     active_workspace_id: Option<Uuid>,
+    view: Option<&ViewMembership>,
 ) -> Vec<FinderEntry> {
     tabs.iter()
         .filter(|tab| settings.current_tab != CurrentTab::Hidden || !tab.active)
@@ -450,11 +543,21 @@ fn build_entries(
             } else {
                 entry.name.clone()
             };
+            let in_view = view.map(|view| view.contains(entry));
+            let membership = match in_view {
+                Some(true) => " · in your view",
+                Some(false) => " · not in your view",
+                None => "",
+            };
             FinderEntry {
                 context_id: entry.id,
                 label,
-                detail: format!("workspace {} · tab {}", entry.workspace, entry.name),
+                detail: format!(
+                    "workspace {} · tab {}{membership}",
+                    entry.workspace, entry.name
+                ),
                 search_text: search_source,
+                in_view,
             }
         })
         .collect()
@@ -465,6 +568,7 @@ async fn handle_response(
     response: tokio::sync::oneshot::Receiver<PromptResponse>,
     actions: action_dispatch::ActionDispatchPort,
     open: OpenFinder,
+    action: impl FnOnce(Uuid) -> String,
 ) {
     let response = response.await;
     // The prompt closed when it delivered this response. Release before the
@@ -484,7 +588,7 @@ async fn handle_response(
         warn!(selected, "finder: invalid selection");
         return;
     };
-    let action = format!("plugin:bmux.workspaces:activate-tab {}", entry.context_id);
+    let action = action(entry.context_id);
     if let Err(error) = actions.dispatch(&action) {
         warn!(%error, "finder: tab switch failed");
     }
@@ -495,7 +599,13 @@ impl Plugin for FinderPlugin {
         d.native_command(
             "show",
             |plugin: &Self, cx: &Call, context: NativeCommandContext| {
-                std::future::ready(plugin.command_now(cx, &context))
+                std::future::ready(plugin.command_now(cx, &context, FinderMode::Open))
+            },
+        );
+        d.native_command(
+            "add-to-view",
+            |plugin: &Self, cx: &Call, context: NativeCommandContext| {
+                std::future::ready(plugin.command_now(cx, &context, FinderMode::AddToView))
             },
         );
     }
@@ -522,7 +632,12 @@ impl Plugin for FinderPlugin {
 }
 
 impl FinderPlugin {
-    fn command_now(&self, cx: &Call, context: &NativeCommandContext) -> author::Result<i32> {
+    fn command_now(
+        &self,
+        cx: &Call,
+        context: &NativeCommandContext,
+        mode: FinderMode,
+    ) -> author::Result<i32> {
         if cx
             .cancellation()
             .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
@@ -535,7 +650,7 @@ impl FinderPlugin {
             cx.invocation()
                 .and_then(|call| call.callback_execution.as_ref()),
         )?;
-        let result = self.show(context);
+        let result = self.show(context, mode);
         drop(entry);
         result
     }
@@ -632,10 +747,12 @@ mod tests {
                 label: "other/tab".into(),
                 detail: String::new(),
                 search_text: String::new(),
+                in_view: None,
             }],
             selection,
             actions.clone(),
             OpenFinder(Arc::new(AtomicBool::new(true))),
+            |id| finder_action(FinderMode::Open, false, id),
         )
         .await;
         assert_eq!(
@@ -669,10 +786,12 @@ mod tests {
                 label: "other/tab".into(),
                 detail: String::new(),
                 search_text: String::new(),
+                in_view: None,
             }],
             selection,
             actions,
             OpenFinder(open.clone()),
+            |id| finder_action(FinderMode::Open, true, id),
         ));
         assert!(open.load(Ordering::Acquire));
         response
@@ -704,6 +823,7 @@ mod tests {
             selection,
             actions,
             OpenFinder(open.clone()),
+            |id| finder_action(FinderMode::Open, true, id),
         ));
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -736,12 +856,65 @@ mod tests {
             &[window(1, 2, "project", "editor", true)],
             &settings,
             Some(Uuid::from_u128(2)),
+            None,
         );
 
         assert_eq!(entries[0].label, "project/editor");
         assert!(entries[0].detail.contains("project"));
         assert!(entries[0].search_text.contains("project"));
         assert!(entries[0].search_text.contains("editor"));
+    }
+
+    #[test]
+    fn all_tabs_are_listed_and_marked_by_view_membership_view_first() {
+        let settings = FinderSettings {
+            current_tab: CurrentTab::Last,
+            ..FinderSettings::default()
+        };
+        let tabs = vec![
+            window(1, 10, "a", "current", true),
+            window(2, 10, "a", "removed", false),
+            window(3, 10, "a", "kept", false),
+            // The view has not arranged workspace 20: its tabs join on the
+            // first visit, so they count as in the view.
+            window(4, 20, "b", "unvisited", false),
+        ];
+        let view = ViewMembership {
+            arranged: [Uuid::from_u128(10)].into(),
+            members: [Uuid::from_u128(1), Uuid::from_u128(3)].into(),
+        };
+        let entries = build_entries(&tabs, &settings, None, Some(&view));
+        assert_eq!(entries.len(), 4, "discovery lists every shared tab");
+        let marks: Vec<_> = entries.iter().map(|entry| entry.in_view).collect();
+        assert_eq!(marks, [Some(true), Some(false), Some(true), Some(true)]);
+        assert!(entries[1].detail.ends_with("not in your view"));
+        assert!(entries[2].detail.ends_with("· in your view"));
+        let groups: Vec<_> = ordered_options(&entries, &tabs, &[], &settings)
+            .iter()
+            .map(|option| option.search_order.unwrap().group)
+            .collect();
+        assert_eq!(groups, [2, 1, 0, 0]);
+        // Without a view nothing is marked and nothing is grouped apart.
+        let plain = build_entries(&tabs, &settings, None, None);
+        assert!(plain.iter().all(|entry| entry.in_view.is_none()));
+        assert!(!plain[1].detail.contains("view"));
+    }
+
+    #[test]
+    fn chosen_tabs_open_or_join_the_view_through_the_tabs_plugin() {
+        let id = Uuid::from_u128(5);
+        assert_eq!(
+            finder_action(FinderMode::Open, true, id),
+            format!("plugin:bmux.tabs:open-tab {id}")
+        );
+        assert_eq!(
+            finder_action(FinderMode::Open, false, id),
+            format!("plugin:bmux.workspaces:activate-tab {id}")
+        );
+        assert_eq!(
+            finder_action(FinderMode::AddToView, true, id),
+            format!("plugin:bmux.tabs:add-tab-to-view {id}")
+        );
     }
 
     #[test]
@@ -783,6 +956,7 @@ mod tests {
             ],
             &settings,
             Some(Uuid::from_u128(10)),
+            None,
         );
 
         assert_eq!(entries.len(), 1);
@@ -800,6 +974,7 @@ mod tests {
             &[window(1, 2, "project", "editor", true)],
             &settings,
             Some(Uuid::from_u128(2)),
+            None,
         );
 
         assert_eq!(entries[0].search_text, "editor");
@@ -833,7 +1008,7 @@ mod tests {
             window(3, 20, "b", "recent", false),
             window(4, 20, "b", "unvisited", false),
         ];
-        let entries = build_entries(&tabs, &settings, None);
+        let entries = build_entries(&tabs, &settings, None, None);
         let options = ordered_options(
             &entries,
             &tabs,
@@ -869,9 +1044,9 @@ mod tests {
             window(2, 10, "w", "b", false),
             window(3, 10, "w", "a", false),
         ];
-        let entries = build_entries(&tabs, &settings, None);
+        let entries = build_entries(&tabs, &settings, None, None);
         let options = ordered_options(&entries, &tabs, &[], &settings);
-        assert_eq!(options[0].search_order.unwrap().group, 1);
+        assert_eq!(options[0].search_order.unwrap().group, 2);
         assert_eq!(options[1].search_order.unwrap().group, 0);
         assert_eq!(options[2].search_order.unwrap().initial, 2);
         assert_eq!(options[2].search_order.unwrap().filtered, 0);

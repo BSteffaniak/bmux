@@ -17,6 +17,18 @@ client can navigate tabs independently.
 - `tabs kill <target>` -- close a specific tab
 - `tabs kill-all` -- close all tabs in the session
 - `tabs switch <target>` -- switch the active tab
+- `next-tab`, `prev-tab`, `goto-tab N`, `last-tab`, `close-current-tab` --
+  walk the caller's personal tab view in the active workspace (an attachment's
+  bound view; a CLI caller's default view where it already arranges the
+  workspace). Callers without one (no principal, or acting for no client) walk
+  the shared order. `close-current-tab` closes the tab for everyone.
+- `tab remove-from-view` -- remove the current tab from this attachment's view;
+  it keeps running and stays discoverable (no default key binding; use the
+  command palette, the tab bar menu or bind it yourself)
+- `tab open <TAB_ID>` -- add a tab to this attachment's view if absent, then
+  switch to it (the finder's choice)
+- `tab add-to-view <TAB_ID>` -- add a tab to this attachment's view without
+  switching
 
 ## Spawn-directory inspection (in development)
 

@@ -73,10 +73,20 @@ navigation remains available at the row ceiling. Status modules appear once.
 Explicit legacy `height` preserves fixed-height single-row behavior and cannot
 be combined with the new row settings. See `docs/tab-presentations.md`.
 
+The strip shows this attachment's personal tab view (delivered to it alone by
+`bmux.tabs`): its members of the active workspace, in its order, with its
+labels. Without one (no principal) it shows the shared order.
+
 Interactions include click switching, hover feedback, drag reorder, wheel
-navigation, middle-click inline rename, and a right-click Switch/Rename/Close
-menu. Rename and menu keyboard input is captured by the plugin and mutations go
-through generated `bmux.tabs` clients.
+navigation, middle-click inline rename, and a right-click menu: Switch, Rename,
+Remove from view (only with a personal view; the tab keeps running) and Close
+for everyone… (asks for confirmation, Cancel first, then terminates the tab
+for
+every user). Drag reorder and the selection menu's Move left/right reorder the
+personal view, never the shared order; the selection menu also offers Remove
+selected from view next to the confirmed Close selected tabs…. Rename and menu
+keyboard input is captured by the plugin and mutations go through generated
+`bmux.tabs` clients.
 
 Migration-era aliases remain accepted when the canonical key is absent:
 `label_template`, `maximum_label_width`, `maximum_visible_tabs`, `show_index`,

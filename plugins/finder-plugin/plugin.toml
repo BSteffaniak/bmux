@@ -13,5 +13,12 @@ name          = "show"
 path          = ["finder", "show"]
 summary       = "Search tabs across workspaces"
 
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "add-to-view"
+path          = ["finder", "add-to-view"]
+summary       = "Add a tab from any workspace to this attachment's tab view"
+
 [keybindings.runtime]
 "shift+f" = "plugin:bmux.finder:show"

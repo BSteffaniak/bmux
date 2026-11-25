@@ -46,6 +46,7 @@ use bmux_tabs_plugin_api::personal_view::{
     PersonalViewMember, PersonalViewProjection, PersonalViewWorkspace, STATE_KIND,
 };
 use bmux_tabs_plugin_api::tabs_personal_attachment::{PersonalAttachmentError, PersonalBinding};
+use bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck;
 use bmux_tabs_plugin_api::tabs_personal_views::PersonalView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -736,6 +737,237 @@ impl Attachments {
         }
         Err("seeding the active workspace kept conflicting".into())
     }
+}
+
+/// An edit of the invoking attachment's bound view, by tab
+/// (`tabs-personal-actions/v1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewEdit {
+    /// Add the tab when absent.
+    Add,
+    /// Remove the tab when present.
+    Remove,
+    /// Move the member tab before the member tab `before`, or to the end.
+    Move { before: Option<Uuid> },
+}
+
+/// Personal navigation (`next-tab`, `goto-tab`, ...) and tab-addressed view
+/// edits.
+impl Attachments {
+    /// The order the caller's navigation walks in `workspace`: the context
+    /// ids of its view's arrangement of that workspace, in view order
+    /// (dangling and moved members included; the caller filters to live
+    /// tabs of the workspace).
+    ///
+    /// An attached caller walks its bound view, seeding the workspace on
+    /// first access. A caller with a principal but no attachment (a CLI
+    /// command) walks its default view when that view already arranges the
+    /// workspace. `None` means personal order does not apply (no client, no
+    /// principal, no default view yet or an unarranged workspace for an
+    /// unattached caller), and the caller falls back to the shared order.
+    ///
+    /// # Errors
+    /// The view repository failed for a caller that has a view.
+    pub fn navigation_order<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        workspace: Uuid,
+    ) -> Result<Option<Vec<Uuid>>> {
+        let Some(client) = client.filter(|id| !id.is_nil()) else {
+            return Ok(None);
+        };
+        if self.binding(client)?.is_none() && !env.host.is_attached(client) {
+            let OwnerResolution::Owner(owner) = resolve_caller(env.caller) else {
+                return Ok(None);
+            };
+            return match Repository::new(env.caller, env.states).default_view(owner) {
+                Ok(view) => Ok(arrangement_order(&view, workspace)),
+                Err(
+                    PersonalViewError::NotInitialized
+                    | PersonalViewError::NotFound
+                    | PersonalViewError::NoPrincipal,
+                ) => Ok(None),
+                Err(error) => Err(view_error(error)),
+            };
+        }
+        let (_, binding) = match self.invoking_binding(env, Some(client)) {
+            Ok(found) => found,
+            Err(PersonalAttachmentError::NoAttachment | PersonalAttachmentError::NoPrincipal) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let view = self.arranged_view(env, &binding, workspace)?;
+        Ok(arrangement_order(&view, workspace))
+    }
+
+    /// The binding's view, with `workspace` seeded when it has no
+    /// arrangement yet.
+    fn arranged_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        binding: &Binding,
+        workspace: Uuid,
+    ) -> Result<PersonalView> {
+        let view = Repository::new(env.caller, env.states)
+            .get_view(binding.owner, binding.view_id)
+            .map_err(view_error)?;
+        if view
+            .workspaces
+            .iter()
+            .any(|arrangement| arrangement.workspace_id == workspace)
+        {
+            return Ok(view);
+        }
+        let view = Self::initialize(env, binding.owner, view, workspace).map_err(unavailable)?;
+        self.schedule();
+        Ok(view)
+    }
+
+    /// Apply `edit` for `context` to the invoking attachment's bound view,
+    /// resolving members and the current revision, and retrying when another
+    /// attachment edited the view meanwhile. When the edit removes this
+    /// attachment's selected tab, `select` selects its neighbour.
+    ///
+    /// # Errors
+    /// `no-attachment`, `no-principal`, `invalid-reference` (the tab is not
+    /// live, or a moved tab or `before` is not a member of the tab's
+    /// arrangement), or `unavailable`.
+    pub fn edit_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        context: Uuid,
+        edit: ViewEdit,
+        select: impl FnOnce(Uuid) -> std::result::Result<(), String>,
+    ) -> Result<PersonalAck> {
+        let (client, binding) = self.invoking_binding(env, client)?;
+        let contexts = crate::list_contexts(env.caller).map_err(unavailable)?;
+        let workspace = contexts
+            .iter()
+            .find(|candidate| candidate.id == context)
+            .map(workspace_of)
+            .ok_or(PersonalAttachmentError::InvalidReference)?;
+        let live: BTreeSet<Uuid> = contexts
+            .iter()
+            .filter(|candidate| workspace_of(candidate) == workspace)
+            .map(|candidate| candidate.id)
+            .collect();
+        let repository = Repository::new(env.caller, env.states);
+        let catalog = LiveCatalog::new(env.caller);
+        for _ in 0..4 {
+            let view = self.arranged_view(env, &binding, workspace)?;
+            let order = arrangement_order(&view, workspace).unwrap_or_default();
+            let member = |tab: Uuid| {
+                view.workspaces
+                    .iter()
+                    .find(|arrangement| arrangement.workspace_id == workspace)
+                    .and_then(|arrangement| {
+                        arrangement
+                            .members
+                            .iter()
+                            .find(|member| member.context_id == tab)
+                    })
+                    .map(|member| member.member_id)
+            };
+            let unchanged = PersonalAck {
+                view_id: view.view_id,
+                revision: view.revision,
+                member_id: member(context),
+            };
+            let command = match edit {
+                ViewEdit::Add => {
+                    if unchanged.member_id.is_some() {
+                        return Ok(unchanged);
+                    }
+                    Command::AddTab {
+                        view_id: view.view_id,
+                        expected_revision: view.revision,
+                        context_id: context,
+                        before: None,
+                    }
+                }
+                ViewEdit::Remove => {
+                    let Some(member_id) = unchanged.member_id else {
+                        return Ok(unchanged);
+                    };
+                    Command::RemoveTab {
+                        view_id: view.view_id,
+                        expected_revision: view.revision,
+                        member_id,
+                    }
+                }
+                ViewEdit::Move { before } => {
+                    let member_id = unchanged
+                        .member_id
+                        .ok_or(PersonalAttachmentError::InvalidReference)?;
+                    let before = match before {
+                        Some(tab) if tab == context => return Ok(unchanged),
+                        Some(tab) => {
+                            Some(member(tab).ok_or(PersonalAttachmentError::InvalidReference)?)
+                        }
+                        None => None,
+                    };
+                    Command::MoveTab {
+                        view_id: view.view_id,
+                        expected_revision: view.revision,
+                        member_id,
+                        before,
+                    }
+                }
+            };
+            // When this attachment's own tab leaves the view, it moves to
+            // the next live member, else the previous one.
+            let neighbour = (edit == ViewEdit::Remove
+                && env.host.selected_context(client) == Some(context))
+            .then(|| removal_neighbour(&order, &live, context))
+            .flatten();
+            match repository.apply(
+                binding.owner,
+                Uuid::new_v4(),
+                &command,
+                &catalog as &dyn Catalog,
+                env.now_ms,
+            ) {
+                Ok(ack) => {
+                    self.schedule();
+                    if let Some(neighbour) = neighbour {
+                        select(neighbour).map_err(unavailable)?;
+                    }
+                    return Ok(ack);
+                }
+                Err(PersonalViewError::RevisionConflict { .. }) => {}
+                Err(error) => return Err(view_error(error)),
+            }
+        }
+        Err(unavailable("the view kept changing; try again"))
+    }
+}
+
+/// The context ids of `view`'s arrangement of `workspace`, in view order, or
+/// `None` when the view has not arranged that workspace.
+fn arrangement_order(view: &PersonalView, workspace: Uuid) -> Option<Vec<Uuid>> {
+    view.workspaces
+        .iter()
+        .find(|arrangement| arrangement.workspace_id == workspace && arrangement.initialized)
+        .map(|arrangement| {
+            arrangement
+                .members
+                .iter()
+                .map(|member| member.context_id)
+                .collect()
+        })
+}
+
+/// The live member after `removed` in `order`, else the live one before it.
+fn removal_neighbour(order: &[Uuid], live: &BTreeSet<Uuid>, removed: Uuid) -> Option<Uuid> {
+    let position = order.iter().position(|tab| *tab == removed)?;
+    order[position + 1..]
+        .iter()
+        .chain(order[..position].iter().rev())
+        .copied()
+        .find(|tab| live.contains(tab))
 }
 
 const fn check_revision(binding: &Binding, expected: u64) -> Result<()> {

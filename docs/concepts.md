@@ -34,8 +34,10 @@ Workspace deletion and tab-finder behavior are configured through plugin
 settings:
 
 ```toml
-[plugins.settings."bmux.workspaces"]
-# "delete" (default) removes an empty workspace; "keep_empty" retains it.
+[plugins.settings."bmux.tabs"]
+# When `close-current-tab` closes the last tab of a workspace (for everyone,
+# not merely the last tab of your personal view): "delete" (default) also
+# removes the workspace; "keep_empty" retains it.
 on_last_tab_closed = "delete"
 
 [plugins.settings."bmux.finder"]
@@ -70,6 +72,14 @@ and tab
 arrangements; `alphabetical` sorts displayed labels. These projections never
 rearrange the tab bar. `current_tab = "last"` places the current tab after other
 matches regardless of ranking; `in_order` treats it like any other result.
+
+The finder is discovery over every shared tab, not only those in your
+personal tab view. Each entry's detail says whether it is in your view, and
+tabs in your view are listed before the others. Choosing a tab adds it to your
+view when it is absent, then switches to it. `bmux finder add-to-view` (or
+`plugin:bmux.finder:add-to-view`) lists only the tabs your view lacks and adds
+the chosen one without switching. Without a personal view (no attachment or
+principal) the finder switches as it always did.
 
 Visit history belongs to the invoking client, not other attachments. It is
 transient, cleared on disconnect, and not restored across server restarts.

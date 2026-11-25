@@ -5,6 +5,9 @@ plugin bmux.finder version 1;
 /// What `bmux.finder` provides to and requires from the host and other plugins.
 world finder {
     require capability bmux.tabs.read;
+    // Reads this attachment's personal view binding (current-binding) to
+    // mark which tabs the view holds.
+    require capability bmux.tabs.write;
     require capability bmux.workspaces.read;
     require capability bmux.contexts.read;
 }

@@ -536,6 +536,35 @@ interface tabs-personal-attachment {
         -> result<personal-binding, personal-attachment-error>;
 }
 
+// Edits of the invoking attachment's bound view, addressed by tab (context
+// id) the way presentations show it. The tabs plugin resolves the members and
+// the current view revision itself, retrying when another attachment edits
+// the same view, so no caller supplies a revision or a mutation id. Each
+// operation is idempotent by content: adding a member tab, removing an absent
+// one or moving a tab to where it already is changes nothing. A workspace the
+// view has not arranged yet is seeded from the canonical order first.
+@capability(TABS_WRITE)
+@interface-version(1)
+interface tabs-personal-actions {
+    // Add a live tab to the view at the end of its workspace's arrangement,
+    // without selecting it.
+    command add-tab(context-id: uuid)
+        -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
+    // Add a live tab when absent, then select it, switching workspace when
+    // it lives in another one (finder discovery).
+    command open-tab(context-id: uuid)
+        -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
+    // Remove a tab from the view. The tab keeps running and stays
+    // discoverable. When it was this attachment's selected tab, the next
+    // member (else the previous one) of the arrangement is selected.
+    command remove-tab(context-id: uuid)
+        -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
+    // Move a member tab before another member tab of the same arrangement,
+    // or to its end.
+    command move-tab(context-id: uuid, before: uuid?)
+        -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
+}
+
 // One attachment's projection of its bound personal view, published by the
 // tabs plugin only to that attachment (recipient-scoped retained delivery,
 // never broadcast). Each publication is complete: members whose tabs are not
@@ -763,6 +792,7 @@ world tabs {
     provide tabs-personal-views;
     provide tabs-personal-commands;
     provide tabs-personal-attachment;
+    provide tabs-personal-actions;
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;

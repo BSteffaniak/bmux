@@ -656,3 +656,166 @@ fn created_tabs_join_the_creating_attachments_bound_view() {
     join_created_tab_for_caller(&a, &states, tab(5), WS, Some((owner(1), work))).unwrap();
     assert!(in_view(default, tab(5)));
 }
+
+fn no_selection(_: Uuid) -> std::result::Result<(), String> {
+    panic!("this edit must not select a tab")
+}
+
+#[test]
+fn navigation_walks_each_callers_own_view_and_falls_back_without_one() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.host.attach(client(2), Some(principal(2)), tab(1));
+    fixture.refresh();
+    let a = fixture.as_client(Some(1));
+    let b = fixture.as_client(Some(2));
+    let order = |caller: &MemoryHost, client: Option<Uuid>, workspace: Uuid| {
+        fixture
+            .attachments
+            .navigation_order(&fixture.env(caller), client, workspace)
+            .unwrap()
+    };
+    let seeded = vec![tab(1), tab(2), tab(3)];
+    assert_eq!(order(&a, Some(client(1)), WS), Some(seeded.clone()));
+
+    // A's reorder changes only A's order.
+    fixture
+        .attachments
+        .edit_view(
+            &fixture.env(&a),
+            Some(client(1)),
+            tab(3),
+            ViewEdit::Move {
+                before: Some(tab(1)),
+            },
+            no_selection,
+        )
+        .unwrap();
+    assert_eq!(
+        order(&a, Some(client(1)), WS),
+        Some(vec![tab(3), tab(1), tab(2)])
+    );
+    assert_eq!(order(&b, Some(client(2)), WS), Some(seeded));
+
+    // An attached caller's first visit to a workspace seeds it.
+    fixture.add_tab(tab(9), None, OTHER_WS);
+    assert_eq!(order(&a, Some(client(1)), OTHER_WS), Some(vec![tab(9)]));
+
+    // An unattached caller (a CLI command) walks its default view where it
+    // already arranges the workspace, and falls back elsewhere.
+    assert_eq!(
+        order(&a, Some(client(7)), WS),
+        Some(vec![tab(3), tab(1), tab(2)])
+    );
+    let fresh_ws = id(0x5_0002);
+    fixture.add_tab(tab(8), None, fresh_ws);
+    assert_eq!(order(&a, Some(client(7)), fresh_ws), None);
+    // No principal, or no client at all: the shared order applies.
+    assert_eq!(order(&fixture.as_client(None), Some(client(8)), WS), None);
+    assert_eq!(order(&a, None, WS), None);
+    // A principal that never had a view: nothing is created by navigating.
+    let c = fixture.as_client(Some(3));
+    assert_eq!(order(&c, Some(client(9)), WS), None);
+    assert_eq!(fixture.repo().list_views(owner(3)).unwrap().len(), 0);
+}
+
+#[test]
+fn tab_addressed_edits_change_only_the_bound_view_and_move_the_editor_off_a_removed_tab() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.refresh();
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    let order = || {
+        fixture
+            .attachments
+            .navigation_order(&env, Some(client(1)), WS)
+            .unwrap()
+            .unwrap()
+    };
+    let edit = |context, edit, select: &mut Vec<Uuid>| {
+        fixture
+            .attachments
+            .edit_view(&env, Some(client(1)), context, edit, |tab| {
+                select.push(tab);
+                fixture.host.select(client(1), tab);
+                Ok(())
+            })
+    };
+    let mut selected = Vec::new();
+
+    // Removing the selected tab selects the next member; the tab lives on.
+    let removed = edit(tab(1), ViewEdit::Remove, &mut selected).unwrap();
+    assert_eq!(selected, [tab(2)]);
+    assert_eq!(order(), [tab(2), tab(3)]);
+    assert!(
+        crate::list_contexts(&fixture.storage)
+            .unwrap()
+            .iter()
+            .any(|context| context.id == tab(1))
+    );
+    // Removing an absent tab changes nothing.
+    let again = edit(tab(1), ViewEdit::Remove, &mut selected).unwrap();
+    assert_eq!(again.revision, removed.revision);
+    assert_eq!(again.member_id, None);
+    // The last member's neighbour is the previous one.
+    fixture.host.select(client(1), tab(3));
+    selected.clear();
+    edit(tab(3), ViewEdit::Remove, &mut selected).unwrap();
+    assert_eq!(selected, [tab(2)]);
+    assert_eq!(order(), [tab(2)]);
+
+    // Adding appends once; a repeat is unchanged.
+    let added = edit(tab(1), ViewEdit::Add, &mut selected).unwrap();
+    assert_eq!(order(), [tab(2), tab(1)]);
+    let repeat = edit(tab(1), ViewEdit::Add, &mut selected).unwrap();
+    assert_eq!(
+        (repeat.revision, repeat.member_id),
+        (added.revision, added.member_id)
+    );
+    // Moving is by tab; `before` must be a member of the same arrangement.
+    edit(
+        tab(1),
+        ViewEdit::Move {
+            before: Some(tab(2)),
+        },
+        &mut selected,
+    )
+    .unwrap();
+    assert_eq!(order(), [tab(1), tab(2)]);
+    edit(tab(1), ViewEdit::Move { before: None }, &mut selected).unwrap();
+    assert_eq!(order(), [tab(2), tab(1)]);
+    assert_eq!(
+        edit(
+            tab(1),
+            ViewEdit::Move {
+                before: Some(tab(3))
+            },
+            &mut selected
+        ),
+        Err(PersonalAttachmentError::InvalidReference),
+        "tab 3 is no longer in the view"
+    );
+    assert_eq!(
+        edit(tab(3), ViewEdit::Move { before: None }, &mut selected),
+        Err(PersonalAttachmentError::InvalidReference)
+    );
+    assert_eq!(
+        edit(id(0xDEAD), ViewEdit::Add, &mut selected),
+        Err(PersonalAttachmentError::InvalidReference),
+        "only live tabs can be added"
+    );
+    assert_eq!(selected, [tab(2)], "only removing the selected tab selects");
+
+    // Only an attachment edits a bound view.
+    assert_eq!(
+        fixture.attachments.edit_view(
+            &env,
+            Some(client(5)),
+            tab(1),
+            ViewEdit::Remove,
+            no_selection
+        ),
+        Err(PersonalAttachmentError::NoAttachment)
+    );
+}

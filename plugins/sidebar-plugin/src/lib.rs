@@ -12,6 +12,7 @@ pub mod declaration {
 
 mod activity;
 mod look;
+mod personal_tabs;
 #[cfg(test)]
 mod preview;
 mod view;
@@ -33,7 +34,7 @@ use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
 };
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
-use bmux_tabs_plugin_api::{tabs_list, tabs_status};
+use bmux_tabs_plugin_api::{personal_view, tabs_list, tabs_status};
 use bmux_tui_components::virtual_list::{CursorInput, CursorOutcome, ItemCursor};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -411,6 +412,9 @@ struct CompanionState {
     catalog: tabs_list::TabListSnapshot,
     /// This attachment's own selection (`tabs-local-view`), when known.
     selected_context_id: Option<Uuid>,
+    /// This attachment's projection of its personal tab view, when it has
+    /// one; it decides which tabs are listed and in what order.
+    personal: Option<personal_view::PersonalViewProjection>,
     snapshot: tabs_list::TabListSnapshot,
     /// The highlighted row, moved by the pointer (hover) and the keyboard.
     cursor: ItemCursor<SidebarHit>,
@@ -636,6 +640,7 @@ impl CompanionState {
                 revision: 0,
             },
             selected_context_id: None,
+            personal: None,
             snapshot: tabs_list::TabListSnapshot {
                 tabs: Vec::new(),
                 revision: 0,
@@ -1337,16 +1342,14 @@ impl CompanionState {
         })
     }
 
-    /// Apply a catalog snapshot. The shared catalog cannot know which tab is
-    /// this attachment's, so a known client-local selection decides `active`,
-    /// exactly as the tab bar does.
-    fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
-        self.catalog = snapshot.clone();
-        if let Some(selected) = self.selected_context_id {
-            for tab in &mut snapshot.tabs {
-                tab.active = tab.id == selected;
-            }
-        }
+    /// Apply a catalog snapshot, arranged by this attachment's personal view
+    /// when it has one ([`personal_tabs::arrange`]). The shared catalog cannot
+    /// know which tab is this attachment's, so a known client-local selection
+    /// decides `active`, exactly as the tab bar does.
+    fn replace_tabs(&mut self, catalog: tabs_list::TabListSnapshot) {
+        let snapshot =
+            personal_tabs::arrange(&catalog, self.personal.as_ref(), self.selected_context_id);
+        self.catalog = catalog;
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
             let keys = self.item_keys();
@@ -1362,6 +1365,17 @@ impl CompanionState {
     fn remeasure(&mut self, reveal_active: bool) {
         self.revision = self.revision.saturating_add(1).max(1);
         self.settle_scroll(reveal_active);
+    }
+
+    /// Adopt this attachment's personal view projection (the nil view means
+    /// it has none). Returns whether it changed.
+    fn set_personal(&mut self, projection: personal_view::PersonalViewProjection) -> bool {
+        let projection = (!projection.view_id.is_nil()).then_some(projection);
+        if self.personal == projection {
+            return false;
+        }
+        self.personal = projection;
+        true
     }
 
     fn select(&mut self, context_id: Option<Uuid>) {
@@ -1498,6 +1512,7 @@ impl SidebarPresentation {
             .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
             .map_err(|error| format!("subscribing to tabs list: {error}"))?;
         let (initial_selection, mut selection_rx) = subscribe_selection(&resources.events);
+        let (initial_personal, mut personal_rx) = subscribe_personal_view(&resources.events)?;
         let mut facts_rx = facts.subscribe()?;
         let (initial_status, mut status_rx) = subscribe_tab_status(&resources.events)?;
         let (initial_appearance, mut appearance_rx) = subscribe_appearance(&resources.events);
@@ -1523,6 +1538,7 @@ impl SidebarPresentation {
                 companion.apply_appearance(appearance);
             }
             companion.selected_context_id = initial_selection;
+            companion.set_personal(initial_personal.as_ref().clone());
             companion.replace_tabs(initial.as_ref().clone());
             publish_companion(companion)?;
             let owner = std::sync::Arc::downgrade(&presentation.owner);
@@ -1534,51 +1550,34 @@ impl SidebarPresentation {
                 let mut frame = spinner_frames();
                 loop {
                     let animating = animating(&owner);
-                    let mut status = None;
-                    let mut ticked = false;
-                    let mut animated = false;
-                    let mut selection = None;
-                    let mut appearance = None;
-                    let tabs = tokio::select! {
+                    let mut changes = Changes::default();
+                    tokio::select! {
                         result = tabs_rx.changed() => {
                             if result.is_err() { break; }
-                            Some(tabs_rx.borrow_and_update().as_ref().clone())
+                            changes.tabs = Some(tabs_rx.borrow_and_update().as_ref().clone());
+                        }
+                        result = personal_rx.changed() => {
+                            if result.is_err() { break; }
+                            changes.personal =
+                                Some(personal_rx.borrow_and_update().as_ref().clone());
                         }
                         context_id = next_selection(&mut selection_rx) => {
-                            selection = Some(context_id);
-                            None
+                            changes.selection = Some(SelectionChange(context_id));
                         }
                         result = facts_rx.changed() => {
                             if result.is_err() { break; }
                             facts_rx.borrow_and_update();
-                            None
                         }
                         result = status_rx.changed() => {
                             if result.is_err() { break; }
-                            status = Some(status_rx.borrow_and_update().as_ref().clone());
-                            None
+                            changes.status = Some(status_rx.borrow_and_update().as_ref().clone());
                         }
-                        changed = next_appearance(&mut appearance_rx) => {
-                            appearance = Some(changed);
-                            None
+                        appearance = next_appearance(&mut appearance_rx) => {
+                            changes.appearance = Some(appearance);
                         }
-                        _ = tick.tick() => {
-                            ticked = true;
-                            None
-                        }
-                        _ = frame.tick(), if animating => {
-                            animated = true;
-                            None
-                        }
-                    };
-                    let changes = Changes {
-                        tabs,
-                        selection: selection.map(SelectionChange),
-                        status,
-                        appearance,
-                        ticked,
-                        animated,
-                    };
+                        _ = tick.tick() => changes.ticked = true,
+                        _ = frame.tick(), if animating => changes.animated = true,
+                    }
                     if !apply_and_publish(&owner, changes) {
                         break;
                     }
@@ -2373,8 +2372,11 @@ struct SelectionChange(Option<Uuid>);
 
 /// What changed since the sidebar last looked: a new tab list, this
 /// client's selection, tab status or appearance, or only time passing.
+#[derive(Default)]
 struct Changes {
     tabs: Option<tabs_list::TabListSnapshot>,
+    /// A new personal view projection for this attachment.
+    personal: Option<personal_view::PersonalViewProjection>,
     selection: Option<SelectionChange>,
     status: Option<tabs_status::TabStatusSnapshot>,
     appearance: Option<bmux_appearance::RuntimeAppearance>,
@@ -2388,6 +2390,7 @@ impl CompanionState {
     fn apply_changes(&mut self, changes: Changes) -> bool {
         let Changes {
             tabs,
+            personal,
             selection,
             status,
             appearance,
@@ -2400,7 +2403,12 @@ impl CompanionState {
         if ticked && !self.activity.time_sensitive() {
             return false;
         }
-        if animated && tabs.is_none() && selection.is_none() && status.is_none() {
+        if animated
+            && tabs.is_none()
+            && personal.is_none()
+            && selection.is_none()
+            && status.is_none()
+        {
             // Only the spinner's glyph changes; nothing needs measuring.
             if !self.animates() {
                 return false;
@@ -2412,10 +2420,16 @@ impl CompanionState {
         if let Some(status) = status {
             self.activity.replace(status);
         }
+        let personal_changed = personal.is_some_and(|projection| self.set_personal(projection));
         if let Some(tabs) = tabs {
             self.replace_tabs(tabs);
         } else if let Some(SelectionChange(context_id)) = selection {
             self.select(context_id);
+            if personal_changed {
+                self.replace_tabs(self.catalog.clone());
+            }
+        } else if personal_changed {
+            self.replace_tabs(self.catalog.clone());
         } else {
             // Only a fact change brings the active tab back into
             // view; status updates and ticks keep the scroll.
@@ -2561,6 +2575,40 @@ fn subscribe_tab_status(
     events
         .subscribe_state::<tabs_status::TabStatusSnapshot>(&tabs_status::STATE_KIND)
         .map_err(|error| format!("subscribing to tab status: {error}"))
+}
+
+/// This attachment's personal tab view projection, delivered only to it by
+/// the tabs plugin through the runtime's generic forwarded-state path;
+/// registers its decoder when nothing has yet (the tab bar may have). The nil
+/// view means none.
+fn subscribe_personal_view(
+    events: &std::sync::Arc<bmux_plugin::EventBus>,
+) -> Result<
+    (
+        std::sync::Arc<personal_view::PersonalViewProjection>,
+        tokio::sync::watch::Receiver<std::sync::Arc<personal_view::PersonalViewProjection>>,
+    ),
+    String,
+> {
+    let kind = &personal_view::STATE_KIND;
+    if let Ok(subscription) = events.subscribe_state::<personal_view::PersonalViewProjection>(kind)
+    {
+        return Ok(subscription);
+    }
+    events.register_state_channel_with_decoder(
+        kind.clone(),
+        personal_view::PersonalViewProjection {
+            view_id: Uuid::nil(),
+            name: String::new(),
+            view_revision: 0,
+            binding_revision: 0,
+            active_workspace_id: Uuid::nil(),
+            workspaces: Vec::new(),
+        },
+    );
+    events
+        .subscribe_state::<personal_view::PersonalViewProjection>(kind)
+        .map_err(|error| format!("subscribing to the personal tab view: {error}"))
 }
 
 /// What an event is addressed to: through the hit table of the revision it
@@ -3718,6 +3766,73 @@ mod tests {
             .unwrap();
         tokio::task::yield_now().await;
         assert!(owner.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarded_personal_view_decides_the_listed_tabs_and_their_order() {
+        let resources = bmux_plugin::AttachPresentationResources::isolated(4);
+        let [one, two, three] = [31, 32, 33].map(Uuid::from_u128);
+        let entry = |id| tabs_list::TabListEntry {
+            id,
+            name: id.to_string(),
+            active: false,
+            workspace: "default".to_string(),
+            workspace_id: Uuid::nil(),
+        };
+        resources.events.register_state_channel(
+            tabs_list::STATE_KIND,
+            tabs_list::TabListSnapshot {
+                tabs: vec![entry(one), entry(two), entry(three)],
+                revision: 1,
+            },
+        );
+        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let listed = |presentation: &SidebarPresentation| {
+            presentation
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .tabs
+                .iter()
+                .map(|tab| tab.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&presentation).len(), 3, "the catalog without a view");
+        // The runtime's generic fallback for forwarded plugin-bus payloads.
+        let member = |id: Uuid, name: &str| personal_view::PersonalViewMember {
+            member_id: Uuid::new_v4(),
+            context_id: id,
+            name: name.to_string(),
+            active: false,
+        };
+        let payload = serde_json::to_vec(&personal_view::PersonalViewProjection {
+            view_id: Uuid::from_u128(0xF1),
+            name: "default".into(),
+            view_revision: 2,
+            binding_revision: 1,
+            active_workspace_id: Uuid::nil(),
+            workspaces: vec![personal_view::PersonalViewWorkspace {
+                workspace_id: Uuid::nil(),
+                members: vec![member(three, "last-first"), member(one, "one")],
+            }],
+        })
+        .unwrap();
+        assert!(
+            resources
+                .events
+                .emit_from_bytes(&personal_view::STATE_KIND, &payload)
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while listed(&presentation) != ["last-first", "one"] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

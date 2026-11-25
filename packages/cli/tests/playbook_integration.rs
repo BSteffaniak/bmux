@@ -332,6 +332,24 @@ fn playbook_real_attach_feedback_without_bcode_is_reported() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_keyboard_and_finder_follow_the_personal_view() {
+    let (json, pass) = run_playbook_fixture("personal_view_navigation_real_attach.dsl");
+    assert!(
+        pass,
+        "keyboard and finder should agree with the visible personal order: {json:#}"
+    );
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step["action"] == "assert-rendered")
+            .count(),
+        2
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_finder_switches_sandbox_tabs() {
     let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
     assert!(

@@ -2,7 +2,7 @@ use bmux_plugin_sdk::PluginCommandError;
 
 use super::{
     ActiveAlignment, ColorSettings, Density, HintPolicy, OverflowStyle, Placement, Preset,
-    SeparatorSet, Settings, TabOrder, TabScope,
+    SeparatorSet, Settings,
 };
 
 #[allow(clippy::too_many_lines)] // Parsing mirrors the intentionally rich settings surface.
@@ -43,27 +43,6 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
         "classic" => Some(Preset::Classic),
         _ => None,
     })?;
-    settings.tab_scope = parse_enum(
-        table,
-        "tab_scope",
-        settings.tab_scope,
-        |value| match value {
-            "all_contexts" => Some(TabScope::AllContexts),
-            "session_contexts" => Some(TabScope::SessionContexts),
-            "mru" => Some(TabScope::Mru),
-            _ => None,
-        },
-    )?;
-    settings.tab_order = parse_enum(
-        table,
-        "tab_order",
-        settings.tab_order,
-        |value| match value {
-            "stable" => Some(TabOrder::Stable),
-            "mru" => Some(TabOrder::Mru),
-            _ => None,
-        },
-    )?;
     settings.hint_policy =
         parse_enum(
             table,

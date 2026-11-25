@@ -1,0 +1,21 @@
+[plugins.settings."bmux.tab_bar"]
+tab_template = "<{active}:{name}>"
+
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+1" = "plugin:bmux.tabs:goto-tab 1"
+"alt+2" = "plugin:bmux.tabs:goto-tab 2"
+"alt+3" = "plugin:bmux.tabs:goto-tab 3"
+"alt+a" = "plugin:bmux.tabs:new-tab --name=alpha"
+"alt+b" = "plugin:bmux.tabs:new-tab --name=beta"
+"alt+c" = "plugin:bmux.tabs:new-tab --name=gamma"
+"alt+f" = "plugin:bmux.finder:show"
+"alt+h" = "plugin:bmux.tabs:prev-tab"
+"alt+j" = "plugin:bmux.tabs:next-tab"
+"alt+x" = "plugin:bmux.tabs:remove-from-view"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true

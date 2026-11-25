@@ -1,8 +1,12 @@
 # bmux_finder_plugin
 
-Standalone read-only finder for tabs across workspaces. It consumes retained
-tabs/workspace state and delegates fuzzy matching to bmux's search-select
-prompt.
+Finder for tabs across workspaces: discovery over every shared tab. It
+consumes tabs/workspace state and delegates fuzzy matching to bmux's
+search-select prompt. Entries say whether a tab is in this attachment's
+personal view, and those that are come first. Choosing a tab dispatches
+`plugin:bmux.tabs:open-tab`, which adds it to the view when absent and switches
+to it. `finder add-to-view` lists the tabs the view lacks and adds the chosen
+one without switching (`plugin:bmux.tabs:add-tab-to-view`).
 
 Defaults search every workspace, order by caller-local last visit before typing,
 rank filtered results by relevance, and hide the current tab. Use

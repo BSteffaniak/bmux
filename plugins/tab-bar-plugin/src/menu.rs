@@ -23,7 +23,73 @@ use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuOutcome, MenuPolicy
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing, ModalTheme};
 use uuid::Uuid;
 
-const LABELS: [&str; 3] = ["Switch", "Rename", "Close"];
+/// One entry of a tab's context menu. "Remove from view" is offered only
+/// while the strip shows this attachment's personal view; it leaves the tab
+/// running, unlike "Close for everyone…", which asks for confirmation first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabAction {
+    Switch,
+    Rename,
+    RemoveFromView,
+    CloseForEveryone,
+}
+
+impl TabAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Switch => "Switch",
+            Self::Rename => "Rename",
+            Self::RemoveFromView => "Remove from view",
+            Self::CloseForEveryone => "Close for everyone…",
+        }
+    }
+}
+
+fn tab_actions(companion: &CompanionState) -> Vec<TabAction> {
+    let mut actions = vec![TabAction::Switch, TabAction::Rename];
+    if companion.personal.is_some() {
+        actions.push(TabAction::RemoveFromView);
+    }
+    actions.push(TabAction::CloseForEveryone);
+    actions
+}
+
+/// One entry of the menu for a multi-tab selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupAction {
+    MoveToWorkspace,
+    MoveLeft,
+    MoveRight,
+    RemoveFromView,
+    Close,
+    ClearSelection,
+}
+
+impl GroupAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MoveToWorkspace => "Move to workspace…",
+            Self::MoveLeft => "Move left",
+            Self::MoveRight => "Move right",
+            Self::RemoveFromView => "Remove selected from view",
+            Self::Close => "Close selected tabs…",
+            Self::ClearSelection => "Clear selection",
+        }
+    }
+}
+
+fn group_actions(companion: &CompanionState) -> Vec<GroupAction> {
+    let mut actions = vec![
+        GroupAction::MoveToWorkspace,
+        GroupAction::MoveLeft,
+        GroupAction::MoveRight,
+    ];
+    if companion.personal.is_some() {
+        actions.push(GroupAction::RemoveFromView);
+    }
+    actions.extend([GroupAction::Close, GroupAction::ClearSelection]);
+    actions
+}
 
 /// The popup's size and the strip region it is attached to. The host places
 /// it next to that region (flipping when the preferred side has no room).
@@ -55,10 +121,8 @@ fn popup_geometry(companion: &CompanionState) -> Option<PopupGeometry> {
         .then_some(())?;
     let width = (if !companion.menu.group.is_empty() || companion.menu.confirming {
         48
-    } else if companion.menu.workspace {
-        22
     } else {
-        12
+        22
     })
     .min(cols);
     let height = u16::try_from(items(companion).len().saturating_add(2))
@@ -123,31 +187,28 @@ fn items(companion: &CompanionState) -> Vec<MenuItem> {
         )
         .collect();
     }
-    if !companion.menu.group.is_empty() {
-        let labels: &[&str] = if companion.menu.confirming {
-            &["Cancel", "Close selected tabs (terminate processes)"]
+    let labels: Vec<&str> = if !companion.menu.group.is_empty() {
+        if companion.menu.confirming {
+            vec!["Cancel", "Close selected tabs (terminate processes)"]
         } else {
-            &[
-                "Move to workspace…",
-                "Move left",
-                "Move right",
-                "Close selected tabs…",
-                "Clear selection",
-            ]
-        };
-        return labels
-            .iter()
-            .enumerate()
-            .map(|(index, label)| MenuItem::new(index.to_string(), *label))
-            .collect();
-    }
-
-    let labels: &[&str] = if companion.menu.confirming {
-        &["Cancel", "Close workspace (move tabs to fallback)"]
+            group_actions(companion)
+                .into_iter()
+                .map(GroupAction::label)
+                .collect()
+        }
     } else if companion.menu.workspace {
-        &["Rename", "Close workspace…"]
+        if companion.menu.confirming {
+            vec!["Cancel", "Close workspace (move tabs to fallback)"]
+        } else {
+            vec!["Rename", "Close workspace…"]
+        }
+    } else if companion.menu.confirming {
+        vec!["Cancel", "Close for everyone (terminate processes)"]
     } else {
-        &LABELS
+        tab_actions(companion)
+            .into_iter()
+            .map(TabAction::label)
+            .collect()
     };
     labels
         .iter()
@@ -394,68 +455,63 @@ fn transition(
     Some(result)
 }
 
+/// Ask the tab bar's server-side group workflow to apply `action` to the
+/// selection.
+fn move_selection(
+    companion: &CompanionState,
+    action: &str,
+) -> Option<bmux_plugin::AttachInputServiceInvocation> {
+    command_invocation::<super::contract::presentation_actions::client::MoveSelectionEndpoint>(
+        &MoveSelectionRequest {
+            action: action.into(),
+            tabs: companion.menu.group.clone(),
+            workspace: companion.workspace_id.unwrap_or_default(),
+        },
+    )
+}
+
 fn activate_group(
     companion: &mut CompanionState,
     result: &mut AttachInputResult,
     index: usize,
     target: Uuid,
 ) {
-    if !companion.menu.group.is_empty() {
-        if companion.menu.confirming || (companion.menu.destinations.is_none() && index != 0) {
-            if companion.menu.confirming && index == 0 {
-                return;
-            }
-            if !companion.menu.confirming && index == 4 {
-                companion.multi_selection.clear();
-                return;
-            }
-            if !companion.menu.confirming && index == 3 {
-                companion.menu.confirming = true;
-                companion.menu.state = MenuState::new(Some(0));
-                companion.menu_tab_id = Some(target);
-                result.release_capture = false;
-                return;
-            }
-            let action = if companion.menu.confirming {
-                "close"
-            } else if index == 1 {
-                "left"
-            } else {
-                "right"
-            };
+    if let Some(destinations) = &companion.menu.destinations {
+        if index == 1 {
             result.service_invocation = command_invocation::<
                 super::contract::presentation_actions::client::MoveSelectionEndpoint,
             >(&MoveSelectionRequest {
-                action: action.into(),
+                action: "new".into(),
                 tabs: companion.menu.group.clone(),
-                workspace: companion.workspace_id.unwrap_or_default(),
+                workspace: Uuid::nil(),
             });
             return;
         }
-        if let Some(destinations) = &companion.menu.destinations {
-            if index == 1 {
-                result.service_invocation = command_invocation::<
-                    super::contract::presentation_actions::client::MoveSelectionEndpoint,
-                >(&MoveSelectionRequest {
-                    action: "new".into(),
-                    tabs: companion.menu.group.clone(),
-                    workspace: Uuid::nil(),
-                });
-                return;
-            }
-            if let Some((workspace, _)) = index
-                .checked_sub(2)
-                .and_then(|index| destinations.get(index))
-            {
-                result.service_invocation = command_invocation::<
-                    super::contract::presentation_actions::client::MoveSelectionEndpoint,
-                >(&MoveSelectionRequest {
-                    action: "move".into(),
-                    tabs: companion.menu.group.clone(),
-                    workspace: *workspace,
-                });
-            }
-        } else {
+        if let Some((workspace, _)) = index
+            .checked_sub(2)
+            .and_then(|index| destinations.get(index))
+        {
+            result.service_invocation = command_invocation::<
+                super::contract::presentation_actions::client::MoveSelectionEndpoint,
+            >(&MoveSelectionRequest {
+                action: "move".into(),
+                tabs: companion.menu.group.clone(),
+                workspace: *workspace,
+            });
+        }
+        return;
+    }
+    if companion.menu.confirming {
+        if index == 1 {
+            result.service_invocation = move_selection(companion, "close");
+        }
+        return;
+    }
+    // Reordering edits the order the strip shows: the personal view's when
+    // it shows one, otherwise the shared order.
+    let personal = companion.personal.is_some();
+    match group_actions(companion).get(index).copied() {
+        Some(GroupAction::MoveToWorkspace) => {
             result.service_invocation = command_invocation::<
                 super::contract::presentation_actions::client::ListDestinationsEndpoint,
             >(&());
@@ -474,6 +530,25 @@ fn activate_group(
             companion.menu_tab_id = Some(target);
             result.release_capture = false;
         }
+        Some(GroupAction::MoveLeft) => {
+            result.service_invocation =
+                move_selection(companion, if personal { "view-left" } else { "left" });
+        }
+        Some(GroupAction::MoveRight) => {
+            result.service_invocation =
+                move_selection(companion, if personal { "view-right" } else { "right" });
+        }
+        Some(GroupAction::RemoveFromView) => {
+            result.service_invocation = move_selection(companion, "remove");
+        }
+        Some(GroupAction::Close) => {
+            companion.menu.confirming = true;
+            companion.menu.state = MenuState::new(Some(0));
+            companion.menu_tab_id = Some(target);
+            result.release_capture = false;
+        }
+        Some(GroupAction::ClearSelection) => companion.multi_selection.clear(),
+        None => {}
     }
 }
 
@@ -521,13 +596,25 @@ fn activate_selection(
         }
         return;
     }
-    result.service_invocation = match index {
-        0 => command_invocation::<tabs_commands::client::SwitchTabEndpoint>(
+    if companion.menu.confirming {
+        // "Cancel" is first so a hurried Enter never terminates anything.
+        if index == 1 {
+            result.service_invocation = command_invocation::<tabs_commands::client::KillTabEndpoint>(
+                &tabs_commands::client::KillTabRequest {
+                    target: target.to_string(),
+                    force_local: false,
+                },
+            );
+        }
+        return;
+    }
+    result.service_invocation = match tab_actions(companion).get(index).copied() {
+        Some(TabAction::Switch) => command_invocation::<tabs_commands::client::SwitchTabEndpoint>(
             &tabs_commands::client::SwitchTabRequest {
                 target: target.to_string(),
             },
         ),
-        1 => {
+        Some(TabAction::Rename) => {
             if let Some(tab) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) {
                 companion.editing_tab_id = Some(target);
                 companion.edit_buffer =
@@ -538,12 +625,20 @@ fn activate_selection(
             }
             None
         }
-        _ => command_invocation::<tabs_commands::client::KillTabEndpoint>(
-            &tabs_commands::client::KillTabRequest {
-                target: target.to_string(),
-                force_local: false,
-            },
-        ),
+        Some(TabAction::RemoveFromView) => {
+            command_invocation::<super::tabs_personal_actions::client::RemoveTabEndpoint>(
+                &super::tabs_personal_actions::client::RemoveTabRequest { context_id: target },
+            )
+        }
+        Some(TabAction::CloseForEveryone) => {
+            companion.menu_tab_id = Some(target);
+            companion.menu.confirming = true;
+            companion.menu.state = MenuState::new(Some(0));
+            result.release_capture = false;
+            result.capture_keyboard = vec!["*".into()];
+            None
+        }
+        None => None,
     };
 }
 
@@ -706,7 +801,15 @@ mod tests {
             let mut companion = companion();
             open(&mut companion);
             companion.menu.state.set_focused(Some(selection));
-            let result = key(&mut companion, "enter").unwrap();
+            let mut result = key(&mut companion, "enter").unwrap();
+            if selection == 2 {
+                // Close for everyone asks first, defaulting to Cancel.
+                assert!(companion.menu.confirming);
+                assert!(result.service_invocation.is_none());
+                assert_eq!(companion.menu.state.selected(), Some(0));
+                result = AttachInputResult::default();
+                activate_selection(&mut companion, &mut result, 1);
+            }
             assert!(companion.menu_tab_id.is_none());
             if selection == 1 {
                 assert!(!result.release_capture);
@@ -734,8 +837,8 @@ mod tests {
     fn pointer_activation_and_outside_dismissal_are_local() {
         let mut companion = companion();
         open(&mut companion);
-        let down = pointer_event(&companion, "down", "2");
-        let up = pointer_event(&companion, "up", "2");
+        let down = pointer_event(&companion, "down", "0");
+        let up = pointer_event(&companion, "up", "0");
         assert!(
             transition(&mut companion, &down)
                 .unwrap()
@@ -803,7 +906,10 @@ mod tests {
             let selected = index.parse::<usize>().unwrap();
             assert_eq!(companion.menu.state.focused(), Some(selected));
             assert_eq!(companion.menu.state.selected(), Some(selected));
-            for (row, label) in LABELS.iter().enumerate() {
+            for (row, label) in ["Switch", "Rename", "Close for everyone"]
+                .iter()
+                .enumerate()
+            {
                 let op = after
                     .iter()
                     .find(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains(label)))
@@ -961,6 +1067,108 @@ mod tests {
         let request: MoveSelectionRequest =
             crate::decode_action_payload(&result.service_invocation.unwrap()).unwrap();
         assert_eq!(request.action, "new");
+    }
+
+    fn label(item: &MenuItem) -> String {
+        item.lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect()
+    }
+
+    fn with_personal_view(mut companion: CompanionState) -> CompanionState {
+        let members = companion
+            .snapshot
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| crate::personal_view::PersonalViewMember {
+                member_id: Uuid::from_u128(0xE0 + index as u128),
+                context_id: tab.id,
+                name: tab.name.clone(),
+                active: tab.active,
+            })
+            .collect();
+        companion.replace_personal(crate::personal_view::PersonalViewProjection {
+            view_id: Uuid::from_u128(0xF1),
+            name: "default".into(),
+            view_revision: 1,
+            binding_revision: 1,
+            active_workspace_id: Uuid::nil(),
+            workspaces: vec![crate::personal_view::PersonalViewWorkspace {
+                workspace_id: Uuid::nil(),
+                members,
+            }],
+        });
+        companion
+    }
+
+    #[test]
+    fn personal_strip_menus_remove_from_the_view_apart_from_closing_for_everyone() {
+        let mut companion = with_personal_view(companion());
+        open(&mut companion);
+        let labels: Vec<String> = items(&companion).iter().map(label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Switch",
+                "Rename",
+                "Remove from view",
+                "Close for everyone…"
+            ]
+        );
+        let mut result = AttachInputResult::default();
+        activate_selection(&mut companion, &mut result, 2);
+        let invocation = result.service_invocation.take().unwrap();
+        assert_eq!(
+            invocation.endpoint.interface_id,
+            crate::tabs_personal_actions::INTERFACE_ID.as_str()
+        );
+        let request: crate::tabs_personal_actions::client::RemoveTabRequest =
+            crate::decode_action_payload(&invocation).unwrap();
+        assert_eq!(request.context_id, Uuid::from_u128(7));
+
+        // Closing for everyone is destructive: confirm, Cancel first.
+        open(&mut companion);
+        activate_selection(&mut companion, &mut result, 3);
+        assert!(companion.menu.confirming && result.service_invocation.is_none());
+        assert_eq!(label(&items(&companion)[0]), "Cancel");
+        activate_selection(&mut companion, &mut result, 1);
+        let request: tabs_commands::client::KillTabRequest =
+            crate::decode_action_payload(&result.service_invocation.take().unwrap()).unwrap();
+        assert_eq!(request.target, Uuid::from_u128(7).to_string());
+
+        // The group menu removes from the view and reorders the view.
+        let group = |companion: &mut CompanionState, index| {
+            open(companion);
+            companion.menu.group = vec![Uuid::from_u128(7)];
+            let mut result = AttachInputResult::default();
+            activate_selection(companion, &mut result, index);
+            result.service_invocation.map(|invocation| {
+                crate::decode_action_payload::<MoveSelectionRequest>(&invocation)
+                    .unwrap()
+                    .action
+            })
+        };
+        open(&mut companion);
+        companion.menu.group = vec![Uuid::from_u128(7)];
+        assert_eq!(label(&items(&companion)[3]), "Remove selected from view");
+        assert_eq!(group(&mut companion, 1).as_deref(), Some("view-left"));
+        assert_eq!(group(&mut companion, 2).as_deref(), Some("view-right"));
+        assert_eq!(group(&mut companion, 3).as_deref(), Some("remove"));
+        assert_eq!(group(&mut companion, 4), None, "close asks first");
+        assert!(companion.menu.confirming);
+
+        // Without a personal view there is nothing to remove from.
+        let mut shared = self::companion();
+        open(&mut shared);
+        assert!(
+            !items(&shared)
+                .iter()
+                .any(|item| label(item).contains("view"))
+        );
+        assert_eq!(group(&mut shared, 1).as_deref(), Some("left"));
     }
 
     #[test]

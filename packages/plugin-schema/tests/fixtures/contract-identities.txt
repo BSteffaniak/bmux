@@ -141,6 +141,7 @@ plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-commands ad11e259a779db9c5f50
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-personal-views/v1 dd19049b366017339a7118f4eccac3cf8a7a23b8c50619d5d16cb41a715f9168
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-personal-commands/v1 8990c3704bbf35432d7fc9478a92c601aebe28075b9ad5dca2c5e31b62b7fbe4
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-personal-attachment/v1 1527f11bbd9472ab6f6a74393662cf741a06703bccc6c488a379287ddf9b7df7
+plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-personal-actions/v1 ac73d047a816f2b2c09e1167d078f292e1ded4b94ac98685c44650b88c7c9123
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl personal-view 51742a1f72aa10a8dd77cc5e7028d0f92e16ffc268e3a40e731120aa388e429a
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-events da18658ec81a4719bc0ca21b02d9c643b759a1abb6ca4926f34ea8041adf1bf8
 plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-local-view e2a56561619c6a4f792e97d71b44e340af851785050707d440ef08b2b7bce9f9

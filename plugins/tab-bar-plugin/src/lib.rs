@@ -52,7 +52,7 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRegistry, PresentationFactRole,
 };
 use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
-use bmux_tabs_plugin_api::{personal_view, tabs_commands, tabs_list};
+use bmux_tabs_plugin_api::{personal_view, tabs_commands, tabs_list, tabs_personal_actions};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -101,19 +101,6 @@ enum SeparatorSet {
     AngledSegments,
     Plain,
     Ascii,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabScope {
-    AllContexts,
-    SessionContexts,
-    Mru,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabOrder {
-    Stable,
-    Mru,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,8 +193,6 @@ struct Settings {
     maximum_visible_tabs: Option<usize>,
     maximum_label_width: Option<u16>,
     label_template: String,
-    tab_scope: TabScope,
-    tab_order: TabOrder,
     show_session_name: bool,
     show_context_name: bool,
     show_mode: bool,
@@ -249,8 +234,6 @@ impl Default for Settings {
             maximum_visible_tabs: None,
             maximum_label_width: None,
             label_template: "{name}".to_string(),
-            tab_scope: TabScope::AllContexts,
-            tab_order: TabOrder::Stable,
             show_session_name: false,
             show_context_name: false,
             show_mode: true,
@@ -2144,6 +2127,24 @@ fn update_drag_local(
                     .filter(|target| target.tab_id != source)
                     .and_then(|insertion| {
                         let target = insertion.tab_id;
+                        // The strip shows this attachment's personal view:
+                        // reorder that view, never the shared order.
+                        if companion.personal.is_some() {
+                            let before = personal_drop_before(
+                                &companion.snapshot.tabs,
+                                source,
+                                target,
+                                insertion.side,
+                            );
+                            return command_invocation::<
+                                tabs_personal_actions::client::MoveTabEndpoint,
+                            >(
+                                &tabs_personal_actions::client::MoveTabRequest {
+                                    context_id: source,
+                                    before,
+                                },
+                            );
+                        }
                         let placement = match insertion.side {
                             projection::DropSide::Before => tabs_commands::TabMovePlacement::Before,
                             projection::DropSide::After => tabs_commands::TabMovePlacement::After,
@@ -2172,6 +2173,25 @@ fn update_drag_local(
             })
         }
         _ => None,
+    }
+}
+
+/// The personal `move-tab` position for dropping `source` beside `target`
+/// in the strip's order: the tab it ends up before, or `None` for the end.
+fn personal_drop_before(
+    tabs: &[tabs_list::TabListEntry],
+    source: Uuid,
+    target: Uuid,
+    side: projection::DropSide,
+) -> Option<Uuid> {
+    match side {
+        projection::DropSide::Before => Some(target),
+        projection::DropSide::After => tabs
+            .iter()
+            .skip_while(|tab| tab.id != target)
+            .skip(1)
+            .find(|tab| tab.id != source)
+            .map(|tab| tab.id),
     }
 }
 
@@ -2451,6 +2471,9 @@ fn decode_action_payload<T: serde::de::DeserializeOwned>(
         id if id == tabs_commands::INTERFACE_ID.as_str() => tabs_commands::SERVICE_CONTRACT,
         id if id == workspaces_commands::INTERFACE_ID.as_str() => {
             workspaces_commands::SERVICE_CONTRACT
+        }
+        id if id == tabs_personal_actions::INTERFACE_ID.as_str() => {
+            tabs_personal_actions::SERVICE_CONTRACT
         }
         id if id == contract::presentation_actions::INTERFACE_ID.as_str() => {
             contract::presentation_actions::SERVICE_CONTRACT
@@ -4392,6 +4415,27 @@ bar_bg = "#112233"
         // The nil view withdraws the projection: back to the catalog.
         state.replace_personal(personal_tabs::no_projection());
         assert_eq!(shown(&state).len(), 3);
+    }
+
+    #[test]
+    fn dropping_in_a_personal_strip_names_the_tab_it_lands_before() {
+        let tabs: Vec<_> = (1..=3)
+            .map(|n| tabs_list::TabListEntry {
+                id: Uuid::from_u128(n),
+                name: format!("t{n}"),
+                active: false,
+                workspace: "main".into(),
+                workspace_id: Uuid::nil(),
+            })
+            .collect();
+        let [one, two, three] = [1, 2, 3].map(Uuid::from_u128);
+        let before = projection::DropSide::Before;
+        let after = projection::DropSide::After;
+        assert_eq!(personal_drop_before(&tabs, three, one, before), Some(one));
+        assert_eq!(personal_drop_before(&tabs, one, two, after), Some(three));
+        // After the tab just before the source: past the source itself.
+        assert_eq!(personal_drop_before(&tabs, three, two, after), None);
+        assert_eq!(personal_drop_before(&tabs, one, three, after), None);
     }
 
     #[tokio::test]

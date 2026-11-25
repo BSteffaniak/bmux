@@ -58,6 +58,10 @@ fn interface_ids_match_bpdl_source() {
         "tabs-personal-attachment/v1"
     );
     assert_eq!(
+        bmux_tabs_plugin_api::tabs_personal_actions::INTERFACE_ID,
+        "tabs-personal-actions/v1"
+    );
+    assert_eq!(
         bmux_tabs_plugin_api::personal_view::STATE_KIND,
         "bmux.tabs/personal-view"
     );
@@ -193,4 +197,35 @@ fn event_payload_alias_matches_declared_type() {
         serde_json::to_string(&via_alias).unwrap(),
         serde_json::to_string(&via_type).unwrap()
     );
+}
+
+#[test]
+fn personal_actions_address_tabs_without_client_owner_or_revision() {
+    use bmux_tabs_plugin_api::tabs_personal_actions::client::{
+        AddTabRequest, MoveTabRequest, OpenTabRequest, RemoveTabRequest,
+    };
+    let tab = uuid::Uuid::from_u128(1);
+    let requests = [
+        serde_json::to_value(AddTabRequest { context_id: tab }).unwrap(),
+        serde_json::to_value(OpenTabRequest { context_id: tab }).unwrap(),
+        serde_json::to_value(RemoveTabRequest { context_id: tab }).unwrap(),
+        serde_json::to_value(MoveTabRequest {
+            context_id: tab,
+            before: Some(uuid::Uuid::from_u128(2)),
+        })
+        .unwrap(),
+    ];
+    // The tabs plugin resolves the attachment, its view, the members and the
+    // revision itself.
+    for request in &requests {
+        assert!(
+            request.as_object().unwrap().keys().all(|key| {
+                !key.contains("client")
+                    && !key.contains("owner")
+                    && !key.contains("revision")
+                    && !key.contains("mutation")
+            }),
+            "{request}"
+        );
+    }
 }

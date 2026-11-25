@@ -46,6 +46,7 @@ use bmux_tabs_plugin_api::tabs_commands::{
     PaneMutationError, PaneResizeDirection, PaneZoomAck, Selector, TabAck, TabError,
     TabMovePlacement, TabsCommandsService,
 };
+use bmux_tabs_plugin_api::tabs_personal_actions as personal_actions;
 use bmux_tabs_plugin_api::tabs_personal_attachment as personal_attachment;
 use bmux_tabs_plugin_api::tabs_personal_commands as personal_commands;
 use bmux_tabs_plugin_api::tabs_personal_views;
@@ -1307,6 +1308,9 @@ impl Plugin for TabsPlugin {
             .blocking_command("last-tab", Self::run_command)
             .blocking_command("goto-tab", Self::run_command)
             .blocking_command("close-current-tab", Self::run_command)
+            .blocking_command("remove-from-view", Self::run_command)
+            .blocking_command("open-tab", Self::run_command)
+            .blocking_command("add-tab-to-view", Self::run_command)
             .blocking_command("reset-order", Self::run_command)
             .blocking_command("focus-pane-in-direction", Self::run_command)
             .blocking_command("split-pane", Self::run_command)
@@ -1489,6 +1493,18 @@ impl TabsPlugin {
                     })
                 }))
             },
+            "tabs-personal-actions/v1", "add-tab" => |req: personal_actions::client::AddTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_action(ctx, ctx.caller_client_id, req.context_id, PersonalAction::Add))
+            },
+            "tabs-personal-actions/v1", "open-tab" => |req: personal_actions::client::OpenTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_action(ctx, ctx.caller_client_id, req.context_id, PersonalAction::Open))
+            },
+            "tabs-personal-actions/v1", "remove-tab" => |req: personal_actions::client::RemoveTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_action(ctx, ctx.caller_client_id, req.context_id, PersonalAction::Remove))
+            },
+            "tabs-personal-actions/v1", "move-tab" => |req: personal_actions::client::MoveTabRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.personal_action(ctx, ctx.caller_client_id, req.context_id, PersonalAction::Move { before: req.before }))
+            },
             "tabs-state", "list-tabs" => |req: ListTabsArgs, ctx| {
                 let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref(), ActiveMarking::Caller)
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
@@ -1641,10 +1657,10 @@ impl TabsPlugin {
 
     /// Run one `tabs-personal-attachment/v1` operation with the invocation as
     /// the caller and the host's attachment state.
-    fn with_attachment_env<T>(
+    fn with_attachment_env<C: HostRuntimeApi + Sync, T>(
         &self,
-        context: &NativeServiceContext,
-        operation: impl FnOnce(&personal_views::attachments::Env<'_, NativeServiceContext>) -> T,
+        context: &C,
+        operation: impl FnOnce(&personal_views::attachments::Env<'_, C>) -> T,
     ) -> T {
         let states = tab_states(&self.runtime_state);
         let sink = personal_views::attachments::host_wire_sink(&states);
@@ -1656,6 +1672,63 @@ impl TabsPlugin {
             sink: sink.as_deref(),
             now_ms: status::now_ms(),
         })
+    }
+
+    /// The caller's personal navigation order in `workspace`
+    /// ([`personal_views::attachments::Attachments::navigation_order`]).
+    fn personal_order<C: HostRuntimeApi + Sync>(
+        &self,
+        context: &C,
+        client: Option<Uuid>,
+        workspace: Uuid,
+    ) -> Result<Option<Vec<Uuid>>, String> {
+        self.with_attachment_env(context, |env| {
+            self.attachments
+                .navigation_order(env, client, workspace)
+                .map_err(|error| format!("personal tab view unavailable: {error:?}"))
+        })
+    }
+
+    /// One `tabs-personal-actions/v1` edit of the invoking attachment's bound
+    /// view. Removing the attachment's selected tab selects its neighbour
+    /// through the ordinary tab switch; opening a tab activates it through the
+    /// workspaces authority, crossing workspaces.
+    fn personal_action<C: HostRuntimeApi + Sync>(
+        &self,
+        context: &C,
+        client: Option<Uuid>,
+        context_id: Uuid,
+        action: PersonalAction,
+    ) -> Result<
+        bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck,
+        personal_attachment::PersonalAttachmentError,
+    > {
+        use personal_views::attachments::ViewEdit;
+        let edit = match action {
+            PersonalAction::Add | PersonalAction::Open => ViewEdit::Add,
+            PersonalAction::Remove => ViewEdit::Remove,
+            PersonalAction::Move { before } => ViewEdit::Move { before },
+        };
+        let ack = self.with_attachment_env(context, |env| {
+            self.attachments
+                .edit_view(env, client, context_id, edit, |neighbour| {
+                    switch_tab(
+                        context,
+                        &self.runtime_state,
+                        context_selector_by_id(neighbour),
+                        &self.last_selected_by_client,
+                        client,
+                    )
+                    .map(|_| ())
+                })
+        })?;
+        if action == PersonalAction::Open {
+            activate_tab_anywhere(context, context_id).map_err(|reason| {
+                personal_attachment::PersonalAttachmentError::Unavailable { reason }
+            })?;
+            self.attachments.schedule();
+        }
+        Ok(ack)
     }
 
     fn activate_with_async(
@@ -2141,6 +2214,9 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
     // context list) directly and refreshes from those, so silence is
     // correct there.
     let emit_to_stdout = context.invocation_source.is_cli();
+    // Navigation walks the caller's personal view when it has one.
+    let personal_order =
+        |workspace| plugin.personal_order(context, context.caller_client_id, workspace);
     match context.command.as_str() {
         "explain-spawn-directory" => {
             let operation = option_value(&context.arguments, "operation")
@@ -2357,12 +2433,13 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "next-tab" => {
-            let ack = cycle_tab(
+            let ack = cycle_tab_in_order(
                 context,
                 &plugin.runtime_state,
                 TabCycleDirection::Next,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
+                Some(&personal_order),
             )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
@@ -2371,12 +2448,13 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "prev-tab" => {
-            let ack = cycle_tab(
+            let ack = cycle_tab_in_order(
                 context,
                 &plugin.runtime_state,
                 TabCycleDirection::Previous,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
+                Some(&personal_order),
             )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
@@ -2385,12 +2463,13 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "last-tab" => {
-            let ack = cycle_tab(
+            let ack = cycle_tab_in_order(
                 context,
                 &plugin.runtime_state,
                 TabCycleDirection::Last,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
+                Some(&personal_order),
             )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
@@ -2407,12 +2486,13 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             if index == 0 {
                 return Err("tab index must be 1 or greater".to_string());
             }
-            let ack = goto_tab_by_index(
+            let ack = goto_tab_in_order(
                 context,
                 &plugin.runtime_state,
                 index,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
+                Some(&personal_order),
             )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
@@ -2421,15 +2501,57 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "close-current-tab" => {
-            let ack = close_current_tab(
+            let ack = close_current_tab_in_order(
                 context,
                 &plugin.runtime_state,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
                 context.settings.as_ref(),
+                Some(&personal_order),
             )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("closed current tab context {id}");
+            }
+            Ok(())
+        }
+        "remove-from-view" => {
+            let target = current_context(context)?
+                .map(|tab| tab.id)
+                .ok_or_else(|| "no current tab to remove from the view".to_string())?;
+            plugin
+                .personal_action(
+                    context,
+                    context.caller_client_id,
+                    target,
+                    PersonalAction::Remove,
+                )
+                .map_err(|error| format!("remove-from-view failed: {error:?}"))?;
+            if emit_to_stdout {
+                println!("removed tab context {target} from the view");
+            }
+            Ok(())
+        }
+        "open-tab" | "add-tab-to-view" => {
+            let target = positional_value(&context.arguments)
+                .ok_or_else(|| "missing required TAB_ID argument".to_string())?;
+            let target = Uuid::parse_str(&target)
+                .map_err(|error| format!("invalid tab id '{target}': {error}"))?;
+            let action = if context.command == "open-tab" {
+                PersonalAction::Open
+            } else {
+                PersonalAction::Add
+            };
+            plugin
+                .personal_action(context, context.caller_client_id, target, action)
+                .map_err(|error| format!("{} failed: {error:?}", context.command))?;
+            if action == PersonalAction::Open {
+                bmux_plugin_sdk::record_command_outcome_metadata(
+                    COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
+                    serde_json::json!(target),
+                );
+            }
+            if emit_to_stdout {
+                println!("{} tab context {target}", context.command);
             }
             Ok(())
         }
@@ -2655,6 +2777,37 @@ fn record_selected_context_outcome(ack: &TabAck) {
             serde_json::json!(context_id),
         );
     }
+}
+
+/// A tab-addressed edit of the invoking attachment's bound view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonalAction {
+    /// Add without selecting.
+    Add,
+    /// Add when absent, then select (across workspaces).
+    Open,
+    /// Remove; the tab keeps running.
+    Remove,
+    /// Move before another member tab, or to the end.
+    Move { before: Option<Uuid> },
+}
+
+/// Select `context_id` for the invoking client wherever it lives, switching
+/// workspace when needed, through the workspaces authority.
+fn activate_tab_anywhere(
+    caller: &(impl ServiceCaller + Sync),
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_activation_v1::client::activate_tab(
+            &mut client,
+            context_id,
+        ),
+    )
+    .map_err(|error| typed_service_error("workspaces-activation-v1/activate-tab", error))?
+    .map(|_| ())
+    .map_err(|error| format!("activating the tab failed: {error:?}"))
 }
 
 #[derive(Debug)]
@@ -3575,7 +3728,43 @@ struct SwitchTabTiming {
     total_started: Instant,
 }
 
-#[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned direction from deserialized request
+/// Where navigation finds the caller's personal tab order: given the active
+/// workspace, the context ids of the caller's view arrangement of it in view
+/// order, or `None` when personal order does not apply to this caller.
+type PersonalOrder<'a> = Option<&'a dyn Fn(Uuid) -> Result<Option<Vec<Uuid>>, String>>;
+
+/// The tabs navigation walks in the caller's active workspace, in order.
+///
+/// With a personal order these are the live members of the caller's view
+/// arrangement of that workspace, in view order; tabs outside the view are
+/// not walked. Without one (no attachment or principal, or a caller acting
+/// for no client) they are every tab of the workspace in the shared
+/// canonical order.
+fn navigation_contexts(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    personal: PersonalOrder<'_>,
+) -> Result<Vec<ContextSummary>, String> {
+    let workspace = active_workspace_id(caller);
+    let contexts = filter_contexts_for_workspace(list_contexts(caller)?, workspace);
+    let Some(order) = personal
+        .map(|order| order(workspace))
+        .transpose()?
+        .flatten()
+    else {
+        return order_contexts_for_navigation(caller, runtime_state, contexts);
+    };
+    let mut by_id = contexts
+        .into_iter()
+        .map(|context| (context.id, context))
+        .collect::<BTreeMap<_, _>>();
+    Ok(order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+#[cfg(test)]
 fn cycle_tab(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
@@ -3583,31 +3772,57 @@ fn cycle_tab(
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
 ) -> Result<TabAck, String> {
+    cycle_tab_in_order(
+        caller,
+        runtime_state,
+        direction,
+        last_selected_by_client,
+        caller_client_id,
+        None,
+    )
+}
+
+/// `next-tab`, `prev-tab` and `last-tab` over the caller's navigation order
+/// ([`navigation_contexts`]). When the caller's tab is not in that order
+/// (for example it was removed from the view), next selects the first tab
+/// and previous the last.
+#[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned direction from deserialized request
+fn cycle_tab_in_order(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    direction: TabCycleDirection,
+    last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
+    personal: PersonalOrder<'_>,
+) -> Result<TabAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
-    let contexts = list_contexts_in_active_workspace(caller)?;
+    let contexts = navigation_contexts(caller, runtime_state, personal)?;
     let context_list_us = list_started.elapsed().as_micros();
-    let order_started = Instant::now();
-    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
-    let order_us = order_started.elapsed().as_micros();
-    if contexts.len() < 2 {
+    let resolve_started = Instant::now();
+    let selected = current_context(caller)?.map(|context| context.id);
+    let current_index =
+        selected.and_then(|current| contexts.iter().position(|context| context.id == current));
+    // The caller's tab is outside the order (not in its view): next and
+    // previous enter the order at its ends.
+    let outside = selected.is_some() && current_index.is_none();
+    if contexts.is_empty() || (!outside && contexts.len() < 2) {
         return Err("no alternate tab available".to_string());
     }
-    let resolve_started = Instant::now();
-    let current_context = caller_current_tab(caller, &contexts)?.unwrap_or(contexts[0].id);
-    let current_index = contexts
-        .iter()
-        .position(|context| context.id == current_context)
-        .unwrap_or(0);
+    let current_context = current_index.map(|index| contexts[index].id);
+    let index = current_index.unwrap_or(0);
     let target_id = match direction {
-        TabCycleDirection::Next => contexts[(current_index + 1) % contexts.len()].id,
-        TabCycleDirection::Previous => {
-            contexts[(current_index + contexts.len() - 1) % contexts.len()].id
-        }
+        TabCycleDirection::Next if outside => contexts[0].id,
+        TabCycleDirection::Previous if outside => contexts[contexts.len() - 1].id,
+        TabCycleDirection::Next => contexts[(index + 1) % contexts.len()].id,
+        TabCycleDirection::Previous => contexts[(index + contexts.len() - 1) % contexts.len()].id,
         TabCycleDirection::Last => {
             let client = caller_client_id
                 .ok_or_else(|| "no previously active tab available (no client)".to_string())?;
-            let workspace_id = context_workspace_id(&contexts[current_index]);
+            if outside {
+                return Err("no previously active tab available".to_string());
+            }
+            let workspace_id = context_workspace_id(&contexts[index]);
             let remembered = last_selected_by_client
                 .lock()
                 .map_err(|_| "tab history lock poisoned".to_string())?
@@ -3617,7 +3832,7 @@ fn cycle_tab(
             if !contexts.iter().any(|context| context.id == remembered) {
                 return Err("no previously active tab available".to_string());
             }
-            if remembered == current_context {
+            if remembered == contexts[index].id {
                 return Err("no previously active tab available".to_string());
             }
             remembered
@@ -3631,7 +3846,6 @@ fn cycle_tab(
         "target_context_id": target_id,
         "context_count": contexts.len(),
         "context_list_us": context_list_us,
-        "order_us": order_us,
         "resolve_us": resolve_us,
         "pre_switch_us": total_started.elapsed().as_micros(),
     }));
@@ -3649,6 +3863,7 @@ fn cycle_tab(
     )
 }
 
+#[cfg(test)]
 fn goto_tab_by_index(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
@@ -3656,14 +3871,33 @@ fn goto_tab_by_index(
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
 ) -> Result<TabAck, String> {
+    goto_tab_in_order(
+        caller,
+        runtime_state,
+        index,
+        last_selected_by_client,
+        caller_client_id,
+        None,
+    )
+}
+
+/// `goto-tab N`: the Nth tab (1-based) of the caller's navigation order
+/// ([`navigation_contexts`]).
+fn goto_tab_in_order(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    index: usize,
+    last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
+    personal: PersonalOrder<'_>,
+) -> Result<TabAck, String> {
     let total_started = Instant::now();
     if index == 0 {
         return Err("tab index must be 1 or greater".to_string());
     }
     let list_started = Instant::now();
-    let contexts = list_contexts_in_active_workspace(caller)?;
+    let contexts = navigation_contexts(caller, runtime_state, personal)?;
     let context_list_us = list_started.elapsed().as_micros();
-    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     if contexts.is_empty() {
         return Err("no tabs available".to_string());
     }
@@ -3726,6 +3960,7 @@ fn kill_active_workspace(caller: &(impl ServiceCaller + Sync)) -> Result<(), Str
         .map_err(|error| format!("kill-workspace failed: {error:?}"))
 }
 
+#[cfg(test)]
 fn close_current_tab(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
@@ -3733,35 +3968,69 @@ fn close_current_tab(
     caller_client_id: Option<Uuid>,
     settings: Option<&toml::Value>,
 ) -> Result<TabAck, String> {
-    let contexts = list_contexts_in_active_workspace(caller)?;
-    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
-    let current_id = caller_current_tab(caller, &contexts)?
-        .ok_or_else(|| "no current tab to close".to_string())?;
+    close_current_tab_in_order(
+        caller,
+        runtime_state,
+        last_selected_by_client,
+        caller_client_id,
+        settings,
+        None,
+    )
+}
 
-    // If there is another tab to switch to, do so before closing.
-    if contexts.len() > 1 {
-        let current_index = contexts
-            .iter()
-            .position(|context| context.id == current_id)
-            .unwrap_or(0);
-        // Switch to the next tab (wrapping), or previous if we are at the end.
-        let fallback_index = if current_index + 1 < contexts.len() {
-            current_index + 1
-        } else {
-            current_index.saturating_sub(1)
-        };
-        let fallback_id = contexts[fallback_index].id;
-        let _ = switch_tab(
+/// `close-current-tab`: close the caller's tab for everyone, first moving the
+/// caller to its neighbour in the caller's navigation order
+/// ([`navigation_contexts`]): the next tab, else the previous one. When the
+/// caller's tab is not in that order, the first tab of the order is the
+/// neighbour.
+///
+/// `on_last_tab_closed` (tabs settings) applies when the closed tab was the
+/// last tab of its workspace for everyone, never because it was the last tab
+/// of one personal view: `"delete"` (default) also kills the workspace,
+/// `"keep_empty"` keeps it.
+fn close_current_tab_in_order(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
+    settings: Option<&toml::Value>,
+    personal: PersonalOrder<'_>,
+) -> Result<TabAck, String> {
+    let workspace_tabs = list_contexts_in_active_workspace(caller)?;
+    let current_id = caller_current_tab(caller, &workspace_tabs)?
+        .ok_or_else(|| "no current tab to close".to_string())?;
+    let contexts = navigation_contexts(caller, runtime_state, personal)?;
+    let fallback_id = contexts
+        .iter()
+        .position(|context| context.id == current_id)
+        .map_or_else(
+            || contexts.first().map(|context| context.id),
+            |index| {
+                contexts
+                    .get(index + 1)
+                    .or_else(|| index.checked_sub(1).and_then(|before| contexts.get(before)))
+                    .map(|context| context.id)
+            },
+        );
+    // Move to the neighbour before closing, so the caller never lands on an
+    // arbitrary replacement.
+    if let Some(fallback_id) = fallback_id {
+        let _ = switch_tab_with_contexts(
             caller,
             runtime_state,
-            context_selector_by_id(fallback_id),
+            &context_selector_by_id(fallback_id),
             last_selected_by_client,
             caller_client_id,
+            &contexts,
+            SwitchTabTiming {
+                context_list_us: 0,
+                total_started: Instant::now(),
+            },
         );
     }
 
     close_context(caller, context_selector_by_id(current_id), false)?;
-    if contexts.len() == 1 && on_last_tab_closed_setting(settings)? == "delete" {
+    if workspace_tabs.len() == 1 && on_last_tab_closed_setting(settings)? == "delete" {
         kill_active_workspace(caller)?;
     }
 
@@ -5199,6 +5468,10 @@ fn interface_ids_match_bpdl_constants() {
     assert_eq!(
         personal_attachment::INTERFACE_ID.as_str(),
         "tabs-personal-attachment/v1"
+    );
+    assert_eq!(
+        personal_actions::INTERFACE_ID.as_str(),
+        "tabs-personal-actions/v1"
     );
 }
 
@@ -7942,6 +8215,79 @@ mod tests {
         };
         assert_eq!(kill_count, 1);
         assert!(first_kill_matches);
+    }
+
+    #[test]
+    fn navigation_walks_the_callers_personal_order_when_one_applies() {
+        let sessions = sample_sessions_three();
+        let (alpha, beta, gamma) = (sessions[0].id, sessions[1].id, sessions[2].id);
+        let fresh = || {
+            let host = MockHost::with_sessions(sessions.clone());
+            seed_tab_order(&host, &sessions);
+            host
+        };
+        let selected = |ack: TabAck| Uuid::parse_str(&ack.id.unwrap()).unwrap();
+        // The caller's view arranges gamma before alpha and leaves beta out;
+        // the caller (the mock's selection) is on alpha.
+        let view = |_workspace: Uuid| -> Result<Option<Vec<Uuid>>, String> {
+            Ok(Some(vec![gamma, alpha]))
+        };
+        let shared = |_workspace: Uuid| -> Result<Option<Vec<Uuid>>, String> { Ok(None) };
+        let history = LastSelectedByClient::default();
+        let runtime = runtime_state();
+        let cycle = |direction, order: &dyn Fn(Uuid) -> Result<Option<Vec<Uuid>>, String>| {
+            selected(
+                cycle_tab_in_order(&fresh(), &runtime, direction, &history, None, Some(order))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            cycle(TabCycleDirection::Next, &view),
+            gamma,
+            "wraps in view order"
+        );
+        assert_eq!(cycle(TabCycleDirection::Previous, &view), gamma);
+        assert_eq!(
+            cycle(TabCycleDirection::Next, &shared),
+            beta,
+            "shared order"
+        );
+        let goto = |index, order: &dyn Fn(Uuid) -> Result<Option<Vec<Uuid>>, String>| {
+            goto_tab_in_order(&fresh(), &runtime, index, &history, None, Some(order))
+        };
+        assert_eq!(selected(goto(1, &view).unwrap()), gamma);
+        assert_eq!(selected(goto(2, &view).unwrap()), alpha);
+        assert!(goto(3, &view).is_err(), "beta is not in the view");
+        assert_eq!(selected(goto(3, &shared).unwrap()), gamma);
+
+        // A tab outside the view enters it at its ends.
+        let outside =
+            |_workspace: Uuid| -> Result<Option<Vec<Uuid>>, String> { Ok(Some(vec![beta, gamma])) };
+        assert_eq!(cycle(TabCycleDirection::Next, &outside), beta);
+        assert_eq!(cycle(TabCycleDirection::Previous, &outside), gamma);
+        let host = fresh();
+        assert!(
+            cycle_tab_in_order(
+                &host,
+                &runtime,
+                TabCycleDirection::Last,
+                &history,
+                Some(Uuid::from_u128(1)),
+                Some(&outside),
+            )
+            .is_err()
+        );
+
+        // Closing moves to the view neighbour (alpha is last: the previous
+        // member), and the workspace survives because other tabs remain.
+        let host = fresh();
+        let closed =
+            close_current_tab_in_order(&host, &runtime, &history, None, None, Some(&view)).unwrap();
+        assert_eq!(selected(closed), alpha);
+        assert_eq!(*host.selected_session_id.lock().unwrap(), Some(gamma));
+        let kills = host.kills.lock().unwrap();
+        assert_eq!(kills.len(), 1);
+        assert_eq!(kills[0].selector.id, Some(alpha));
     }
 
     #[test]

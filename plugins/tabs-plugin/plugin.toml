@@ -19,6 +19,9 @@ owns_namespaces = [
     "last-tab",
     "goto-tab",
     "close-current-tab",
+    "remove-from-view",
+    "open-tab",
+    "add-tab-to-view",
     "reset-order",
     "focus-pane-in-direction",
     "split-pane",
@@ -339,6 +342,41 @@ expose_in_cli = true
 name          = "close-current-tab"
 path          = ["close-current-tab"]
 summary       = "Close the current workspace tab"
+
+[[commands]]
+aliases       = [["tab", "remove-from-view"]]
+expose_in_cli = true
+name          = "remove-from-view"
+path          = ["remove-from-view"]
+summary       = "Remove the current tab from this attachment's tab view (it keeps running)"
+
+[[commands]]
+aliases       = [["tab", "open"]]
+expose_in_cli = true
+name          = "open-tab"
+path          = ["open-tab"]
+summary       = "Add a tab to this attachment's tab view if absent, then switch to it"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "tab"
+position   = 0
+required   = true
+value_name = "TAB_ID"
+
+[[commands]]
+aliases       = [["tab", "add-to-view"]]
+expose_in_cli = true
+name          = "add-tab-to-view"
+path          = ["add-tab-to-view"]
+summary       = "Add a tab to this attachment's tab view without switching to it"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "tab"
+position   = 0
+required   = true
+value_name = "TAB_ID"
 
 [[commands]]
 aliases       = [["tab", "reset-order"]]
