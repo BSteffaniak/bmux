@@ -22,5 +22,6 @@ kitty-keyboard   = []
 
 # What simulations run of this crate (see switchy_cargo; `cargo sim NAME --check`).
 [package.metadata.switchy.simulation]
-# Pointer-shape output to the user's own terminal: client side, never in a pane runtime.
-exempt = ["pointer_output.rs"]
+# Output to the user's own terminal (pointer shapes; the bell and notifications, detected from
+# the client's environment): client side, never in a pane runtime.
+exempt = ["notification_output.rs", "pointer_output.rs"]
