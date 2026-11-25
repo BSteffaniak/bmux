@@ -408,10 +408,15 @@ impl Observer {
                         () = cancellation.cancelled() => return Ok(()),
                         _ = tick.tick() => {
                             let observer = Arc::clone(&jobs_observer);
-                            let changed = worker
+                            let changed = match worker
                                 .spawn_blocking(move || observer.list_jobs())
                                 .await
-                                .map_err(|error| error.to_string())?;
+                            {
+                                Ok(changed) => changed,
+                                // Teardown closed the scope first: this is a normal stop.
+                                Err(error) if error.is_closed() => return Ok(()),
+                                Err(error) => return Err(error.to_string()),
+                            };
                             if changed {
                                 wake_on_jobs.notify_one();
                             }
@@ -431,10 +436,12 @@ impl Observer {
                         () = tokio::time::sleep(SAFETY_PASS) => {}
                     }
                     let pass_observer = Arc::clone(&observer);
-                    worker
-                        .spawn_blocking(move || pass_observer.pass())
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    match worker.spawn_blocking(move || pass_observer.pass()).await {
+                        Ok(()) => {}
+                        // Teardown closed the scope during the pass: this is a normal stop.
+                        Err(error) if error.is_closed() => return Ok(()),
+                        Err(error) => return Err(error.to_string()),
+                    }
                     tokio::time::sleep(MIN_PASS_INTERVAL).await;
                 }
             })

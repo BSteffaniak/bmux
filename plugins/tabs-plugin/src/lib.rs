@@ -3237,17 +3237,23 @@ fn list_tabs(
 }
 
 /// Publish the tab status on a blocking worker, off the observer's task.
+/// `false` when teardown already closed the worker's scope: the observer
+/// stops, as it does when cancelled.
 async fn publish_on_worker(
     worker: &bmux_plugin_sdk::HostAsyncHandle,
     shared: &TabsSharedState,
     board: &Arc<Mutex<status::StatusBoard>>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let shared = shared.clone();
     let board = Arc::clone(board);
-    worker
+    match worker
         .spawn_blocking(move || publish_tab_status(&shared, &board))
         .await
-        .map_err(|error| error.to_string())
+    {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_closed() => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Follow pane signals and publish each tab's status once a second when it
@@ -3321,7 +3327,9 @@ fn spawn_status_observer(
                             board.set_agents(&snapshot);
                         }
                         // Agent states change at their own pace: show them now.
-                        publish_on_worker(&worker, &shared, &board).await?;
+                        if !publish_on_worker(&worker, &shared, &board).await? {
+                            return Ok(());
+                        }
                     }
                     // Events only say a pane may have changed: the status
                     // reads each pane's retained signals, so missing some
@@ -3346,10 +3354,14 @@ fn spawn_status_observer(
                     },
                     _ = refresh.tick(), if dirty => {
                         dirty = false;
-                        publish_on_worker(&worker, &shared, &board).await?;
+                        if !publish_on_worker(&worker, &shared, &board).await? {
+                            return Ok(());
+                        }
                     }
                     _ = tick.tick() => {
-                        publish_on_worker(&worker, &shared, &board).await?;
+                        if !publish_on_worker(&worker, &shared, &board).await? {
+                            return Ok(());
+                        }
                     }
                 }
             }
