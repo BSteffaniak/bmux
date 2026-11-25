@@ -795,6 +795,47 @@ mod tests {
         assert_eq!(title.map(|verdict| verdict.state), Some(RuleState::Working));
     }
 
+    /// Cursor's background-task count is background work only as a status
+    /// row of its own; the same words in the agent's prose near the prompt
+    /// are not.
+    #[test]
+    fn cursor_background_tasks_count_only_as_a_status_row() {
+        let cursor = agent("cursor");
+        let background = |text: &str| {
+            cursor
+                .evaluate(&Input {
+                    screen: text,
+                    ..Input::default()
+                })
+                .filter(|verdict| verdict.background_working)
+                .map(|verdict| verdict.rule)
+        };
+        for row in [
+            "2 background tasks",
+            "  1 background task running",
+            "⬢ 3 background tasks",
+            "Auto · ctrl+r to review · 2 background tasks",
+            "2 background tasks · ctrl+b to view",
+        ] {
+            assert_eq!(
+                background(&format!("→ ask anything\n{row}")).as_deref(),
+                Some("background_task_status_working"),
+                "{row}"
+            );
+        }
+        for prose in [
+            "I kicked off 2 background tasks to run the suite.",
+            "2 background tasks are still running, so I will wait for them.",
+            "The 0 background tasks finished.",
+        ] {
+            assert_eq!(
+                background(&format!("{prose}\n→ ask anything")),
+                None,
+                "{prose}"
+            );
+        }
+    }
+
     #[test]
     fn regions_select_what_they_name() {
         let text = "one\n\ntwo\n───\nbox\n───\nafter";

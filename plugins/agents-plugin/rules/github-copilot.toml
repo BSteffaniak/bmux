@@ -1,8 +1,8 @@
 aliases            = ["github-copilot", "ghcs"]
 id                 = "copilot"
 min_engine_version = 1
-updated_at         = "2026-08-29T00:00:00Z"
-version            = "2026.08.29.1"
+updated_at         = "2026-11-24T00:00:00Z"
+version            = "2026.11.24.1"
 
 [[rules]]
 all = [

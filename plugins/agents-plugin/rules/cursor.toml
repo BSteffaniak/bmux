@@ -1,8 +1,8 @@
 aliases            = ["cursor-agent"]
 id                 = "cursor"
 min_engine_version = 1
-updated_at         = "2026-08-03T01:08:04Z"
-version            = "2026.08.03.1"
+updated_at         = "2026-11-24T00:00:00Z"
+version            = "2026.11.24.1"
 
 [[rules]]
 any = [
@@ -69,11 +69,17 @@ visible_working = true
 [[rules]]
 background_working = true
 id                 = "background_task_status_working"
-line_regex         = ['(?i)\b[1-9][0-9]*\s+background\s+tasks?\b']
-priority           = 95
-region             = "bottom_non_empty_lines(5)"
-state              = "working"
-visible_working    = true
+# bmux: only a status row counts, with the count as its own segment (at the
+# start, after a glyph, or after a `·`/`|` separator) and nothing but
+# "running"/"active" after it, so prose like "kicked off 2 background tasks"
+# near the prompt is not background work.
+line_regex = [
+    '(?i)^\s*(?:.*\s[·•|]\s+|[^\p{Alphabetic}\p{N}\s]+\s+)?[1-9][0-9]*\s+background\s+tasks?(?:\s+(?:running|active|in\s+progress))?\s*(?:[·•|]\s.*)?$',
+]
+priority = 95
+region = "bottom_non_empty_lines(5)"
+state = "working"
+visible_working = true
 
 [[rules]]
 id              = "spinner_working"

@@ -1,8 +1,8 @@
 aliases            = ["claude-code"]
 id                 = "claude"
 min_engine_version = 2
-updated_at         = "2026-10-11T00:00:00Z"
-version            = "2026.10.11.1"
+updated_at         = "2026-11-24T00:00:00Z"
+version            = "2026.11.24.1"
 
 [[rules]]
 id              = "osc_title_working"

@@ -25,7 +25,7 @@ use bmux_agents_plugin_api::agent_states::{AgentSnapshot, AgentState, PaneAgent}
 use bmux_tabs_plugin_api::tabs_bells::TabBells;
 use bmux_tabs_plugin_api::tabs_status::{AgentActivity, GitStatus, TabAgent, TabStatus};
 
-use crate::attention::{AgentSignal, AttentionBook, FailedClears, Loaded, Observation};
+use crate::attention::{AgentSignal, AttentionBook, Exit, FailedClears, Loaded, Observation};
 use uuid::Uuid;
 
 /// How long a git status stays fresh.
@@ -137,8 +137,12 @@ pub struct StatusBoard {
     failed_clears: FailedClears,
     /// The saved book has been read (or there was none).
     attention_loaded: bool,
-    /// The saved book may be overwritten: not one in an unknown format.
+    /// The saved book may be overwritten: not one in a newer format.
     attention_writable: bool,
+    /// The book as last written, and when: a write happens only when the
+    /// book's bytes differ, at most once per [`SAVE_INTERVAL_MS`].
+    saved_bytes: Option<Vec<u8>>,
+    saved_at_ms: Option<u64>,
     /// When each recorded tab was first found missing from the tab list.
     missing_since: HashMap<Uuid, u64>,
 }
@@ -146,6 +150,9 @@ pub struct StatusBoard {
 /// How long a tab may be missing from the tab list before what it recorded is
 /// forgotten: tabs come back one by one after a restart.
 const FORGET_MISSING_TAB_MS: u64 = 60_000;
+/// How often the attention book is written at most: a pane ringing its bell
+/// over and over changes it every refresh.
+pub const SAVE_INTERVAL_MS: u64 = 5_000;
 
 impl StatusBoard {
     /// Record what is new in a tab, mark it seen when looked at, and decide
@@ -165,29 +172,20 @@ impl StatusBoard {
     /// Forget what tabs recorded once they have been missing from the tab
     /// list for [`FORGET_MISSING_TAB_MS`].
     fn forget_missing_tabs(&mut self, tabs: &[TabPanes], now_ms: u64) {
-        let live = tabs
-            .iter()
-            .map(|tab| tab.tab_id)
-            .collect::<std::collections::HashSet<_>>();
-        let recorded = self.attention.tabs.keys().copied().collect::<Vec<_>>();
-        self.missing_since.retain(|tab, _| !live.contains(tab));
-        for tab in recorded.into_iter().filter(|tab| !live.contains(tab)) {
-            self.missing_since.entry(tab).or_insert(now_ms);
+        let live = |tab: &Uuid| tabs.iter().any(|live| live.tab_id == *tab);
+        let missing_since = &mut self.missing_since;
+        missing_since.retain(|tab, _| !live(tab));
+        for tab in self.attention.tabs.keys().filter(|tab| !live(tab)) {
+            missing_since.entry(*tab).or_insert(now_ms);
         }
-        let keep = self
-            .attention
-            .tabs
-            .keys()
-            .copied()
-            .filter(|tab| {
-                self.missing_since
-                    .get(tab)
-                    .is_none_or(|since| now_ms.saturating_sub(*since) < FORGET_MISSING_TAB_MS)
-            })
-            .collect();
-        if self.attention.retain(&keep) {
+        if self.attention.retain(|tab| {
+            missing_since
+                .get(tab)
+                .is_none_or(|since| now_ms.saturating_sub(*since) < FORGET_MISSING_TAB_MS)
+        }) {
             self.attention_changed = true;
-            self.missing_since.retain(|tab, _| keep.contains(tab));
+            let recorded = &self.attention.tabs;
+            missing_since.retain(|tab, _| recorded.contains_key(tab));
         }
     }
 
@@ -197,25 +195,68 @@ impl StatusBoard {
         !self.attention_loaded
     }
 
-    /// Start from what was saved, ending failed states by `failed_clears`.
-    pub fn load_attention(&mut self, saved: Loaded, failed_clears: FailedClears) {
+    /// End failed states by `failed_clears` (the plugin's setting).
+    pub const fn set_failed_clears(&mut self, failed_clears: FailedClears) {
         self.failed_clears = failed_clears;
+    }
+
+    /// Start from what was saved. A book in a newer format is left alone; a
+    /// damaged one is replaced by a fresh one.
+    pub fn load_attention(&mut self, saved: Loaded) {
         self.attention_loaded = true;
         match saved {
-            Loaded::Book(book) => {
+            Loaded::Book(mut book) => {
+                book.mark_restored();
                 self.attention = book;
                 self.attention_writable = true;
             }
-            Loaded::Nothing => self.attention_writable = true,
+            Loaded::Nothing | Loaded::Corrupt(_) => {
+                self.attention_writable = true;
+                // Replace a damaged save even before anything changes.
+                self.attention_changed = true;
+            }
             Loaded::Unsupported => self.attention_writable = false,
         }
     }
 
-    /// The attention book to save, when it changed since this was last
-    /// called and may be saved.
-    pub fn take_changed_attention(&mut self) -> Option<AttentionBook> {
-        (std::mem::take(&mut self.attention_changed) && self.attention_writable)
-            .then(|| self.attention.clone())
+    /// The attention book's bytes to write at `now_ms`: when they differ
+    /// from what was last written, the book may be written, and the last
+    /// write was [`SAVE_INTERVAL_MS`] ago or more, or `flush` asks for it
+    /// now. Report the outcome with [`StatusBoard::attention_written`].
+    pub fn attention_to_save(&mut self, now_ms: u64, flush: bool) -> Option<Vec<u8>> {
+        if !self.attention_changed || !self.attention_writable {
+            return None;
+        }
+        if !flush
+            && self
+                .saved_at_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) < SAVE_INTERVAL_MS)
+        {
+            return None;
+        }
+        self.attention_changed = false;
+        let bytes = match self.attention.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "tabs attention not encoded");
+                return None;
+            }
+        };
+        if self.saved_bytes.as_deref() == Some(bytes.as_slice()) {
+            return None;
+        }
+        self.saved_at_ms = Some(now_ms);
+        Some(bytes)
+    }
+
+    /// Record whether `bytes`, from [`StatusBoard::attention_to_save`], were
+    /// written; a failed write is retried.
+    pub fn attention_written(&mut self, bytes: Vec<u8>, written: bool) {
+        if written {
+            self.saved_bytes = Some(bytes);
+        } else {
+            self.attention_changed = true;
+        }
     }
 
     /// Take the agents plugin's latest snapshot.
@@ -250,6 +291,22 @@ impl StatusBoard {
                 changed_at_ms: agent.changed_at_ms,
                 finished_at_ms: agent.finished_at_ms,
             })
+    }
+
+    /// The tab's latest exit, judged by its own pane: a command running in
+    /// another pane does not end a failure.
+    fn latest_exit(&self, tab: &TabPanes) -> Option<Exit> {
+        tab.panes
+            .iter()
+            .filter_map(|pane| {
+                let (at_ms, status) = self.panes.get(&pane.id)?.last_exit?;
+                Some(Exit {
+                    at_ms,
+                    status,
+                    rerun: pane.running_command.is_some(),
+                })
+            })
+            .max_by_key(|exit| exit.at_ms)
     }
 
     fn shell_command(&self, tab: &TabPanes) -> Option<String> {
@@ -388,10 +445,7 @@ impl StatusBoard {
                     })
                     .max_by_key(|(at, _)| *at);
                 let agent = self.tab_agent(tab);
-                let last_exit = tab_signals
-                    .iter()
-                    .filter_map(|signals| signals.last_exit)
-                    .max_by_key(|(at, _)| *at);
+                let last_exit = self.latest_exit(tab);
                 let output_at_ms = tab_signals
                     .iter()
                     .filter_map(|signals| signals.output_at_ms)
@@ -421,7 +475,7 @@ impl StatusBoard {
                     cwd,
                     title: signals.and_then(|signals| signals.title),
                     git,
-                    last_exit: last_exit.map(|(_, status)| status),
+                    last_exit: last_exit.map(|exit| exit.status),
                     output_at_ms,
                     attention_at_ms: attention.as_ref().map(|(at, _)| *at),
                     attention: attention.and_then(|(_, text)| text),
@@ -713,14 +767,16 @@ mod tests {
     }
 
     /// A tab whose agent finished while nobody looked is published done
-    /// until a focused client shows it; what it recorded is saved, survives a
-    /// reload, and survives the tab briefly missing from the list.
+    /// until a focused client shows it. What it recorded is saved and
+    /// survives a restart, where the agent comes back with no finish time
+    /// (the agents plugin keeps it only in memory), and the tab briefly
+    /// missing from the list.
     #[test]
     fn a_finished_agent_is_done_until_looked_at_and_that_is_saved() {
         use bmux_tabs_plugin_api::tabs_status::TabState;
         let tabs = [tab(1, &[(11, true, Some("claude"))])];
         let tab_id = Uuid::from_u128(1);
-        let mut idle = AgentSnapshot {
+        let agent = |changed_at_ms: u64, finished_at_ms: Option<u64>| AgentSnapshot {
             panes: vec![PaneAgent {
                 session_id: Uuid::from_u128(9),
                 pane_id: Uuid::from_u128(11),
@@ -729,62 +785,73 @@ mod tests {
                 source: bmux_agents_plugin_api::agent_states::AgentSource::Report,
                 rule: None,
                 message: None,
-                changed_at_ms: 10_000,
-                finished_at_ms: None,
+                changed_at_ms,
+                finished_at_ms,
             }],
             revision: 1,
         };
         let nobody = std::collections::HashSet::new();
         let looking = std::collections::HashSet::from([tab_id]);
         let mut board = StatusBoard::default();
-        board.load_attention(Loaded::Nothing, FailedClears::WhenSeen);
-        board.set_agents(&idle);
+        board.load_attention(Loaded::Nothing);
+        board.set_agents(&agent(10_000, None));
         let state = |built: Vec<TabStatus>| (built[0].state, built[0].state_since_ms);
         assert_eq!(
             state(board.build(&tabs, &nobody, 10_000, &mut |_| None)),
             (TabState::Idle, None),
             "an idle agent with no observed work"
         );
-        idle.panes[0].finished_at_ms = Some(10_000);
-        board.set_agents(&idle);
+        board.set_agents(&agent(10_000, Some(10_000)));
         assert_eq!(
             state(board.build(&tabs, &nobody, 12_000, &mut |_| None)),
             (TabState::Done, Some(10_000))
         );
-        let saved = board.take_changed_attention().expect("the finish is saved");
-        assert_eq!(board.take_changed_attention(), None, "once");
+        let saved = board
+            .attention_to_save(12_000, false)
+            .expect("the finish is saved");
+        board.attention_written(saved.clone(), true);
+        assert_eq!(board.attention_to_save(30_000, false), None, "once");
 
-        // A restarted board reads it back: still done.
-        let mut restarted = StatusBoard::default();
-        restarted.load_attention(
-            Loaded::from_bytes(Some(&saved.to_bytes().unwrap())),
-            FailedClears::WhenSeen,
-        );
-        restarted.set_agents(&idle);
+        // The server restarts: the agents plugin knows the agent again, but
+        // not when it finished. The saved finish is still done.
+        let restart = || {
+            let mut restarted = StatusBoard::default();
+            restarted.load_attention(Loaded::from_bytes(Some(&saved)));
+            restarted.set_agents(&agent(20_000, None));
+            restarted
+        };
+        let mut restarted = restart();
         // Missing from the list for a while keeps it.
-        restarted.build(&[], &nobody, 13_000, &mut |_| None);
+        restarted.build(&[], &nobody, 20_000, &mut |_| None);
         restarted.build(&[tab(2, &[(12, true, None)])], &nobody, 40_000, &mut |_| {
             None
         });
         assert_eq!(
-            state(restarted.build(&tabs, &nobody, 41_000, &mut |_| None)).0,
-            TabState::Done
+            state(restarted.build(&tabs, &nobody, 41_000, &mut |_| None)),
+            (TabState::Done, Some(10_000))
         );
         assert_eq!(
-            state(restarted.build(&tabs, &looking, 42_000, &mut |_| None)).0,
-            TabState::Stopped,
+            state(restarted.build(&tabs, &looking, 42_000, &mut |_| None)),
+            (TabState::Idle, None),
             "looked at"
         );
-        assert!(restarted.take_changed_attention().is_some());
+        let seen = restarted.attention_to_save(42_000, false);
+        assert!(seen.is_some(), "the seen mark is saved");
 
-        let mut relaunched = idle.clone();
-        relaunched.panes[0].finished_at_ms = None;
-        relaunched.panes[0].changed_at_ms = 43_000;
-        restarted.set_agents(&relaunched);
+        // Working again after the restart supersedes the saved finish.
+        let mut relaunched = restart();
+        let mut working = agent(43_000, None);
+        working.panes[0].state = AgentState::Working;
+        relaunched.set_agents(&working);
         assert_eq!(
-            state(restarted.build(&tabs, &nobody, 43_000, &mut |_| None)),
-            (TabState::Idle, None),
-            "an earlier job's completion does not make the new agent stopped"
+            state(relaunched.build(&tabs, &nobody, 43_000, &mut |_| None)).0,
+            TabState::Working
+        );
+        relaunched.set_agents(&agent(44_000, Some(44_000)));
+        assert_eq!(
+            state(relaunched.build(&tabs, &nobody, 44_000, &mut |_| None)),
+            (TabState::Stopped, Some(44_000)),
+            "the old finish is gone; the new one settles first"
         );
 
         // Missing for long enough, it is forgotten.
@@ -795,12 +862,81 @@ mod tests {
         });
         assert!(!restarted.attention.tabs.contains_key(&tab_id));
 
-        // A book in an unknown format is neither used nor overwritten.
+        // A book in a newer format is neither used nor overwritten.
         let mut future = StatusBoard::default();
-        future.load_attention(Loaded::Unsupported, FailedClears::WhenSeen);
-        future.set_agents(&idle);
+        future.load_attention(Loaded::Unsupported);
+        future.set_agents(&agent(10_000, Some(10_000)));
         future.build(&tabs, &nobody, 12_000, &mut |_| None);
-        assert_eq!(future.take_changed_attention(), None);
+        assert_eq!(future.attention_to_save(12_000, true), None);
+
+        // A damaged one is replaced, even before anything changes.
+        let mut damaged = StatusBoard::default();
+        damaged.load_attention(Loaded::from_bytes(Some(&saved[..saved.len() / 2])));
+        assert!(damaged.attention_to_save(0, false).is_some());
+    }
+
+    /// A command that fails in a split is failed while the focused pane runs
+    /// an editor, until a command runs in the split again.
+    #[test]
+    fn a_failure_in_a_split_shows_while_the_focused_pane_runs() {
+        use bmux_tabs_plugin_api::tabs_status::TabState;
+        let nobody = std::collections::HashSet::new();
+        let mut board = StatusBoard::default();
+        let exit = |status: Option<u32>| RetainedSignals {
+            pane_id: Uuid::from_u128(12),
+            exit_status: status,
+            ..RetainedSignals::default()
+        };
+        board.apply_signals(&[exit(None)], 1_000);
+        board.apply_signals(&[exit(Some(101))], 2_000);
+        let split = |command: Option<&'static str>| {
+            [tab(1, &[(11, true, Some("nvim")), (12, false, command)])]
+        };
+        assert_eq!(
+            board.build(&split(None), &nobody, 2_000, &mut |_| None)[0].state,
+            TabState::Failed
+        );
+        assert_eq!(
+            board.build(&split(Some("cargo test")), &nobody, 3_000, &mut |_| None)[0].state,
+            TabState::Idle
+        );
+    }
+
+    /// Changes are written at most once per [`SAVE_INTERVAL_MS`], only when
+    /// the saved bytes differ, and a flush or failed write loses nothing.
+    #[test]
+    fn the_attention_book_is_written_sparingly() {
+        let tabs = [tab(1, &[(11, true, None)])];
+        let nobody = std::collections::HashSet::new();
+        let mut board = StatusBoard::default();
+        board.load_attention(Loaded::Nothing);
+        let bell = |board: &mut StatusBoard, bells: u64, now: u64| {
+            board.apply_signals(
+                &[RetainedSignals {
+                    pane_id: Uuid::from_u128(11),
+                    bells,
+                    ..RetainedSignals::default()
+                }],
+                now,
+            );
+            board.build(&tabs, &nobody, now, &mut |_| None);
+        };
+        bell(&mut board, 0, 0);
+        let first = board.attention_to_save(0, false).expect("written");
+        board.attention_written(first, true);
+        bell(&mut board, 1, 1_000);
+        bell(&mut board, 2, 2_000);
+        assert_eq!(board.attention_to_save(2_000, false), None, "too soon");
+        let flushed = board.attention_to_save(2_000, true).expect("flushed");
+        board.attention_written(flushed, false);
+        assert_eq!(board.attention_to_save(3_000, false), None, "too soon");
+        let retried = board
+            .attention_to_save(2_000 + SAVE_INTERVAL_MS, false)
+            .expect("a failed write is retried");
+        board.attention_written(retried, true);
+        // Nothing new: nothing written, however long it has been.
+        bell(&mut board, 2, 20_000);
+        assert_eq!(board.attention_to_save(20_000, false), None);
     }
 
     #[test]

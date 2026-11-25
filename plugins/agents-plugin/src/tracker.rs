@@ -8,10 +8,14 @@
 //! 1. Is it working? The first channel that says either way decides: the
 //!    agent's title (OSC 0/2) or progress report (OSC 9;4) by its rules, its
 //!    own report (its hooks, or `bmux agents report`), then its screen by its
-//!    rules. An agent with no rules is working while its visible screen keeps
+//!    rules. A "working" report that arrived after the title or progress
+//!    last changed outranks their idle or asking verdict, which is stale.
+//!    An agent with no rules is working while its visible screen keeps
 //!    changing.
-//! 2. When it is not working, is it waiting for an answer? A blocker on its
-//!    screen (a permission or question dialog) or its own report says so.
+//! 2. When it is not working, is it waiting for an answer? Its title or
+//!    progress, a blocker on its screen (a permission or question dialog) or
+//!    its own report says so. Otherwise, background work its screen shows
+//!    (by a rule marked `background_working`) keeps it working.
 //!
 //! Asking only when not working keeps text that merely looks like a dialog
 //! (in an agent's transcript) from turning a working agent into a waiting
@@ -73,6 +77,10 @@ struct Track {
     /// Listings of the pane's jobs a reported agent has gone unseen in.
     unseen: u8,
     report: Option<(AgentState, Option<String>)>,
+    /// The [`Tracker::epoch`] its report last arrived in, and that its title
+    /// or progress last changed in: the newer of the two is the current one.
+    report_epoch: u64,
+    signal_epoch: u64,
     /// The title and progress the pane had when the agent appeared: not the
     /// agent's until they change.
     inherited: Option<(Option<String>, Option<String>)>,
@@ -98,6 +106,8 @@ impl Track {
             identified,
             unseen: 0,
             report: None,
+            report_epoch: 0,
+            signal_epoch: 0,
             inherited: None,
             title_live: false,
             progress_live: false,
@@ -120,6 +130,9 @@ pub struct Tracker {
     reports_seen: HashMap<Uuid, u64>,
     tracks: BTreeMap<Uuid, Track>,
     published: Option<Vec<PaneAgent>>,
+    /// How many times views were taken: orders reports against title and
+    /// progress changes.
+    epoch: u64,
 }
 
 impl Tracker {
@@ -133,6 +146,7 @@ impl Tracker {
             .collect::<std::collections::HashSet<_>>();
         self.tracks.retain(|pane, _| live.contains(pane));
         self.reports_seen.retain(|pane, _| live.contains(pane));
+        self.epoch += 1;
         for view in views {
             let seen = self.reports_seen.insert(view.pane_id, view.reports);
             if let Some(report) = view.report.clone()
@@ -146,6 +160,12 @@ impl Tracker {
                     .get_or_insert_with(|| (view.title.clone(), view.progress.clone()));
                 track.title_live |= view.title != inherited.0;
                 track.progress_live |= view.progress != inherited.1;
+                let previous = self.views.get(&view.pane_id);
+                if previous.is_none_or(|previous| {
+                    previous.title != view.title || previous.progress != view.progress
+                }) {
+                    track.signal_epoch = self.epoch;
+                }
             }
             self.views.insert(view.pane_id, view);
         }
@@ -186,6 +206,7 @@ impl Tracker {
             track.agent.clone_from(agent);
         }
         track.report = Some((state, report.message.clone()));
+        track.report_epoch = self.epoch;
     }
 
     /// Follow the panes' foreground jobs: identify agents, and end tracks
@@ -373,27 +394,33 @@ fn classify(
         RuleState::Idle | RuleState::Blocked => Some(false),
         RuleState::Unknown => None,
     };
-    // 1. Is it working?
-    let signalled = rules.and_then(|rules| {
-        [Channel::Title, Channel::Progress]
-            .into_iter()
-            .filter_map(|channel| rules.evaluate_channel(&signals, channel))
-            .filter(|verdict| !verdict.skip)
-            .find_map(|verdict| {
-                says(&verdict).map(|working| (working, verdict.state, verdict.rule))
-            })
-    });
+    // 1. Is it working? A working report newer than an idle or blocked
+    // title or progress outranks it: that title is stale.
+    let report = track.report.as_ref().map(|(state, _)| *state);
+    let signalled = rules
+        .and_then(|rules| {
+            [Channel::Title, Channel::Progress]
+                .into_iter()
+                .filter_map(|channel| rules.evaluate_channel(&signals, channel))
+                .filter(|verdict| !verdict.skip)
+                .find_map(|verdict| {
+                    says(&verdict).map(|working| (working, verdict.state, verdict.rule))
+                })
+        })
+        .filter(|(working, ..)| {
+            *working
+                || report != Some(AgentState::Working)
+                || track.report_epoch <= track.signal_epoch
+        });
+    // A title or progress that says the agent is asking, whichever path
+    // decides it is not working.
     let channel_blocked = signalled
         .as_ref()
-        .is_some_and(|(_, state, _)| *state == RuleState::Blocked);
+        .filter(|(_, state, _)| *state == RuleState::Blocked)
+        .map(|(.., rule)| rule.clone());
     let working = signalled
         .map(|(working, _, rule)| (working, AgentSource::Screen, Some(rule)))
-        .or_else(|| {
-            track
-                .report
-                .as_ref()
-                .map(|(state, _)| (*state == AgentState::Working, AgentSource::Report, None))
-        })
+        .or_else(|| report.map(|state| (state == AgentState::Working, AgentSource::Report, None)))
         .or_else(|| {
             let verdict = track.screen_verdict.as_ref()?;
             let working = says(verdict)?;
@@ -413,24 +440,11 @@ fn classify(
     if working.0 {
         return (AgentState::Working, working.1, working.2);
     }
-    // An idle title, progress signal or report can describe the foreground
-    // turn while a live screen indicator still shows background work.
-    if !matches!(track.report, Some((AgentState::Blocked, _)))
-        && let Some(verdict) = track
-            .screen_verdict
-            .as_ref()
-            .filter(|verdict| verdict.background_working)
-    {
-        if channel_blocked {
-            return (AgentState::Blocked, working.1, working.2);
-        }
-        return (
-            AgentState::Working,
-            AgentSource::Screen,
-            Some(verdict.rule.clone()),
-        );
+    // 2. Not working: is it waiting for an answer? Its title or progress,
+    // its screen, or its report can say so.
+    if let Some(rule) = channel_blocked {
+        return (AgentState::Blocked, AgentSource::Screen, Some(rule));
     }
-    // 2. Not working: is it waiting for an answer?
     if let Some(verdict) = track
         .screen_verdict
         .as_ref()
@@ -442,8 +456,21 @@ fn classify(
             Some(verdict.rule.clone()),
         );
     }
-    if matches!(track.report, Some((AgentState::Blocked, _))) {
+    if report == Some(AgentState::Blocked) {
         return (AgentState::Blocked, AgentSource::Report, None);
+    }
+    // An idle title, progress signal or report can describe the foreground
+    // turn while a live screen indicator still shows background work.
+    if let Some(verdict) = track
+        .screen_verdict
+        .as_ref()
+        .filter(|verdict| verdict.background_working)
+    {
+        return (
+            AgentState::Working,
+            AgentSource::Screen,
+            Some(verdict.rule.clone()),
+        );
     }
     (AgentState::Idle, working.1, working.2)
 }
@@ -670,6 +697,76 @@ mod tests {
         // Another job in the pane ends the agent and its report.
         tracker.set_jobs(&[job(41, "vim")], &catalog());
         assert_eq!(tracker.snapshot().len(), 0);
+    }
+
+    /// A working report that arrives after the title last changed is newer
+    /// than the idle title, which is stale; a title change after the report
+    /// is newer again.
+    #[test]
+    fn a_working_report_outranks_an_older_idle_title() {
+        let rules = claude();
+        let mut tracker = Tracker::default();
+        let reported = |reports: u64, state: &str, title: &str| PaneView {
+            report: Some(Report {
+                state: state.into(),
+                agent: Some("claude".into()),
+                message: None,
+            }),
+            reports,
+            ..view(Some(title), reports)
+        };
+        tracker.set_views(vec![view(None, 0)]);
+        tracker.set_views(vec![reported(1, "idle", "✳ ready")]);
+        tracker.set_jobs(&[job(40, "claude")], &catalog());
+        tracker.settle(10, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
+
+        // The title stays idle; the agent reports working.
+        tracker.set_views(vec![reported(2, "working", "✳ ready")]);
+        tracker.settle(20, |_| Some(&rules));
+        let agent = tracker.snapshot().remove(0);
+        assert_eq!(
+            (agent.state, agent.source),
+            (AgentState::Working, AgentSource::Report)
+        );
+
+        // Unchanged views keep it so.
+        tracker.set_views(vec![reported(2, "working", "✳ ready")]);
+        tracker.settle(30, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Working);
+
+        // The title changes after the report: the report is the stale one.
+        tracker.set_views(vec![reported(2, "working", "✳ all done")]);
+        tracker.settle(40, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
+    }
+
+    /// A title that says the agent asks makes it blocked, with no
+    /// background work on its screen too.
+    #[test]
+    fn a_blocked_title_asks_without_background_work() {
+        let codex = rules::Agent::parse(
+            rules::BUNDLED
+                .iter()
+                .find(|(name, _)| *name == "codex")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let catalog = Catalog::new(
+            [(codex.id.as_str(), codex.aliases.as_slice())],
+            &[] as &[String],
+        );
+        let mut tracker = Tracker::default();
+        tracker.set_views(vec![view(None, 0)]);
+        tracker.set_jobs(&[job(40, "codex")], &catalog);
+        tracker.set_views(vec![view(Some("Action Required: approve"), 1)]);
+        tracker.settle(10, |_| Some(&codex));
+        let agent = tracker.snapshot().remove(0);
+        assert_eq!(
+            (agent.state, agent.rule.as_deref()),
+            (AgentState::Blocked, Some("osc_title_blocked"))
+        );
     }
 
     #[test]

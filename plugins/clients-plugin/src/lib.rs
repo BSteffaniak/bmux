@@ -738,7 +738,9 @@ impl clients_presence_commands_v1::ClientsPresenceCommandsV1Service for Selectio
     }
 }
 
-/// What each connected client shows, and whether its terminal has focus.
+/// What each attached client (one with an open attach stream) shows, and
+/// whether its terminal has focus. A connected client that is not attached,
+/// such as a CLI command, shows nothing.
 fn list_presence(events: &ClientEvents) -> Vec<Presence> {
     let Some(state) = events.states.get::<FollowState>() else {
         return Vec::new();
@@ -749,6 +751,7 @@ fn list_presence(events: &ClientEvents) -> Vec<Presence> {
     state
         .connected_clients
         .iter()
+        .filter(|client| state.attached_stream_session(**client).is_some())
         .map(|client| Presence {
             client_id: client.0,
             selected_context_id: state.selected_contexts.get(client).copied().flatten(),
@@ -1741,6 +1744,7 @@ mod presence_tests {
             follow
                 .selected_contexts
                 .insert(ClientId(*client), Some(*client));
+            follow.set_attached_stream_session(ClientId(*client), Some(SessionId(*client)));
         }
         let state = Arc::new(RwLock::new(follow));
         states.register::<FollowState>(&state);
@@ -1779,5 +1783,19 @@ mod presence_tests {
             set_terminal_focus(&events, None, false),
             Err(PresenceError::NoCurrentClient)
         );
+    }
+
+    /// A connected client without an attach stream (a CLI command) shows
+    /// nothing, whatever it selected.
+    #[test]
+    fn only_attached_clients_are_present() {
+        let (attached, command) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let events = events_with(&[attached, command]);
+        let state = events.states.get::<FollowState>().unwrap();
+        state
+            .write()
+            .unwrap()
+            .set_attached_stream_session(ClientId(command), None);
+        assert_eq!(focused(&events), [(attached, true)]);
     }
 }

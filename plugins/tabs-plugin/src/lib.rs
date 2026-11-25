@@ -3267,7 +3267,22 @@ fn spawn_status_observer(
             let mut dirty = false;
             loop {
                 tokio::select! {
-                    () = cancellation.cancelled() => return Ok(()),
+                    () = cancellation.cancelled() => {
+                        // Write what changed since the last write.
+                        let shared = shared.clone();
+                        let board = Arc::clone(&board);
+                        let _ = worker
+                            .spawn_blocking(move || {
+                                save_attention_if_due(
+                                    shared.caller.as_ref(),
+                                    &board,
+                                    status::now_ms(),
+                                    true,
+                                );
+                            })
+                            .await;
+                        return Ok(());
+                    }
                     ready = bus.subscribe_when_registered::<TerminalEvent>(&terminal_kind), if terminal.is_none() => {
                         terminal = ready.ok();
                     }
@@ -3412,113 +3427,176 @@ fn with_shared_attachment_env<T>(
     })
 }
 
-/// Every tab with its session's panes, as the pane runtime lists them.
-fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
-    let Ok(contexts) = list_contexts(caller) else {
-        return Vec::new();
-    };
+/// Every tab with its session's panes, as the pane runtime lists them; an
+/// error when any part of the listing failed, so that a failed listing is
+/// never taken for tabs or panes that are gone.
+fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<status::TabPanes>, String> {
+    let contexts = list_contexts(caller)?;
     let mut sessions = std::collections::BTreeMap::new();
-    contexts
-        .into_iter()
-        .filter_map(|context| {
-            let session_id = context
-                .attributes
-                .get("bmux.session_id")
-                .and_then(|id| Uuid::parse_str(id).ok())?;
-            let panes = sessions
-                .entry(session_id)
-                .or_insert_with(|| {
-                    list_panes(caller, Some(session_id))
-                        .map(|list| {
-                            list.panes
-                                .into_iter()
-                                .map(|pane| status::PaneInfo {
-                                    id: pane.id,
-                                    focused: pane.focused,
-                                    running_command: pane.active_command,
-                                    cwd: pane.cwd,
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .clone();
-            Some(status::TabPanes {
-                tab_id: context.id,
-                panes,
-            })
-        })
-        .collect()
-}
-
-/// The attention book saved in this plugin's storage.
-fn load_attention(caller: &(impl ServiceCaller + Sync)) -> attention::Loaded {
-    let Ok(key) = bmux_plugin_sdk::StorageKey::new(attention::STORAGE_KEY) else {
-        return attention::Loaded::Unsupported;
-    };
-    match caller.storage_get(&bmux_plugin_sdk::StorageGetRequest::new(key)) {
-        Ok(response) => attention::Loaded::from_bytes(response.value.as_deref()),
-        Err(error) => {
-            tracing::warn!(%error, "tabs attention not loaded; starting fresh without saving");
-            attention::Loaded::Unsupported
-        }
+    let mut tabs = Vec::with_capacity(contexts.len());
+    for context in contexts {
+        let Some(session_id) = context
+            .attributes
+            .get("bmux.session_id")
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        let panes = match sessions.entry(session_id) {
+            std::collections::btree_map::Entry::Occupied(panes) => panes.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                list_panes(caller, Some(session_id))?
+                    .panes
+                    .into_iter()
+                    .map(|pane| status::PaneInfo {
+                        id: pane.id,
+                        focused: pane.focused,
+                        running_command: pane.active_command,
+                        cwd: pane.cwd,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        tabs.push(status::TabPanes {
+            tab_id: context.id,
+            panes: panes.clone(),
+        });
     }
+    Ok(tabs)
 }
 
-/// Save the attention book in this plugin's storage; a failure is logged and
-/// retried with the next change.
-fn save_attention(caller: &(impl ServiceCaller + Sync), book: &attention::AttentionBook) {
+/// The attention book saved in this plugin's storage, or why it could not
+/// be read (to try again later).
+fn load_attention(caller: &(impl ServiceCaller + Sync)) -> Result<attention::Loaded, String> {
+    let key = bmux_plugin_sdk::StorageKey::new(attention::STORAGE_KEY)
+        .map_err(|error| error.to_string())?;
+    caller
+        .storage_get(&bmux_plugin_sdk::StorageGetRequest::new(key))
+        .map(|response| attention::Loaded::from_bytes(response.value.as_deref()))
+        .map_err(|error| error.to_string())
+}
+
+/// Save the attention book's `bytes` in this plugin's storage; returns
+/// whether it was saved (a failure is logged).
+fn save_attention(caller: &(impl ServiceCaller + Sync), bytes: Vec<u8>) -> bool {
     let saved = bmux_plugin_sdk::StorageKey::new(attention::STORAGE_KEY)
         .map_err(|error| error.to_string())
-        .and_then(|key| Ok((key, book.to_bytes()?)))
-        .and_then(|(key, bytes)| {
+        .and_then(|key| {
             caller
                 .storage_set(&bmux_plugin_sdk::StorageSetRequest::new(key, bytes))
                 .map_err(|error| error.to_string())
         });
-    if let Err(error) = saved {
-        tracing::warn!(%error, "tabs attention not saved");
+    if let Err(error) = &saved {
+        tracing::warn!(%error, "tabs attention not saved; retrying");
+    }
+    saved.is_ok()
+}
+
+/// Write the attention book when a write is due (or now, with `flush`),
+/// outside the board's lock.
+fn save_attention_if_due(
+    caller: &(impl ServiceCaller + Sync),
+    board: &Mutex<status::StatusBoard>,
+    now_ms: u64,
+    flush: bool,
+) {
+    let Some(bytes) = board
+        .lock()
+        .ok()
+        .and_then(|mut board| board.attention_to_save(now_ms, flush))
+    else {
+        return;
+    };
+    let written = save_attention(caller, bytes.clone());
+    if let Ok(mut board) = board.lock() {
+        board.attention_written(bytes, written);
     }
 }
 
-/// The tabs a person is looking at now: each shown by a client whose
-/// terminal has focus. Looking at a tab marks what it signalled seen.
+/// The tabs a person is looking at now: each shown by an attached client
+/// whose terminal has focus. Looking at a tab marks what it signalled seen.
+///
+/// Without the clients plugin's presence, every client's selected tab
+/// counts (as before terminal focus was known); without the clients plugin
+/// at all, the current tab does.
 fn looked_at_tabs(caller: &(impl ServiceCaller + Sync)) -> std::collections::HashSet<Uuid> {
     let mut client = dispatch_client(caller);
-    bmux_plugin::block_on_typed_dispatch(
+    if let Ok(clients) = bmux_plugin::block_on_typed_dispatch(
         bmux_clients_plugin_api::clients_presence_state_v1::client::list_presence(&mut client),
-    )
-    .map(|clients| {
-        clients
+    ) {
+        return clients
             .into_iter()
             .filter(|client| client.terminal_focused)
             .filter_map(|client| client.selected_context_id)
-            .collect()
-    })
-    .unwrap_or_default()
+            .collect();
+    }
+    if let Ok(clients) =
+        bmux_plugin::block_on_typed_dispatch(api_clients_state::client::list_clients(&mut client))
+    {
+        return clients
+            .into_iter()
+            .filter_map(|client| client.selected_context_id)
+            .collect();
+    }
+    current_context(caller)
+        .ok()
+        .flatten()
+        .map(|context| context.id)
+        .into_iter()
+        .collect()
 }
 
 static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Read the saved attention book when the board has not yet; `None` when
+/// it has, or when reading failed (tried again on the next publish, and
+/// nothing is written until it is read).
+fn attention_to_load(
+    caller: &(impl ServiceCaller + Sync),
+    board: &Mutex<status::StatusBoard>,
+) -> Option<attention::Loaded> {
+    if !board.lock().is_ok_and(|board| board.attention_unloaded()) {
+        return None;
+    }
+    load_attention(caller)
+        .inspect_err(|error| tracing::warn!(%error, "tabs attention not loaded yet; retrying"))
+        .ok()
+        .inspect(|loaded| {
+            if let attention::Loaded::Corrupt(error) = loaded {
+                tracing::warn!(%error, "tabs attention unreadable; starting fresh");
+            }
+        })
+}
+
 fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoard>) {
     let caller = shared.caller.as_ref();
-    let tabs = tab_panes(caller);
+    // Everything the board needs from other plugins is read before it is
+    // locked.
+    let tabs = match tab_panes(caller) {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            // Taking a failed listing for no tabs would forget them all.
+            tracing::debug!(%error, "tabs status skipped: tabs not listed");
+            return;
+        }
+    };
     let signals = pane_signals(caller);
+    let looked_at = looked_at_tabs(caller);
+    let loaded = attention_to_load(caller, board);
+    let failed_clears =
+        attention::FailedClears::parse(shared.settings.as_ref()).unwrap_or_default();
 
-    let Ok(mut board) = board.lock() else {
+    let now_ms = status::now_ms();
+    let Ok(mut locked) = board.lock() else {
         return;
     };
-    if board.attention_unloaded() {
-        board.load_attention(
-            load_attention(caller),
-            attention::FailedClears::parse(shared.settings.as_ref()).unwrap_or_default(),
-        );
+    if let Some(loaded) = loaded {
+        locked.load_attention(loaded);
     }
-    let now_ms = status::now_ms();
-    board.apply_signals(&signals, now_ms);
-    let looked_at = looked_at_tabs(caller);
-    let statuses = board.build(&tabs, &looked_at, now_ms, &mut status::git_status);
-    if let Some(bells) = board.changed_bells(&tabs)
+    locked.set_failed_clears(failed_clears);
+    locked.apply_signals(&signals, now_ms);
+    let statuses = locked.build(&tabs, &looked_at, now_ms, &mut status::git_status);
+    if let Some(bells) = locked.changed_bells(&tabs)
         && let Some(events) = tab_events(&shared.runtime_state)
     {
         let _ = events.publish_state(
@@ -3530,13 +3608,12 @@ fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoar
             },
         );
     }
-    if let Some(book) = board.take_changed_attention() {
-        save_attention(caller, &book);
-    }
-    if !board.changed(&statuses) {
+    let changed = locked.changed(&statuses);
+    drop(locked);
+    save_attention_if_due(caller, board, now_ms, false);
+    if !changed {
         return;
     }
-    drop(board);
     let snapshot = bmux_tabs_plugin_api::tabs_status::TabStatusSnapshot {
         tabs: statuses,
         now_ms: status::now_ms(),
