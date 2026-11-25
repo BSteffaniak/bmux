@@ -12,13 +12,16 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_agents_plugin_api       = { workspace = true }
+bmux_client_state            = { workspace = true }
 bmux_clients_plugin_api      = { workspace = true }
+bmux_context_state           = { workspace = true }
 bmux_contexts_plugin_api     = { workspace = true }
 bmux_ipc                     = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true, features = ["tui"] }
 bmux_plugin_schema_macros    = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
+bmux_session_models          = { workspace = true }
 bmux_sessions_plugin_api     = { workspace = true }
 bmux_snapshot_runtime        = { workspace = true }
 bmux_tabs_plugin_api         = { workspace = true }
@@ -37,7 +40,6 @@ bmux_client               = { workspace = true }
 bmux_contexts_plugin      = { workspace = true }
 bmux_keybind              = { workspace = true }
 bmux_plugin_runtime       = { workspace = true }
-bmux_session_models       = { workspace = true }
 bmux_tab_bar_plugin       = { workspace = true }
 
 [features]
@@ -47,7 +49,10 @@ dynamic-backend = []
 dynamic-frontend = []
 fail-on-warnings = [
     "bmux_agents_plugin_api/fail-on-warnings",
+    "bmux_client_state/fail-on-warnings",
+    "bmux_context_state/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
+    "bmux_session_models/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

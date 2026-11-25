@@ -46,6 +46,7 @@ use bmux_tabs_plugin_api::tabs_commands::{
     PaneMutationError, PaneResizeDirection, PaneZoomAck, Selector, TabAck, TabError,
     TabMovePlacement, TabsCommandsService,
 };
+use bmux_tabs_plugin_api::tabs_personal_attachment as personal_attachment;
 use bmux_tabs_plugin_api::tabs_personal_commands as personal_commands;
 use bmux_tabs_plugin_api::tabs_personal_views;
 use bmux_tabs_plugin_api::tabs_state::{
@@ -1279,10 +1280,14 @@ fn tab_events(runtime_state: &TabRuntimeStateHandle) -> Option<Arc<bmux_plugin::
         .and_then(|state| state.events.clone())
 }
 
+type AttachmentsHandle = Arc<personal_views::attachments::Attachments>;
+
 #[derive(Default)]
 pub struct TabsPlugin {
     last_selected_by_client: LastSelectedByClient,
     runtime_state: TabRuntimeStateHandle,
+    /// Per-attachment personal view bindings; transient, never stored.
+    attachments: AttachmentsHandle,
 }
 
 impl Plugin for TabsPlugin {
@@ -1465,6 +1470,25 @@ impl TabsPlugin {
             "tabs-personal-commands/v1", "set-label" => |req: personal_commands::client::SetLabelRequest, ctx| {
                 Ok::<_, ServiceResponse>(self.personal_command(ctx, req.mutation_id, &personal_views::Command::SetLabel { view_id: req.view_id, expected_revision: req.expected_revision, member_id: req.member_id, label: req.label }))
             },
+            "tabs-personal-attachment/v1", "current-binding" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(self.with_attachment_env(ctx, |env| {
+                    self.attachments.current_binding(env, ctx.caller_client_id)
+                }))
+            },
+            "tabs-personal-attachment/v1", "bind-view" => |req: personal_attachment::client::BindViewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.with_attachment_env(ctx, |env| {
+                    self.attachments.bind_view(env, ctx.caller_client_id, req.view_id, req.expected_binding_revision)
+                }))
+            },
+            "tabs-personal-attachment/v1", "select-member" => |req: personal_attachment::client::SelectMemberRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.with_attachment_env(ctx, |env| {
+                    // The ordinary tab switch: contexts selection for this
+                    // client, with its per-client history.
+                    self.attachments.select_member(env, ctx.caller_client_id, req.member_id, req.expected_binding_revision, |context_id| {
+                        switch_tab(ctx, &self.runtime_state, context_selector_by_id(context_id), &self.last_selected_by_client, ctx.caller_client_id).map(|_| ())
+                    })
+                }))
+            },
             "tabs-state", "list-tabs" => |req: ListTabsArgs, ctx| {
                 let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref(), ActiveMarking::Caller)
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
@@ -1474,7 +1498,8 @@ impl TabsPlugin {
                 Ok::<_, ServiceResponse>(active_tab_panes(ctx))
             },
             "tabs-commands", "new-tab" => |req: NewTabArgs, ctx| {
-                Ok::<_, ServiceResponse>(create_tab_with_settings(ctx, &self.runtime_state, req.name, ctx.settings.as_ref())
+                let bound = self.attachments.bound_view(ctx.caller_client_id);
+                Ok::<_, ServiceResponse>(create_tab_with_settings(ctx, &self.runtime_state, req.name, ctx.settings.as_ref(), bound)
                     .map_err(|reason| TabError::Failed { reason }))
             },
             "tabs-commands", "rename-tab" => |req: RenameTabArgs, ctx| {
@@ -1601,12 +1626,36 @@ impl TabsPlugin {
         bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck,
         bmux_tabs_plugin_api::tabs_personal_views::PersonalViewError,
     > {
-        personal_views::apply_for_caller(
+        let result = personal_views::apply_for_caller(
             context,
             &tab_states(&self.runtime_state),
             mutation_id,
             command,
-        )
+        );
+        if result.is_ok() {
+            // Republish to every attachment bound to the edited view.
+            self.attachments.schedule();
+        }
+        result
+    }
+
+    /// Run one `tabs-personal-attachment/v1` operation with the invocation as
+    /// the caller and the host's attachment state.
+    fn with_attachment_env<T>(
+        &self,
+        context: &NativeServiceContext,
+        operation: impl FnOnce(&personal_views::attachments::Env<'_, NativeServiceContext>) -> T,
+    ) -> T {
+        let states = tab_states(&self.runtime_state);
+        let sink = personal_views::attachments::host_wire_sink(&states);
+        let host = personal_views::attachments::RegistryHost(&states);
+        operation(&personal_views::attachments::Env {
+            caller: context,
+            states: Some(&states),
+            host: &host,
+            sink: sink.as_deref(),
+            now_ms: status::now_ms(),
+        })
     }
 
     fn activate_with_async(
@@ -1623,8 +1672,10 @@ impl TabsPlugin {
             settings: context.settings.clone(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
+            attachments: self.attachments.clone(),
         };
         spawn_status_observer(&async_handle, shared.clone())?;
+        spawn_attachment_refresher(&async_handle, shared.clone())?;
         let worker = async_handle.clone();
         async_handle.spawn_background("tabs-catalog-observer", move |mut cancellation| async move {
             let Some(bus) = tab_events(&shared.runtime_state) else {
@@ -1673,6 +1724,9 @@ impl TabsPlugin {
                     }
                     if let Some(event) = event { handle_context_event(&shared, &event); }
                     else { publish_tab_list_snapshot(shared.caller.as_ref(), &shared.runtime_state); }
+                    // Tab create/rename/close, selection and workspace changes
+                    // can change attachments' projections.
+                    shared.attachments.schedule();
                 }).await.map_err(|error| error.to_string())?;
             }
         }).map_err(PluginCommandError::failed)?;
@@ -1697,6 +1751,7 @@ impl TabsPlugin {
             settings: context.plugin_settings_map.get("bmux.tabs").cloned(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
+            attachments: self.attachments.clone(),
         };
 
         let handles_started = Instant::now();
@@ -2140,8 +2195,15 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             } else {
                 cwd::CwdSettings::parse(context.settings.as_ref())?.new_tab
             };
-            let ack =
-                create_tab_with_policy(context, &plugin.runtime_state, name, &policy, source)?;
+            let bound = plugin.attachments.bound_view(context.caller_client_id);
+            let ack = create_tab_with_policy(
+                context,
+                &plugin.runtime_state,
+                name,
+                &policy,
+                source,
+                bound,
+            )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created tab context: {context_id}");
@@ -2756,6 +2818,12 @@ fn spawn_status_observer(
                         if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                             panes = None;
                         }
+                        if let Ok(event) = &event
+                            && matches!(**event, PaneEvent::ClientAttached { .. } | PaneEvent::ClientDetached { .. })
+                        {
+                            // A client attached or detached: bind or retire it.
+                            shared.attachments.schedule();
+                        }
                         dirty = true;
                     },
                     _ = refresh.tick(), if dirty => {
@@ -2789,6 +2857,56 @@ async fn agents_changed<T: Send + Sync>(
     match receiver {
         Some(receiver) => receiver.changed().await.is_ok(),
         None => std::future::pending().await,
+    }
+}
+
+/// Keep every attachment's binding and projection current: on demand (tab,
+/// selection, workspace, view and attach events) and once a second, which
+/// also retires detached or disconnected attachments and picks up selection
+/// changes that announce no event.
+fn spawn_attachment_refresher(
+    async_handle: &bmux_plugin_sdk::HostAsyncHandle,
+    shared: TabsSharedState,
+) -> std::result::Result<(), PluginCommandError> {
+    let worker = async_handle.clone();
+    async_handle
+        .spawn_background(
+            "tabs-personal-attachments",
+            move |mut cancellation| async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        _ = tick.tick() => {}
+                        () = shared.attachments.woken() => {}
+                    }
+                    let shared = shared.clone();
+                    worker
+                        .spawn_blocking(move || refresh_attachments(&shared))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            },
+        )
+        .map_err(PluginCommandError::failed)
+}
+
+fn refresh_attachments(shared: &TabsSharedState) {
+    let states = tab_states(&shared.runtime_state);
+    let sink = personal_views::attachments::host_wire_sink(&states);
+    let host = personal_views::attachments::RegistryHost(&states);
+    let failures = shared
+        .attachments
+        .refresh(&personal_views::attachments::Env {
+            caller: shared.caller.as_ref(),
+            states: Some(&states),
+            host: &host,
+            sink: sink.as_deref(),
+            now_ms: status::now_ms(),
+        });
+    for failure in failures {
+        tracing::warn!(%failure, "personal view projection not delivered");
     }
 }
 
@@ -3036,17 +3154,21 @@ fn create_tab(
     runtime_state: &TabRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<TabAck, String> {
-    create_tab_with_settings(caller, runtime_state, name, None)
+    create_tab_with_settings(caller, runtime_state, name, None, None)
 }
+
+/// The creating attachment's bound view, with the owner it was bound for.
+type BoundView = Option<(personal_views::Owner, Uuid)>;
 
 fn create_tab_with_settings(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
     name: Option<String>,
     settings: Option<&toml::Value>,
+    bound: BoundView,
 ) -> Result<TabAck, String> {
     let policy = cwd::CwdSettings::parse(settings)?.new_tab;
-    create_tab_with_policy(caller, runtime_state, name, &policy, None)
+    create_tab_with_policy(caller, runtime_state, name, &policy, None, bound)
 }
 
 fn create_tab_with_policy(
@@ -3055,11 +3177,13 @@ fn create_tab_with_policy(
     name: Option<String>,
     policy: &cwd::DirectoryPolicy,
     source: Option<(Uuid, Uuid)>,
+    bound: BoundView,
 ) -> Result<TabAck, String> {
-    create_tab_joining_view(caller, runtime_state, name, policy, source).map(|(ack, _)| ack)
+    create_tab_joining_view(caller, runtime_state, name, policy, source, bound).map(|(ack, _)| ack)
 }
 
-/// Create a tab, then add it to the creating principal's view.
+/// Create a tab, then add it to the creating attachment's bound view (or,
+/// without one, the creating principal's default view).
 ///
 /// The tab exists once the context is created. A failed view update is
 /// logged and returned beside the successful acknowledgement, never as a
@@ -3071,6 +3195,7 @@ fn create_tab_joining_view(
     name: Option<String>,
     policy: &cwd::DirectoryPolicy,
     source: Option<(Uuid, Uuid)>,
+    bound: BoundView,
 ) -> Result<(TabAck, Result<personal_views::CreatedTabJoin, String>), String> {
     let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
@@ -3120,6 +3245,7 @@ fn create_tab_joining_view(
         &tab_states(runtime_state),
         context_id,
         context_workspace_id(&context),
+        bound,
     );
     if let Err(error) = &joined {
         log_tab_rename_error(caller, format!("tab {context_id} created; {error}"));
@@ -3919,6 +4045,7 @@ struct TabsSharedState {
     caller: Arc<TypedServiceCaller>,
     last_selected_by_client: LastSelectedByClient,
     runtime_state: TabRuntimeStateHandle,
+    attachments: AttachmentsHandle,
 }
 
 /// Typed implementation of [`TabsCommandsService`]. Wraps a
@@ -4493,11 +4620,14 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<TabAck, TabError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
+            // This handle acts for no client, so the tab joins the
+            // default view of no one: it has no caller principal.
             create_tab_with_settings(
                 &*caller,
                 &self.shared.runtime_state,
                 name,
                 self.shared.settings.as_ref(),
+                None,
             )
             .map_err(|reason| TabError::Failed { reason })
         })
@@ -5065,6 +5195,10 @@ fn interface_ids_match_bpdl_constants() {
     assert_eq!(
         personal_commands::INTERFACE_ID.as_str(),
         "tabs-personal-commands/v1"
+    );
+    assert_eq!(
+        personal_attachment::INTERFACE_ID.as_str(),
+        "tabs-personal-attachment/v1"
     );
 }
 

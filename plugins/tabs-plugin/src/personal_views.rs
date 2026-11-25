@@ -71,6 +71,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
+pub mod attachments;
+
 /// Schema version of an owner document and of snapshot payloads.
 pub const SCHEMA_VERSION: u32 = 1;
 const INDEX_SCHEMA_VERSION: u32 = 1;
@@ -851,10 +853,13 @@ pub enum CreatedTabJoin {
     },
 }
 
-/// The view a tab created by `owner` joins. Phase 3 replaces this with the
-/// creating attachment's bound view; today it is the owner's default view.
-const fn creation_target_view(document: &OwnerDocument) -> Option<Uuid> {
-    document.default_view
+/// The view a tab created by `owner` joins: the creating attachment's bound
+/// view when it still exists, otherwise (attachment-less callers such as a
+/// CLI connection, or a bound view deleted meanwhile) the owner's default view.
+fn creation_target_view(document: &OwnerDocument, bound: Option<Uuid>) -> Option<Uuid> {
+    bound
+        .filter(|view_id| document.view(*view_id).is_ok())
+        .or(document.default_view)
 }
 
 // ----- Repository -----
@@ -1057,7 +1062,8 @@ impl<'a, S: HostRuntimeApi + ?Sized> Repository<'a, S> {
     }
 
     /// Add a tab its owner just created to the owner's creation target view
-    /// ([`creation_target_view`]), at the end of its workspace arrangement.
+    /// ([`creation_target_view`]: the creating attachment's `bound` view, else
+    /// the default view), at the end of its workspace arrangement.
     /// Idempotent by content: a retry finds the existing member. Joins only
     /// an initialized arrangement; an uninitialized one picks the tab up from
     /// the canonical order when it is seeded.
@@ -1069,12 +1075,13 @@ impl<'a, S: HostRuntimeApi + ?Sized> Repository<'a, S> {
         owner: Owner,
         context_id: Uuid,
         workspace_id: Uuid,
+        bound: Option<Uuid>,
     ) -> Result<CreatedTabJoin> {
         let _guard = PERSONAL_VIEW_MUTATION.lock().map_err(unavailable)?;
         let Some(mut document) = self.load(owner)? else {
             return Ok(CreatedTabJoin::NoView);
         };
-        let Some(view_id) = creation_target_view(&document) else {
+        let Some(view_id) = creation_target_view(&document, bound) else {
             return Ok(CreatedTabJoin::NoView);
         };
         let view = document.view_mut(view_id)?;
@@ -1286,8 +1293,10 @@ pub fn apply_for_caller(
 }
 
 /// Creation hook: a tab created by a client with a principal joins that
-/// principal's creation target view. Tabs created without a caller join no
-/// view. The tab already exists and stays running whatever this returns.
+/// principal's creation target view: `bound`, the creating attachment's bound
+/// view (with the owner it was bound for), else the default view. Tabs
+/// created without a caller join no view. The tab already exists and stays
+/// running whatever this returns.
 ///
 /// # Errors
 /// The identity authority was unreachable, or the view update failed.
@@ -1296,6 +1305,7 @@ pub fn join_created_tab_for_caller(
     states: &PluginStateRegistry,
     context_id: Uuid,
     workspace_id: Uuid,
+    bound: Option<(Owner, Uuid)>,
 ) -> std::result::Result<CreatedTabJoin, String> {
     let owner = match resolve_caller(caller) {
         OwnerResolution::Owner(owner) => owner,
@@ -1304,8 +1314,10 @@ pub fn join_created_tab_for_caller(
             return Err(format!("resolving the creating principal failed: {error}"));
         }
     };
+    // A binding is honoured only for the owner it was made for.
+    let bound = bound.and_then(|(bound_owner, view_id)| (bound_owner == owner).then_some(view_id));
     Repository::new(caller, Some(states))
-        .join_created_tab(owner, context_id, workspace_id)
+        .join_created_tab(owner, context_id, workspace_id, bound)
         .map_err(|error| format!("adding the new tab to its personal view failed: {error:?}"))
 }
 

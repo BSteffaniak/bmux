@@ -69,6 +69,14 @@ delivery                     = "state"
 forward_to_streaming_clients = true
 kind                         = "bmux.tabs/tabs-bells"
 
+# Each attachment's projection of its personal tab view. Published only to
+# that attachment with recipient-scoped retained delivery, so it is never
+# forwarded to every streaming client.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = false
+kind                         = "bmux.tabs/personal-view"
+
 [[commands]]
 expose_in_cli = true
 name          = "explain-spawn-directory"

@@ -53,6 +53,72 @@ fn interface_ids_match_bpdl_source() {
         bmux_tabs_plugin_api::tabs_personal_commands::INTERFACE_ID,
         "tabs-personal-commands/v1"
     );
+    assert_eq!(
+        bmux_tabs_plugin_api::tabs_personal_attachment::INTERFACE_ID,
+        "tabs-personal-attachment/v1"
+    );
+    assert_eq!(
+        bmux_tabs_plugin_api::personal_view::STATE_KIND,
+        "bmux.tabs/personal-view"
+    );
+}
+
+#[test]
+fn personal_attachment_contracts_take_no_client_and_round_trip() {
+    use bmux_tabs_plugin_api::personal_view::{
+        PersonalViewMember, PersonalViewProjection, PersonalViewWorkspace,
+    };
+    use bmux_tabs_plugin_api::tabs_personal_attachment::PersonalAttachmentError;
+    use bmux_tabs_plugin_api::tabs_personal_attachment::client::{
+        BindViewRequest, SelectMemberRequest,
+    };
+    // Requests name a view or member and a binding revision, never a client
+    // or an owner: the host resolves the invoking attachment.
+    let bind = serde_json::to_value(BindViewRequest {
+        view_id: uuid::Uuid::from_u128(1),
+        expected_binding_revision: 2,
+    })
+    .unwrap();
+    let select = serde_json::to_value(SelectMemberRequest {
+        member_id: uuid::Uuid::from_u128(3),
+        expected_binding_revision: 2,
+    })
+    .unwrap();
+    for request in [&bind, &select] {
+        let fields = request.as_object().unwrap();
+        assert!(
+            fields
+                .keys()
+                .all(|key| !key.contains("client") && !key.contains("owner")),
+            "{request}"
+        );
+    }
+    let projection = PersonalViewProjection {
+        view_id: uuid::Uuid::from_u128(1),
+        name: "default".into(),
+        view_revision: 4,
+        binding_revision: 2,
+        active_workspace_id: uuid::Uuid::nil(),
+        workspaces: vec![PersonalViewWorkspace {
+            workspace_id: uuid::Uuid::nil(),
+            members: vec![PersonalViewMember {
+                member_id: uuid::Uuid::from_u128(5),
+                context_id: uuid::Uuid::from_u128(6),
+                name: "mine".into(),
+                active: true,
+            }],
+        }],
+    };
+    let round: PersonalViewProjection =
+        serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+    assert_eq!(round, projection);
+    assert!(
+        serde_json::to_string(&PersonalAttachmentError::RevisionConflict {
+            current_revision: 3
+        })
+        .unwrap()
+        .contains("revision_conflict")
+    );
 }
 
 #[test]

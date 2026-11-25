@@ -10,19 +10,19 @@ type Storage = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 /// A host for one invoking client: shared in-memory plugin storage, the
 /// client's host-bound principal, live contexts, and storage fault injection.
 #[derive(Clone)]
-struct MemoryHost {
+pub(super) struct MemoryHost {
     storage: Storage,
     /// `None`: the identity authority says this caller has no principal.
     principal: Option<Uuid>,
     identity_unreachable: bool,
-    contexts: Arc<Mutex<Vec<ContextSummary>>>,
+    pub(super) contexts: Arc<Mutex<Vec<ContextSummary>>>,
     /// Storage `set` fails for keys starting with this prefix.
     fail_set_prefix: Arc<Mutex<Option<String>>>,
     sets: Arc<Mutex<Vec<String>>>,
 }
 
 impl MemoryHost {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             storage: Arc::default(),
             principal: None,
@@ -34,7 +34,7 @@ impl MemoryHost {
     }
 
     /// The same installation, invoked by a client bound to `principal`.
-    fn client(&self, principal: Option<Uuid>) -> Self {
+    pub(super) fn client(&self, principal: Option<Uuid>) -> Self {
         Self {
             principal,
             ..self.clone()
@@ -1261,7 +1261,7 @@ fn created_tabs_join_the_creators_default_view_once() {
     let new_tab = id(0x7777);
     // Not yet arranged: the tab is picked up when the workspace is seeded.
     assert_eq!(
-        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil()),
+        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil(), None),
         Ok(CreatedTabJoin::WorkspaceNotInitialized {
             view_id: ensure.view_id
         })
@@ -1278,13 +1278,13 @@ fn created_tabs_join_the_creators_default_view_once() {
     )
     .unwrap();
     let Ok(CreatedTabJoin::Joined { member_id, .. }) =
-        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil())
+        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil(), None)
     else {
         panic!("tab should join the default view");
     };
     // A retry never duplicates the member.
     assert_eq!(
-        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil()),
+        join_created_tab_for_caller(&a, &states, new_tab, Uuid::nil(), None),
         Ok(CreatedTabJoin::AlreadyMember {
             view_id: view.view_id,
             member_id
@@ -1298,7 +1298,7 @@ fn created_tabs_join_the_creators_default_view_once() {
     assert_eq!(members, vec![existing[0], existing[1], new_tab]);
     // No caller principal, no view.
     assert_eq!(
-        join_created_tab_for_caller(&host.client(None), &states, id(0x8888), Uuid::nil()),
+        join_created_tab_for_caller(&host.client(None), &states, id(0x8888), Uuid::nil(), None),
         Ok(CreatedTabJoin::NoView)
     );
     // Another principal without views joins nothing.
@@ -1307,7 +1307,8 @@ fn created_tabs_join_the_creators_default_view_once() {
             &host.client(Some(id(0xB1))),
             &states,
             id(0x8888),
-            Uuid::nil()
+            Uuid::nil(),
+            None
         ),
         Ok(CreatedTabJoin::NoView)
     );
@@ -1339,6 +1340,7 @@ fn a_failed_view_update_never_fails_the_created_tab_and_a_retry_does_not_duplica
         Some("kept".into()),
         &crate::cwd::DirectoryPolicy::RuntimeDefault,
         None,
+        None,
     )
     .unwrap();
     assert!(ack.ok);
@@ -1361,12 +1363,12 @@ fn a_failed_view_update_never_fails_the_created_tab_and_a_retry_does_not_duplica
 
     host.fail_sets(None);
     let Ok(CreatedTabJoin::Joined { member_id, .. }) =
-        join_created_tab_for_caller(&a, &states, created, Uuid::nil())
+        join_created_tab_for_caller(&a, &states, created, Uuid::nil(), None)
     else {
         panic!("retry should join");
     };
     assert!(matches!(
-        join_created_tab_for_caller(&a, &states, created, Uuid::nil()),
+        join_created_tab_for_caller(&a, &states, created, Uuid::nil(), None),
         Ok(CreatedTabJoin::AlreadyMember { member_id: again, .. }) if again == member_id
     ));
     assert_eq!(
@@ -1382,6 +1384,7 @@ fn a_failed_view_update_never_fails_the_created_tab_and_a_retry_does_not_duplica
         &runtime,
         None,
         &crate::cwd::DirectoryPolicy::RuntimeDefault,
+        None,
         None,
     )
     .unwrap();
@@ -1400,6 +1403,7 @@ fn a_failed_view_update_never_fails_the_created_tab_and_a_retry_does_not_duplica
         &runtime,
         None,
         &crate::cwd::DirectoryPolicy::RuntimeDefault,
+        None,
         None,
     )
     .unwrap();

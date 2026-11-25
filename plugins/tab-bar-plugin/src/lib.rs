@@ -22,6 +22,7 @@ mod external;
 mod group_actions;
 mod live_indicator;
 mod menu;
+mod personal_tabs;
 mod projection;
 mod rename_input;
 mod settings;
@@ -51,7 +52,7 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRegistry, PresentationFactRole,
 };
 use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
-use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
+use bmux_tabs_plugin_api::{personal_view, tabs_commands, tabs_list};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -352,6 +353,9 @@ struct CompanionState {
     local_presentation: AttachLocalPresentationSnapshot,
     live_indicator: Option<live_indicator::LiveIndicator>,
     catalog: tabs_list::TabListSnapshot,
+    /// This attachment's projection of its personal view, when it has one;
+    /// preferred over `catalog` for the tabs shown and their order.
+    personal: Option<personal_view::PersonalViewProjection>,
     selected_context_id: Option<Uuid>,
     workspace_label: Option<String>,
     workspace_id: Option<Uuid>,
@@ -425,6 +429,7 @@ impl CompanionState {
                 tabs: Vec::new(),
                 revision: 0,
             },
+            personal: None,
             selected_context_id: None,
             workspace_label: None,
             workspace_id: None,
@@ -487,22 +492,31 @@ impl CompanionState {
         true
     }
 
-    fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
+    fn replace_tabs(&mut self, snapshot: tabs_list::TabListSnapshot) {
+        self.catalog = snapshot;
+        self.reproject_tabs();
+    }
+
+    /// Adopt this attachment's personal view projection; the nil view means
+    /// it has none, and the shared catalog is shown instead.
+    fn replace_personal(&mut self, projection: personal_view::PersonalViewProjection) {
+        let projection = (!projection.view_id.is_nil()).then_some(projection);
+        if self.personal != projection {
+            self.personal = projection;
+            self.reproject_tabs();
+        }
+    }
+
+    /// Recompute the shown tabs from their source: the personal view when
+    /// this attachment has one, otherwise the shared catalog.
+    fn reproject_tabs(&mut self) {
         let previous_workspace = self.workspace_id;
-        self.catalog = snapshot.clone();
         let selected = self.selected_context_id;
-        let workspace_id = snapshot
-            .tabs
-            .iter()
-            .find(|tab| selected.map_or(tab.active, |id| tab.id == id))
-            .map(|tab| tab.workspace_id)
-            .or_else(|| selected.is_none().then_some(Uuid::nil()));
-        // A remembered label is not evidence of a live workspace identity.
-        self.workspace_id = snapshot
-            .tabs
-            .iter()
-            .find(|tab| Some(tab.workspace_id) == workspace_id)
-            .map(|tab| tab.workspace_id);
+        let projected =
+            personal_tabs::from_projection(self.personal.as_ref(), &self.catalog, selected)
+                .unwrap_or_else(|| personal_tabs::from_catalog(&self.catalog, selected));
+        let snapshot = projected.tabs;
+        self.workspace_id = projected.workspace_id;
         if previous_workspace != self.workspace_id {
             self.multi_selection.clear();
         }
@@ -519,20 +533,8 @@ impl CompanionState {
             self.editing_workspace_id = None;
             self.edit_buffer.clear();
         }
-        if let Some(tab) = snapshot
-            .tabs
-            .iter()
-            .find(|tab| Some(tab.workspace_id) == workspace_id)
-        {
-            self.workspace_label = Some(tab.workspace.clone());
-        }
-        snapshot
-            .tabs
-            .retain(|tab| Some(tab.workspace_id) == workspace_id);
-        if let Some(selected) = selected {
-            for tab in &mut snapshot.tabs {
-                tab.active = tab.id == selected;
-            }
+        if let Some(label) = projected.workspace_label {
+            self.workspace_label = Some(label);
         }
         if self.snapshot != snapshot {
             let active_id = |tabs: &[tabs_list::TabListEntry]| {
@@ -1094,12 +1096,16 @@ where
         .map_err(|error| format!("subscribing to {kind}: {error}"))
 }
 
-/// Forwarded plugin-contribution feeds (status items and toasts).
+/// Forwarded server state feeds: plugin-contributed status items and toasts,
+/// and this attachment's personal tab view projection.
 struct ExternalFeeds {
     status_items:
         tokio::sync::watch::Receiver<std::sync::Arc<status_items_list::StatusItemSnapshot>>,
     notifications:
         tokio::sync::watch::Receiver<std::sync::Arc<notifications_list::NotificationSnapshot>>,
+    /// Delivered only to this attachment by the tabs plugin; the runtime's
+    /// generic forwarded-event path decodes it into this channel.
+    personal: tokio::sync::watch::Receiver<std::sync::Arc<personal_view::PersonalViewProjection>>,
 }
 
 impl ExternalFeeds {
@@ -1122,11 +1128,18 @@ impl ExternalFeeds {
                     revision: 0,
                 }
             })?;
+        let (projection, personal) = subscribe_forwarded_state(
+            events,
+            &personal_view::STATE_KIND,
+            personal_tabs::no_projection,
+        )?;
         companion.replace_status_items(&items);
         companion.replace_notifications(&toasts);
+        companion.replace_personal(projection.as_ref().clone());
         Ok(Self {
             status_items,
             notifications,
+            personal,
         })
     }
 
@@ -1149,6 +1162,9 @@ impl ExternalFeeds {
             }),
             result = self.notifications.changed() => result.ok().map(|()| {
                 PresentationUpdate::Notifications(self.notifications.borrow_and_update().as_ref().clone())
+            }),
+            result = self.personal.changed() => result.ok().map(|()| {
+                PresentationUpdate::Personal(Box::new(self.personal.borrow_and_update().as_ref().clone()))
             }),
         }
     }
@@ -1174,6 +1190,7 @@ enum PresentationUpdate {
     Indicator(Option<live_indicator::LiveIndicator>),
     Workspaces(Vec<workspaces_state::WorkspaceSummary>),
     Tabs(tabs_list::TabListSnapshot),
+    Personal(Box<personal_view::PersonalViewProjection>),
     Local(Box<AttachLocalPresentationSnapshot>),
     Selection(Option<Uuid>),
 }
@@ -1210,6 +1227,7 @@ fn apply_presentation_update(
         }
         PresentationUpdate::Workspaces(workspaces) => companion.workspace_choices = workspaces,
         PresentationUpdate::Tabs(snapshot) => companion.replace_tabs(snapshot),
+        PresentationUpdate::Personal(projection) => companion.replace_personal(*projection),
         PresentationUpdate::Local(snapshot) => companion.replace_local_presentation(*snapshot),
         PresentationUpdate::Selection(context_id) => {
             if companion.selected_context_id == context_id {
@@ -1222,7 +1240,7 @@ fn apply_presentation_update(
             companion.pointer_source = None;
             companion.drag_target = None;
             companion.scroll_anchor = None;
-            companion.replace_tabs(companion.catalog.clone());
+            companion.reproject_tabs();
         }
     }
     let result = publish_companion(companion);
@@ -4278,6 +4296,133 @@ bar_bg = "#112233"
         state.replace_tabs(catalog);
         assert_eq!(state.snapshot.tabs.len(), 1);
         assert_eq!(state.snapshot.tabs[0].id, first);
+    }
+
+    fn projection(
+        workspace: Uuid,
+        members: &[(Uuid, &str, bool)],
+    ) -> personal_view::PersonalViewProjection {
+        personal_view::PersonalViewProjection {
+            view_id: Uuid::from_u128(0xF1),
+            name: "default".into(),
+            view_revision: 3,
+            binding_revision: 1,
+            active_workspace_id: workspace,
+            workspaces: vec![personal_view::PersonalViewWorkspace {
+                workspace_id: workspace,
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, (id, name, active))| personal_view::PersonalViewMember {
+                            member_id: Uuid::from_u128(0xE0 + index as u128),
+                            context_id: *id,
+                            name: (*name).to_string(),
+                            active: *active,
+                        },
+                    )
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn personal_view_projection_decides_tabs_order_and_names_over_the_catalog() {
+        let mut state = CompanionState::new(Settings::default());
+        let (first, second, third) = (
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+        );
+        let entry = |id, name: &str| tabs_list::TabListEntry {
+            id,
+            name: name.to_string(),
+            active: false,
+            workspace: "main".to_string(),
+            workspace_id: Uuid::nil(),
+        };
+        state.selected_context_id = Some(first);
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                entry(first, "one"),
+                entry(second, "two"),
+                entry(third, "three"),
+            ],
+            revision: 1,
+        });
+        let shown = |state: &CompanionState| {
+            state
+                .snapshot
+                .tabs
+                .iter()
+                .map(|tab| (tab.name.clone(), tab.active))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&state).len(), 3, "the catalog without a projection");
+
+        // The view's own order, membership and labels; the attachment's
+        // local selection marks the active tab.
+        state.replace_personal(projection(
+            Uuid::nil(),
+            &[(third, "mine", false), (first, "one", true)],
+        ));
+        assert_eq!(
+            shown(&state),
+            [("mine".to_string(), false), ("one".to_string(), true)]
+        );
+        assert_eq!(state.snapshot.tabs[0].workspace, "main");
+        assert_eq!(state.workspace_id, Some(Uuid::nil()));
+        // Catalog changes no longer reorder or add tabs.
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                entry(second, "two"),
+                entry(first, "one"),
+                entry(third, "three"),
+            ],
+            revision: 2,
+        });
+        assert_eq!(shown(&state).len(), 2);
+        state.selected_context_id = Some(third);
+        state.reproject_tabs();
+        assert_eq!(
+            shown(&state),
+            [("mine".to_string(), true), ("one".to_string(), false)]
+        );
+
+        // The nil view withdraws the projection: back to the catalog.
+        state.replace_personal(personal_tabs::no_projection());
+        assert_eq!(shown(&state).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn forwarded_personal_view_bytes_reach_the_installed_strip() {
+        let resources = populated_resources(0x100);
+        let presentation = TabBarPresentation::install(None, &resources).unwrap();
+        // The attach runtime's generic fallback for forwarded plugin-bus
+        // payloads: decode into whatever channel registered a decoder.
+        let payload = serde_json::to_vec(&projection(
+            Uuid::nil(),
+            &[(Uuid::from_u128(0x101), "only-mine", true)],
+        ))
+        .unwrap();
+        assert!(
+            resources
+                .events
+                .emit_from_bytes(&personal_view::STATE_KIND, &payload)
+                .unwrap()
+        );
+        wait_for(|| {
+            owner_text_runs(&resources, SURFACE_ID)
+                .iter()
+                .any(|text| text.contains("only-mine"))
+        })
+        .await;
+        let texts = owner_text_runs(&resources, SURFACE_ID);
+        assert!(
+            !texts.iter().any(|text| text.contains("long-tab-0")),
+            "catalog tabs outside the view are hidden: {texts:?}"
+        );
+        drop(presentation);
     }
 
     #[test]

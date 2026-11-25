@@ -486,6 +486,91 @@ interface tabs-personal-commands {
     ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
 }
 
+// The invoking attachment's binding to one of its owner's personal views.
+// A binding is transient, attachment-local state: it is created when a
+// client attaches (or on its first call here), defaults to the owner's
+// default view, and is retired when the client detaches or disconnects. It
+// is never durable. Every operation acts on the invoking attachment, resolved
+// by the host; none accepts a client or owner.
+//
+// `revision` advances whenever the bound view or the selected member changes,
+// whatever changed it (including the attachment's own tab switches), so an
+// expected revision fails when the binding moved since it was read.
+//
+// The attachment's projection of its bound view is delivered only to that
+// attachment, on the `personal-view` state kind.
+@capability(TABS_WRITE)
+@interface-version(1)
+interface tabs-personal-attachment {
+    record personal-binding {
+        view-id: uuid,
+        revision: u64,
+        // The member of the bound view whose tab this attachment has
+        // selected, when its selected tab is a member of its active
+        // workspace's arrangement.
+        selected-member: uuid?,
+    }
+
+    variant personal-attachment-error {
+        // The invoking client has no live attach stream.
+        no-attachment,
+        // The invoking client has no host-bound principal.
+        no-principal,
+        // The owner has no such view.
+        not-found,
+        revision-conflict { current-revision: u64 },
+        // The member is not in the bound view, its tab is not live, or it is
+        // not in the attachment's active workspace.
+        invalid-reference,
+        // The view repository or the selection authority failed.
+        unavailable { reason: string },
+    }
+
+    // The current binding, created first when the attachment has none.
+    command current-binding() -> result<personal-binding, personal-attachment-error>;
+    // Bind the attachment to another view of the same owner.
+    command bind-view(view-id: uuid, expected-binding-revision: u64)
+        -> result<personal-binding, personal-attachment-error>;
+    // Select a member's tab through the attachment's ordinary tab selection.
+    command select-member(member-id: uuid, expected-binding-revision: u64)
+        -> result<personal-binding, personal-attachment-error>;
+}
+
+// One attachment's projection of its bound personal view, published by the
+// tabs plugin only to that attachment (recipient-scoped retained delivery,
+// never broadcast). Each publication is complete: members whose tabs are not
+// live, or no longer in the arrangement's workspace, are omitted, and names
+// already prefer the personal label. `active` reflects this attachment's own
+// selection. A projection with the nil `view-id` means none is available.
+interface personal-view {
+    record personal-view-member {
+        member-id: uuid,
+        context-id: uuid,
+        // The personal label when set, otherwise the tab's shared name.
+        name: string,
+        active: bool,
+    }
+
+    record personal-view-workspace {
+        workspace-id: uuid,
+        members: list<personal-view-member>,
+    }
+
+    record personal-view-projection {
+        view-id: uuid,
+        name: string,
+        view-revision: u64,
+        binding-revision: u64,
+        // The workspace of the attachment's selected tab (nil: the default
+        // workspace).
+        active-workspace-id: uuid,
+        // Every initialized arrangement of the view, in the view's order.
+        workspaces: list<personal-view-workspace>,
+    }
+
+    @state events personal-view-projection;
+}
+
 interface tabs-events {
     // A single event describing a pane-level state change.
     variant pane-event {
@@ -677,6 +762,7 @@ world tabs {
     provide tabs-placement-v1;
     provide tabs-personal-views;
     provide tabs-personal-commands;
+    provide tabs-personal-attachment;
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;
