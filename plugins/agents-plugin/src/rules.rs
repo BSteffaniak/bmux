@@ -450,28 +450,37 @@ impl Agent {
             background_working: rule.background_working,
             background_shell_count: rule
                 .background_working
-                .then(|| {
-                    let text = rule.region.text(input);
-                    rule.gate.regex.iter().find_map(|regex| {
-                        if !regex
-                            .capture_names()
-                            .flatten()
-                            .any(|name| name == "shell_count")
-                        {
-                            return None;
-                        }
-                        regex
-                            .captures(text)?
-                            .name("shell_count")?
-                            .as_str()
-                            .parse()
-                            .ok()
-                    })
-                })
+                .then(|| shell_count(rule, input))
                 .flatten(),
             skip: rule.skip_state_update || rule.state == RuleState::Unknown,
         })
     }
+}
+
+/// The capture group a background rule names to report its live shell count.
+const SHELL_COUNT: &str = "shell_count";
+
+/// The live shell count `rule`'s regexes capture from its region of `input`,
+/// when one of them names [`SHELL_COUNT`].
+fn shell_count(rule: &Rule, input: &Input<'_>) -> Option<u32> {
+    let text = rule.region.text(input);
+    rule.gate
+        .regex
+        .iter()
+        .filter(|regex| {
+            regex
+                .capture_names()
+                .flatten()
+                .any(|name| name == SHELL_COUNT)
+        })
+        .find_map(|regex| {
+            regex
+                .captures(text)?
+                .name(SHELL_COUNT)?
+                .as_str()
+                .parse()
+                .ok()
+        })
 }
 
 fn lines_of(content: &str) -> Vec<&str> {

@@ -95,7 +95,21 @@ struct Track {
     state: Option<(AgentState, AgentSource, Option<String>)>,
     changed_at_ms: u64,
     finished_at_ms: Option<u64>,
-    background_shell_since_ms: Option<u64>,
+    shells: Shells,
+}
+
+/// The agent's background shells since it was last idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Shells {
+    /// None were seen: a finish is the agent's leaving working.
+    #[default]
+    Unseen,
+    /// The screen shows them, first seen at `since_ms`; each period of
+    /// shells has its own age.
+    Shown { since_ms: u64 },
+    /// They were shown and are gone, but the agent has not been idle since:
+    /// its finish still waits for that idle.
+    Seen,
 }
 
 impl Track {
@@ -119,7 +133,7 @@ impl Track {
             state: None,
             changed_at_ms: 0,
             finished_at_ms: None,
-            background_shell_since_ms: None,
+            shells: Shells::Unseen,
         }
     }
 }
@@ -332,16 +346,20 @@ impl Tracker {
                     .as_ref()
                     .is_some_and(|verdict| verdict.background_shell_count.is_some())
             {
-                track.background_shell_since_ms.get_or_insert(now_ms);
+                if !matches!(track.shells, Shells::Shown { .. }) {
+                    track.shells = Shells::Shown { since_ms: now_ms };
+                }
+            } else if matches!(track.shells, Shells::Shown { .. }) {
+                track.shells = Shells::Seen;
             }
-            let was_waiting_for_shells = track.background_shell_since_ms.is_some();
+            let waits_for_shells = track.shells != Shells::Unseen;
             if state == AgentState::Idle {
-                track.background_shell_since_ms = None;
+                track.shells = Shells::Unseen;
             }
             if previous != Some(state) {
                 track.changed_at_ms = now_ms;
-                if (previous == Some(AgentState::Working) && !was_waiting_for_shells)
-                    || (state == AgentState::Idle && was_waiting_for_shells)
+                if (previous == Some(AgentState::Working) && !waits_for_shells)
+                    || (state == AgentState::Idle && waits_for_shells)
                 {
                     track.finished_at_ms = Some(now_ms);
                 }
@@ -380,9 +398,12 @@ impl Tracker {
                     changed_at_ms: track.changed_at_ms,
                     finished_at_ms: track.finished_at_ms,
                     background_shell_count,
-                    background_shell_since_ms: track
-                        .background_shell_since_ms
-                        .filter(|_| background_shell_count.is_some()),
+                    background_shell_since_ms: match track.shells {
+                        Shells::Shown { since_ms } if background_shell_count.is_some() => {
+                            Some(since_ms)
+                        }
+                        _ => None,
+                    },
                 })
             })
             .collect()
@@ -871,6 +892,30 @@ mod tests {
         assert_eq!(pane.tracker.snapshot()[0].background_shell_count, None);
         pane.show(Some("✳ ready"), cleared, 4_325_000);
         assert_eq!(pane.tracker.snapshot()[0].finished_at_ms, Some(4_324_000));
+    }
+
+    /// Each period of background shells is aged from its own start, even
+    /// when the agent works in the foreground between them without idling.
+    #[test]
+    fn each_period_of_background_shells_has_its_own_age() {
+        let mut pane = Pane::claude();
+        pane.show(Some("◐ building"), WORKING, 500);
+        let footer = "✻ Crunched for 1m · 1 shell still running\n─────\n❯\n─────\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage";
+        pane.show(Some("✳ ready"), footer, 1_000);
+        assert_eq!(
+            pane.tracker.snapshot()[0].background_shell_since_ms,
+            Some(1_000)
+        );
+        assert_eq!(
+            pane.show(Some("◐ building"), WORKING, 2_000).0,
+            AgentState::Working
+        );
+        assert_eq!(pane.tracker.snapshot()[0].background_shell_since_ms, None);
+        pane.show(Some("✳ ready"), footer, 3_000);
+        let agent = &pane.tracker.snapshot()[0];
+        assert_eq!(agent.background_shell_since_ms, Some(3_000));
+        // The foreground work between the shells did not count as a finish.
+        assert_eq!(agent.finished_at_ms, None);
     }
 
     /// A report from before the agents plugin saw the pane is history, and a

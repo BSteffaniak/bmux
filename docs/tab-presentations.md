@@ -233,15 +233,16 @@ bar and, with a theme, a tinted background.
 
 States, most urgent first:
 
-| Glyph       | State       | When                                                                                                                                                                                 |
-| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
-| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
-| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
-| `◉` green   | working     | its agent is working (a spinner by default)                                                                                                                                          |
-| `›` magenta | shell       | a tab without an agent has a pane running a foreground command; the command's name is its summary                                                                                    |
-| `■` blue    | stopped     | its agent returned to idle after observed work, and that was seen                                                                                                                    |
-| `○` dim     | idle        | otherwise                                                                                                                                                                            |
+| Glyph       | State            | When                                                                                                                                                                                 |
+| ----------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow  | needs input      | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
+| `▲` red     | failed           | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan    | done             | its agent finished since anyone looked at the tab                                                                                                                                    |
+| `◉` green   | working          | its agent is working (a spinner by default)                                                                                                                                          |
+| `◌` green   | background shell | its agent is ready for another prompt while its footer still reports background shells; the age counts from when bmux first saw them                                                 |
+| `›` magenta | shell            | a tab without an agent has a pane running a foreground command; the command's name is its summary                                                                                    |
+| `■` blue    | stopped          | its agent returned to idle after observed work, and that was seen                                                                                                                    |
+| `○` dim     | idle             | otherwise                                                                                                                                                                            |
 
 A tab with an agent always shows its agent's state; a command in another of
 its panes only adds to the shell counts in the headers.

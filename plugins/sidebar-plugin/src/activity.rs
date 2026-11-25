@@ -78,11 +78,25 @@ impl TabState {
         }
     }
 
+    /// When the age a card in this state shows started: a background
+    /// shell's age is its shells', not its state's.
     fn age_start(self, status: &TabStatus) -> Option<u64> {
-        if self == Self::BackgroundShell {
-            status.agent.as_ref()?.background_shell_since_ms
-        } else {
-            status.state_since_ms.filter(|_| self.shows_age())
+        if !self.shows_age() {
+            return None;
+        }
+        match self {
+            Self::BackgroundShell => status.agent.as_ref()?.background_shell_since_ms,
+            _ => status.state_since_ms,
+        }
+    }
+
+    /// What sets a card's age off from its summary: a dot after a summary of
+    /// several words (`2 background shells · 1h 12m`), else a space.
+    #[must_use]
+    pub const fn age_separator(self) -> &'static str {
+        match self {
+            Self::BackgroundShell => " · ",
+            _ => " ",
         }
     }
 
@@ -150,6 +164,9 @@ pub struct TabActivity {
     pub state: TabState,
     /// Shown at the right of the tab's first line.
     pub summary: Option<String>,
+    /// A shorter summary for a card too narrow for [`Self::summary`], when
+    /// the state has one.
+    pub short_summary: Option<String>,
     /// The tab's second line: directory, git status, age or the attention text.
     pub detail: String,
     pub command: Option<String>,
@@ -333,27 +350,27 @@ impl ActivityView {
         let state = TabState::displayed(status);
         let program = status.running_command.as_deref().and_then(command_program);
         let agent = status.agent.as_ref();
-        let summary =
-            match state {
-                TabState::Blocked => Some("needs input".to_string()),
-                TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
-                TabState::Done => Some("done".to_string()),
-                TabState::BackgroundShell => agent
-                    .and_then(|agent| agent.background_shell_count)
-                    .map(|count| {
-                        let plural = if count == 1 { "" } else { "s" };
-                        format!("{count} background shell{plural}")
-                    }),
-                TabState::Working if agent.is_some() => Some("working".to_string()),
-                TabState::Shell => status
-                    .shell_command
-                    .as_deref()
-                    .and_then(command_program)
-                    .or_else(|| Some("shell".to_string())),
-                TabState::Stopped => Some("stopped".to_string()),
-                TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
-                TabState::Working | TabState::Idle => program.clone(),
-            };
+        let shells = agent.and_then(|agent| agent.background_shell_count);
+        let summary = match state {
+            TabState::Blocked => Some("needs input".to_string()),
+            TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
+            TabState::Done => Some("done".to_string()),
+            TabState::BackgroundShell => shells.map(|count| shells_summary(count, "background ")),
+            TabState::Working if agent.is_some() => Some("working".to_string()),
+            TabState::Shell => status
+                .shell_command
+                .as_deref()
+                .and_then(command_program)
+                .or_else(|| Some("shell".to_string())),
+            TabState::Stopped => Some("stopped".to_string()),
+            TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
+            TabState::Working | TabState::Idle => program.clone(),
+        };
+        let short_summary = match state {
+            TabState::Blocked => Some("input".to_string()),
+            TabState::BackgroundShell => shells.map(|count| shells_summary(count, "")),
+            _ => None,
+        };
         let message = (state == TabState::Blocked)
             .then(|| {
                 agent
@@ -361,14 +378,9 @@ impl ActivityView {
                     .or_else(|| status.attention.clone())
             })
             .flatten();
-        let since = state.age_start(status).map(|at| {
-            let elapsed = now.saturating_sub(at);
-            if state == TabState::BackgroundShell && (3_600_000..86_400_000).contains(&elapsed) {
-                format!("{}h {}m", elapsed / 3_600_000, elapsed / 60_000 % 60)
-            } else {
-                format_age(elapsed)
-            }
-        });
+        let since = state
+            .age_start(status)
+            .map(|at| format_age(now.saturating_sub(at)));
         let cwd = status.cwd.as_deref().map(|cwd| self.shorten_home(cwd));
         let branch = status.git.as_ref().map(|git| {
             let mut branch = git.branch.clone();
@@ -402,6 +414,7 @@ impl ActivityView {
         Some(TabActivity {
             state,
             summary,
+            short_summary,
             detail,
             command: program,
             cwd,
@@ -444,7 +457,7 @@ impl ActivityView {
     }
 }
 
-/// A short age: `now`, `12s`, `3m`, `2h`, `4d`.
+/// A short age: `now`, `12s`, `3m`, `2h`, `1h 12m`, `4d`.
 #[must_use]
 pub fn format_age(ms: u64) -> String {
     let seconds = ms / 1000;
@@ -452,9 +465,18 @@ pub fn format_age(ms: u64) -> String {
         0..=4 => "now".to_string(),
         5..=59 => format!("{seconds}s"),
         60..=3599 => format!("{}m", seconds / 60),
-        3600..=86_399 => format!("{}h", seconds / 3600),
+        3600..=86_399 => match seconds / 60 % 60 {
+            0 => format!("{}h", seconds / 3600),
+            minutes => format!("{}h {minutes}m", seconds / 3600),
+        },
         _ => format!("{}d", seconds / 86_400),
     }
+}
+
+/// `2 background shells`, `1 shell`: `count` shells, `kind` before the noun.
+fn shells_summary(count: u32, kind: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {kind}shell{plural}")
 }
 
 /// Shorten a path from the left to `width` terminal cells, keeping its end
@@ -704,7 +726,6 @@ mod tests {
         assert_eq!(shown.summary.as_deref(), Some("claude"));
     }
 
-    /// Only states that show an age make the view change with time.
     #[test]
     fn background_shells_show_their_own_elapsed_time() {
         let mut tab = status(1, tabs_status::TabState::Working);
@@ -716,10 +737,12 @@ mod tests {
         let card = view.activity(Uuid::from_u128(1)).unwrap();
         assert_eq!(card.state, TabState::BackgroundShell);
         assert_eq!(card.summary.as_deref(), Some("2 background shells"));
+        assert_eq!(card.short_summary.as_deref(), Some("2 shells"));
         assert_eq!(card.since.as_deref(), Some("1h 12m"));
         assert!(view.time_sensitive());
     }
 
+    /// Only states that show an age make the view change with time.
     #[test]
     fn only_shown_ages_make_the_view_time_sensitive() {
         let since = |state| {
@@ -750,6 +773,7 @@ mod tests {
         assert_eq!(format_age(12_000), "12s");
         assert_eq!(format_age(180_000), "3m");
         assert_eq!(format_age(7_200_000), "2h");
+        assert_eq!(format_age(4_320_000), "1h 12m");
         assert_eq!(shorten_left("~/a/long/path", 8), "…ng/path");
         assert_eq!(shorten_left("short", 8), "short");
         // Wide characters take two cells; none is split.

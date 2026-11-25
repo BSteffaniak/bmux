@@ -139,8 +139,11 @@ const FOLDER_ICON: &str = "\u{f07b} ";
 /// Below this width, cards are one line whatever the density, and their
 /// state shows only in their glyph.
 const COMPACT_BELOW_WIDTH: u16 = 20;
-/// Below this width, state pills and ages say less.
+/// Below this width, state pills say less.
 const PILL_SHORT_BELOW_WIDTH: u16 = 28;
+/// Cells a card's title line keeps for its glyph and name before its state's
+/// summary and age.
+const TITLE_KEEPS: u16 = 11;
 
 /// Milliseconds on this client's clock, for animation frames.
 fn clock_ms() -> u64 {
@@ -1097,8 +1100,10 @@ impl CompanionState {
         self.settings.density == Density::Compact || self.allocated_width() < COMPACT_BELOW_WIDTH
     }
 
-    /// A card's state at the right of its title. Use a solid badge for
-    /// input, failure, and completion, with the age beside the state when it fits.
+    /// A card's state at the right of its title: a solid pill for states
+    /// that deserve a look, else the summary in the state's color, then the
+    /// age when it fits. Narrow cards, and cards whose summary and age leave
+    /// the name too little room, use the shorter summary when there is one.
     fn card_state(
         &self,
         activity: &activity::TabActivity,
@@ -1110,44 +1115,45 @@ impl CompanionState {
         if self.allocated_width() < COMPACT_BELOW_WIDTH {
             return None;
         }
-        let mut summary = activity.summary.clone()?;
-        let narrow = self.allocated_width() < PILL_SHORT_BELOW_WIDTH;
-        let background = activity.state == activity::TabState::BackgroundShell;
-        let mut since = activity.since.as_deref().filter(|_| !narrow || background);
-        if background {
-            // Keep room for the tab name, even with an hours-and-minutes age.
-            let room = usize::from(self.allocated_width().saturating_sub(11));
-            let age_width = since.map_or(0, |age| 3 + bmux_cell_geometry::display_width(age));
-            if bmux_cell_geometry::display_width(&summary) + age_width > room {
-                summary = summary.replace(" background", "");
+        let pill = activity.state.deserves_a_look();
+        let text = |summary: &str| {
+            if pill {
+                format!(" {summary} ")
+            } else {
+                summary.to_string()
             }
-            if bmux_cell_geometry::display_width(&summary) + age_width > room {
-                since = None;
-            }
-        }
-        let state_style = RenderStyle::new().foreground(activity.state.color());
-        let label = match activity.state {
-            activity::TabState::Blocked | activity::TabState::Failed | activity::TabState::Done => {
-                let text = if narrow && activity.state == activity::TabState::Blocked {
-                    "input"
-                } else {
-                    &summary
-                };
-                let pill = RenderStyle::new()
-                    .background(activity.state.color())
-                    .foreground(palette.on_pill)
-                    .bold();
-                Span::styled(format!(" {text} "), tui_style(pill))
-            }
-            activity::TabState::Idle => Span::styled(summary, tui_style(palette.muted)),
-            activity::TabState::Working
-            | activity::TabState::BackgroundShell
-            | activity::TabState::Shell
-            | activity::TabState::Stopped => Span::styled(summary, tui_style(state_style)),
         };
-        let mut spans = vec![label];
+        let room = usize::from(self.allocated_width().saturating_sub(TITLE_KEEPS));
+        let separator = activity.state.age_separator();
+        let with_age = |label: &str| {
+            bmux_cell_geometry::display_width(label)
+                + activity.since.as_deref().map_or(0, |age| {
+                    bmux_cell_geometry::display_width(separator)
+                        + bmux_cell_geometry::display_width(age)
+                })
+        };
+        let full = text(activity.summary.as_deref()?);
+        let narrow = self.allocated_width() < PILL_SHORT_BELOW_WIDTH;
+        let label = match activity.short_summary.as_deref() {
+            Some(short) if narrow || with_age(&full) > room => text(short),
+            _ => full,
+        };
+        let since = activity
+            .since
+            .as_deref()
+            .filter(|_| with_age(&label) <= room);
+        let style = if pill {
+            RenderStyle::new()
+                .background(activity.state.color())
+                .foreground(palette.on_pill)
+                .bold()
+        } else if activity.state == activity::TabState::Idle {
+            palette.muted
+        } else {
+            RenderStyle::new().foreground(activity.state.color())
+        };
+        let mut spans = vec![Span::styled(label, tui_style(style))];
         if let Some(since) = since {
-            let separator = if background { " · " } else { " " };
             spans.push(Span::styled(
                 format!("{separator}{since}"),
                 tui_style(palette.muted),
@@ -4277,6 +4283,7 @@ mod tests {
         let activity = activity::TabActivity {
             state: activity::TabState::Idle,
             summary: None,
+            short_summary: None,
             detail: String::new(),
             command: None,
             cwd: Some("~/bmux".into()),
@@ -6324,6 +6331,36 @@ mod tests {
     /// A detail that fits the list exactly is shown whole, also while the
     /// scrollbar takes a column; one that does not shortens its directory
     /// instead of being cut.
+    /// A background shell's card says less, then drops its age, as the
+    /// sidebar narrows, so the tab's name keeps its room.
+    #[test]
+    fn background_shell_cards_shorten_to_keep_the_name() {
+        let activity = activity::TabActivity {
+            state: activity::TabState::BackgroundShell,
+            summary: Some("2 background shells".into()),
+            short_summary: Some("2 shells".into()),
+            detail: String::new(),
+            command: None,
+            cwd: None,
+            branch: None,
+            agent: None,
+            git: None,
+            message: None,
+            since: Some("1h 12m".into()),
+        };
+        let mut state = CompanionState::new(shown_settings(), None);
+        let mut shown = |width| {
+            state.allocation = Some(ExtensionRect::new(0, 0, width, 4));
+            state
+                .card_state(&activity, &look::Palette::default())
+                .map(|line| line.plain_text())
+        };
+        assert_eq!(shown(40).as_deref(), Some("2 background shells · 1h 12m"));
+        assert_eq!(shown(30).as_deref(), Some("2 shells · 1h 12m"));
+        assert_eq!(shown(22).as_deref(), Some("2 shells"));
+        assert_eq!(shown(19), None);
+    }
+
     #[test]
     fn the_detail_line_fits_the_list_beside_the_scrollbar() {
         let detail = |cwd: &str| {

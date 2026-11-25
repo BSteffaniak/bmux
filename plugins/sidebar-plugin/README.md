@@ -169,9 +169,9 @@ its name unless `workspace_colors` sets it), which also runs down its tabs as
 a thin rail; a blank row sets each group off from the next. While a group's
 tabs scroll under the top, its header stays pinned there. The header sums up
 what its tabs are doing: how many need input (`◆`), failed (`▲`), are done
-(`✓`), are working (`◉`), run a shell command (`›`) and have stopped
-(`■`),
-most pressing first, or how many tabs it holds when none is doing anything.
+(`✓`), are working (`◉`), wait on background shells (`◌`), run a shell command
+(`›`) and have stopped (`■`), most pressing first, or how many tabs it holds
+when none is doing anything.
 Click a header (or press Enter or space on it) to collapse or expand its group;
 left and right collapse and expand. A collapsed header still shows its sum, and
 is marked when it hides the tab you are looking at. Manual group choices are
