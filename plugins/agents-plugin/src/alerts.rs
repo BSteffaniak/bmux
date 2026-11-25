@@ -455,6 +455,8 @@ mod tests {
                             .then(|| "Do you want to proceed?".into()),
                         changed_at_ms: 0,
                         finished_at_ms: *finished_at_ms,
+                        background_shell_count: None,
+                        background_shell_since_ms: None,
                     }),
                 })
                 .collect(),

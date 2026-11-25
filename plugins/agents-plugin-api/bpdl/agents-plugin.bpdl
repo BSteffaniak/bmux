@@ -42,6 +42,10 @@ interface agent-states {
         // (went from working to idle).
         changed-at-ms: u64,
         finished-at-ms: u64?,
+        // Live background shells reported by an agent ready for another prompt.
+        background-shell-count: u32?,
+        // When this continuous period of background shell activity was first observed.
+        background-shell-since-ms: u64?,
     }
 
     record agent-snapshot {

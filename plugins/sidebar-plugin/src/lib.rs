@@ -1110,8 +1110,21 @@ impl CompanionState {
         if self.allocated_width() < COMPACT_BELOW_WIDTH {
             return None;
         }
-        let summary = activity.summary.clone()?;
+        let mut summary = activity.summary.clone()?;
         let narrow = self.allocated_width() < PILL_SHORT_BELOW_WIDTH;
+        let background = activity.state == activity::TabState::BackgroundShell;
+        let mut since = activity.since.as_deref().filter(|_| !narrow || background);
+        if background {
+            // Keep room for the tab name, even with an hours-and-minutes age.
+            let room = usize::from(self.allocated_width().saturating_sub(11));
+            let age_width = since.map_or(0, |age| 3 + bmux_cell_geometry::display_width(age));
+            if bmux_cell_geometry::display_width(&summary) + age_width > room {
+                summary = summary.replace(" background", "");
+            }
+            if bmux_cell_geometry::display_width(&summary) + age_width > room {
+                since = None;
+            }
+        }
         let state_style = RenderStyle::new().foreground(activity.state.color());
         let label = match activity.state {
             activity::TabState::Blocked | activity::TabState::Failed | activity::TabState::Done => {
@@ -1128,12 +1141,17 @@ impl CompanionState {
             }
             activity::TabState::Idle => Span::styled(summary, tui_style(palette.muted)),
             activity::TabState::Working
+            | activity::TabState::BackgroundShell
             | activity::TabState::Shell
             | activity::TabState::Stopped => Span::styled(summary, tui_style(state_style)),
         };
         let mut spans = vec![label];
-        if let Some(since) = activity.since.as_ref().filter(|_| !narrow) {
-            spans.push(Span::styled(format!(" {since}"), tui_style(palette.muted)));
+        if let Some(since) = since {
+            let separator = if background { " · " } else { " " };
+            spans.push(Span::styled(
+                format!("{separator}{since}"),
+                tui_style(palette.muted),
+            ));
         }
         Some(bmux_tui::text::Line::from_spans(spans))
     }
@@ -1542,7 +1560,12 @@ impl CompanionState {
         self.activity
             .status_summary(tab)
             .is_some_and(|(state, shell_job)| {
-                shell_job || state == activity::TabState::Working || state.deserves_a_look()
+                shell_job
+                    || matches!(
+                        state,
+                        activity::TabState::Working | activity::TabState::BackgroundShell
+                    )
+                    || state.deserves_a_look()
             })
     }
 
@@ -4815,6 +4838,8 @@ mod tests {
                     message: None,
                     changed_at_ms: now - 5_000,
                     finished_at_ms,
+                    background_shell_count: None,
+                    background_shell_since_ms: None,
                 }),
             }
         };
@@ -5078,6 +5103,8 @@ mod tests {
                 message: message.map(Into::into),
                 changed_at_ms: now - 5_000,
                 finished_at_ms: None,
+                background_shell_count: None,
+                background_shell_since_ms: None,
             }),
         };
         state.activity.replace(TabStatusSnapshot {
@@ -5486,6 +5513,8 @@ mod tests {
                         message: None,
                         changed_at_ms: now - 1_000,
                         finished_at_ms: None,
+                        background_shell_count: None,
+                        background_shell_since_ms: None,
                     }),
                 })
                 .collect(),
@@ -6707,6 +6736,8 @@ mod tests {
             message: message.map(str::to_string),
             changed_at_ms: now - 5_000,
             finished_at_ms: None,
+            background_shell_count: None,
+            background_shell_since_ms: None,
         };
         state.activity.replace(TabStatusSnapshot {
             tabs: vec![
@@ -6861,6 +6892,8 @@ mod tests {
                             .then(|| "Which layout?".into()),
                         changed_at_ms: now - 60_000,
                         finished_at_ms: *finished_at_ms,
+                        background_shell_count: None,
+                        background_shell_since_ms: None,
                     }),
                 })
                 .collect(),

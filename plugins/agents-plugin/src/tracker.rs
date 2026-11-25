@@ -95,6 +95,7 @@ struct Track {
     state: Option<(AgentState, AgentSource, Option<String>)>,
     changed_at_ms: u64,
     finished_at_ms: Option<u64>,
+    background_shell_since_ms: Option<u64>,
 }
 
 impl Track {
@@ -118,6 +119,7 @@ impl Track {
             state: None,
             changed_at_ms: 0,
             finished_at_ms: None,
+            background_shell_since_ms: None,
         }
     }
 }
@@ -303,6 +305,12 @@ impl Tracker {
             match verdict {
                 // A viewer or menu says nothing: keep what the screen last said.
                 Some(verdict) if verdict.skip => {}
+                // A redraw with no recognizable prompt or status does not
+                // establish that an observed shell has exited.
+                None if track
+                    .screen_verdict
+                    .as_ref()
+                    .is_some_and(|verdict| verdict.background_shell_count.is_some()) => {}
                 verdict => track.screen_verdict = verdict,
             }
         }
@@ -318,9 +326,23 @@ impl Tracker {
             let view = self.views.get(pane);
             let (state, source, rule) = classify(track, view, rules_for(&track.agent), now_ms);
             let previous = track.state.as_ref().map(|(state, ..)| *state);
+            if state == AgentState::Working
+                && track
+                    .screen_verdict
+                    .as_ref()
+                    .is_some_and(|verdict| verdict.background_shell_count.is_some())
+            {
+                track.background_shell_since_ms.get_or_insert(now_ms);
+            }
+            let was_waiting_for_shells = track.background_shell_since_ms.is_some();
+            if state == AgentState::Idle {
+                track.background_shell_since_ms = None;
+            }
             if previous != Some(state) {
                 track.changed_at_ms = now_ms;
-                if previous == Some(AgentState::Working) {
+                if (previous == Some(AgentState::Working) && !was_waiting_for_shells)
+                    || (state == AgentState::Idle && was_waiting_for_shells)
+                {
                     track.finished_at_ms = Some(now_ms);
                 }
             }
@@ -344,6 +366,9 @@ impl Tracker {
                             .then(|| self.views.get(pane)?.last_notification.clone())
                             .flatten()
                     });
+                let background_shell_count = (state == AgentState::Working)
+                    .then(|| track.screen_verdict.as_ref()?.background_shell_count)
+                    .flatten();
                 Some(PaneAgent {
                     session_id: track.session_id,
                     pane_id: *pane,
@@ -354,6 +379,10 @@ impl Tracker {
                     message,
                     changed_at_ms: track.changed_at_ms,
                     finished_at_ms: track.finished_at_ms,
+                    background_shell_count,
+                    background_shell_since_ms: track
+                        .background_shell_since_ms
+                        .filter(|_| background_shell_count.is_some()),
                 })
             })
             .collect()
@@ -798,6 +827,50 @@ mod tests {
         tracker.apply_screen(PANE, 3, "─────\n❯ \n─────", Some(&rules), 30);
         tracker.settle(30, |_| Some(&rules));
         assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_background_shells_hold_completion_until_the_footer_clears() {
+        let mut pane = Pane::claude();
+        pane.show(Some("◐ building"), WORKING, 500);
+        let footer = "✻ Crunched for 12m 43s · done 10:51 PM · 1 shell still running\n─────\n❯\n─────\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage";
+        for now in [1_000, 4_321_000] {
+            assert_eq!(
+                pane.show(Some("✳ ready"), footer, now).0,
+                AgentState::Working
+            );
+            let agent = &pane.tracker.snapshot()[0];
+            assert_eq!(agent.background_shell_count, Some(1));
+            assert_eq!(agent.background_shell_since_ms, Some(1_000));
+            assert_eq!(agent.finished_at_ms, None);
+        }
+        assert_eq!(
+            pane.show(Some("✳ ready"), "─────", 4_321_500).0,
+            AgentState::Working
+        );
+
+        let two_shells = footer.replace("1 shell ·", "2 shells ·");
+        pane.show(Some("✳ ready"), &two_shells, 4_322_000);
+        assert_eq!(pane.tracker.snapshot()[0].background_shell_count, Some(2));
+        assert_eq!(
+            pane.tracker.snapshot()[0].background_shell_since_ms,
+            Some(1_000)
+        );
+
+        assert_eq!(
+            pane.show(Some("✳ ready"), ASKING, 4_323_000).0,
+            AgentState::Blocked
+        );
+        assert_eq!(pane.tracker.snapshot()[0].finished_at_ms, None);
+
+        let cleared = "✻ Crunched for 12m 43s · done 10:51 PM · 1 shell still running\n─────\n❯\n─────\n  ⏵⏵ auto mode on";
+        assert_eq!(
+            pane.show(Some("✳ ready"), cleared, 4_324_000).0,
+            AgentState::Idle
+        );
+        assert_eq!(pane.tracker.snapshot()[0].background_shell_count, None);
+        pane.show(Some("✳ ready"), cleared, 4_325_000);
+        assert_eq!(pane.tracker.snapshot()[0].finished_at_ms, Some(4_324_000));
     }
 
     /// A report from before the agents plugin saw the pane is history, and a

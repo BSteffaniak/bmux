@@ -48,15 +48,16 @@ as boxes or blanks, so set `icons = false` to leave them out.
 
 Sidebar states, most urgent first (see also the tabs plugin README):
 
-| Glyph       | State       | When                                                                                                                                                                                 |
-| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
-| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
-| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
-| `◉` green   | working     | its agent is working (a spinner by default)                                                                                                                                          |
-| `›` magenta | shell       | a tab without an agent has a pane running a foreground command, including quiet commands; the command's name is its summary                                                          |
-| `■` blue    | stopped     | its agent returned to idle after observed work                                                                                                                                       |
-| `○` dim     | idle        | otherwise                                                                                                                                                                            |
+| Glyph       | State            | When                                                                                                                                                                                 |
+| ----------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow  | needs input      | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
+| `▲` red     | failed           | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan    | done             | its agent finished since anyone looked at the tab                                                                                                                                    |
+| `◉` green   | working          | its agent is working (a spinner by default)                                                                                                                                          |
+| `◌` green   | background shell | Claude is ready for another prompt and its live footer still reports shells. Age measures time since bmux first observed the background activity. It never marks the job done.       |
+| `›` magenta | shell            | a tab without an agent has a pane running a foreground command, including quiet commands; the command's name is its summary                                                          |
+| `■` blue    | stopped          | its agent returned to idle after observed work                                                                                                                                       |
+| `○` dim     | idle             | otherwise                                                                                                                                                                            |
 
 A tab with an agent always shows its agent's state: a command running in
 another of its panes (an editor beside the agent, say) does not replace it,
@@ -168,7 +169,8 @@ its name unless `workspace_colors` sets it), which also runs down its tabs as
 a thin rail; a blank row sets each group off from the next. While a group's
 tabs scroll under the top, its header stays pinned there. The header sums up
 what its tabs are doing: how many need input (`◆`), failed (`▲`), are done
-(`✓`), are working (`◉`), run a shell command (`›`) and have stopped (`■`),
+(`✓`), are working (`◉`), run a shell command (`›`) and have stopped
+(`■`),
 most pressing first, or how many tabs it holds when none is doing anything.
 Click a header (or press Enter or space on it) to collapse or expand its group;
 left and right collapse and expand. A collapsed header still shows its sum, and

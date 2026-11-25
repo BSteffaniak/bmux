@@ -290,6 +290,8 @@ impl StatusBoard {
                 message: agent.message.clone(),
                 changed_at_ms: agent.changed_at_ms,
                 finished_at_ms: agent.finished_at_ms,
+                background_shell_count: agent.background_shell_count,
+                background_shell_since_ms: agent.background_shell_since_ms,
             })
     }
 
@@ -787,6 +789,8 @@ mod tests {
                 message: None,
                 changed_at_ms,
                 finished_at_ms,
+                background_shell_count: None,
+                background_shell_since_ms: None,
             }],
             revision: 1,
         };
@@ -986,6 +990,8 @@ mod tests {
             message: Some("approve?".into()),
             changed_at_ms: 5,
             finished_at_ms: None,
+            background_shell_count: None,
+            background_shell_since_ms: None,
         };
         board.set_agents(&AgentSnapshot {
             panes: vec![agent(11, AgentState::Idle), agent(12, AgentState::Blocked)],
@@ -1032,6 +1038,8 @@ mod tests {
                 message: None,
                 changed_at_ms: 1,
                 finished_at_ms: None,
+                background_shell_count: None,
+                background_shell_since_ms: None,
             }],
             revision: 1,
         });

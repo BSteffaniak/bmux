@@ -341,6 +341,8 @@ pub struct Verdict {
     pub visible: bool,
     /// This is live background work and can coexist with an idle foreground.
     pub background_working: bool,
+    /// Live shell count captured by a background-working screen rule.
+    pub background_shell_count: Option<u32>,
     /// The screen shows something that says nothing about the state (a
     /// transcript viewer): keep the previous state.
     pub skip: bool,
@@ -446,6 +448,27 @@ impl Agent {
             state: rule.state,
             visible: rule.visible,
             background_working: rule.background_working,
+            background_shell_count: rule
+                .background_working
+                .then(|| {
+                    let text = rule.region.text(input);
+                    rule.gate.regex.iter().find_map(|regex| {
+                        if !regex
+                            .capture_names()
+                            .flatten()
+                            .any(|name| name == "shell_count")
+                        {
+                            return None;
+                        }
+                        regex
+                            .captures(text)?
+                            .name("shell_count")?
+                            .as_str()
+                            .parse()
+                            .ok()
+                    })
+                })
+                .flatten(),
             skip: rule.skip_state_update || rule.state == RuleState::Unknown,
         })
     }

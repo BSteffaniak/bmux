@@ -1,8 +1,8 @@
 aliases            = ["claude-code"]
 id                 = "claude"
 min_engine_version = 2
-updated_at         = "2026-11-24T00:00:00Z"
-version            = "2026.11.24.1"
+updated_at         = "2026-11-25T00:00:00Z"
+version            = "2026.11.25.1"
 
 [[rules]]
 id              = "osc_title_working"
@@ -27,6 +27,19 @@ priority = 970
 region = "bottom_non_empty_lines(12)"
 state = "working"
 visible_working = true
+
+[[rules]]
+background_working = true
+id                 = "background_shell_working"
+priority           = 966
+region             = "bottom_non_empty_lines(12)"
+state              = "working"
+visible_working    = true
+# The completion summary above the prompt can outlive the shells. Read the
+# current prompt's management footer, where the count clears on completion.
+regex = [
+    '(?m)^[ \t]*❯[^\n]*\n(?:[ \t]+[^\n]*\n)*[ \t]*─{3,}[ \t]*\n[ \t]*(?:[⏵⏸]+[^\n]*?·[ \t]+)?(?P<shell_count>[1-9][0-9]*)[ \t]+shells?[ \t]+·[ \t]+↓[ \t]+to[ \t]+manage(?:[ \t]+·[^\n]*)?\s*\z',
+]
 
 [[rules]]
 background_working = true

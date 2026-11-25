@@ -27,6 +27,8 @@ fn snapshots_round_trip() {
             message: Some("approve edit?".into()),
             changed_at_ms: 10,
             finished_at_ms: Some(5),
+            background_shell_count: None,
+            background_shell_since_ms: None,
         }],
         revision: 3,
     };

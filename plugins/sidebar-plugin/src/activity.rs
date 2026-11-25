@@ -37,6 +37,7 @@ pub enum TabState {
     Failed,
     Done,
     Working,
+    BackgroundShell,
     Shell,
     Stopped,
     Idle,
@@ -60,13 +61,28 @@ impl TabState {
     /// tab without an agent running a foreground command shows as a shell.
     fn displayed(status: &TabStatus) -> Self {
         let state = Self::from(status.state);
-        if status.agent.is_none()
+        if state == Self::Working
+            && status
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.background_shell_count.is_some())
+        {
+            Self::BackgroundShell
+        } else if status.agent.is_none()
             && status.shell_command.is_some()
             && matches!(state, Self::Working | Self::Stopped | Self::Idle)
         {
             Self::Shell
         } else {
             state
+        }
+    }
+
+    fn age_start(self, status: &TabStatus) -> Option<u64> {
+        if self == Self::BackgroundShell {
+            status.agent.as_ref()?.background_shell_since_ms
+        } else {
+            status.state_since_ms.filter(|_| self.shows_age())
         }
     }
 
@@ -80,7 +96,10 @@ impl TabState {
     /// Whether a card in this state shows how long it has been in it.
     #[must_use]
     pub const fn shows_age(self) -> bool {
-        matches!(self, Self::Working | Self::Stopped | Self::Done)
+        matches!(
+            self,
+            Self::Working | Self::BackgroundShell | Self::Stopped | Self::Done
+        )
     }
 
     #[must_use]
@@ -90,6 +109,7 @@ impl TabState {
             Self::Failed => '▲',
             Self::Done => '✓',
             Self::Working => '◉',
+            Self::BackgroundShell => '◌',
             Self::Shell => '›',
             Self::Stopped => '■',
             Self::Idle => '○',
@@ -102,7 +122,7 @@ impl TabState {
             Self::Blocked => RenderNamedColor::Yellow,
             Self::Failed => RenderNamedColor::Red,
             Self::Done => RenderNamedColor::Cyan,
-            Self::Working => RenderNamedColor::Green,
+            Self::Working | Self::BackgroundShell => RenderNamedColor::Green,
             Self::Shell => RenderNamedColor::Magenta,
             Self::Stopped => RenderNamedColor::Blue,
             Self::Idle => RenderNamedColor::BrightBlack,
@@ -116,6 +136,7 @@ impl TabState {
             Self::Failed => "failed",
             Self::Done => "done",
             Self::Working => "working",
+            Self::BackgroundShell => "background shell",
             Self::Shell => "shell",
             Self::Stopped => "stopped",
             Self::Idle => "idle",
@@ -312,20 +333,27 @@ impl ActivityView {
         let state = TabState::displayed(status);
         let program = status.running_command.as_deref().and_then(command_program);
         let agent = status.agent.as_ref();
-        let summary = match state {
-            TabState::Blocked => Some("needs input".to_string()),
-            TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
-            TabState::Done => Some("done".to_string()),
-            TabState::Working if agent.is_some() => Some("working".to_string()),
-            TabState::Shell => status
-                .shell_command
-                .as_deref()
-                .and_then(command_program)
-                .or_else(|| Some("shell".to_string())),
-            TabState::Stopped => Some("stopped".to_string()),
-            TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
-            TabState::Working | TabState::Idle => program.clone(),
-        };
+        let summary =
+            match state {
+                TabState::Blocked => Some("needs input".to_string()),
+                TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
+                TabState::Done => Some("done".to_string()),
+                TabState::BackgroundShell => agent
+                    .and_then(|agent| agent.background_shell_count)
+                    .map(|count| {
+                        let plural = if count == 1 { "" } else { "s" };
+                        format!("{count} background shell{plural}")
+                    }),
+                TabState::Working if agent.is_some() => Some("working".to_string()),
+                TabState::Shell => status
+                    .shell_command
+                    .as_deref()
+                    .and_then(command_program)
+                    .or_else(|| Some("shell".to_string())),
+                TabState::Stopped => Some("stopped".to_string()),
+                TabState::Idle if agent.is_some() => agent.map(|agent| agent.name.clone()),
+                TabState::Working | TabState::Idle => program.clone(),
+            };
         let message = (state == TabState::Blocked)
             .then(|| {
                 agent
@@ -333,10 +361,14 @@ impl ActivityView {
                     .or_else(|| status.attention.clone())
             })
             .flatten();
-        let since = status
-            .state_since_ms
-            .filter(|_| state.shows_age())
-            .map(|at| format_age(now.saturating_sub(at)));
+        let since = state.age_start(status).map(|at| {
+            let elapsed = now.saturating_sub(at);
+            if state == TabState::BackgroundShell && (3_600_000..86_400_000).contains(&elapsed) {
+                format!("{}h {}m", elapsed / 3_600_000, elapsed / 60_000 % 60)
+            } else {
+                format_age(elapsed)
+            }
+        });
         let cwd = status.cwd.as_deref().map(|cwd| self.shorten_home(cwd));
         let branch = status.git.as_ref().map(|git| {
             let mut branch = git.branch.clone();
@@ -382,14 +414,14 @@ impl ActivityView {
     }
 
     /// Whether any tab's shown age can change with time alone, so the view
-    /// should be refreshed: only working, stopped and done tabs show one.
+    /// should be refreshed.
     #[must_use]
     pub fn time_sensitive(&self) -> bool {
         self.snapshot.as_ref().is_some_and(|(snapshot, _)| {
             snapshot
                 .tabs
                 .iter()
-                .any(|tab| tab.state_since_ms.is_some() && TabState::displayed(tab).shows_age())
+                .any(|tab| TabState::displayed(tab).age_start(tab).is_some())
         })
     }
 
@@ -480,6 +512,8 @@ mod tests {
             message: (activity == AgentActivity::Blocked).then(|| "approve edit?".into()),
             changed_at_ms: 1_000,
             finished_at_ms: None,
+            background_shell_count: None,
+            background_shell_since_ms: None,
         }
     }
 
@@ -671,6 +705,21 @@ mod tests {
     }
 
     /// Only states that show an age make the view change with time.
+    #[test]
+    fn background_shells_show_their_own_elapsed_time() {
+        let mut tab = status(1, tabs_status::TabState::Working);
+        let mut claude = agent(AgentActivity::Working);
+        claude.background_shell_count = Some(2);
+        claude.background_shell_since_ms = Some(1_000);
+        tab.agent = Some(claude);
+        let view = view(vec![tab], 4_321_000);
+        let card = view.activity(Uuid::from_u128(1)).unwrap();
+        assert_eq!(card.state, TabState::BackgroundShell);
+        assert_eq!(card.summary.as_deref(), Some("2 background shells"));
+        assert_eq!(card.since.as_deref(), Some("1h 12m"));
+        assert!(view.time_sensitive());
+    }
+
     #[test]
     fn only_shown_ages_make_the_view_time_sensitive() {
         let since = |state| {

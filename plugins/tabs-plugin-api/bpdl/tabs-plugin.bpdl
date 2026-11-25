@@ -762,6 +762,10 @@ interface tabs-status {
         changed-at-ms: u64,
         // When it last finished work (went from working to idle).
         finished-at-ms: u64?,
+        // Live background shells reported by an agent ready for another prompt.
+        background-shell-count: u32?,
+        // When this continuous period of background shell activity was first observed.
+        background-shell-since-ms: u64?,
     }
 
     // What a tab is doing, most pressing first. The tabs plugin decides it
