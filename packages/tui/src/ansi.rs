@@ -738,13 +738,19 @@ pub(crate) fn emit_row_span(
 ///
 /// A grapheme needs one when any of its scalars is one terminals disagree on
 /// ([`width_disputed_scalar`]): symbols with emoji presentation, presentation
-/// selectors, joiners, flags, keycaps and tag sequences. ASCII, Box Drawing
+/// selectors, joiners, flags, keycaps and tag sequences. So does a cluster
+/// whose later scalars have width of their own (spacing marks such as
+/// Devanagari `ि`): terminals that measure scalar by scalar advance past them,
+/// terminals that measure clusters do not. ASCII, Box Drawing
 /// (`U+2500..=U+257F`), Block Elements (`U+2580..=U+259F`), Braille
-/// (`U+2800..=U+28FF`), ordinary alphabetic scripts and their combining marks
-/// (accents, Thai, Devanagari) return `false` so borders, spinners and prose
-/// incur zero extra bytes.
+/// (`U+2800..=U+28FF`), ordinary alphabetic scripts and their nonspacing marks
+/// (accents, Thai vowels above and below) return `false` so borders, spinners
+/// and prose incur zero extra bytes.
 fn needs_cursor_reanchor(symbol: &str) -> bool {
     symbol.chars().any(width_disputed_scalar)
+        || symbol.chars().skip(1).any(|scalar| {
+            bmux_cell_geometry::unicode_scalar_width(scalar).is_some_and(|width| width > 0)
+        })
 }
 
 /// Whether terminals disagree on the width of a grapheme holding `scalar`.
@@ -2004,14 +2010,15 @@ mod tests {
             "\u{1F1FA}\u{1F1F8}",
             "1\u{FE0F}\u{20E3}",
             "\u{1F44D}\u{1F3FD}",
+            // Spacing marks: as wide as a letter when measured scalar by scalar.
+            "\u{0915}\u{093F}",
         ] {
             assert!(super::needs_cursor_reanchor(symbol), "{symbol:?}");
         }
-        // Letters with combining marks are as wide everywhere.
+        // Letters with nonspacing marks are as wide everywhere.
         for symbol in [
             "e\u{301}",
             "\u{0E01}\u{0E34}",
-            "\u{0915}\u{093F}",
             "a\u{0308}\u{0323}",
             "a",
             "\u{2500}",
