@@ -68,11 +68,27 @@ enum Scope {
     CurrentWorkspace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceVisibility {
+    Manual,
+    FollowFocus,
+    FollowFocusAndAttention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtherWorkspaceTabs {
+    All,
+    Active,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     placement: Placement,
     grouping: Grouping,
     scope: Scope,
+    workspace_visibility: WorkspaceVisibility,
+    pinned_workspaces: std::collections::BTreeSet<String>,
+    other_workspace_tabs: OtherWorkspaceTabs,
     width: u16,
     maximum_width: u16,
     order: i32,
@@ -169,6 +185,9 @@ impl Default for Settings {
             },
             grouping: Grouping::None,
             scope: Scope::AllWorkspaces,
+            workspace_visibility: WorkspaceVisibility::Manual,
+            pinned_workspaces: std::collections::BTreeSet::new(),
+            other_workspace_tabs: OtherWorkspaceTabs::All,
             working_indicator: WorkingIndicator::Spinner,
             density: Density::Comfortable,
             workspace_colors: std::collections::BTreeMap::new(),
@@ -353,6 +372,41 @@ fn parse_organization(
             }
         };
     }
+    if let Some(mode) = table.get("workspace_visibility") {
+        settings.workspace_visibility = match mode.as_str() {
+            Some("manual") => WorkspaceVisibility::Manual,
+            Some("follow_focus") => WorkspaceVisibility::FollowFocus,
+            Some("follow_focus_and_attention") => WorkspaceVisibility::FollowFocusAndAttention,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(
+                    "bmux.sidebar workspace_visibility must be 'manual', 'follow_focus', or 'follow_focus_and_attention'",
+                ));
+            }
+        };
+    }
+    if let Some(mode) = table.get("other_workspace_tabs") {
+        settings.other_workspace_tabs = match mode.as_str() {
+            Some("all") => OtherWorkspaceTabs::All,
+            Some("active") => OtherWorkspaceTabs::Active,
+            _ => {
+                return Err(PluginCommandError::invalid_arguments(
+                    "bmux.sidebar other_workspace_tabs must be 'all' or 'active'",
+                ));
+            }
+        };
+    }
+    if let Some(pinned) = table.get("pinned_workspaces") {
+        let incompatible = || {
+            PluginCommandError::invalid_arguments(
+                "bmux.sidebar pinned_workspaces must be an array of workspace names",
+            )
+        };
+        for name in pinned.as_array().ok_or_else(incompatible)? {
+            settings
+                .pinned_workspaces
+                .insert(name.as_str().ok_or_else(incompatible)?.to_string());
+        }
+    }
     Ok(())
 }
 
@@ -418,8 +472,10 @@ struct CompanionState {
     snapshot: tabs_list::TabListSnapshot,
     /// The highlighted row, moved by the pointer (hover) and the keyboard.
     cursor: ItemCursor<SidebarHit>,
-    /// Workspaces whose tabs are hidden under their header.
-    collapsed: std::collections::BTreeSet<Uuid>,
+    /// Manual group choices. A true value collapses the group.
+    group_overrides: std::collections::BTreeMap<Uuid, bool>,
+    /// Most recent focused workspace, retained through gaps in the catalog.
+    last_focused_workspace: Option<Uuid>,
     /// Where collapsed groups are remembered, when they are.
     groups_memory: Option<std::path::PathBuf>,
     /// What each tab is doing, from the tabs plugin's `tabs-status`.
@@ -618,12 +674,18 @@ impl CompanionState {
             .as_deref()
             .filter(|_| settings.remember.groups)
             .map(|directory| directory.join(GROUPS_FILE));
-        let collapsed = groups_memory
+        let group_overrides = groups_memory
             .as_deref()
             .and_then(|file| std::fs::read_to_string(file).ok())
             .map(|text| {
                 text.lines()
-                    .filter_map(|line| Uuid::parse_str(line.trim()).ok())
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        let (id, collapsed) = line
+                            .strip_prefix('+')
+                            .map_or((line, true), |id| (id, false));
+                        Uuid::parse_str(id).ok().map(|id| (id, collapsed))
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -635,7 +697,8 @@ impl CompanionState {
                 width.clamp(settings.collapsed_width + 1, settings.maximum_width)
             });
         Self {
-            collapsed,
+            group_overrides,
+            last_focused_workspace: None,
             groups_memory,
             width,
             width_mode: WidthMode::default(),
@@ -1292,10 +1355,7 @@ impl CompanionState {
     /// grouped, with a collapsed workspace's tabs left out.
     fn rows(&self) -> Vec<SidebarRow> {
         let tabs = &self.snapshot.tabs;
-        let current = tabs
-            .iter()
-            .find(|tab| tab.active)
-            .map(|tab| tab.workspace_id);
+        let current = self.focused_workspace();
         let listed = tabs.iter().enumerate().filter(|(_, tab)| {
             self.settings.scope == Scope::AllWorkspaces
                 || current.is_none_or(|current| tab.workspace_id == current)
@@ -1314,7 +1374,23 @@ impl CompanionState {
         }
         let mut rows = Vec::new();
         for (id, name, members) in groups {
-            let collapsed = self.collapsed.contains(&id);
+            let background = current.is_some_and(|current| current != id);
+            let collapsed = self.group_overrides.get(&id).copied().unwrap_or_else(|| {
+                background
+                    && !self.settings.pinned_workspaces.contains(&name)
+                    && match self.settings.workspace_visibility {
+                        WorkspaceVisibility::Manual => false,
+                        WorkspaceVisibility::FollowFocus => true,
+                        WorkspaceVisibility::FollowFocusAndAttention => {
+                            !members.iter().any(|index| {
+                                matches!(
+                                    self.activity.state(tabs[*index].id),
+                                    Some(activity::TabState::Blocked | activity::TabState::Failed)
+                                )
+                            })
+                        }
+                    }
+            });
             rows.push(SidebarRow::Group {
                 id,
                 name,
@@ -1322,10 +1398,41 @@ impl CompanionState {
                 collapsed,
             });
             if !collapsed {
-                rows.extend(members.into_iter().map(SidebarRow::Tab));
+                rows.extend(
+                    members
+                        .into_iter()
+                        .filter(|index| {
+                            !background
+                                || self.settings.other_workspace_tabs == OtherWorkspaceTabs::All
+                                || matches!(
+                                    self.activity.state(tabs[*index].id),
+                                    Some(
+                                        activity::TabState::Working
+                                            | activity::TabState::Blocked
+                                            | activity::TabState::Failed
+                                    )
+                                )
+                        })
+                        .map(SidebarRow::Tab),
+                );
             }
         }
         rows
+    }
+
+    fn focused_workspace(&self) -> Option<Uuid> {
+        self.snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .map(|tab| tab.workspace_id)
+    }
+
+    fn group_collapsed(&self, workspace: Uuid) -> Option<bool> {
+        self.rows().into_iter().find_map(|row| match row {
+            SidebarRow::Group { id, collapsed, .. } if id == workspace => Some(collapsed),
+            _ => None,
+        })
     }
 
     /// The row showing this client's tab: its own, or its collapsed group's.
@@ -1366,9 +1473,8 @@ impl CompanionState {
     }
 
     fn toggle_group(&mut self, workspace: Uuid) -> Option<String> {
-        if !self.collapsed.remove(&workspace) {
-            self.collapsed.insert(workspace);
-        }
+        let collapsed = self.group_collapsed(workspace)?;
+        self.group_overrides.insert(workspace, !collapsed);
         self.revision = self.revision.saturating_add(1).max(1);
         self.settle_scroll(false);
         let keys = self.item_keys();
@@ -1386,25 +1492,27 @@ impl CompanionState {
             return Ok(());
         };
         let text = self
-            .collapsed
+            .group_overrides
             .iter()
-            .map(Uuid::to_string)
+            .map(|(id, collapsed)| {
+                if *collapsed {
+                    id.to_string()
+                } else {
+                    format!("+{id}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let write = || -> std::io::Result<()> {
             if let Some(parent) = file.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let temporary = file.with_extension(format!("{}.tmp", std::process::id()));
+            let temporary = file.with_extension(format!("{}.tmp", Uuid::new_v4()));
             std::fs::write(&temporary, text)?;
             std::fs::rename(&temporary, file)
         };
-        write().map_err(|error| {
-            format!(
-                "remembering collapsed sidebar groups in {}: {error}",
-                file.display()
-            )
-        })
+        write()
+            .map_err(|error| format!("remembering sidebar groups in {}: {error}", file.display()))
     }
 
     /// Apply a catalog snapshot, arranged by this attachment's personal view
@@ -1417,9 +1525,25 @@ impl CompanionState {
         self.catalog = catalog;
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
+            let follows_focus = self.settings.grouping == Grouping::Workspace
+                && self.settings.workspace_visibility != WorkspaceVisibility::Manual;
+            if let Some(workspace) = self.focused_workspace() {
+                let previous = self.last_focused_workspace.replace(workspace);
+                if follows_focus
+                    && previous.is_some_and(|previous| previous != workspace)
+                    && !self.group_overrides.is_empty()
+                {
+                    self.group_overrides.clear();
+                    if let Err(error) = self.remember_groups() {
+                        tracing::warn!(%error, "clearing sidebar group overrides");
+                    }
+                }
+            }
             let keys = self.item_keys();
             self.cursor.retain(&keys);
-            self.settle_scroll(true);
+            let filters_tabs = self.settings.grouping == Grouping::Workspace
+                && self.settings.other_workspace_tabs == OtherWorkspaceTabs::Active;
+            self.settle_scroll(!follows_focus && !filters_tabs);
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -2582,7 +2706,18 @@ impl CompanionState {
             self.activity.replace(status);
         }
         let personal_changed = personal.is_some_and(|projection| self.set_personal(projection));
+        if status_changed
+            && self.settings.grouping == Grouping::Workspace
+            && (self.settings.workspace_visibility == WorkspaceVisibility::FollowFocusAndAttention
+                || self.settings.other_workspace_tabs == OtherWorkspaceTabs::Active)
+        {
+            let keys = self.item_keys();
+            self.cursor.retain(&keys);
+        }
         if let Some(tabs) = tabs {
+            if let Some(SelectionChange(context_id)) = selection {
+                self.selected_context_id = context_id;
+            }
             self.replace_tabs(tabs);
         } else if let Some(SelectionChange(context_id)) = selection {
             self.select(context_id);
@@ -3130,7 +3265,7 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
             let SidebarHit::Group(workspace) = target else {
                 return None;
             };
-            let collapsed = companion.collapsed.contains(&workspace);
+            let collapsed = companion.group_collapsed(workspace)?;
             let toggle = match key {
                 "left" => !collapsed,
                 "right" => collapsed,
@@ -4826,8 +4961,8 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .collapsed
-                .contains(&notes)
+                .group_collapsed(notes)
+                .unwrap()
         };
         for (pressed, expected) in [
             ("left", true),
@@ -4874,6 +5009,96 @@ mod tests {
             state.select(Some(Uuid::from_u128(4)));
             assert_eq!(names(&state), ["todo"], "{grouping:?}");
         }
+    }
+
+    #[test]
+    fn follow_focus_keeps_pins_open_and_reapplies_on_workspace_change() {
+        let options = toml::Value::Table(toml::toml! {
+            grouping = "workspace"
+            workspace_visibility = "follow_focus"
+            pinned_workspaces = ["notes"]
+        });
+        let mut state = grouped_state(Settings::parse(Some(&options)).unwrap(), None);
+        let text =
+            |state: &CompanionState| surface_text(&build_surface(state, 1), 32, 12).join("\n");
+        assert!(text(&state).contains("todo"));
+        state.toggle_group(Uuid::from_u128(200));
+        state.select(Some(Uuid::from_u128(2)));
+        assert!(!text(&state).contains("todo"));
+        state.select(Some(Uuid::from_u128(4)));
+        assert!(!text(&state).contains("build"));
+        assert!(text(&state).contains("◆1 ◉1 ■1 ▸"));
+        state.toggle_group(Uuid::from_u128(100));
+        assert!(text(&state).contains("build"));
+        state.select(Some(Uuid::from_u128(2)));
+        state.select(Some(Uuid::from_u128(4)));
+        assert!(!text(&state).contains("build"));
+    }
+
+    #[test]
+    fn manual_expansion_bypasses_auto_collapse_after_restart_until_focus_moves() {
+        let dir = scratch_dir();
+        let settings = Settings {
+            workspace_visibility: WorkspaceVisibility::FollowFocus,
+            ..grouped()
+        };
+        let notes = Uuid::from_u128(200);
+        let shown = |state: &CompanionState| {
+            surface_text(&build_surface(state, 1), 32, 12)
+                .iter()
+                .any(|line| line.contains("todo"))
+        };
+        let mut state = grouped_state(settings.clone(), Some(dir.clone()));
+        assert!(!shown(&state));
+        assert!(state.toggle_group(notes).is_none());
+        let mut restored = grouped_state(settings.clone(), Some(dir.clone()));
+        assert!(shown(&restored));
+        restored.select(Some(Uuid::from_u128(4)));
+        restored.select(Some(Uuid::from_u128(1)));
+        assert!(!shown(&grouped_state(settings, Some(dir.clone()))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follow_attention_opens_background_groups_and_filter_keeps_their_full_counts() {
+        let options = toml::Value::Table(toml::toml! {
+            grouping = "workspace"
+            workspace_visibility = "follow_focus_and_attention"
+            other_workspace_tabs = "active"
+        });
+        let settings = Settings::parse(Some(&options)).unwrap();
+        let mut state = grouped_state(settings, None);
+        let text =
+            |state: &CompanionState| surface_text(&build_surface(state, 1), 32, 12).join("\n");
+        state.select(Some(Uuid::from_u128(4)));
+        let rendered = text(&state);
+        assert!(rendered.contains("◆1 ◉1 ■1 ▾"));
+        assert!(
+            rendered.contains("review") && rendered.contains("build") && rendered.contains("todo")
+        );
+        assert!(!rendered.contains("docs"));
+        let update = |state: &mut CompanionState, tab_state| {
+            let mut status = state.activity.snapshot().unwrap().clone();
+            status.tabs[1].state = tab_state;
+            status.revision += 1;
+            state.apply_changes(Changes {
+                tabs: None,
+                personal: None,
+                selection: None,
+                status: Some(status),
+                appearance: None,
+                ticked: false,
+                animated: false,
+            });
+        };
+        update(&mut state, tabs_status::TabState::Idle);
+        assert!(text(&state).contains("◉1 ■1 ▸"));
+        update(&mut state, tabs_status::TabState::Failed);
+        assert!(text(&state).contains("▲1 ◉1 ■1 ▾"));
+        update(&mut state, tabs_status::TabState::Idle);
+        let rendered = text(&state);
+        assert!(rendered.contains("◉1 ■1 ▸"));
+        assert!(!rendered.contains("build"));
     }
 
     /// A narrow header keeps the most pressing counts.

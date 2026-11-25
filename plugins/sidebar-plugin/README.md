@@ -80,6 +80,9 @@ only ever runs in the directory the shell itself reports, with
 placement = "left" # or "right"
 grouping = "none"          # or "workspace": tabs under a header per workspace
 scope = "all_workspaces"   # or "current_workspace": only the shown tab's workspace
+workspace_visibility = "manual" # or "follow_focus" or "follow_focus_and_attention"
+pinned_workspaces = []
+other_workspace_tabs = "all" # or "active"
 width = 28         # until you resize it
 maximum_width = 60
 order = 200
@@ -95,13 +98,29 @@ collapsed_width = 8
 visible = false            # closed when a client attaches
 remember_visibility = true  # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
-remember_groups = true      # start with the groups last collapsed collapsed
+remember_groups = true      # remember manual expansion and collapse choices
 working_indicator = "spinner" # or "static": a still ◉
 density = "comfortable"     # or "compact": one line per tab
 
 [plugins.settings."bmux.sidebar".workspace_colors]
 bmux = "magenta"            # a terminal color name, or "#rrggbb"
 ```
+
+With `grouping = "workspace"` and `scope = "all_workspaces"`, use
+`workspace_visibility = "follow_focus"` to expand the focused tab's workspace
+and collapse the other workspaces to their headers.
+`"follow_focus_and_attention"`
+also opens background workspaces with a blocked or failed tab. Add workspace
+names to `pinned_workspaces` to keep those groups open by default.
+
+`other_workspace_tabs = "active"` limits open background groups to working,
+blocked, and failed tabs. Every workspace keeps its header and full status
+counts,
+and the focused workspace shows every tab. Click a header to expand or collapse
+it manually. In follow modes, manual overrides last until focus switches
+workspaces. With `remember_groups = true`, the sidebar reloads the manual
+choices
+you left in effect. In manual mode, those choices also survive focus changes.
 
 Templates support `{state_icon}`, `{state}`, `{name}`, `{command}`, `{cwd}`,
 `{branch}`, `{detail}`, `{marker}`, `{index}`, `{id}`, `{active}`, `{fact}`,
@@ -132,7 +151,7 @@ it
 holds when none is doing anything. Click a header (or press Enter or space on
 it) to collapse or expand its group; left and right collapse and expand. A
 collapsed header still shows its sum, and is marked when it hides the tab you
-are looking at. Collapsed groups are remembered on this machine unless
+are looking at. Manual group choices are remembered on this machine unless
 `remember_groups = false`.
 
 `scope = "current_workspace"` lists only the workspace of the tab you are
