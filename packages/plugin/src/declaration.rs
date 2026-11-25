@@ -384,6 +384,7 @@ mod tests {
                     execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
                     accepts_repeat: false,
+                    forward_help: false,
                 },
                 PluginCommand {
                     name: "run".to_string(),
@@ -395,6 +396,7 @@ mod tests {
                     execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
                     accepts_repeat: false,
+                    forward_help: false,
                 },
             ],
             event_subscriptions: Vec::new(),
@@ -442,6 +444,7 @@ mod tests {
                 execution: CommandExecutionKind::RuntimeHook,
                 expose_in_cli: true,
                 accepts_repeat: false,
+                forward_help: false,
             }],
             event_subscriptions: Vec::new(),
             event_publications: Vec::new(),

@@ -503,6 +503,10 @@ fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Command {
     if let Some(description) = &schema.description {
         command = command.long_about(description.clone());
     }
+    if schema.forward_help {
+        // The command parses its own arguments and answers help itself.
+        command = command.disable_help_flag(true);
+    }
     for argument in &schema.arguments {
         command = command.arg(build_clap_arg(argument));
     }
@@ -556,6 +560,16 @@ fn validate_argument_metadata(command: &PluginCommand) -> Result<()> {
                 command.name
             );
         }
+    }
+    if command.forward_help
+        && !(command.arguments.len() == 1
+            && command.arguments[0].trailing_var_arg
+            && command.arguments[0].position.is_some())
+    {
+        bail!(
+            "{} forwards help, so it must take only one trailing positional argument",
+            command.name
+        );
     }
     Ok(())
 }
@@ -725,7 +739,8 @@ fn validate_plugin_owns_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginCommandRegistry, selected_subcommand_path};
+    use super::{PluginCommandRegistry, selected_subcommand_path, validate_argument_metadata};
+    use bmux_plugin_sdk::{PluginCommand, PluginCommandArgument, PluginCommandArgumentKind};
     use bmux_cli_schema::Cli;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
@@ -1102,6 +1117,38 @@ minimum = "1.0"
             .resolve_exact_path(&["new-session".to_string()])
             .expect("plugin command should resolve on owned built-in path");
         assert_eq!(resolved.plugin_id, "example.plugin");
+    }
+
+    #[test]
+    fn forwarded_help_reaches_the_command_arguments() {
+        let mut command = PluginCommand::new("drive", "drive things").forward_help(true);
+        command.arguments.push(PluginCommandArgument {
+            name: "args".into(),
+            kind: PluginCommandArgumentKind::String,
+            choice_values: Vec::new(),
+            choice_aliases: std::collections::BTreeMap::new(),
+            default_value: None,
+            conflicts_with: Vec::new(),
+            position: Some(0),
+            long: None,
+            short: None,
+            required: false,
+            multiple: true,
+            trailing_var_arg: true,
+            allow_hyphen_values: true,
+            summary: None,
+            value_name: None,
+        });
+        validate_argument_metadata(&command).expect("one trailing positional may forward help");
+        for help in ["--help", "-h"] {
+            let arguments =
+                PluginCommandRegistry::validate_arguments(&command, &[help.to_owned()])
+                    .expect("help is an argument, not a request to the CLI");
+            assert_eq!(arguments, vec![help.to_owned()]);
+        }
+        let mut flagged = command.clone();
+        flagged.arguments[0].trailing_var_arg = false;
+        assert!(validate_argument_metadata(&flagged).is_err());
     }
 
     #[test]
