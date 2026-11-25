@@ -669,25 +669,40 @@ mod tests {
 
     #[test]
     fn dec_mode_reports_follow_the_profile() {
-        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
-        assert_eq!(
-            csi(&mut engine, b"?$", &[2048], 'p', false),
-            b"\x1b[?2048;0$y"
-        );
-        assert_eq!(
+        let report = |profile, modes: &[u16]| {
             csi(
-                &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+                &mut TerminalProtocolEngine::new(profile),
                 b"?$",
-                &[2048],
+                modes,
                 'p',
-                false
-            ),
-            b"\x1b[?2048;0$y"
-        );
+                false,
+            )
+        };
+        // Mouse tracking (1000) is reset-but-supported where the profile offers it, and unknown
+        // to the screen and conservative profiles.
+        for (profile, reply) in [
+            (ProtocolProfile::Bmux, &b"\x1b[?1000;2$y"[..]),
+            (ProtocolProfile::Xterm, b"\x1b[?1000;2$y"),
+            (ProtocolProfile::Screen, b"\x1b[?1000;0$y"),
+            (ProtocolProfile::Conservative, b"\x1b[?1000;0$y"),
+        ] {
+            assert_eq!(report(profile, &[1000]), reply, "{profile:?}");
+        }
+        // Application cursor keys (1) are unknown only to the conservative profile.
         assert_eq!(
-            csi(&mut engine, b"?$", &[1, 25], 'p', false),
+            report(ProtocolProfile::Xterm, &[1, 25]),
             b"\x1b[?1;2$y\x1b[?25;1$y"
         );
+        assert_eq!(
+            report(ProtocolProfile::Conservative, &[1, 25]),
+            b"\x1b[?1;0$y\x1b[?25;1$y"
+        );
+        // In-band resize notifications (2048) are not offered by any profile; the kitty
+        // keyboard protocol is negotiated with CSI ? u, not this mode.
+        for profile in [ProtocolProfile::Bmux, ProtocolProfile::Xterm] {
+            assert_eq!(report(profile, &[2048]), b"\x1b[?2048;0$y", "{profile:?}");
+        }
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         // A report with no mode is no query.
         assert!(csi(&mut engine, b"?$", &[0], 'p', false).is_empty());
     }

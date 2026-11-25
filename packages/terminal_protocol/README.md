@@ -26,6 +26,19 @@ which features bmux can use in that terminal.
 - **`ProtocolTraceEvent`**: Timestamped record of a query or reply with decoded details
 - **`ProtocolTraceBuffer`**: Ring buffer of trace events for diagnostic output
 
+## DEC mode reports (DECRQM)
+
+`CSI ? Ps $ p` is answered per profile with `CSI ? Ps ; status $ y` (0 unknown, 1 set,
+2 reset). Two modes depend on the pane rather than the profile:
+
+- **2026 (synchronized output)** is supported by the `Bmux`, `Xterm` and `Screen` profiles:
+  it reports 1 while the application has a synchronized update open and 2 otherwise, so
+  applications that probe for it before using it do so. `Conservative` reports 0.
+- **2004 (bracketed paste)** reports the pane's current state when the engine supports bracketed paste.
+
+**2048 (in-band resize notifications)** is reported as 0 by every profile: panes are not
+sent in-band resize reports. Kitty keyboard support is negotiated separately (`CSI ? u`).
+
 ## OSC 22 pointer shapes
 
 The public `pointer_shape` module provides all 30 published CSS shape names,

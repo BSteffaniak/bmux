@@ -736,27 +736,38 @@ pub(crate) fn emit_row_span(
 /// `bmux_cell_geometry` expects for `symbol`, requiring an explicit CUP
 /// re-anchor before continuing the row.
 ///
-/// ASCII, Box Drawing (`U+2500..=U+257F`), Block Elements (`U+2580..=U+259F`),
-/// Braille (`U+2800..=U+28FF`), and ordinary alphabetic scripts return `false`
-/// so borders, spinners, and prose incur zero extra bytes.
+/// A grapheme needs one when any of its scalars is one terminals disagree on
+/// ([`width_disputed_scalar`]): symbols with emoji presentation, presentation
+/// selectors, joiners, flags, keycaps and tag sequences. ASCII, Box Drawing
+/// (`U+2500..=U+257F`), Block Elements (`U+2580..=U+259F`), Braille
+/// (`U+2800..=U+28FF`), ordinary alphabetic scripts and their combining marks
+/// (accents, Thai, Devanagari) return `false` so borders, spinners and prose
+/// incur zero extra bytes.
 fn needs_cursor_reanchor(symbol: &str) -> bool {
-    let mut chars = symbol.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if chars.next().is_some() {
-        // Multi-scalar grapheme cluster (VS16, ZWJ, flags, combining marks).
-        return true;
-    }
+    symbol.chars().any(width_disputed_scalar)
+}
+
+/// Whether terminals disagree on the width of a grapheme holding `scalar`.
+const fn width_disputed_scalar(scalar: char) -> bool {
     matches!(
-        first,
+        scalar,
+        // Arrows, Miscellaneous Technical, Geometric Shapes through Dingbats,
+        // Supplemental Arrows through Miscellaneous Symbols and Arrows.
         '\u{2190}'..='\u{21FF}'
             | '\u{2300}'..='\u{23FF}'
             | '\u{25A0}'..='\u{27BF}'
             | '\u{2900}'..='\u{2BFF}'
+            // Private use (Nerd Font icons).
             | '\u{E000}'..='\u{F8FF}'
-            | '\u{1F000}'..='\u{1FFFF}'
             | '\u{F0000}'..='\u{10FFFF}'
+            // Emoji, regional indicators (flags) and skin tone modifiers.
+            | '\u{1F000}'..='\u{1FFFF}'
+            // Zero width joiner, keycap, text/emoji presentation selectors, tags.
+            | '\u{200D}'
+            | '\u{20E3}'
+            | '\u{FE0E}'
+            | '\u{FE0F}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }
 
@@ -1981,6 +1992,48 @@ mod tests {
         assert!(output.contains("\x1b[0;1;31mA"));
         assert!(output.contains("\x1b[0;48;2;1;2;3mB"));
         assert!(output.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn cursor_reanchors_after_disputed_graphemes_only() {
+        // Emoji presentation, presentation selectors, joiners, flags and keycaps.
+        for symbol in [
+            "\u{2764}\u{FE0F}",
+            "\u{263A}\u{FE0F}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F1FA}\u{1F1F8}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F44D}\u{1F3FD}",
+        ] {
+            assert!(super::needs_cursor_reanchor(symbol), "{symbol:?}");
+        }
+        // Letters with combining marks are as wide everywhere.
+        for symbol in [
+            "e\u{301}",
+            "\u{0E01}\u{0E34}",
+            "\u{0915}\u{093F}",
+            "a\u{0308}\u{0323}",
+            "a",
+            "\u{2500}",
+        ] {
+            assert!(!super::needs_cursor_reanchor(symbol), "{symbol:?}");
+        }
+    }
+
+    #[test]
+    fn ansi_frame_does_not_reanchor_after_combining_marks() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buffer.set_cell(Point::new(0, 0), "e\u{301}", Style::new());
+        buffer.set_cell(Point::new(1, 0), "\u{0E01}\u{0E34}", Style::new());
+        buffer.set_cell(Point::new(2, 0), "o", Style::new());
+        let mut out = Vec::new();
+        write_ansi_frame(&mut out, &buffer, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output.matches("\x1b[1;").count(),
+            1,
+            "combining marks should not emit per-cell CUPs: {output:?}"
+        );
     }
 
     #[test]

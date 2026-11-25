@@ -11395,21 +11395,15 @@ fn render_attach_frame_inner(
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
     // The cursor the host shows now, kept while nothing moves it.
     let previous_cursor_state = view_state.last_cursor_state;
-    // Keep the retained buffer intact across full-frame damage when any visible
-    // pane has already drawn rows and is inside an open DEC 2026 synchronized
-    // update: resetting the presenter buffer would blank those deferred rows.
-    let preserve_sync_deferred = view_state.terminal_presenter.shown()
-        && layout_state.scene.surfaces.iter().any(|surface| {
-            surface.visible
-                && surface.pane_id.is_some_and(|pane_id| {
-                    view_state
-                        .pane_buffers
-                        .get(&pane_id)
-                        .is_some_and(|buffer| buffer.rows_drawn && buffer.sync_update_deferring())
-                })
-        });
+    let frame_geometry = super::state::PresentedGeometry::of(
+        terminal_size,
+        &layout_state.scene,
+        current_help_overlay_surface.as_ref(),
+        current_prompt_overlay_surface.as_ref(),
+    );
     let frame_spec = bmux_attach_pipeline::frame_presenter::FrameSpec {
-        full: frame_damage.is_full_frame() && !preserve_sync_deferred,
+        full: frame_damage.is_full_frame()
+            && !preserve_sync_deferred_rows(view_state, layout_state, &frame_geometry),
         size: terminal_size,
         margins: terminal_render_capabilities(view_state).left_right_margins,
         host: view_state.presenting,
@@ -11836,9 +11830,37 @@ fn render_attach_frame_inner(
     };
     view_state.last_help_overlay_surface = current_help_overlay_surface;
     view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
+    view_state.last_presented_geometry = Some(frame_geometry);
     view_state.dirty.clear_frame_damage();
     view_state.terminal_presenter.recycle(frame_bytes);
     Ok(stats)
+}
+
+/// Whether full-frame damage paints over the last presented frame instead of a blank screen.
+///
+/// A visible pane inside an open synchronized update (DEC mode 2026) that has drawn rows keeps
+/// them: the renderer does not paint it, so a blank start would show it empty until the update
+/// ends. That is only safe while the host shows what was presented and every cell keeps its
+/// owner: a host repair ([`AttachDirtySource::repairs_host`]) and a frame whose geometry
+/// differs from the last presented one (a pane closed, zoomed, moved or resized; an overlay
+/// opened or closed) start blank, as the renderer's full frames assume.
+fn preserve_sync_deferred_rows(
+    view_state: &AttachViewState,
+    layout_state: &AttachLayoutState,
+    frame_geometry: &super::state::PresentedGeometry,
+) -> bool {
+    view_state.terminal_presenter.shown()
+        && !view_state.dirty.full_frame_repairs_host()
+        && view_state.last_presented_geometry.as_ref() == Some(frame_geometry)
+        && layout_state.scene.surfaces.iter().any(|surface| {
+            surface.visible
+                && surface.pane_id.is_some_and(|pane_id| {
+                    view_state
+                        .pane_buffers
+                        .get(&pane_id)
+                        .is_some_and(|buffer| buffer.rows_drawn && buffer.sync_update_deferring())
+                })
+        })
 }
 
 pub fn resolve_attach_context_label_from_catalog(
@@ -20289,6 +20311,135 @@ mod tests {
             },
             zoomed: false,
         }
+    }
+
+    fn sync_test_layout(session_id: Uuid, pane_id: Uuid, width: u16) -> AttachLayoutState {
+        AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![test_pane_surface(
+                    pane_id,
+                    AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: width,
+                        h: 4,
+                    },
+                )],
+            },
+            zoomed: false,
+        }
+    }
+
+    fn render_sync_test_frame(state: &mut AttachViewState, layout: &AttachLayoutState) -> String {
+        let mut output = Vec::new();
+        render_attach_frame_to_writer(
+            &mut output,
+            state,
+            layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 40, rows: 4 },
+            None,
+        )
+        .expect("frame renders");
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    fn shown_row(state: &AttachViewState, row: u16) -> String {
+        let cells = state
+            .terminal_presenter
+            .shown_cells()
+            .expect("a frame was presented");
+        (0..cells.area().width)
+            .filter_map(|x| cells.get(bmux_tui::geometry::Point::new(x, row)))
+            .map(|cell| cell.symbol.as_str())
+            .collect()
+    }
+
+    /// Full-frame damage that does not repair the host paints over the presented frame while a
+    /// pane is inside a synchronized update, so its drawn rows stay shown; a manual redraw and a
+    /// frame with new geometry still start from a blank screen.
+    #[test]
+    fn full_frames_keep_sync_deferred_rows_unless_they_repair_or_move() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut state = AttachViewState::new(AttachOpenInfo {
+            session_id,
+            context_id: None,
+            can_write: true,
+        });
+        state
+            .pane_buffers
+            .insert(pane_id, PaneRenderBuffer::default());
+        append_pane_output(
+            state.pane_buffers.get_mut(&pane_id).unwrap(),
+            b"committed-rows",
+        );
+        let layout = sync_test_layout(session_id, pane_id, 40);
+        render_sync_test_frame(&mut state, &layout);
+        assert!(shown_row(&state, 0).starts_with("committed-rows"));
+
+        // The application opens a synchronized update and starts redrawing.
+        let buffer = state.pane_buffers.get_mut(&pane_id).unwrap();
+        append_pane_output(buffer, b"\x1b[2J\x1b[Hhalf-drawn");
+        buffer.sync_update_in_progress = true;
+        state.dirty.mark_full_frame(AttachDirtySource::FocusChanged);
+        render_sync_test_frame(&mut state, &layout);
+        assert!(
+            shown_row(&state, 0).starts_with("committed-rows"),
+            "full-frame damage blanked a sync-deferred pane: {:?}",
+            shown_row(&state, 0)
+        );
+
+        // A manual redraw repairs the host: a real full frame, painted over a blank screen.
+        state
+            .dirty
+            .mark_layout_frame_dirty(AttachDirtySource::ManualRedraw);
+        render_sync_test_frame(&mut state, &layout);
+        assert!(
+            !shown_row(&state, 0).contains("committed-rows"),
+            "a manual redraw kept the previous frame's cells: {:?}",
+            shown_row(&state, 0)
+        );
+
+        // Once something is presented again, new geometry also starts blank: no cell of the
+        // previous frame survives where the moved pane no longer paints.
+        state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .sync_update_in_progress = false;
+        state
+            .dirty
+            .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+        render_sync_test_frame(&mut state, &layout);
+        assert!(shown_row(&state, 0).starts_with("half-drawn"));
+        state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .sync_update_in_progress = true;
+        let narrower = sync_test_layout(session_id, pane_id, 4);
+        state
+            .dirty
+            .mark_layout_frame_dirty(AttachDirtySource::LayoutChanged);
+        render_sync_test_frame(&mut state, &narrower);
+        assert!(
+            !shown_row(&state, 0).contains("drawn"),
+            "cells outside the narrowed pane kept stale content: {:?}",
+            shown_row(&state, 0)
+        );
     }
 
     #[cfg(feature = "image-kitty")]

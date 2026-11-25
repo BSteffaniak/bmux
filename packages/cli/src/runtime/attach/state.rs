@@ -81,6 +81,36 @@ pub enum AttachDirtySource {
     FollowTargetChanged,
 }
 
+impl AttachDirtySource {
+    /// Whether full-frame damage from this source repairs the host screen: what the host shows
+    /// may differ from what was presented (a user's redraw, a frame whose bytes did not reach
+    /// the host), so the frame is painted over a blank screen and every cell is written again,
+    /// even while a pane holds its rows back for a synchronized update.
+    #[must_use]
+    pub const fn repairs_host(self) -> bool {
+        match self {
+            Self::ManualRedraw => true,
+            Self::PaneOutput
+            | Self::LayoutChanged
+            | Self::FocusChanged
+            | Self::SceneChanged
+            | Self::PromptOverlay
+            | Self::HelpOverlay
+            | Self::AppearanceChanged
+            | Self::SnapshotHydration
+            | Self::AlternateScreenTransition
+            | Self::PluginCommand
+            | Self::UserAction
+            | Self::ActionDispatch
+            | Self::Mouse
+            | Self::Scrollback
+            | Self::Selection
+            | Self::ProfileChanged
+            | Self::FollowTargetChanged => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachDirtyKind {
     Pane,
@@ -221,6 +251,15 @@ impl AttachDirtyFlags {
         damage
     }
 
+    /// Whether the pending full-frame damage includes a host repair
+    /// ([`AttachDirtySource::repairs_host`]).
+    #[must_use]
+    pub fn full_frame_repairs_host(&self) -> bool {
+        self.dirty_events
+            .iter()
+            .any(|event| event.kind == AttachDirtyKind::FullFrame && event.source.repairs_host())
+    }
+
     #[must_use]
     pub fn needs_render(&self) -> bool {
         self.full_pane_redraw
@@ -239,6 +278,55 @@ impl AttachDirtyFlags {
         self.precise_frame_damage = FrameDamage::default();
         self.pane_dirty_ids.clear();
         self.dirty_events.clear();
+    }
+}
+
+/// Where a frame places what it paints: the terminal size, the scene's surfaces and the open
+/// overlays. Frames with equal geometry own the same cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedGeometry {
+    size: (u16, u16),
+    surfaces: Vec<PresentedSurfaceGeometry>,
+    overlays: [Option<bmux_attach_layout_protocol::AttachRect>; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresentedSurfaceGeometry {
+    id: Uuid,
+    z: i32,
+    rect: bmux_attach_layout_protocol::AttachRect,
+    content_rect: bmux_attach_layout_protocol::AttachRect,
+    visible: bool,
+    opaque: bool,
+}
+
+impl PresentedGeometry {
+    #[must_use]
+    pub fn of(
+        size: (u16, u16),
+        scene: &AttachScene,
+        help_overlay: Option<&AttachSurface>,
+        prompt_overlay: Option<&AttachSurface>,
+    ) -> Self {
+        Self {
+            size,
+            surfaces: scene
+                .surfaces
+                .iter()
+                .map(|surface| PresentedSurfaceGeometry {
+                    id: surface.id,
+                    z: surface.z,
+                    rect: surface.rect,
+                    content_rect: surface.content_rect,
+                    visible: surface.visible,
+                    opaque: surface.opaque,
+                })
+                .collect(),
+            overlays: [
+                help_overlay.map(|surface| surface.rect),
+                prompt_overlay.map(|surface| surface.rect),
+            ],
+        }
     }
 }
 
@@ -393,6 +481,9 @@ pub struct AttachViewState {
     pub last_help_overlay_surface: Option<AttachSurface>,
     pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
+    /// Where the last presented frame placed its surfaces; a frame with other geometry repaints
+    /// cells no surface of the previous frame owned.
+    pub(super) last_presented_geometry: Option<PresentedGeometry>,
     /// Pointer intent resolved from committed interaction metadata.
     pub(super) pointer_shape: Option<bmux_attach_pipeline::pointer_shape::ResolvedPointerShape>,
     pub(super) last_pointer_shape:
@@ -804,6 +895,7 @@ impl AttachViewState {
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,
             last_cursor_state: None,
+            last_presented_geometry: None,
             pointer_shape: None,
             last_pointer_shape: None,
             mouse: AttachMouseState {

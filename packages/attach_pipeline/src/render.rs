@@ -4226,42 +4226,39 @@ fn queue_pane_content_for_surface(
             .as_ref()
             .map_or_else(|| entry.scrollback_viewport_base(None), |(_, base)| *base);
         let selection = scrollback.and_then(|view| entry.scrollback_selection_bounds(&view));
+        let clamp_to_content = |row: usize, col: usize| {
+            (
+                u16::try_from(row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
+                u16::try_from(col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
+            )
+        };
+        if !use_scrollback && !stage.sync_deferred {
+            // Outside a synchronized update the grid's cursor is committed: a later sync-deferred
+            // frame keeps showing it, whether or not the pane has focus now.
+            let cursor = entry.terminal_grid.grid().cursor();
+            let (row, col) = clamp_to_content(cursor.row, cursor.col);
+            entry.last_committed_cursor = Some(AttachCursorState {
+                x: col,
+                y: row,
+                visible: cursor.visible,
+            });
+        }
         if stage.focus {
-            if !use_scrollback && stage.sync_deferred {
-                cursor_state = entry.last_committed_cursor;
+            let content_cursor = if let Some(view) = scrollback {
+                let (row, col) = clamp_to_content(view.cursor.row, view.cursor.col);
+                Some((row, col, true))
             } else {
-                let (cursor_row, cursor_col) = if let Some(view) = scrollback {
-                    let cursor = view.cursor;
-                    (
-                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                    )
-                } else {
-                    let cursor = entry.terminal_grid.grid().cursor();
-                    (
-                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                    )
-                };
-                let cursor_visible = if use_scrollback {
-                    true
-                } else {
-                    entry.terminal_grid.grid().cursor().visible
-                };
-                let next_cursor = AttachCursorState {
-                    x: stage.content.x.saturating_add(cursor_col),
-                    y: stage.content.y.saturating_add(cursor_row),
-                    visible: cursor_visible,
-                };
-                if !use_scrollback {
-                    entry.last_committed_cursor = Some(next_cursor);
-                }
-                cursor_state = Some(next_cursor);
-            }
+                // Sync-deferred or not, the committed cursor matches the rows the host shows.
+                entry.last_committed_cursor.map(|cursor| {
+                    let (row, col) = clamp_to_content(usize::from(cursor.y), usize::from(cursor.x));
+                    (row, col, cursor.visible)
+                })
+            };
+            cursor_state = content_cursor.map(|(row, col, visible)| AttachCursorState {
+                x: stage.content.x.saturating_add(col),
+                y: stage.content.y.saturating_add(row),
+                visible,
+            });
             if let Some(trace) = render_trace.as_deref_mut() {
                 trace.push(AttachRenderTraceOp::Cursor {
                     surface_index: stage.surface_index,
@@ -10339,6 +10336,87 @@ mod tests {
                 y: 4,
                 visible: false,
             })
+        );
+    }
+
+    #[test]
+    fn sync_deferred_cursor_follows_the_pane_rect_when_focus_arrives_mid_update() {
+        let pane_id = Uuid::from_u128(441);
+        let other_id = Uuid::from_u128(442);
+        let surface = |rect: AttachRect, cursor_owner: bool| AttachSurface {
+            id: pane_id,
+            kind: AttachSurfaceKind::Pane,
+            layer: bmux_attach_layout_protocol::AttachLayer::Pane,
+            z: 0,
+            rect,
+            content_rect: rect,
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner,
+            pane_id: Some(pane_id),
+        };
+        let unfocused = AttachScene {
+            session_id: Uuid::from_u128(451),
+            focus: AttachFocusTarget::Pane { pane_id: other_id },
+            surfaces: vec![surface(
+                AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 6,
+                },
+                false,
+            )],
+        };
+        let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
+        let buffer = pane_buffers.entry(pane_id).or_default();
+        buffer.terminal_grid.resize(20, 6).unwrap();
+        append_pane_output(buffer, b"hello");
+
+        let mut host = TestHost::new(20, 8);
+        let first = render_test_cursor_step(
+            &mut host,
+            &unfocused,
+            &mut pane_buffers,
+            true,
+            &FrameDamage::full_frame(),
+        );
+        assert_eq!(first, None, "an unfocused pane owns no cursor");
+
+        // Mid-update, the pane gains focus and moves down a row.
+        let entry = pane_buffers.get_mut(&pane_id).unwrap();
+        append_pane_output(entry, b"\x1b[?25l\x1b[4;10H");
+        entry.sync_update_in_progress = true;
+        let focused = AttachScene {
+            session_id: unfocused.session_id,
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![surface(
+                AttachRect {
+                    x: 0,
+                    y: 2,
+                    w: 20,
+                    h: 6,
+                },
+                true,
+            )],
+        };
+        let deferred = render_test_cursor_step(
+            &mut host,
+            &focused,
+            &mut pane_buffers,
+            false,
+            &content_damage(pane_id),
+        );
+        assert_eq!(
+            deferred,
+            Some(crate::AttachCursorState {
+                x: 5,
+                y: 2,
+                visible: true,
+            }),
+            "the committed cursor is shown at the pane's current rect"
         );
     }
 
