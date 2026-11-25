@@ -15,6 +15,7 @@ plugins/broadcast-plugin-api/bpdl/broadcast-plugin.bpdl broadcast-diagnostics-v1
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-identity/v1 e8aec6b40399e21d6654864a85b84423ebc5ea12762d0feb9c38fd2f279692e2
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-state 358623a5866efbd4027391429352f6065f6d816c7b7583bdad0a4b3445ad7f51
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-commands ec97f138fbd5579b571dee75eae789f6c33486c52eaf611e6e5356804b8ca81a
+plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-follow-v1 3f9afafcd7fbe8d675a7a827a17bddf966954963ffffdf10e0a9966574494b06
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-selection-state-v1 4e2ad160121b5241fea93e337d1b14e53ac3ff147d83002e21c4270a7a851477
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-selection-commands-v1 13b7b88dd6078f362d69e2c9d3161b4749798d835de24bc6e615bc1d6f990554
 plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-presence-state-v1 ae94c6c29f24264de961f5136d045c0a2b18bef228d9610d2f863111c4bb2f5c

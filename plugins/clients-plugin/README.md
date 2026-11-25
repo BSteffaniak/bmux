@@ -10,5 +10,12 @@ the leader's current tab changes (contexts announces
 selected onto the same tab for itself (contexts `select-for-client`), so its
 attach moves exactly as for its own switch.
 
+From a key binding or the command palette, `follow` and `unfollow` act for
+that attachment. From a command line they act for the invoking principal's
+attached terminal (`clients-follow-v1`): the one named with `--client <id>`,
+or else its only attachment. With several and no `--client`, or with none,
+the command fails and says so; a command line never redirects another
+principal's attachment.
+
 This plugin is bundled into the `bmux` CLI by default via the
 `bundled-plugin-clients` feature.

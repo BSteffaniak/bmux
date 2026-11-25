@@ -74,12 +74,26 @@ long    = "global"
 name    = "global"
 summary = "Keep following as the target switches tabs and sessions"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+summary    = "Attached client of yours that follows (default: your only attachment)"
+value_name = "CLIENT_ID"
+
 [[commands]]
 aliases       = [["session", "unfollow"]]
 expose_in_cli = true
 name          = "unfollow"
 path          = ["unfollow"]
 summary       = "Stop following a client"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+summary    = "Attached client of yours that stops following (default: your only attachment)"
+value_name = "CLIENT_ID"
 
 [cli_help]
 "follow"           = { order = 16 }

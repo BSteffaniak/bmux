@@ -33,6 +33,7 @@ use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
+use bmux_clients_plugin_api::clients_follow_v1::{self, FollowForError};
 use bmux_clients_plugin_api::clients_presence_commands_v1::{self, PresenceError};
 use bmux_clients_plugin_api::clients_presence_state_v1::{self, Presence};
 use bmux_clients_plugin_api::clients_selection_commands_v1;
@@ -449,18 +450,22 @@ impl ClientsPlugin {
     fn set_following_here(
         &self,
         ctx: &NativeCommandContext,
+        follower: Option<Uuid>,
         target: Option<Uuid>,
         global: bool,
-    ) -> Option<Result<ClientAck, SetFollowingError>> {
+    ) -> Option<Result<ClientAck, FollowForError>> {
         if ctx.invocation_source.is_cli() {
             return None;
         }
         let events = self.events();
         events.states.get::<FollowState>()?;
-        Some(set_following_via_ipc(
+        // An attachment acts for itself unless it names another client.
+        let follower = follower.or(ctx.caller_client_id);
+        Some(set_following_for(
             &events,
             ctx,
             ctx.caller_client_id,
+            follower,
             &SetFollowingArgs {
                 target_client_id: target,
                 global,
@@ -481,13 +486,13 @@ impl Plugin for ClientsPlugin {
         d.blocking_activate(Self::activate)
             .blocking_command("list-clients", |_, ctx| cli::list(ctx))
             .blocking_command("follow", |plugin, ctx| {
-                cli::follow(ctx, &|target, global| {
-                    plugin.set_following_here(ctx, target, global)
+                cli::follow(ctx, &|follower, target, global| {
+                    plugin.set_following_here(ctx, follower, target, global)
                 })
             })
             .blocking_command("unfollow", |plugin, ctx| {
-                cli::unfollow(ctx, &|target, global| {
-                    plugin.set_following_here(ctx, target, global)
+                cli::unfollow(ctx, &|follower, target, global| {
+                    plugin.set_following_here(ctx, follower, target, global)
                 })
             })
             .blocking_services(Self::invoke_service, None)
@@ -619,6 +624,18 @@ impl ClientsPlugin {
                     set_following_via_ipc(&self.events(), ctx, ctx.caller_client_id, &req)
                 )
             },
+            "clients-follow-v1", "set-following-for" => |req: clients_follow_v1::client::SetFollowingForRequest, ctx| {
+                Ok::<Result<ClientAck, FollowForError>, ServiceResponse>(set_following_for(
+                    &self.events(),
+                    ctx,
+                    ctx.caller_client_id,
+                    req.follower_client_id,
+                    &SetFollowingArgs {
+                        target_client_id: req.target_client_id,
+                        global: req.global,
+                    },
+                ))
+            },
         })
     }
 
@@ -644,8 +661,9 @@ impl ClientsPlugin {
         let _ = clients_selection_commands_v1::register_provider(registry, selection.clone());
         let _ = clients_presence_state_v1::register_provider(registry, selection.clone());
         let _ = clients_presence_commands_v1::register_provider(registry, selection);
-        let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
-            Arc::new(ClientsCommandsHandle::new(caller, self.events()));
+        let commands = Arc::new(ClientsCommandsHandle::new(caller, self.events()));
+        let _ = clients_follow_v1::register_provider(registry, commands.clone());
+        let commands: Arc<dyn ClientsCommandsService + Send + Sync> = commands;
         let _ = clients_commands::register_provider(registry, commands);
     }
 }
@@ -1131,17 +1149,114 @@ fn current_client_local(
         .ok_or(ClientQueryError::NotFound)
 }
 
-#[allow(clippy::too_many_lines)]
 fn set_following_via_ipc(
     events: &ClientEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     req: &SetFollowingArgs,
 ) -> Result<ClientAck, SetFollowingError> {
+    set_following_of(events, caller, caller_client_id, caller_client_id, req)
+}
+
+/// The principal a client connected as, when the host recorded one.
+fn client_principal(events: &ClientEvents, client: ClientId) -> Option<Uuid> {
+    events
+        .states
+        .get::<bmux_client_state::ClientPrincipalHandle>()
+        .and_then(|handle| handle.read().ok().map(|value| value.clone()))
+        .and_then(|handle| handle.0.get(client))
+}
+
+/// The client `set-following-for` acts on: `requested`, which must be the
+/// caller or an attached client of the caller's principal, or, when absent,
+/// the caller principal's only attached client other than the caller.
+fn resolve_follower(
+    events: &ClientEvents,
+    caller_client_id: Option<Uuid>,
+    requested: Option<Uuid>,
+) -> Result<Uuid, FollowForError> {
+    let denied = |reason: String| FollowForError::Denied { reason };
+    let caller = caller_client_id.ok_or_else(|| denied("no current client identity".into()))?;
+    if requested == Some(caller) {
+        return Ok(caller);
+    }
+    let principal = client_principal(events, ClientId(caller))
+        .ok_or_else(|| denied("the calling client has no principal".into()))?;
+    let attached: Vec<ClientId> = {
+        let state = events
+            .states
+            .get::<FollowState>()
+            .ok_or_else(|| denied("clients plugin state not registered".into()))?;
+        let state = state
+            .read()
+            .map_err(|_| denied("follow state lock poisoned".into()))?;
+        state
+            .connected_clients
+            .iter()
+            .copied()
+            .filter(|client| state.attached_stream_session(*client).is_some())
+            .collect()
+    };
+    // Only an attachment of the same principal: a person may redirect their
+    // own terminals, never someone else's.
+    let eligible = |client: ClientId| {
+        client.0 != caller
+            && attached.contains(&client)
+            && client_principal(events, client) == Some(principal)
+    };
+    if let Some(follower) = requested {
+        return if eligible(ClientId(follower)) {
+            Ok(follower)
+        } else {
+            Err(denied(format!(
+                "client {follower} is not an attached client of yours"
+            )))
+        };
+    }
+    let candidates: Vec<Uuid> = attached
+        .iter()
+        .copied()
+        .filter(|client| eligible(*client))
+        .map(|client| client.0)
+        .collect();
+    match candidates.as_slice() {
+        [] => Err(FollowForError::NoAttachment),
+        [follower] => Ok(*follower),
+        _ => Err(FollowForError::Ambiguous { candidates }),
+    }
+}
+
+/// `clients-follow-v1.set-following-for`.
+fn set_following_for(
+    events: &ClientEvents,
+    caller: &(impl ServiceCaller + Sync),
+    caller_client_id: Option<Uuid>,
+    follower: Option<Uuid>,
+    req: &SetFollowingArgs,
+) -> Result<ClientAck, FollowForError> {
+    let follower = resolve_follower(events, caller_client_id, follower)?;
+    set_following_of(events, caller, caller_client_id, Some(follower), req).map_err(|error| {
+        match error {
+            SetFollowingError::TargetNotFound => FollowForError::TargetNotFound,
+            SetFollowingError::Denied { reason } => FollowForError::Denied { reason },
+        }
+    })
+}
+
+/// Set or stop following for `follower`, on behalf of `invoking_client_id`
+/// (the same client, or another attachment of its principal).
+#[allow(clippy::too_many_lines)]
+fn set_following_of(
+    events: &ClientEvents,
+    caller: &(impl ServiceCaller + Sync),
+    invoking_client_id: Option<Uuid>,
+    follower_client_id: Option<Uuid>,
+    req: &SetFollowingArgs,
+) -> Result<ClientAck, SetFollowingError> {
     use bmux_session_models::{ClientId, SessionId};
 
     // Determine self-id for the returned `ClientAck`.
-    let Some(self_id) = caller_client_id else {
+    let Some(self_id) = follower_client_id else {
         return Err(SetFollowingError::Denied {
             reason: "no current client identity".to_string(),
         });
@@ -1221,7 +1336,13 @@ fn set_following_via_ipc(
     // plugins' internals.
     if req.global {
         if let Some(initial_target_context) = initial_target_context {
-            let _ = select_context_via_typed_dispatch(caller, initial_target_context);
+            // The follower's own invocation selects for itself; acting for
+            // another attachment selects on its behalf.
+            let _ = if Some(self_id) == invoking_client_id {
+                select_context_via_typed_dispatch(caller, initial_target_context)
+            } else {
+                select_for_client_via_typed_dispatch(caller, self_id, initial_target_context)
+            };
         }
 
         // Determine the follower's previous session, for session
@@ -1603,6 +1724,30 @@ impl ClientsCommandsService for ClientsCommandsHandle {
     }
 }
 
+impl clients_follow_v1::ClientsFollowV1Service for ClientsCommandsHandle {
+    fn set_following_for<'a>(
+        &'a self,
+        follower_client_id: Option<Uuid>,
+        target_client_id: Option<Uuid>,
+        global: bool,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<ClientAck, FollowForError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let caller_client_id = current_client_id_for_typed_handle(self.caller.as_ref());
+            set_following_for(
+                &self.events,
+                self.caller.as_ref(),
+                caller_client_id,
+                follower_client_id,
+                &SetFollowingArgs {
+                    target_client_id,
+                    global,
+                },
+            )
+        })
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn current_client_id_for_typed_handle(caller: &TypedServiceCaller) -> Option<Uuid> {
@@ -1800,5 +1945,99 @@ mod presence_tests {
             .unwrap()
             .set_attached_stream_session(ClientId(command), None);
         assert_eq!(focused(&events), [(attached, true)]);
+    }
+}
+
+#[cfg(test)]
+mod follow_for_tests {
+    use super::*;
+    use bmux_client_state::{ClientPrincipalHandle, ClientPrincipalLookup};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Principals(Mutex<BTreeMap<ClientId, Uuid>>);
+
+    impl ClientPrincipalLookup for Principals {
+        fn get(&self, client_id: ClientId) -> Option<Uuid> {
+            self.0.lock().unwrap().get(&client_id).copied()
+        }
+        fn set(&self, client_id: ClientId, principal_id: Uuid) {
+            self.0.lock().unwrap().insert(client_id, principal_id);
+        }
+        fn remove(&self, client_id: ClientId) {
+            self.0.lock().unwrap().remove(&client_id);
+        }
+    }
+
+    /// Clients as `(id, principal, attached)`.
+    fn events_with(clients: &[(Uuid, Uuid, bool)]) -> ClientEvents {
+        let states = Arc::new(PluginStateRegistry::new());
+        let mut follow = FollowState::default();
+        let principals = Principals::default();
+        for (client, principal, attached) in clients {
+            follow.connect_client(ClientId(*client));
+            if *attached {
+                follow.set_attached_stream_session(ClientId(*client), Some(SessionId(*client)));
+            }
+            principals.set(ClientId(*client), *principal);
+        }
+        states.register::<FollowState>(&Arc::new(RwLock::new(follow)));
+        states.register::<ClientPrincipalHandle>(&Arc::new(RwLock::new(
+            ClientPrincipalHandle::new(principals),
+        )));
+        ClientEvents::new(None, states)
+    }
+
+    /// A command line acts for its principal's only attachment, refuses to
+    /// guess between several, and never reaches another principal's
+    /// attachment, nor a client of its own that is not attached.
+    #[test]
+    fn a_command_line_acts_only_for_an_unambiguous_attachment_of_its_principal() {
+        let (me, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let (cli, a, b, theirs, idle) = (
+            Uuid::from_u128(10),
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+            Uuid::from_u128(14),
+        );
+        let one = events_with(&[
+            (cli, me, false),
+            (a, me, true),
+            (theirs, other, true),
+            (idle, me, false),
+        ]);
+        assert_eq!(resolve_follower(&one, Some(cli), None), Ok(a));
+        assert_eq!(resolve_follower(&one, Some(cli), Some(a)), Ok(a));
+        assert_eq!(resolve_follower(&one, Some(cli), Some(cli)), Ok(cli));
+        for refused in [theirs, idle, Uuid::from_u128(99)] {
+            assert!(
+                matches!(
+                    resolve_follower(&one, Some(cli), Some(refused)),
+                    Err(FollowForError::Denied { .. })
+                ),
+                "{refused} must be refused"
+            );
+        }
+        assert!(matches!(
+            resolve_follower(&one, None, None),
+            Err(FollowForError::Denied { .. })
+        ));
+
+        let two = events_with(&[(cli, me, false), (a, me, true), (b, me, true)]);
+        assert_eq!(
+            resolve_follower(&two, Some(cli), None),
+            Err(FollowForError::Ambiguous {
+                candidates: vec![a, b]
+            })
+        );
+        assert_eq!(resolve_follower(&two, Some(cli), Some(b)), Ok(b));
+
+        let none = events_with(&[(cli, me, false), (theirs, other, true)]);
+        assert_eq!(
+            resolve_follower(&none, Some(cli), None),
+            Err(FollowForError::NoAttachment)
+        );
     }
 }

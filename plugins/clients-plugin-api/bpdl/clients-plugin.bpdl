@@ -101,6 +101,31 @@ interface clients-commands {
         -> result<client-ack, set-following-error>;
 }
 
+// Following on behalf of another attachment of the caller's own principal:
+// a command line (`bmux follow`, `bmux unfollow`) acts for the person's
+// attached terminal rather than for its own short-lived connection.
+@capability(CLIENTS_WRITE)
+interface clients-follow-v1 {
+    variant follow-for-error {
+        // The caller's principal has no attached client besides the caller.
+        no-attachment,
+        // It has several: name one with `follower-client-id`.
+        ambiguous { candidates: list<uuid> },
+        target-not-found,
+        denied { reason: string },
+    }
+
+    // Set following (`target-client-id` present) or stop it (absent) for
+    // `follower-client-id`, or, when that is absent, for the only attached
+    // client of the caller's principal. The follower must be attached and
+    // belong to the caller's principal. Returns the follower.
+    command set-following-for(
+        follower-client-id: uuid?,
+        target-client-id: uuid?,
+        global: bool,
+    ) -> result<clients-commands.client-ack, follow-for-error>;
+}
+
 @capability(CLIENTS_READ)
 interface clients-selection-state-v1 {
     record selection {
@@ -206,6 +231,7 @@ world clients {
     provide clients-identity;
     provide clients-state;
     provide clients-commands;
+    provide clients-follow-v1;
     provide clients-events capability bmux.clients.read;
     provide clients-selection-commands-v1;
     provide clients-selection-state-v1;

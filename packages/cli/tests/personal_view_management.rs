@@ -3,8 +3,10 @@
 //! arrangements, a personal label renames a tab for one view while a shared
 //! rename reaches everyone, following another client shows its tab without
 //! adding it to the follower's view, also as the leader switches tabs (ending
-//! the follow restores the follower's own tab), and deleting a view rebinds its attachment to the
-//! default view, which itself cannot be deleted.
+//! the follow restores the follower's own tab), a command-line `follow` /
+//! `unfollow` acts for an attachment of its own principal (never guessing
+//! between several, never another principal's), and deleting a view rebinds
+//! its attachment to the default view, which itself cannot be deleted.
 #![cfg(unix)]
 
 #[allow(dead_code)] // Shared process/path fixture supports other integration targets too.
@@ -313,6 +315,27 @@ async fn wait_text(frame: &Frame, label: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run one `bmux` command line of this profile; its exit code and output.
+async fn cli(env: &support::ServerEnv, args: &[&str]) -> Result<(i32, String)> {
+    let mut full = vec!["--runtime", "default", "--target", "local"];
+    full.extend_from_slice(args);
+    let mut command = isolated_command(env, &full);
+    let output = tokio::time::timeout(
+        STARTUP,
+        tokio::task::spawn_blocking(move || command.output()),
+    )
+    .await
+    .context("command line did not finish")???;
+    Ok((
+        output.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    ))
+}
+
 /// The daemon and attach configuration: a quiet shell, no follow by default,
 /// and key bindings for the view commands (with `follow` bound to `leader`
 /// once its client id is known).
@@ -372,16 +395,23 @@ async fn wait_without(frame: &Frame, label: &str, text: &str) -> Result<()> {
 async fn exercise() -> Result<()> {
     let daemon = OwnedDaemon::start()?;
     let paths = daemon.paths();
-    let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
     let mut control = connect_as(&paths, Uuid::new_v4())
         .await
         .with_context(|| format!("isolated daemon readiness failed: {}", daemon.logs()))?;
+    // Principal one is the profile's own, so this profile's command lines
+    // (`bmux follow`) act for its attachments.
+    let one = Uuid::parse_str(std::fs::read_to_string(paths.principal_id_file())?.trim())?;
+    let two = Uuid::new_v4();
     let (alpha, alpha_session) = create_tab(&mut control, "alpha").await?;
     let (_, beta_session) = create_tab(&mut control, "beta").await?;
     let (gamma, gamma_session) = create_tab(&mut control, "gamma").await?;
     // Principal one: attachments A and C, plus an unattached connection that
     // reads its views. Principal two: attachment B, which A follows.
-    let client_a = connect_as(&paths, one).await?;
+    let mut client_a = connect_as(&paths, one).await?;
+    let follower_a = bmux_clients_plugin_api::clients_state::client::current_client(&mut client_a)
+        .await?
+        .map_err(|error| anyhow::anyhow!("current client: {error:?}"))?
+        .id;
     let client_c = connect_as(&paths, one).await?;
     let mut client_b = connect_as(&paths, two).await?;
     let mut owner_one = connect_as(&paths, one).await?;
@@ -494,6 +524,45 @@ async fn exercise() -> Result<()> {
             ensure!(
                 views(&mut owner_one).await? == before,
                 "ending the follow changed the follower's views"
+            );
+
+            // A command line acts for the person's attached terminal, not
+            // for its own connection: it refuses to guess between A and C,
+            // redirects the one named with `--client`, and never another
+            // principal's attachment.
+            let leader_id = leader.to_string();
+            let a_id = follower_a.to_string();
+            let (code, output) = cli(&daemon.env, &["follow", &leader_id, "--global"]).await?;
+            ensure!(
+                code != 0 && output.contains("several attached terminals"),
+                "an ambiguous command-line follow was not refused: {output}"
+            );
+            let (code, output) =
+                cli(&daemon.env, &["follow", &a_id, "--client", &leader_id]).await?;
+            ensure!(
+                code != 0 && output.contains("not an attached client of yours"),
+                "a command line redirected another principal's attachment: {output}"
+            );
+            let (code, output) = cli(
+                &daemon.env,
+                &[
+                    "session", "follow", &leader_id, "--global", "--client", &a_id,
+                ],
+            )
+            .await?;
+            ensure!(code == 0, "command-line follow failed: {output}");
+            wait_attached(&a, alpha_session, "a").await?;
+            ensure!(
+                attached_session(&c) == Some(alpha_session)
+                    && attached_session(&b) == Some(alpha_session),
+                "a command-line follow moved another attachment"
+            );
+            let (code, output) = cli(&daemon.env, &["unfollow", "--client", &a_id]).await?;
+            ensure!(code == 0, "command-line unfollow failed: {output}");
+            wait_attached(&a, gamma_session, "a").await?;
+            ensure!(
+                views(&mut owner_one).await? == before,
+                "a command-line follow changed the follower's views"
             );
 
             // Deleting work rebinds A to the default view; its tab is there.

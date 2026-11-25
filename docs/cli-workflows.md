@@ -44,7 +44,8 @@ bmux workspace switch project
 
 # Multi-client collaboration
 bmux list-clients
-bmux follow <client-uuid>
+bmux follow <client-uuid>                     # your attached terminal follows
+bmux follow <client-uuid> --client <your-id>  # with several attachments, name one
 bmux unfollow
 
 # Remote targets over SSH
