@@ -22,6 +22,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::pointer::PointerIntent;
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span, Text, TextWrap, TrailingAlign, TrailingPlacement};
+use bmux_tui_components::panel_window::WindowControls;
 use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
 
 /// The list's id; its rows' hit regions are named under it.
@@ -30,6 +31,7 @@ pub const LIST_ID: &str = "sidebar.rows";
 pub const RESIZE_EDGE: &str = "resize-edge";
 /// The scrollbar thumb's hit region.
 pub const SCROLLBAR: &str = "scrollbar";
+pub const WINDOW_ID: &str = "sidebar.window";
 
 /// Columns a row's content starts after: the active bar and a space.
 const CONTENT_X: u16 = 2;
@@ -442,6 +444,8 @@ pub struct SidebarView<'a, K> {
     pub base: Style,
     pub heading: Line,
     pub count: Line,
+    pub controls: WindowControls,
+    pub strip_summary: Option<Vec<Line>>,
     pub list: VirtualList<'a, K>,
     pub state: &'a RefCell<VirtualListState<K>>,
     /// The rows the list may use, below the heading.
@@ -487,22 +491,69 @@ where
     fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let (width, height) = self.size;
         cx.fill(LocalRect::new(0, 0, width, height), " ", self.base);
+        self.paint_header(cx);
+        if let Some(summary) = &self.strip_summary {
+            let x = u16::from(self.edge.is_some_and(|edge| edge.x == 0));
+            let room = width.saturating_sub(u16::from(self.edge.is_some()));
+            for (y, line) in (1..height).zip(summary) {
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(i32::from(x), i64::from(y), room, 1),
+                    line,
+                    self.base,
+                );
+            }
+        } else {
+            self.paint_list(cx);
+        }
+        self.paint_edge(cx);
+    }
+}
+
+impl<K: Clone + Ord + ToString> SidebarView<'_, K> {
+    fn paint_header(&self, cx: &mut PaintCx<'_, '_>) {
+        let width = self.size.0;
+        let left = self.edge.is_some_and(|edge| edge.x == 0);
+        let start = u16::from(left);
+        let controls = self.controls.paint_inline(
+            WINDOW_ID,
+            Rect::new(
+                start,
+                0,
+                width.saturating_sub(u16::from(self.edge.is_some())),
+                1,
+            ),
+            cx,
+        );
+        if self.strip_summary.is_some() {
+            return;
+        }
+        let end = controls.saturating_sub(1);
+        let heading_start = start.max(1);
+        let count_width = u16::try_from(self.count.width()).unwrap_or(u16::MAX);
+        let count_start = end.saturating_sub(count_width);
+        let title_end = if count_width == 0 {
+            end
+        } else {
+            count_start.saturating_sub(1)
+        };
         cx.write_line_with_fallback_style(
-            LocalRect::new(1, 0, width.saturating_sub(1), 1),
+            LocalRect::new(
+                i32::from(heading_start),
+                0,
+                title_end.saturating_sub(heading_start),
+                1,
+            ),
             &self.heading,
             self.base,
         );
-        let count_width = u16::try_from(self.count.width()).unwrap_or(u16::MAX);
         cx.write_line_with_fallback_style(
-            LocalRect::new(
-                i32::from(width.saturating_sub(1).saturating_sub(count_width)),
-                0,
-                count_width,
-                1,
-            ),
+            LocalRect::new(i32::from(count_start), 0, count_width, 1),
             &self.count,
             self.base,
         );
+    }
+
+    fn paint_list(&self, cx: &mut PaintCx<'_, '_>) {
         // The list paints at its own origin; place it below the heading.
         let (list_x, list_width) = self.list_columns;
         cx.with_child_size(
@@ -524,6 +575,9 @@ where
                 list.paint(&node, cx);
             },
         );
+    }
+
+    fn paint_edge(&self, cx: &mut PaintCx<'_, '_>) {
         // One column faces the panes: the resize edge, carrying the
         // scrollbar over the rows while they overflow.
         let track = self

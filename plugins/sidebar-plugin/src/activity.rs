@@ -131,6 +131,7 @@ impl TabActivity {
 #[derive(Debug)]
 pub struct ActivityView {
     snapshot: Option<(TabStatusSnapshot, Instant)>,
+    positions: std::collections::HashMap<Uuid, usize>,
     home: Option<String>,
 }
 
@@ -138,6 +139,7 @@ impl Default for ActivityView {
     fn default() -> Self {
         Self {
             snapshot: None,
+            positions: std::collections::HashMap::new(),
             home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
         }
     }
@@ -146,6 +148,10 @@ impl Default for ActivityView {
 impl ActivityView {
     /// Take a new status snapshot.
     pub fn replace(&mut self, snapshot: TabStatusSnapshot) {
+        self.positions.clear();
+        for (index, status) in snapshot.tabs.iter().enumerate() {
+            self.positions.entry(status.tab_id).or_insert(index);
+        }
         self.snapshot = Some((snapshot, Instant::now()));
     }
 
@@ -168,7 +174,11 @@ impl ActivityView {
     fn status(&self, tab: Uuid) -> Option<&TabStatus> {
         self.snapshot
             .as_ref()
-            .and_then(|(snapshot, _)| snapshot.tabs.iter().find(|status| status.tab_id == tab))
+            .and_then(|(snapshot, _)| snapshot.tabs.get(*self.positions.get(&tab)?))
+    }
+
+    pub fn state(&self, tab: Uuid) -> Option<TabState> {
+        self.status(tab).map(|status| TabState::from(status.state))
     }
 
     /// `tab`'s activity: its published state, and what its card says.

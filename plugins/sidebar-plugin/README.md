@@ -81,7 +81,6 @@ placement = "left" # or "right"
 grouping = "none"          # or "workspace": tabs under a header per workspace
 scope = "all_workspaces"   # or "current_workspace": only the shown tab's workspace
 width = 28         # until you resize it
-minimum_width = 16
 maximum_width = 60
 order = 200
 show_index = true
@@ -157,6 +156,17 @@ click the track to jump there.
 Resize it by dragging the edge that faces the panes (the pointer shows a resize
 cursor there, on terminals that support OSC 22 pointer shapes), or with
 `plugin:bmux.sidebar:widen` and `plugin:bmux.sidebar:narrow` (`ctrl+a >` and
-`ctrl+a <` by default, two cells per press; hold to repeat). The width stays
-within `minimum_width` and `maximum_width`, and is remembered on this machine
-unless `remember_width = false`.
+`ctrl+a <` by default, two cells per press; hold to repeat). Resize between
+`collapsed_width` and `maximum_width`. The sidebar becomes a status strip at
+the floor, and dragging outward brings the tabs back. Its last expanded width
+is remembered on this machine unless `remember_width = false`.
+
+Use ▾ to minimize and ▸ to restore. The strip shows live status counts
+across
+all workspaces on the attached server, even when the full sidebar is scoped to
+the current workspace. The strip also appears automatically below
+`collapse_below_width` and expands again when space returns. You can restore it
+explicitly while the terminal is narrow.
+
+Use × to close the sidebar and return its space to the terminal. Reopen it
+with the usual sidebar toggle (`ctrl+alt+s` by default).

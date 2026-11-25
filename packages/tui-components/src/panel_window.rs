@@ -173,12 +173,11 @@ impl Default for WindowGlyphs {
 ///
 /// On a title row the controls form one cluster, `┤ ▾ ⤢ × ├`: the caps join the border, a
 /// space sits between the glyphs, and a border cell separates the cluster from the title and
-/// the right title. A minimized strip shows its restore control alone, padded by a space on
-/// each side.
+/// the right title. A minimized strip shows restore by default and can also offer close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowControls {
     shape: PanelShape,
-    closable: bool,
+    options: WindowControlOptions,
     shown: bool,
     glyphs: WindowGlyphs,
     style: Style,
@@ -186,6 +185,13 @@ pub struct WindowControls {
     close_hover: Style,
     hovered: Option<WindowControl>,
     min_title: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowControlOptions {
+    closable: bool,
+    maximizable: bool,
+    close_in_strip: bool,
 }
 
 impl WindowControls {
@@ -196,7 +202,11 @@ impl WindowControls {
         let bold = Style::new().add_modifier(Modifier::BOLD);
         Self {
             shape,
-            closable: true,
+            options: WindowControlOptions {
+                closable: true,
+                maximizable: true,
+                close_in_strip: false,
+            },
             shown: true,
             glyphs: WindowGlyphs::UNICODE,
             style: Style::new(),
@@ -210,7 +220,21 @@ impl WindowControls {
     /// Whether the panel offers a close control.
     #[must_use]
     pub const fn closable(mut self, closable: bool) -> Self {
-        self.closable = closable;
+        self.options.closable = closable;
+        self
+    }
+
+    /// Whether the expanded panel offers a maximize control.
+    #[must_use]
+    pub const fn maximizable(mut self, maximizable: bool) -> Self {
+        self.options.maximizable = maximizable;
+        self
+    }
+
+    /// Whether a minimized strip also offers its close control.
+    #[must_use]
+    pub const fn close_in_strip(mut self, close_in_strip: bool) -> Self {
+        self.options.close_in_strip = close_in_strip;
         self
     }
 
@@ -275,15 +299,17 @@ impl WindowControls {
         self.shown || self.shape.minimized()
     }
 
-    /// The controls the panel offers in title-row order, left to right, shown or not. A
-    /// minimized panel has only its restore control.
+    /// The controls the panel offers in title-row order.
     #[must_use]
     pub fn list(&self) -> Vec<WindowControl> {
-        if self.shape.minimized() {
-            return vec![WindowControl::Minimize];
+        let mut list = vec![WindowControl::Minimize];
+        if !self.shape.minimized() && self.options.maximizable {
+            list.push(WindowControl::Maximize);
         }
-        let mut list = vec![WindowControl::Minimize, WindowControl::Maximize];
-        if self.closable {
+        if self.options.closable
+            && (!self.shape.minimized()
+                || (self.shape == PanelShape::Strip && self.options.close_in_strip))
+        {
             list.push(WindowControl::Close);
         }
         list
@@ -313,8 +339,7 @@ impl WindowControls {
         }
     }
 
-    /// The label of `control`: its glyph, padded by a space on each side in a strip (where it
-    /// stands alone between the corners).
+    /// The label of `control`: its glyph, padded by a space on each side in a strip.
     #[must_use]
     pub fn label(&self, control: WindowControl) -> Line {
         let glyph = self.glyph(control);
@@ -323,6 +348,66 @@ impl WindowControls {
         } else {
             Line::from_spans(vec![Span::styled(glyph, self.style)])
         }
+    }
+
+    /// Paint controls at the end of a borderless title row. Returns the first
+    /// occupied column so the caller can fit the rest of the title around them.
+    pub fn paint_inline(
+        &self,
+        id: &str,
+        area: Rect,
+        cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    ) -> u16 {
+        use bmux_tui::hit::{HitRegion, HitRole};
+        use bmux_tui::paint::LocalRect;
+        use bmux_tui::pointer::PointerIntent;
+
+        let controls = self.painted();
+        let glyph_width =
+            |control| u16::try_from(Line::raw(self.glyph(control)).width()).unwrap_or(u16::MAX);
+        let total = controls
+            .iter()
+            .copied()
+            .map(glyph_width)
+            .fold(0, u16::saturating_add);
+        let gaps = u16::try_from(controls.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        let gap = u16::from(total.saturating_add(gaps) <= area.width);
+        let mut x = area
+            .right()
+            .saturating_sub(total.saturating_add(gaps * gap))
+            .max(area.x);
+        let start = x;
+        for control in controls {
+            let width = glyph_width(control);
+            if x.saturating_add(width) > area.right() || area.height == 0 {
+                break;
+            }
+            let style = if self.hovered == Some(control) {
+                self.style.patch(if control == WindowControl::Close {
+                    self.close_hover
+                } else {
+                    self.hover
+                })
+            } else {
+                self.style
+            };
+            let line = Line::from_spans(vec![Span::styled(self.glyph(control), style)]);
+            cx.write_line_with_fallback_style(
+                LocalRect::new(i32::from(x), i64::from(area.y), width, 1),
+                &line,
+                style,
+            );
+            cx.push_hit(
+                HitRegion::new(
+                    format!("{id}.action.{}", control.id()),
+                    Rect::new(x, area.y, width, 1),
+                )
+                .role(HitRole::Action)
+                .pointer_intent(PointerIntent::Auto),
+            );
+            x = x.saturating_add(width).saturating_add(gap);
+        }
+        start
     }
 
     /// The cluster's caps and separator: each cap a space inside its border glyph.
@@ -335,11 +420,19 @@ impl WindowControls {
         )
     }
 
-    /// Width of a minimized strip: its padded restore control between the pane's two corners.
+    /// Width of a minimized strip: its padded controls between the pane's two corners.
     #[must_use]
     pub fn strip_width(&self) -> u16 {
-        let restore = Line::raw(format!(" {} ", self.glyphs.restore_minimized)).width();
-        u16::try_from(restore).unwrap_or(u16::MAX).saturating_add(2)
+        let strip = Self {
+            shape: PanelShape::Strip,
+            ..*self
+        };
+        let width = strip
+            .list()
+            .into_iter()
+            .map(|control| strip.label(control).width())
+            .sum::<usize>();
+        u16::try_from(width).unwrap_or(u16::MAX).saturating_add(2)
     }
 
     /// The title action of `control`.
@@ -353,7 +446,7 @@ impl WindowControls {
     }
 
     /// `pane` with the painted controls appended as its last title-row actions: one cluster
-    /// ([`Self::group`]) on a title row, the restore control alone in a strip. Unless the
+    /// ([`Self::group`]) on a title row, or individual controls in a strip. Unless the
     /// panel is a strip, the title keeps [`Self::min_title_width`].
     #[must_use]
     pub fn apply<'a>(&self, mut pane: Pane<'a>) -> Pane<'a> {

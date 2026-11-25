@@ -35,6 +35,7 @@ use bmux_presentation_state::visibility::{
 };
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
 use bmux_tabs_plugin_api::{personal_view, tabs_list, tabs_status};
+use bmux_tui_components::panel_window::{PanelShape, WindowControl, WindowControls};
 use bmux_tui_components::virtual_list::{CursorInput, CursorOutcome, ItemCursor};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -73,7 +74,6 @@ struct Settings {
     grouping: Grouping,
     scope: Scope,
     width: u16,
-    minimum_width: u16,
     maximum_width: u16,
     order: i32,
     show_index: bool,
@@ -146,7 +146,6 @@ impl Default for Settings {
         Self {
             placement: Placement::Left,
             width: 28,
-            minimum_width: 16,
             maximum_width: 60,
             order: 200,
             show_index: true,
@@ -198,7 +197,6 @@ impl Settings {
         parse_look(table, &mut settings)?;
         for (key, target) in [
             ("width", &mut settings.width),
-            ("minimum_width", &mut settings.minimum_width),
             ("maximum_width", &mut settings.maximum_width),
             ("collapse_below_width", &mut settings.collapse_below_width),
             ("collapsed_width", &mut settings.collapsed_width),
@@ -214,14 +212,12 @@ impl Settings {
                     })?;
             }
         }
-        if settings.minimum_width > settings.width || settings.width > settings.maximum_width {
+        if settings.collapsed_width < 3
+            || settings.collapsed_width >= settings.width
+            || settings.width > settings.maximum_width
+        {
             return Err(PluginCommandError::invalid_arguments(
-                "bmux.sidebar requires minimum_width <= width <= maximum_width",
-            ));
-        }
-        if settings.collapsed_width > settings.width {
-            return Err(PluginCommandError::invalid_arguments(
-                "bmux.sidebar collapsed_width must not exceed width",
+                "bmux.sidebar requires 3 <= collapsed_width < width <= maximum_width",
             ));
         }
         if let Some(order) = table.get("order").and_then(toml::Value::as_integer) {
@@ -432,8 +428,9 @@ struct CompanionState {
     list: std::cell::RefCell<bmux_tui_components::virtual_list::VirtualListState<SidebarHit>>,
     /// What each published revision's region keys mean.
     hits: std::cell::RefCell<HitTables<SidebarHit>>,
-    /// The width the sidebar asks for, within its minimum and maximum.
+    /// The last expanded width, which the restore control returns to.
     width: u16,
+    width_mode: WidthMode,
     /// Where the width is remembered, when it is.
     width_memory: Option<std::path::PathBuf>,
     /// A drag of the resize edge in progress.
@@ -446,11 +443,21 @@ struct CompanionState {
     palette: look::Palette,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum WidthMode {
+    #[default]
+    Responsive,
+    Collapsed,
+    /// Explicitly restored while below the automatic breakpoint.
+    Expanded,
+}
+
 /// How the pointer and keyboard are engaged with the sidebar's chrome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Engagement {
     /// The pointer is over the resize edge.
     edge_hovered: bool,
+    control_hovered: Option<WindowControl>,
     /// The sidebar has keyboard focus in this client.
     focused: bool,
 }
@@ -461,6 +468,7 @@ struct Engagement {
 struct ResizeDrag {
     start_col: u16,
     start_width: u16,
+    restore_width: u16,
     /// Where on the scrollbar's track it was pressed, and how far below the
     /// thumb's top when it was pressed on the thumb.
     start_row: i32,
@@ -503,6 +511,7 @@ const WIDTH_FILE: &str = "sidebar-width";
 /// The typed meaning of a sidebar region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SidebarHit {
+    Control(WindowControl),
     Tab(Uuid),
     /// A workspace's header, by workspace id.
     Group(Uuid),
@@ -550,6 +559,7 @@ fn item_region_id(item: SidebarHit) -> String {
         SidebarHit::Group(id) => format!("group:{id}"),
         SidebarHit::ResizeEdge => RESIZE_EDGE_REGION.to_string(),
         SidebarHit::Scrollbar => view::SCROLLBAR.to_string(),
+        SidebarHit::Control(control) => format!("{}.action.{}", view::WINDOW_ID, control.id()),
     }
 }
 
@@ -559,6 +569,11 @@ fn region_item(region: &str) -> Option<SidebarHit> {
     }
     if region == view::SCROLLBAR {
         return Some(SidebarHit::Scrollbar);
+    }
+    if let Some((id, action)) = region.split_once(".action.")
+        && id == view::WINDOW_ID
+    {
+        return WindowControl::from_id(action).map(SidebarHit::Control);
     }
     if let Some(id) = region.strip_prefix("group:") {
         return Uuid::parse_str(id).ok().map(SidebarHit::Group);
@@ -617,12 +632,13 @@ impl CompanionState {
             .and_then(|file| std::fs::read_to_string(file).ok())
             .and_then(|text| text.trim().parse::<u16>().ok())
             .map_or(settings.width, |width| {
-                width.clamp(settings.minimum_width, settings.maximum_width)
+                width.clamp(settings.collapsed_width + 1, settings.maximum_width)
             });
         Self {
             collapsed,
             groups_memory,
             width,
+            width_mode: WidthMode::default(),
             width_memory,
             resize: None,
             engaged: Engagement::default(),
@@ -664,8 +680,21 @@ impl CompanionState {
     const fn allocated_width(&self) -> u16 {
         match self.allocation {
             Some(rect) => rect.w,
-            None => self.width,
+            None => self.requested_width(),
         }
+    }
+
+    const fn requested_width(&self) -> u16 {
+        if matches!(self.width_mode, WidthMode::Collapsed) {
+            self.settings.collapsed_width
+        } else {
+            self.width
+        }
+    }
+
+    const fn is_strip(&self) -> bool {
+        matches!(self.width_mode, WidthMode::Collapsed)
+            || self.allocated_width() <= self.settings.collapsed_width
     }
 
     /// Take a focus change for the region `hook` names: the focused row is
@@ -695,15 +724,24 @@ impl CompanionState {
         publish_companion(self).is_ok()
     }
 
-    /// Ask for `width`, kept within the minimum and maximum. Returns whether
-    /// the width changed.
+    /// Resize to the strip floor or to an expanded width.
     fn set_width(&mut self, width: u16) -> bool {
-        let width = width.clamp(self.settings.minimum_width, self.settings.maximum_width);
-        if width == self.width {
-            return false;
+        let previous = (self.width, self.width_mode);
+        if width <= self.settings.collapsed_width {
+            self.width_mode = WidthMode::Collapsed;
+        } else {
+            self.width_mode = self.restored_width_mode();
+            self.width = width.min(self.settings.maximum_width);
         }
-        self.width = width;
-        true
+        previous != (self.width, self.width_mode)
+    }
+
+    const fn restored_width_mode(&self) -> WidthMode {
+        match self.width_mode {
+            WidthMode::Expanded => WidthMode::Expanded,
+            WidthMode::Responsive if self.visible() && self.is_strip() => WidthMode::Expanded,
+            WidthMode::Collapsed | WidthMode::Responsive => WidthMode::Responsive,
+        }
     }
 
     /// Remember the width for the next start, when this installation does.
@@ -1206,6 +1244,9 @@ impl CompanionState {
     /// Keep the scroll position within the rows and, when `reveal_active`,
     /// on the row showing this client's tab.
     fn settle_scroll(&self, reveal_active: bool) {
+        if self.is_strip() {
+            return;
+        }
         let rows = self.row_views(self.revision);
         let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         let _list = self.synced_list(&rows);
@@ -1312,6 +1353,7 @@ impl CompanionState {
     /// the spinner, and a tab may be working.
     fn animates(&self) -> bool {
         self.visible()
+            && !self.is_strip()
             && self.settings.working_indicator == WorkingIndicator::Spinner
             && self.activity.any_working()
     }
@@ -1763,10 +1805,18 @@ fn register_width_commands(
 
 /// Widen or narrow the sidebar by [`WIDTH_STEP`] cells and remember it.
 fn step_width(companion: &mut CompanionState, widen: bool) -> AttachInputResult {
-    let width = if widen {
-        companion.width.saturating_add(WIDTH_STEP)
+    let width = if companion.visible()
+        && companion.is_strip()
+        && companion.width_mode == WidthMode::Responsive
+    {
+        companion.allocated_width()
     } else {
-        companion.width.saturating_sub(WIDTH_STEP)
+        companion.requested_width()
+    };
+    let width = if widen {
+        width.saturating_add(WIDTH_STEP)
+    } else {
+        width.saturating_sub(WIDTH_STEP)
     };
     let changed = companion.set_width(width);
     if changed {
@@ -1830,6 +1880,9 @@ fn apply_visibility(
     if changed {
         if !companion.visible() {
             companion.cursor.set_hovered(None);
+            companion.engaged = Engagement::default();
+            companion.resize = None;
+            companion.width_mode = WidthMode::Responsive;
         }
         companion.revision = companion.revision.saturating_add(1).max(1);
         companion.presentation_pending.set(true);
@@ -1841,11 +1894,17 @@ fn apply_visibility(
         consumed: true,
         dirty: changed,
         status_message,
+        release_capture: changed && !companion.visible(),
         ..AttachInputResult::default()
     }
 }
 
-fn layout_request(settings: &Settings, width: u16, visible: bool) -> PluginLayoutRequest {
+fn layout_request(
+    settings: &Settings,
+    width: u16,
+    visible: bool,
+    mode: WidthMode,
+) -> PluginLayoutRequest {
     let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
     if !visible {
         return PluginLayoutRequest::hidden(id, settings.order);
@@ -1857,10 +1916,14 @@ fn layout_request(settings: &Settings, width: u16, visible: bool) -> PluginLayou
             Placement::Left => LayoutEdge::Left,
             Placement::Right => LayoutEdge::Right,
         },
-        LayoutExtent::Responsive {
-            preferred: width,
-            collapsed: settings.collapsed_width,
-            collapse_below: settings.collapse_below_width,
+        match mode {
+            WidthMode::Collapsed => LayoutExtent::Cells(settings.collapsed_width),
+            WidthMode::Expanded => LayoutExtent::Cells(width),
+            WidthMode::Responsive => LayoutExtent::Responsive {
+                preferred: width,
+                collapsed: settings.collapsed_width,
+                collapse_below: settings.collapse_below_width,
+            },
         },
     )
 }
@@ -1870,7 +1933,12 @@ fn publish_layout(companion: &CompanionState) -> Result<(), String> {
     let Some(layouts) = companion.layouts.as_deref() else {
         return Ok(());
     };
-    let request = layout_request(&companion.settings, companion.width, companion.visible());
+    let request = layout_request(
+        &companion.settings,
+        companion.width,
+        companion.visible(),
+        companion.width_mode,
+    );
     if layouts.requests().contains(&request) {
         return Ok(());
     }
@@ -2109,7 +2177,7 @@ fn resize_edge(state: &CompanionState, content_rows: u16) -> Option<ExtensionRec
     if width < 3 {
         return None;
     }
-    let height = if state.settings.content_height {
+    let height = if state.settings.content_height && !state.is_strip() {
         content_rows.saturating_add(1)
     } else {
         state
@@ -2142,7 +2210,7 @@ fn sidebar_summary(state: &CompanionState, palette: &look::Palette) -> bmux_tui:
         .into_iter()
         .collect::<Vec<_>>();
     let heading = bmux_cell_geometry::display_width(&state.settings.heading);
-    let room = usize::from(state.allocated_width()).saturating_sub(heading + 4);
+    let room = usize::from(state.allocated_width()).saturating_sub(heading + 8);
     let mut spans = Vec::new();
     for (index, (text, color)) in group_summary(state, &tabs, room).into_iter().enumerate() {
         if index > 0 {
@@ -2168,18 +2236,9 @@ fn group_summary(
     tabs: &[usize],
     room: usize,
 ) -> Vec<(String, Option<RenderColor>)> {
-    let mut counts = std::collections::BTreeMap::<activity::TabState, usize>::new();
-    for index in tabs {
-        let tab = &state.snapshot.tabs[*index];
-        if let Some(activity) = state.activity.activity(tab.id)
-            && activity.state != activity::TabState::Idle
-        {
-            *counts.entry(activity.state).or_default() += 1;
-        }
-    }
     let mut parts = Vec::new();
     let mut used = 0;
-    for (tab_state, count) in counts {
+    for (tab_state, count) in status_counts(state, tabs.iter().copied()) {
         let text = format!("{}{count}", tab_state.glyph());
         let cells = bmux_cell_geometry::display_width(&text) + usize::from(!parts.is_empty());
         if used + cells > room {
@@ -2196,6 +2255,47 @@ fn group_summary(
     }
     parts
 }
+fn status_counts(
+    state: &CompanionState,
+    tabs: impl IntoIterator<Item = usize>,
+) -> std::collections::BTreeMap<activity::TabState, usize> {
+    let mut counts = std::collections::BTreeMap::<activity::TabState, usize>::new();
+    for index in tabs {
+        let tab = &state.snapshot.tabs[index];
+        if let Some(status) = state.activity.state(tab.id)
+            && status != activity::TabState::Idle
+        {
+            *counts.entry(status).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn strip_summary(state: &CompanionState) -> Vec<bmux_tui::text::Line> {
+    use bmux_plugin::render_paint::{tui_color, tui_style};
+    use bmux_tui::style::{Modifier, Style};
+
+    let total = state.snapshot.tabs.len();
+    let counts = status_counts(state, 0..total);
+    if counts.is_empty() {
+        return vec![view::styled(
+            total.to_string(),
+            tui_style(state.palette.muted),
+        )];
+    }
+    counts
+        .into_iter()
+        .map(|(status, count)| {
+            view::styled(
+                format!("{}{count}", status.glyph()),
+                Style::new()
+                    .fg(tui_color(status.color()))
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     build_surface_with_hits(state, revision).0
@@ -2227,6 +2327,8 @@ fn sidebar_regions(
             Some(SidebarHit::ResizeEdge)
         } else if hit.local_id == view::SCROLLBAR {
             Some(SidebarHit::Scrollbar)
+        } else if hit.local_id.starts_with(view::WINDOW_ID) {
+            region_item(&hit.local_id)
         } else {
             hit.local_id
                 .strip_prefix(view::LIST_ID)
@@ -2239,7 +2341,7 @@ fn sidebar_regions(
         let cursor = match item {
             SidebarHit::ResizeEdge => bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal,
             SidebarHit::Scrollbar => thumb_cursor(drag),
-            SidebarHit::Tab(_) | SidebarHit::Group(_) => {
+            SidebarHit::Tab(_) | SidebarHit::Group(_) | SidebarHit::Control(_) => {
                 bmux_plugin::surface::PluginSurfaceCursor::Pointer
             }
         };
@@ -2250,7 +2352,7 @@ fn sidebar_regions(
         // Rows take the keyboard under the pointer, like panes, where the
         // user has focus-on-hover; the resize edge never does.
         regions.push(match item {
-            SidebarHit::ResizeEdge | SidebarHit::Scrollbar => region,
+            SidebarHit::ResizeEdge | SidebarHit::Scrollbar | SidebarHit::Control(_) => region,
             SidebarHit::Tab(_) | SidebarHit::Group(_) => region.focus_on_hover(),
         });
     }
@@ -2284,18 +2386,21 @@ fn visible_field_text(
 /// The sidebar's surface and what its regions' keys mean: the heading, the
 /// rows (painted, clipped and given hit regions by the list component), and
 /// the resize edge.
-fn build_surface_with_hits(
-    state: &CompanionState,
-    revision: u64,
-) -> (PluginSurface, HitTable<SidebarHit>) {
+fn sidebar_view<'a>(
+    state: &'a CompanionState,
+    rows: &'a [(SidebarHit, view::RowView)],
+) -> view::SidebarView<'a, SidebarHit> {
     use bmux_plugin::render_paint::tui_style;
-    let mut hits = HitTable::new();
     let width = state.allocated_width();
     let palette = state.palette;
-    let rows = state.row_views(revision);
+    let strip = state.is_strip();
     let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
-    let list = state.synced_list(&rows);
-    let list_height = state.list_height(&keys);
+    let list = if strip {
+        view::list(rows)
+    } else {
+        state.synced_list(rows)
+    };
+    let list_height = if strip { 0 } else { state.list_height(&keys) };
     let (list_columns, scrollbar_x) = state.list_columns(list_height);
     let shown_rows = {
         let list_state = state.list.borrow();
@@ -2307,7 +2412,9 @@ fn build_surface_with_hits(
         )
         .unwrap_or(u16::MAX)
     };
-    let height = if state.settings.content_height {
+    let height = if strip {
+        state.allocation.map_or(8, |rect| rect.h)
+    } else if state.settings.content_height {
         shown_rows.saturating_add(2)
     } else {
         state
@@ -2315,14 +2422,27 @@ fn build_surface_with_hits(
             .map_or_else(|| list_height.saturating_add(2), |rect| rect.h)
     }
     .max(1);
-    let summary = sidebar_summary(state, &palette);
+    let summary = if strip {
+        bmux_tui::text::Line::default()
+    } else {
+        sidebar_summary(state, &palette)
+    };
+    let controls = WindowControls::new(if strip {
+        PanelShape::Strip
+    } else {
+        PanelShape::Normal
+    })
+    .maximizable(false)
+    .close_in_strip(true)
+    .style(tui_style(palette.muted.background_of(palette.base)))
+    .hovered(state.engaged.control_hovered);
     let edge = resize_edge(state, shown_rows).map(|edge| view::Edge {
         x: edge.x,
         height: edge.h.min(height),
         highlighted: state.engaged.edge_hovered || state.resize.is_some(),
         style: tui_style(state.edge_colors.hover.background_of(palette.base)),
     });
-    let component = view::SidebarView {
+    view::SidebarView {
         size: (width, height),
         base: tui_style(palette.base),
         heading: view::styled(
@@ -2338,13 +2458,31 @@ fn build_surface_with_hits(
             }),
         ),
         count: summary,
+        controls,
+        strip_summary: strip.then(|| strip_summary(state)),
         list,
         state: &state.list,
         list_height,
         list_columns,
-        scrollbar: scrollbar_x.map(|x| scrollbar_view(state, x, list_height, &palette)),
+        scrollbar: scrollbar_x
+            .filter(|_| !strip)
+            .map(|x| scrollbar_view(state, x, list_height, &palette)),
         edge,
+    }
+}
+
+fn build_surface_with_hits(
+    state: &CompanionState,
+    revision: u64,
+) -> (PluginSurface, HitTable<SidebarHit>) {
+    let mut hits = HitTable::new();
+    let rows = if state.is_strip() {
+        Vec::new()
+    } else {
+        state.row_views(revision)
     };
+    let component = sidebar_view(state, &rows);
+    let (width, height) = component.size;
     let size = bmux_tui::geometry::Size::new(width, height);
     let layout = bmux_tui::component::Component::layout(
         &component,
@@ -2381,7 +2519,7 @@ fn build_surface_with_hits(
     }
     // Fields are laid out at the list's width, one column short of the
     // sidebar's while the scrollbar shows.
-    let text = visible_field_text(&rows, &placed, list_columns.1);
+    let text = visible_field_text(&rows, &placed, component.list_columns.1);
     surface.metadata = Some(bmux_plugin::surface::PluginSurfaceMetadata {
         selection: Some(painted.selection),
         semantics: Some(painted.semantics),
@@ -2782,7 +2920,8 @@ fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<At
                 .map(|(_, layout)| row - i32::from(layout.thumb_start));
             companion.resize = Some(ResizeDrag {
                 start_col: screen_col,
-                start_width: companion.width,
+                start_width: companion.allocated_width(),
+                restore_width: companion.width,
                 start_row: row,
                 grab,
                 mode: ColumnGesture::Undecided,
@@ -2864,7 +3003,13 @@ fn drag_column(
                 Placement::Right => i32::from(drag.start_width) - sideways,
             };
             let width = u16::try_from(width.max(0)).unwrap_or(u16::MAX);
-            companion.set_width(width) && republish_width(companion, true)
+            if !companion.set_width(width) {
+                return false;
+            }
+            if matches!(companion.width_mode, WidthMode::Collapsed) {
+                companion.width = drag.restore_width;
+            }
+            republish_width(companion, true)
         }
         ColumnGesture::Scroll => {
             if let (Some(grab), Some((_, layout))) = (drag.grab, companion.scrollbar_geometry()) {
@@ -2908,20 +3053,24 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
         hit(companion, event)
     };
     let previous = companion.cursor.clone();
-    let previous_edge = companion.engaged.edge_hovered;
+    let previous_engagement = companion.engaged;
     // The column facing the panes lights up anywhere on it, thumb included.
     companion.engaged.edge_hovered = matches!(
         hovered,
         Some(SidebarHit::ResizeEdge | SidebarHit::Scrollbar)
     );
+    companion.engaged.control_hovered = match hovered {
+        Some(SidebarHit::Control(control)) => Some(control),
+        _ => None,
+    };
     let row = hovered.filter(|hit| matches!(hit, SidebarHit::Tab(_) | SidebarHit::Group(_)));
-    if !companion.cursor.set_hovered(row) && previous_edge == companion.engaged.edge_hovered {
+    if !companion.cursor.set_hovered(row) && previous_engagement == companion.engaged {
         return false;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
     if publish_companion(companion).is_err() {
         companion.cursor = previous;
-        companion.engaged.edge_hovered = previous_edge;
+        companion.engaged = previous_engagement;
         return false;
     }
     true
@@ -2937,6 +3086,9 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
+    if companion.is_strip() {
+        return false;
+    }
     let previous_scroll = companion.list.borrow().scroll;
     if !companion.scroll_rows(if event.wheel_delta > 0 { -1 } else { 1 }) {
         return true;
@@ -2956,6 +3108,9 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let target = hit(companion, event).filter(|hit| *hit != SidebarHit::ResizeEdge)?;
+    if matches!(target, SidebarHit::Control(_)) && event.key.as_deref() != Some("esc") {
+        return None;
+    }
     let input = match event.key.as_deref()? {
         "up" => CursorInput::Up,
         "down" => CursorInput::Down,
@@ -3055,7 +3210,25 @@ fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<Att
                 ..AttachInputResult::default()
             })
         }
-        SidebarHit::ResizeEdge | SidebarHit::Scrollbar => None,
+        SidebarHit::Control(WindowControl::Minimize) => {
+            companion.width_mode = if companion.is_strip() {
+                companion.restored_width_mode()
+            } else {
+                WidthMode::Collapsed
+            };
+            Some(AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                dirty: republish_width(companion, true),
+                ..AttachInputResult::default()
+            })
+        }
+        SidebarHit::Control(WindowControl::Close) => {
+            Some(apply_visibility(companion, VisibilityCommand::Hide))
+        }
+        SidebarHit::Control(WindowControl::Maximize)
+        | SidebarHit::ResizeEdge
+        | SidebarHit::Scrollbar => None,
     }
 }
 
@@ -3434,7 +3607,7 @@ mod tests {
 
     #[test]
     fn layout_request_places_sidebar_on_configured_edge_and_order() {
-        let left = layout_request(&shown_settings(), 28, true);
+        let left = layout_request(&shown_settings(), 28, true, WidthMode::Responsive);
         let right = layout_request(
             &Settings {
                 placement: Placement::Right,
@@ -3443,6 +3616,7 @@ mod tests {
             },
             28,
             true,
+            WidthMode::Responsive,
         );
         assert!(matches!(
             left.operation,
@@ -3655,7 +3829,7 @@ mod tests {
         assert_eq!(settings.title_template, "{state_icon} {name}");
         assert_eq!(settings.collapse_below_width, 80);
         let invalid: toml::Value =
-            toml::from_str("width = 10\nminimum_width = 12\nmaximum_width = 40").unwrap();
+            toml::from_str("width = 10\ncollapsed_width = 12\nmaximum_width = 40").unwrap();
         assert!(Settings::parse(Some(&invalid)).is_err());
     }
 
@@ -4284,7 +4458,7 @@ mod tests {
         assert_eq!(
             text,
             [
-                " TABS                  ◆1 ◉1 ■1",
+                " TABS              ◆1 ◉1 ■1 ▾ ×",
                 "▌ bmux               ◆1 ◉1 ■1 ▾",
                 "▎ ◉ build            working 5s",
                 "▏ ◆ review         needs input",
@@ -4624,7 +4798,7 @@ mod tests {
         assert_eq!(
             text,
             [
-                " TABS                  ◆1 ◉1 ■1",
+                " TABS              ◆1 ◉1 ■1 ▾ ×",
                 "▌ bmux               ◆1 ◉1 ■1 ▸",
                 "",
                 "▌ notes                     1 ▾",
@@ -4695,7 +4869,7 @@ mod tests {
             // The heading sums up only the listed tabs.
             assert_eq!(
                 surface_text(&build_surface(&state, 1), 32, 1)[0],
-                " TABS                  ◆1 ◉1 ■1"
+                " TABS              ◆1 ◉1 ■1 ▾ ×"
             );
             state.select(Some(Uuid::from_u128(4)));
             assert_eq!(names(&state), ["todo"], "{grouping:?}");
@@ -5042,13 +5216,14 @@ mod tests {
         super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "down", 31, 6)).unwrap();
         super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "drag", 35, 6)).unwrap();
         super::handle_local_input(&owner, &pointer(RESIZE_EDGE_REGION, "up", 35, 6)).unwrap();
-        assert_eq!(width(&owner), before + 4);
+        assert_eq!(width(&owner), 36);
         assert_eq!(offset(&owner), scrolled);
-
         // Sideways from the thumb resizes too: the first movement decides.
         let thumb = {
-            let guard = owner.lock().unwrap();
-            let surface = build_surface(guard.as_ref().unwrap(), 2);
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.resize(ExtensionRect::new(0, 0, 36, 8));
+            let surface = build_surface(state, 2);
             drop(guard);
             region(&surface, view::SCROLLBAR).unwrap()
         };
@@ -5154,6 +5329,10 @@ mod tests {
                         extent: LayoutExtent::Responsive { preferred, .. },
                         ..
                     } => Some(preferred),
+                    bmux_plugin::layout::LayoutOperation::Split {
+                        extent: LayoutExtent::Cells(width),
+                        ..
+                    } => Some(width),
                     _ => None,
                 })
                 .expect("a split request")
@@ -5243,7 +5422,9 @@ mod tests {
         sidebar.handled("drag", 500);
         assert_eq!(sidebar.requested_width(), 60);
         sidebar.handled("drag", 0);
-        assert_eq!(sidebar.requested_width(), 16);
+        assert_eq!(sidebar.requested_width(), 8);
+        sidebar.reallocate(ExtensionRect::new(0, 0, 8, 20));
+        assert_eq!(sidebar.edge().rect.x, 7);
         sidebar.handled("drag", 33);
         assert_eq!(sidebar.requested_width(), 34);
         let released = sidebar.handled("up", 33);
@@ -5272,11 +5453,123 @@ mod tests {
         sidebar.handled("down", 72);
         sidebar.handled("drag", 62);
         assert_eq!(sidebar.requested_width(), 38);
+        sidebar.handled("drag", 99);
+        assert_eq!(sidebar.requested_width(), 8);
+        sidebar.reallocate(ExtensionRect::new(92, 0, 8, 20));
+        assert_eq!(sidebar.edge().rect.x, 0);
         sidebar.handled("drag", 80);
         assert_eq!(sidebar.requested_width(), 20);
         sidebar.handled("up", 80);
         drop(sidebar);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sidebar_controls_minimize_restore_and_close_the_attachment() {
+        let dir = scratch_dir();
+        let sidebar = Installed::new("left", ExtensionRect::new(0, 0, 28, 20), &dir);
+        let allocate = |width| {
+            let resolved = bmux_plugin::layout::resolve_plugin_layout(
+                ExtensionRect::new(0, 0, width, 20),
+                (1, 1),
+                &sidebar.layouts.requests(),
+            )
+            .unwrap();
+            sidebar.reallocate(resolved.allocations[0].rect);
+            resolved.remaining.w
+        };
+        let surface = || {
+            sidebar
+                .surfaces
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .surfaces
+                .remove(0)
+        };
+        let click = |control| {
+            let id = item_region_id(SidebarHit::Control(control));
+            let snapshot = sidebar.surfaces.owner_snapshot(OWNER).unwrap();
+            let region = snapshot.surfaces[0]
+                .interactive_regions
+                .iter()
+                .find(|region| region.local_id == id)
+                .unwrap();
+            let mut event = press(&id);
+            let target = event.target.as_mut().unwrap();
+            target.revision = snapshot.revision;
+            target.key = region.key;
+            let result = sidebar.input.dispatch(&input_endpoint(), &event);
+            assert!(
+                matches!(result, bmux_plugin::AttachPresentationInputDispatch::Handled(result) if result.consumed && result.dirty)
+            );
+        };
+        assert!(surface_text(&surface(), 28, 1)[0].ends_with("▾ ×"));
+        click(WindowControl::Minimize);
+        assert_eq!(sidebar.requested_width(), 8);
+        assert_eq!(allocate(100), 92);
+        assert!(surface_text(&surface(), 8, 1)[0].ends_with("▸ ×"));
+        click(WindowControl::Minimize);
+        assert_eq!(sidebar.requested_width(), 28);
+        assert_eq!(allocate(100), 72);
+
+        // The host can allocate the strip in responsive mode too.
+        assert_eq!(allocate(60), 52);
+        assert!(surface_text(&surface(), 8, 1)[0].ends_with("▸ ×"));
+        assert_eq!(allocate(100), 72);
+        assert!(surface_text(&surface(), 28, 1)[0].ends_with("▾ ×"));
+
+        click(WindowControl::Minimize);
+        assert_eq!(allocate(100), 92);
+        click(WindowControl::Close);
+        assert_eq!(allocate(60), 60);
+        assert!(matches!(
+            sidebar.layouts.requests()[0].operation,
+            bmux_plugin::layout::LayoutOperation::Hidden
+        ));
+        assert_eq!(sidebar.surfaces.owner_snapshot(OWNER).unwrap().surfaces, []);
+        assert!(
+            sidebar
+                .input
+                .command(OWNER, "toggle", &[])
+                .unwrap()
+                .consumed
+        );
+        assert_eq!(sidebar.requested_width(), 28);
+        drop(sidebar);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strip_summarizes_live_status_across_workspaces_even_with_current_workspace_scope() {
+        let mut state = grouped_state(
+            Settings {
+                scope: Scope::CurrentWorkspace,
+                ..grouped()
+            },
+            None,
+        );
+        state.select(Some(Uuid::from_u128(4)));
+        state.resize(ExtensionRect::new(0, 0, 8, 4));
+        let text = |state: &CompanionState| surface_text(&build_surface(state, 1), 8, 4);
+        assert_eq!(text(&state), ["    ▸ ×", "◆1", "◉1", "■1"]);
+        state.apply_changes(Changes {
+            tabs: None,
+            personal: None,
+            selection: None,
+            status: Some(tabs_status::TabStatusSnapshot {
+                tabs: vec![tabs_status::TabStatus {
+                    tab_id: Uuid::from_u128(4),
+                    state: tabs_status::TabState::Failed,
+                    ..idle_status()
+                }],
+                now_ms: 600_001,
+                revision: 2,
+            }),
+            appearance: None,
+            ticked: false,
+            animated: false,
+        });
+        assert_eq!(text(&state), ["    ▸ ×", "▲1", "", ""]);
     }
 
     /// `widen` and `narrow` step the width within its bounds and remember it.
@@ -5293,13 +5586,13 @@ mod tests {
         for _ in 0..20 {
             run("narrow");
         }
-        assert_eq!(sidebar.requested_width(), 16);
+        assert_eq!(sidebar.requested_width(), 8);
         drop(sidebar);
         assert_eq!(
             std::fs::read_to_string(dir.join(WIDTH_FILE))
                 .unwrap()
                 .trim(),
-            "16"
+            "10"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5665,7 +5958,7 @@ mod tests {
         assert_eq!(
             text,
             [
-                " TABS                  ◆1 ▲1 ◉1",
+                " TABS              ◆1 ▲1 ◉1 ▾ ×",
                 "▎ ○ editor                 nvim",
                 "▎   \u{f07b} /work/bmux · \u{e0a0} main* ↑2",
                 "  ◉ claude           working 5s",
@@ -6202,7 +6495,9 @@ mod tests {
             revision: 1,
         });
         let surface = build_surface(&state, 1);
-        assert_eq!(surface.interactive_regions[0].local_id, format!("tab:{id}"));
+        let tabs = tab_regions(&surface);
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].local_id, format!("tab:{id}"));
         assert!(surface.accepts_input);
     }
 }

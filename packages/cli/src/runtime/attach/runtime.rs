@@ -6206,6 +6206,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 view_state
                     .dirty
                     .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
+                view_state
+                    .dirty
+                    .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
             }
 
             // Windows-plugin published a new ordered window list.
@@ -6385,6 +6388,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 view_state
                     .dirty
                     .mark_full_frame(AttachDirtySource::LayoutChanged);
+                view_state
+                    .dirty
+                    .mark_retained_surfaces_dirty(AttachDirtySource::LayoutChanged);
                 hydrate_attach_state_from_snapshot_mode(
                     &mut client,
                     &mut view_state,
@@ -14325,6 +14331,11 @@ pub async fn handle_attach_terminal_event(
         // reflow. Capture logical endpoints before changing presentation size.
         prepare_attach_selections_for_resize(view_state);
         view_state.driver_geometry = Some(geometry);
+        // The same plugin layout requests can resolve to different allocations
+        // at the new viewport, even when no plugin has published a revision.
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::LayoutChanged);
         update_attach_viewport_with_geometry(client, view_state, geometry).await?;
     }
 
