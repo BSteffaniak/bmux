@@ -386,6 +386,31 @@ fn playbook_real_attach_keyboard_and_finder_follow_the_personal_view() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_tab_bar_drag_reorders_only_this_view() {
+    let (json, pass) = run_playbook_fixture("personal_view_drag_real_attach.dsl");
+    assert!(
+        pass,
+        "dragging a tab should reorder the view this attachment shows, and no other: {json:#}"
+    );
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step["action"] == "terminal-event")
+            .count(),
+        4
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step["action"] == "assert-rendered")
+            .count(),
+        3
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_finder_switches_sandbox_tabs() {
     let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
     assert!(

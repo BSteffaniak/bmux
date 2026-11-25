@@ -1971,7 +1971,7 @@ fn execute_attach_sim_step(
             Ok(Some(format!("captured attach-sim snapshot '{id}'")))
         }
         Action::TerminalEvent(event) => {
-            let terminal_event = attach_sim_terminal_event(event, runtime_vars)?;
+            let terminal_event = playbook_mouse_event(event, runtime_vars)?;
             sim.mouse_event(terminal_event)?;
             Ok(Some("terminal event consumed".to_string()))
         }
@@ -2062,7 +2062,7 @@ fn execute_attach_sim_step(
     }
 }
 
-fn attach_sim_terminal_event(
+fn playbook_mouse_event(
     event: &SimTerminalEvent,
     runtime_vars: &RuntimeVars,
 ) -> Result<crate::host::MouseEvent> {
@@ -2072,10 +2072,7 @@ fn attach_sim_terminal_event(
     };
 
     let kind = runtime_vars.resolve_opt(&event.kind);
-    ensure!(
-        kind == "mouse",
-        "attach-sim terminal-event only supports kind=mouse"
-    );
+    ensure!(kind == "mouse", "terminal-event only supports kind=mouse");
     let phase = match runtime_vars.resolve_opt(&event.phase).as_str() {
         "down" => TerminalMousePhase::Down,
         "up" => TerminalMousePhase::Up,
@@ -2105,6 +2102,61 @@ fn attach_sim_terminal_event(
         button,
         col: runtime_vars.resolve_opt(&event.col).parse()?,
         row: runtime_vars.resolve_opt(&event.row).parse()?,
+    })
+}
+
+/// The terminal input event a terminal's reader yields for `event`, after
+/// decoding the SGR mouse report (`ESC [ < b ; x ; y M/m`) it received.
+fn terminal_event_from_mouse(event: crate::host::MouseEvent) -> Result<TermEvent> {
+    use crate::host::{MouseButton, MousePhase};
+    use bmux_terminal::event::{
+        MouseButton as TermMouseButton, MouseEvent as TermMouseEvent, MouseEventKind,
+    };
+
+    let button = || -> Result<TermMouseButton> {
+        Ok(
+            match event
+                .button
+                .context("terminal-event phase down, up and drag need a button")?
+            {
+                MouseButton::Left => TermMouseButton::Left,
+                MouseButton::Right => TermMouseButton::Right,
+                MouseButton::Middle => TermMouseButton::Middle,
+            },
+        )
+    };
+    let kind = match event.phase {
+        MousePhase::Down => MouseEventKind::Down(button()?),
+        MousePhase::Up => MouseEventKind::Up(button()?),
+        MousePhase::Drag => MouseEventKind::Drag(button()?),
+        MousePhase::Move => MouseEventKind::Moved,
+        MousePhase::ScrollUp => MouseEventKind::ScrollUp,
+        MousePhase::ScrollDown => MouseEventKind::ScrollDown,
+        MousePhase::ScrollLeft => MouseEventKind::ScrollLeft,
+        MousePhase::ScrollRight => MouseEventKind::ScrollRight,
+    };
+    Ok(TermEvent::Mouse(TermMouseEvent {
+        kind,
+        column: event.col,
+        row: event.row,
+        modifiers: KeyModifiers::NONE,
+    }))
+}
+
+/// Find `text` in rendered rows: zero-based cell columns (one per character)
+/// and row of its first occurrence.
+fn locate_rendered_text(rendered: &str, text: &str) -> Option<crate::host::LocatedText> {
+    let width = text.chars().count().checked_sub(1)?;
+    rendered.lines().enumerate().find_map(|(row, line)| {
+        let byte = line.find(text)?;
+        let start_col = line[..byte].chars().count();
+        let end_col = start_col + width;
+        Some(crate::host::LocatedText {
+            start_col,
+            end_col,
+            center_col: start_col + width / 2,
+            row,
+        })
     })
 }
 
@@ -4458,6 +4510,42 @@ async fn execute_step_paced(
         Action::RenderMark { .. } | Action::AssertRender { .. } => {
             bail!("render trace actions are handled by the playbook runner")
         }
+        Action::Locate { id, text } if real_attach_runtime.is_some() => {
+            let runtime = real_attach_runtime.context("locate requires an attach driver")?;
+            let text = runtime_vars.resolve_opt(text);
+            let rendered = runtime.0.rendered_text(*viewport_rows)?;
+            let location = locate_rendered_text(&rendered, &text)
+                .with_context(|| format!("could not locate '{text}' in:\n{rendered}"))?;
+            for (field, value) in [
+                ("start_col", location.start_col),
+                ("end_col", location.end_col),
+                ("center_col", location.center_col),
+                ("row", location.row),
+            ] {
+                runtime_vars
+                    .static_vars
+                    .insert(format!("{id}.{field}"), value.to_string());
+            }
+            Ok(Some(format!(
+                "{id}: cols {}-{} row {}",
+                location.start_col, location.end_col, location.row
+            )))
+        }
+        Action::TerminalEvent(event) if real_attach_runtime.is_some() => {
+            let runtime =
+                real_attach_runtime.context("terminal-event requires an attach driver")?;
+            let event = terminal_event_from_mouse(playbook_mouse_event(event, runtime_vars)?)?;
+            runtime.wait_until_ready().await?;
+            let target = runtime
+                .send_event(event, deadline)
+                .await
+                .map_err(|e| anyhow::anyhow!("terminal-event failed: {e}"))?;
+            reconcile_real_attach_target(target, client, session_id, runtime_vars).await?;
+            Ok(Some(format!(
+                "real_attach_output_bytes={}",
+                runtime.0.output_byte_count()
+            )))
+        }
         Action::SeedTabList { .. }
         | Action::SeedPaneText { .. }
         | Action::SeedPaneLayout { .. }
@@ -4468,7 +4556,9 @@ async fn execute_step_paced(
         | Action::AssertNoEffect { .. }
         | Action::AssertState { .. }
         | Action::SetConfig { .. } => {
-            bail!("attach simulation actions require @driver attach-sim")
+            bail!(
+                "attach simulation actions require @driver attach-sim (locate and terminal-event also run with @driver real-attach)"
+            )
         }
     };
     if result.is_ok()
@@ -5120,6 +5210,38 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locate_counts_cells_by_character_on_the_matching_row() {
+        let rendered = "top\n│ ╭ <idle:alpha> │ <active:gamma>";
+        let gamma = locate_rendered_text(rendered, "<active:gamma>").unwrap();
+        assert_eq!(
+            (gamma.start_col, gamma.end_col, gamma.center_col, gamma.row),
+            (19, 32, 25, 1)
+        );
+        assert!(locate_rendered_text(rendered, "missing").is_none());
+    }
+
+    #[test]
+    fn mouse_terminal_events_carry_the_decoded_report() {
+        use crate::host::{MouseButton, MouseEvent, MousePhase};
+        use bmux_terminal::event::{MouseButton as Button, MouseEventKind};
+        let event = |phase, button| MouseEvent {
+            phase,
+            button,
+            col: 4,
+            row: 7,
+        };
+        let TermEvent::Mouse(drag) =
+            terminal_event_from_mouse(event(MousePhase::Drag, Some(MouseButton::Left))).unwrap()
+        else {
+            panic!("a mouse event");
+        };
+        assert_eq!(drag.kind, MouseEventKind::Drag(Button::Left));
+        assert_eq!((drag.column, drag.row), (4, 7));
+        assert!(terminal_event_from_mouse(event(MousePhase::Up, None)).is_err());
+        assert!(terminal_event_from_mouse(event(MousePhase::ScrollUp, None)).is_ok());
+    }
 
     #[tokio::test]
     async fn requested_recording_preserves_provider_id_and_starts_once() {
