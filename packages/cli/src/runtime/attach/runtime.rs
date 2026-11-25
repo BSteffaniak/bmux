@@ -2698,7 +2698,7 @@ fn ask_pane_clipboard_write(view_state: &mut AttachViewState, pane_id: Uuid, tex
 }
 
 fn write_pane_clipboard_text(view_state: &mut AttachViewState, text: &str) {
-    if let Err(error) = copy_text_with_clipboard_plugin(text) {
+    if let Err(error) = copy_text_for_attach(view_state, text) {
         view_state.set_transient_status(
             format!("clipboard write failed: {error}"),
             SystemAttachClock.now(),
@@ -9714,7 +9714,7 @@ pub fn copy_attach_selection_at(
         return;
     };
 
-    match copy_text_with_clipboard_plugin(&text) {
+    match copy_text_for_attach(view_state, &text) {
         Ok(()) => {
             view_state.set_transient_status(
                 ATTACH_SELECTION_COPIED_STATUS,
@@ -9742,6 +9742,17 @@ pub fn confirm_attach_scrollback_at(view_state: &mut AttachViewState, now: Insta
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClipboardWriteRequest {
     text: String,
+}
+
+/// Copies `text` on this machine for an attachment. The clipboard provider runs in this
+/// process with the attachment's command runtime selected: an attach entered without one on
+/// its thread (`connect <host>` hands it over explicitly) must still reach the provider.
+fn copy_text_for_attach(view_state: &AttachViewState, text: &str) -> Result<()> {
+    let _selected = view_state
+        .command_state
+        .as_ref()
+        .map(super::super::plugin_runtime::SelectedCommandStateGuard::enter);
+    copy_text_with_clipboard_plugin(text)
 }
 
 pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {

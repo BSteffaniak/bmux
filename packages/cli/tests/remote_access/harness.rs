@@ -78,10 +78,56 @@ fn isolated_env(root: &Path, dirs: &Dirs) -> Vec<(OsString, Option<OsString>)> {
     ] {
         env.push((key.into(), Some(value.into_os_string())));
     }
+    // The clipboard: no display reaches the developer's own, and copies land in a file.
+    let bin = clipboard_capture(root);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+        .expect("PATH with the clipboard capture");
+    env.push(("PATH".into(), Some(path)));
+    env.push(("DISPLAY".into(), None));
+    env.push(("WAYLAND_DISPLAY".into(), Some(NO_DISPLAY.into())));
     env.push(("BMUX_NO_BASE_CONFIG".into(), Some("1".into())));
     env.push(("BMUX_RUNTIME_NAME".into(), Some("default".into())));
     env.push(("TERM".into(), Some("xterm-256color".into())));
     env
+}
+
+/// A Wayland display name no compositor serves: native clipboard writes fail and fall back
+/// to `wl-copy`, which [`clipboard_capture`] provides.
+const NO_DISPLAY: &str = "bmux-test-no-display";
+
+/// Where copies made by processes under `root` land.
+fn clipboard_file(root: &Path) -> PathBuf {
+    root.join("clipboard.txt")
+}
+
+/// A directory holding a `wl-copy` that writes its input to [`clipboard_file`].
+fn clipboard_capture(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = root.join("clipboard-bin");
+    let program = bin.join("wl-copy");
+    if !program.exists() {
+        private_dir(&bin);
+        let target = clipboard_file(root);
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncat > {}.tmp && mv {}.tmp {}\n",
+                shell_quote(&target),
+                shell_quote(&target),
+                shell_quote(&target)
+            ),
+        )
+        .expect("write the clipboard capture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make the clipboard capture executable");
+    }
+    bin
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +286,12 @@ impl Host {
         term
     }
 
+    /// What the host's own processes last copied to the clipboard, if anything.
+    #[must_use]
+    pub fn clipboard(&self) -> Option<String> {
+        std::fs::read_to_string(clipboard_file(self.env.root())).ok()
+    }
+
     /// The host's endpoint id, read from `bmux remote status`.
     #[must_use]
     pub fn endpoint_id(&self) -> iroh::EndpointId {
@@ -291,6 +343,12 @@ impl Client {
     #[must_use]
     pub fn root(&self) -> &Path {
         self.root.path()
+    }
+
+    /// What this client's processes last copied to the clipboard, if anything.
+    #[must_use]
+    pub fn clipboard(&self) -> Option<String> {
+        std::fs::read_to_string(clipboard_file(self.root())).ok()
     }
 
     /// Adds `toml` to this client's configuration.
@@ -768,24 +826,4 @@ pub fn lines_with(screen: &[String], needles: &[&str]) -> Vec<String> {
         .filter(|line| needles.iter().any(|needle| line.contains(needle)))
         .map(|line| line.trim_end().to_owned())
         .collect()
-}
-
-/// Decodes standard base64 (OSC 52 payloads).
-#[must_use]
-pub fn decode_base64(text: &str) -> Vec<u8> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let (mut buffer, mut bits) = (0u32, 0u32);
-    for byte in text.bytes() {
-        let Some(value) = ALPHABET.iter().position(|&c| c == byte) else {
-            continue;
-        };
-        buffer = (buffer << 6) | u32::try_from(value).expect("six bits");
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(u8::try_from((buffer >> bits) & 0xff).expect("one byte"));
-        }
-    }
-    out
 }

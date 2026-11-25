@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use harness::{
     COLS, Client, Host, PREFIX, PREFIX_KEYMAP, QUIET, RemoteSettings, Role, STEP, Term,
-    decode_base64, lines_with, marker, pair, pair_only, reserve_udp_port,
+    lines_with, marker, pair, pair_only, reserve_udp_port,
 };
 use probe::{Dial, PAIR_ALPN, Peer, SESSION_ALPN, assert_refused};
 use relay::LocalRelay;
@@ -121,13 +121,21 @@ fn prefixed(term: &mut Term, key: &[u8]) {
     term.send(key);
 }
 
+/// The pane frame alone puts `│` at both edges; a vertical split adds a divider between them.
+fn two_pane_border(screen: &str) -> bool {
+    screen
+        .lines()
+        .filter(|line| line.matches('│').count() >= 3)
+        .count()
+        >= 10
+}
+
 /// SGR mouse report for a left-button event at 1-based `col`, `row`.
 fn sgr_mouse(code: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
     format!("\x1b[<{code};{col};{row}{}", if press { 'M' } else { 'm' }).into_bytes()
 }
 
 #[test]
-#[ignore = "blocked outside remote access: with two tabs the owner's view often misses another client's split (reproduces with two local attaches); the mouse-selection OSC 52 step is unverified"]
 fn gate2_remote_attach_matches_local_attach() {
     let host = Host::start(
         "parity-h",
@@ -149,6 +157,8 @@ fn gate2_remote_attach_matches_local_attach() {
 
     let client = Client::new("parity-c", &RemoteSettings::default());
     client.configure(PREFIX_KEYMAP);
+    // Releasing a mouse selection copies it and leaves the selection (scroll) mode.
+    client.configure("\n[behavior.mouse]\nselection_release = \"copy_and_exit\"\n");
     pair_only(&host, &client, ALIAS, DEVICE, Role::Full);
 
     // List sessions through the saved host.
@@ -173,16 +183,8 @@ fn gate2_remote_attach_matches_local_attach() {
 
     // Split vertically from the remote side; both viewers show two panes.
     prefixed(&mut remote, b"%");
-    // The pane frame alone puts `│` at both edges; a split adds a divider between them.
-    let border = |screen: &str| {
-        screen
-            .lines()
-            .filter(|line| line.matches('│').count() >= 3)
-            .count()
-            >= 10
-    };
-    remote.wait_screen("a vertical split", STEP, border);
-    owner.wait_screen("the remote's split", STEP, border);
+    remote.wait_screen("a vertical split", STEP, two_pane_border);
+    owner.wait_screen("the remote's split", STEP, two_pane_border);
 
     // Mouse: click the left pane to focus it, then type there.
     assert!(
@@ -200,13 +202,18 @@ fn gate2_remote_attach_matches_local_attach() {
         .into_iter()
         .find(|line| line.contains(&clicked))
         .expect("clicked marker row");
-    let column = row.find(&clicked).expect("marker column");
+    // Screen columns are characters; the frame's `│` is several bytes.
+    let column = row[..row.find(&clicked).expect("marker column")]
+        .chars()
+        .count();
     assert!(
         column < left_half,
         "the click did not focus the left pane (marker at column {column}): {row}"
     );
 
-    // Mouse selection: dragging over the marker copies it to the VIEWING terminal (OSC 52).
+    // Mouse selection: dragging over the marker copies it on the VIEWING machine. The copy
+    // runs in the viewer's own process through its clipboard provider (here the harness's
+    // `wl-copy` capture), never on the host and never as OSC 52 to the outer terminal.
     let screen_row = remote
         .lines()
         .iter()
@@ -220,26 +227,36 @@ fn gate2_remote_attach_matches_local_attach() {
     remote.send(&sgr_mouse(0, start, row, true));
     remote.send(&sgr_mouse(32, end, row, true));
     remote.send(&sgr_mouse(0, end, row, false));
-    remote.expect("\\x1b\\]52;[a-z]*;([A-Za-z0-9+/=]+)(\\x07|\\x1b\\\\)", STEP);
-    let copied = {
-        let raw = String::from_utf8_lossy(remote.raw()).into_owned();
-        let payload = raw
-            .rsplit("\x1b]52;")
-            .next()
-            .and_then(|rest| rest.split(';').nth(1))
-            .map(|rest| {
-                rest.split(['\x07', '\x1b'])
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .unwrap_or_default();
-        String::from_utf8_lossy(&decode_base64(&payload)).into_owned()
+    let deadline = Instant::now() + STEP;
+    let copied = loop {
+        if let Some(copied) = client.clipboard() {
+            break copied;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the mouse selection copied nothing on the viewing machine:\n{}",
+            remote.text()
+        );
+        assert!(!remote.has_exited(), "the remote viewer exited");
+        std::thread::sleep(Duration::from_millis(100));
     };
-    assert!(
-        copied.contains(&clicked[..clicked.len() - 2]),
-        "the selection copied {copied:?}, not the marker"
+    assert_eq!(
+        copied.trim_end(),
+        clicked,
+        "the selection copied the wrong text"
     );
+    assert!(
+        host.clipboard().is_none(),
+        "the remote viewer's selection was copied on the host"
+    );
+    assert!(
+        !remote.raw_contains(b"\x1b]52;"),
+        "the selection was written to the viewing terminal as OSC 52"
+    );
+    // `copy_and_exit` leaves the selection's scroll mode.
+    remote.wait_screen("insert mode after the copy", STEP, |screen| {
+        !screen.contains("SCROLL")
+    });
 
     // Scrollback: 200 numbered lines, then scroll mode to the top shows the first.
     remote.send(b"i=1; while [ $i -le 200 ]; do printf 'SB%03d\\n' $i; i=$((i+1)); done\r");
@@ -248,15 +265,28 @@ fn gate2_remote_attach_matches_local_attach() {
     remote.send(b"g");
     remote.wait_text("SB001", STEP);
     remote.send(b"\x1b");
+    remote.wait_screen("scroll mode left", STEP, |screen| {
+        !screen.contains("SCROLL")
+    });
     remote.wait_text("SB200", STEP);
 
     // Screens match: what the owner sees locally of the same session, the remote sees too.
+    // The bottom row is each viewer's own status bar (its mode, its transient messages, the
+    // host's hosting state), so only the panes above it are compared.
     let needles = [existing.as_str(), clicked.as_str(), "SB200", "│"];
+    let panes = |term: &Term| {
+        let mut lines = term.lines();
+        lines.pop();
+        lines_with(&lines, &needles)
+    };
     let settle = Instant::now() + STEP;
     loop {
-        let local = lines_with(&owner.lines(), &needles);
-        let seen = lines_with(&remote.lines(), &needles);
-        if local == seen && !local.is_empty() {
+        // Read what both terminals drew since the last look.
+        assert!(!owner.has_exited(), "the owner's attach exited");
+        assert!(!remote.has_exited(), "the remote viewer exited");
+        let local = panes(&owner);
+        let seen = panes(&remote);
+        if local == seen && local.iter().any(|line| line.contains("SB200")) {
             break;
         }
         assert!(
@@ -266,8 +296,6 @@ fn gate2_remote_attach_matches_local_attach() {
             seen.join("\n")
         );
         std::thread::sleep(Duration::from_millis(100));
-        owner.wait_screen("anything", Duration::from_millis(100), |_| true);
-        remote.wait_screen("anything", Duration::from_millis(100), |_| true);
     }
 }
 
@@ -842,4 +870,30 @@ fn fixture_local_relay_serves_plain_http_on_loopback() {
 fn fixture_idle_duration_outlasts_the_old_lease() {
     assert!(idle_duration() >= OLD_LEASE * 3);
     assert!(BLACKHOLE > Duration::from_secs(30));
+}
+
+// ---------------------------------------------------------------------------------------
+// Two local attaches to one tab: what gate 2's owner view relies on.
+// ---------------------------------------------------------------------------------------
+
+/// A split made by one attachment reaches every other attachment of the same tab, not only
+/// the one that ran the command (which refreshes from its own command's reply).
+#[test]
+fn local_split_reaches_every_attach_of_the_tab() {
+    let host = Host::start_with(
+        "split-h",
+        RemoteSettings::loopback_host(reserve_udp_port()),
+        PREFIX_KEYMAP,
+    );
+    host.new_tab("work");
+    host.new_tab("side");
+    let mut first = host.attach("work");
+    let existing = marker("existing");
+    first.type_marker(&existing);
+    first.wait_text(&existing, STEP);
+    let mut second = host.attach("work");
+    second.wait_text(&existing, STEP);
+    prefixed(&mut second, b"%");
+    second.wait_screen("a vertical split", STEP, two_pane_border);
+    first.wait_screen("the other attach's split", STEP, two_pane_border);
 }

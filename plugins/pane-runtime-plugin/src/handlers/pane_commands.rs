@@ -426,8 +426,11 @@ fn emit_attach_view_changed_scene(host: &crate::runtime::PaneRuntimeHost, sessio
     let Some(revision) = handle.0.bump_attach_view_revision(session_id) else {
         return;
     };
+    // Attach clients bound to a context accept only events naming it, so a
+    // context-less event would reach the client that made the change (which
+    // refreshes on its own command's reply) and no other attachment.
     host.publish_pane_event(PaneEvent::AttachViewChanged {
-        context_id: None,
+        context_id: host.current_context_id_for_session(session_id),
         session_id: session_id.0,
         revision,
         components: vec![AttachViewComponent::Scene],

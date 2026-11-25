@@ -44,15 +44,18 @@ impl Request {
     fn live_window_request(self) -> crate::pane_runtime_client::PaneGridWindowRequest {
         crate::pane_runtime_client::PaneGridWindowRequest {
             pane_id: self.pane,
-            scrollback_offset: if self.boundary == Some(Boundary::Newest) {
-                0
-            } else {
-                self.offset
+            // A boundary names its end of history, not an offset: the oldest row is
+            // the server's to find (it clamps to its deepest offset), so jumping to
+            // the top works before this view has learned how deep history is.
+            scrollback_offset: match self.boundary {
+                Some(Boundary::Newest) => 0,
+                Some(Boundary::Oldest) => usize::MAX,
+                None => self.offset,
             },
             rows: self.rows,
-            // Following the current tail is deliberately unanchored. Applying
-            // growth from a historical window would land behind new output.
-            anchor_total_scrolled_rows: if self.boundary == Some(Boundary::Newest) {
+            // Following either end is deliberately unanchored. Applying growth
+            // from a historical window would land behind new output.
+            anchor_total_scrolled_rows: if self.boundary.is_some() {
                 None
             } else {
                 self.total
@@ -386,6 +389,27 @@ mod tests {
         .live_window_request();
         assert_eq!(relative.scrollback_offset, 40);
         assert_eq!(relative.anchor_total_scrolled_rows, Some(100));
+    }
+
+    #[test]
+    fn live_oldest_asks_for_the_deepest_row_not_the_requested_offset() {
+        // Before the first window arrives the view knows no history depth, so the
+        // requested offset is 0: the live tail. The boundary must still reach the top.
+        let oldest = Request {
+            boundary: Some(Boundary::Oldest),
+            session: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+            pin: None,
+            offset: 0,
+            width: 80,
+            rows: 24,
+            total: Some(100),
+            anchor: None,
+            delta: 0,
+        }
+        .live_window_request();
+        assert_eq!(oldest.scrollback_offset, usize::MAX);
+        assert_eq!(oldest.anchor_total_scrolled_rows, None);
     }
 
     #[test]

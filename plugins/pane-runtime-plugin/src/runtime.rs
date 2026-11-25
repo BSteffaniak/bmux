@@ -401,7 +401,7 @@ impl PaneRuntimeHost {
         self.recording_sink().map(|handle| (handle, data.to_vec()))
     }
 
-    fn current_context_id_for_session(&self, session_id: SessionId) -> Option<Uuid> {
+    pub(crate) fn current_context_id_for_session(&self, session_id: SessionId) -> Option<Uuid> {
         self.context_handle().0.context_for_session(session_id)
     }
 
