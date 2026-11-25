@@ -92,6 +92,14 @@ pub enum LayoutExtent {
         collapsed: u16,
         collapse_below: u16,
     },
+    /// `preferred` cells, but never so many that fewer than `reserve` cells
+    /// of the region remain for what follows, unless that leaves fewer than
+    /// `minimum` cells.
+    Reserving {
+        preferred: u16,
+        minimum: u16,
+        reserve: u16,
+    },
     Fill,
 }
 
@@ -123,6 +131,14 @@ impl LayoutExtent {
                     preferred.min(available)
                 }
             }
+            Self::Reserving {
+                preferred,
+                minimum,
+                reserve,
+            } => preferred
+                .min(available.saturating_sub(reserve))
+                .max(minimum.min(preferred))
+                .min(available),
             Self::Fill => available,
         }
     }
@@ -685,6 +701,34 @@ mod tests {
             resolve_plugin_layout(ExtensionRect::new(0, 0, 60, 24), (1, 1), &[request]).unwrap();
         assert_eq!(wide.allocations[0].rect.w, 28);
         assert_eq!(narrow.allocations[0].rect.w, 8);
+    }
+
+    #[test]
+    fn reserving_extent_leaves_its_reserve_for_what_follows() {
+        let reserving = |width| {
+            let request = request(
+                "owner",
+                "reserving",
+                0,
+                LayoutOperation::Split {
+                    edge: LayoutEdge::Left,
+                    extent: LayoutExtent::Reserving {
+                        preferred: 40,
+                        minimum: 4,
+                        reserve: 20,
+                    },
+                },
+            );
+            let resolved =
+                resolve_plugin_layout(ExtensionRect::new(0, 0, width, 24), (1, 1), &[request])
+                    .unwrap();
+            (resolved.allocations[0].rect.w, resolved.remaining.w)
+        };
+        assert_eq!(reserving(100), (40, 60));
+        assert_eq!(reserving(50), (30, 20));
+        // Never below its minimum, and never past the host's own remainder.
+        assert_eq!(reserving(15), (4, 11));
+        assert_eq!(reserving(3), (2, 1));
     }
 
     #[test]

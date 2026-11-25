@@ -4,7 +4,8 @@
 //! Surfaces (cards, header bands) are blends of the theme's background toward
 //! its foreground or accent, so they read the same on light and dark themes.
 //! Colors that carry meaning (states, workspaces) are the terminal's own
-//! sixteen colors, which the theme already defines.
+//! sixteen colors, which the theme already defines. Without a theme the
+//! sidebar uses the terminal's own default colors and tints nothing.
 
 use bmux_color::{Rgb, mix};
 use bmux_plugin::{RenderColor, RenderNamedColor, RenderStyle};
@@ -37,18 +38,26 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The palette of `appearance`, or one for a dark terminal when there is
-    /// none or its colors do not parse.
+    /// The palette of `appearance`. Without a theme (the runtime's unthemed
+    /// default appearance) or when its colors do not parse, the terminal's
+    /// own colors: the host terminal's foreground and background are not
+    /// known, so nothing is blended from a guess at them.
     #[must_use]
-    pub fn from_appearance(appearance: Option<&bmux_appearance::RuntimeAppearance>) -> Self {
-        appearance
-            .and_then(|appearance| {
-                let fg = appearance.foreground.parse::<Rgb>().ok()?;
-                let bg = appearance.background.parse::<Rgb>().ok()?;
-                let accent = appearance.cursor.parse::<Rgb>().unwrap_or(fg);
-                Some(Self::from_colors(fg, bg, accent))
-            })
-            .unwrap_or_default()
+    pub fn from_appearance(appearance: &bmux_appearance::RuntimeAppearance) -> Self {
+        let unthemed = bmux_appearance::RuntimeAppearance::default();
+        if appearance.foreground == unthemed.foreground
+            && appearance.background == unthemed.background
+        {
+            return Self::default();
+        }
+        let (Ok(fg), Ok(bg)) = (
+            appearance.foreground.parse::<Rgb>(),
+            appearance.background.parse::<Rgb>(),
+        ) else {
+            return Self::default();
+        };
+        let accent = appearance.cursor.parse::<Rgb>().unwrap_or(fg);
+        Self::from_colors(fg, bg, accent)
     }
 
     /// The palette blended from a theme's foreground, background and accent.
@@ -77,21 +86,22 @@ impl Palette {
     }
 }
 
+/// The terminal's own colors, for any background: text in its default
+/// foreground and named colors, no tinted surfaces (the shown tab keeps its
+/// bar and bold name), and hovered rows and header bands in reverse video.
 impl Default for Palette {
     fn default() -> Self {
         Self {
             base: RenderStyle::new(),
-            text: RenderStyle::new().named_foreground(RenderNamedColor::White),
-            strong: RenderStyle::new()
-                .named_foreground(RenderNamedColor::BrightWhite)
-                .bold(),
+            text: RenderStyle::new(),
+            strong: RenderStyle::new().bold(),
             muted: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlack),
             faint: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlack),
             accent: RenderColor::Named(RenderNamedColor::Blue),
-            active_card: RenderStyle::new().background(RenderColor::Indexed(237)),
-            hover_card: RenderStyle::new().background(RenderColor::Indexed(235)),
-            band: RenderStyle::new().background(RenderColor::Indexed(236)),
-            band_hover: RenderStyle::new().background(RenderColor::Indexed(238)),
+            active_card: RenderStyle::new(),
+            hover_card: RenderStyle::new().reverse(),
+            band: RenderStyle::new(),
+            band_hover: RenderStyle::new().reverse(),
             on_pill: RenderColor::Named(RenderNamedColor::Black),
         }
     }
@@ -248,5 +258,29 @@ mod tests {
             }
             assert!(luminance(palette.muted, false).contrast_ratio(bg) > 3.0);
         }
+    }
+
+    /// Without a theme, nothing assumes a dark terminal: no fixed text color
+    /// or tinted surface, so light terminals get no black card.
+    #[test]
+    fn without_a_theme_the_palette_uses_the_terminals_own_colors() {
+        let unthemed = Palette::from_appearance(&bmux_appearance::RuntimeAppearance::default());
+        assert_eq!(unthemed, Palette::default());
+        for surface in [
+            unthemed.active_card,
+            unthemed.hover_card,
+            unthemed.band,
+            unthemed.band_hover,
+        ] {
+            assert_eq!(surface.bg, None);
+        }
+        assert_eq!(unthemed.text.fg, None);
+        assert_ne!(unthemed.hover_card, unthemed.base, "hover still shows");
+        let themed = Palette::from_appearance(&bmux_appearance::RuntimeAppearance {
+            foreground: "#1f2328".into(),
+            background: "#ffffff".into(),
+            ..bmux_appearance::RuntimeAppearance::default()
+        });
+        assert!(themed.active_card.bg.is_some());
     }
 }

@@ -1295,3 +1295,115 @@ fn shown_and_hidden_controls_agree_with_painting_at_every_size() {
         }
     }
 }
+
+/// Controls painted inline at the end of a borderless row: right-aligned, a space between each
+/// two while they fit, packed when not, and cut from the right when even that does not fit; each
+/// with its hit region and its hover style.
+#[test]
+fn inline_controls_paint_at_the_row_end_with_hit_regions_and_hover_styles() {
+    use bmux_tui::style::{Color, Style};
+    let paint = |controls: WindowControls, width: u16| {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let start = controls.paint_inline(
+            "panel",
+            Rect::new(0, 0, width, 1),
+            &mut PaintCx::new(&mut frame),
+        );
+        let hits = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| (region.id.as_str().to_owned(), region.area))
+            .collect::<Vec<_>>();
+        drop(frame);
+        (start, buffer, hits)
+    };
+    let row = |buffer: &Buffer| buffer.row_symbols(0).unwrap_or_default();
+    let controls = WindowControls::new(PanelShape::Normal).maximizable(false);
+    assert_eq!(controls.inline_width(), 3);
+    let (start, buffer, hits) = paint(controls, 10);
+    assert_eq!((start, row(&buffer).as_str()), (7, "       ▾ ×"));
+    assert_eq!(
+        hits,
+        [
+            ("panel.action.minimize".to_owned(), Rect::new(7, 0, 1, 1)),
+            ("panel.action.close".to_owned(), Rect::new(9, 0, 1, 1)),
+        ]
+    );
+    let (start, buffer, _) = paint(controls, 2);
+    assert_eq!((start, row(&buffer).as_str()), (0, "▾×"));
+    let (_, buffer, hits) = paint(controls, 1);
+    assert_eq!(row(&buffer), "▾");
+    assert_eq!(hits.len(), 1);
+
+    // All three, and only restore on a strip.
+    let all = WindowControls::new(PanelShape::Normal);
+    assert_eq!(all.inline_width(), 5);
+    assert_eq!(row(&paint(all, 6).1), " ▾ ⤢ ×");
+    let strip = WindowControls::new(PanelShape::Strip);
+    assert_eq!(strip.inline_width(), 1);
+    assert_eq!(row(&paint(strip, 3).1), "  ▸");
+
+    // Hidden controls paint nothing.
+    let (_, buffer, hits) = paint(controls.shown(false), 4);
+    assert_eq!((row(&buffer).as_str(), hits.len()), ("    ", 0));
+
+    // The hovered control takes its hover style; close its own.
+    let styled = |hovered| {
+        let controls = controls
+            .style(Style::new().fg(Color::Yellow))
+            .hover_styles(Style::new().fg(Color::Blue), Style::new().fg(Color::Red))
+            .hovered(hovered);
+        let (_, buffer, _) = paint(controls, 3);
+        [0, 2].map(|x| buffer.get(Point::new(x, 0)).unwrap().style.fg)
+    };
+    assert_eq!(styled(None), [Some(Color::Yellow), Some(Color::Yellow)]);
+    assert_eq!(
+        styled(Some(WindowControl::Minimize)),
+        [Some(Color::Blue), Some(Color::Yellow)]
+    );
+    assert_eq!(
+        styled(Some(WindowControl::Close)),
+        [Some(Color::Yellow), Some(Color::Red)]
+    );
+}
+
+/// `maximizable(false)` drops maximize from an expanded panel's controls; a minimized panel
+/// offers only restore whatever its options, and its strip is as wide as that control.
+#[test]
+fn maximizable_and_strip_width_follow_the_offered_controls() {
+    use WindowControl::{Close, Maximize, Minimize};
+    assert_eq!(
+        WindowControls::new(PanelShape::Normal).list(),
+        [Minimize, Maximize, Close]
+    );
+    assert_eq!(
+        WindowControls::new(PanelShape::Normal)
+            .maximizable(false)
+            .list(),
+        [Minimize, Close]
+    );
+    assert_eq!(
+        WindowControls::new(PanelShape::Maximized)
+            .maximizable(false)
+            .closable(false)
+            .list(),
+        [Minimize]
+    );
+    for shape in [PanelShape::Row, PanelShape::Strip] {
+        assert_eq!(
+            WindowControls::new(shape).maximizable(false).list(),
+            [Minimize]
+        );
+    }
+    // A strip holds its padded restore control between two corners, from any shape.
+    for controls in [
+        WindowControls::new(PanelShape::Normal),
+        WindowControls::new(PanelShape::Normal).maximizable(false),
+        WindowControls::new(PanelShape::Maximized).closable(false),
+        WindowControls::new(PanelShape::Normal).glyphs(WindowGlyphs::ASCII),
+    ] {
+        assert_eq!(controls.strip_width(), 5);
+    }
+}

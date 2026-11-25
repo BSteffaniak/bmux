@@ -173,7 +173,8 @@ impl Default for WindowGlyphs {
 ///
 /// On a title row the controls form one cluster, `┤ ▾ ⤢ × ├`: the caps join the border, a
 /// space sits between the glyphs, and a border cell separates the cluster from the title and
-/// the right title. A minimized strip shows restore by default and can also offer close.
+/// the right title. A minimized strip shows its restore control alone, padded by a space on
+/// each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowControls {
     shape: PanelShape,
@@ -191,7 +192,6 @@ pub struct WindowControls {
 struct WindowControlOptions {
     closable: bool,
     maximizable: bool,
-    close_in_strip: bool,
 }
 
 impl WindowControls {
@@ -205,7 +205,6 @@ impl WindowControls {
             options: WindowControlOptions {
                 closable: true,
                 maximizable: true,
-                close_in_strip: false,
             },
             shown: true,
             glyphs: WindowGlyphs::UNICODE,
@@ -228,13 +227,6 @@ impl WindowControls {
     #[must_use]
     pub const fn maximizable(mut self, maximizable: bool) -> Self {
         self.options.maximizable = maximizable;
-        self
-    }
-
-    /// Whether a minimized strip also offers its close control.
-    #[must_use]
-    pub const fn close_in_strip(mut self, close_in_strip: bool) -> Self {
-        self.options.close_in_strip = close_in_strip;
         self
     }
 
@@ -299,17 +291,18 @@ impl WindowControls {
         self.shown || self.shape.minimized()
     }
 
-    /// The controls the panel offers in title-row order.
+    /// The controls the panel offers in title-row order, left to right, shown or not. A
+    /// minimized panel has only its restore control.
     #[must_use]
     pub fn list(&self) -> Vec<WindowControl> {
+        if self.shape.minimized() {
+            return vec![WindowControl::Minimize];
+        }
         let mut list = vec![WindowControl::Minimize];
-        if !self.shape.minimized() && self.options.maximizable {
+        if self.options.maximizable {
             list.push(WindowControl::Maximize);
         }
-        if self.options.closable
-            && (!self.shape.minimized()
-                || (self.shape == PanelShape::Strip && self.options.close_in_strip))
-        {
+        if self.options.closable {
             list.push(WindowControl::Close);
         }
         list
@@ -350,8 +343,38 @@ impl WindowControls {
         }
     }
 
-    /// Paint controls at the end of a borderless title row. Returns the first
-    /// occupied column so the caller can fit the rest of the title around them.
+    /// The style layered over `control` while it is hovered: the close hover for close, the
+    /// other hover for the rest.
+    const fn hover_style(&self, control: WindowControl) -> Style {
+        match control {
+            WindowControl::Close => self.close_hover,
+            WindowControl::Minimize | WindowControl::Maximize => self.hover,
+        }
+    }
+
+    /// Cells [`Self::paint_inline`] takes for the painted controls given all the room they
+    /// want: their glyphs, a space between each two.
+    #[must_use]
+    pub fn inline_width(&self) -> u16 {
+        let controls = self.painted();
+        let glyphs = controls
+            .iter()
+            .map(|control| self.glyph_width(*control))
+            .fold(0, u16::saturating_add);
+        let gaps = u16::try_from(controls.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        glyphs.saturating_add(gaps)
+    }
+
+    /// Cells of `control`'s glyph.
+    fn glyph_width(&self, control: WindowControl) -> u16 {
+        u16::try_from(Line::raw(self.glyph(control)).width()).unwrap_or(u16::MAX)
+    }
+
+    /// Paint the painted controls ([`Self::painted`]) at the end of a borderless title row,
+    /// `area`, each with a hit region `<id>.action.<control id>`: a space between each two
+    /// when [`Self::inline_width`] fits, packed otherwise, and those that do not fit at all
+    /// left out from the right. Returns the first column they take, so the caller can fit the
+    /// rest of the row around them.
     pub fn paint_inline(
         &self,
         id: &str,
@@ -363,31 +386,24 @@ impl WindowControls {
         use bmux_tui::pointer::PointerIntent;
 
         let controls = self.painted();
-        let glyph_width =
-            |control| u16::try_from(Line::raw(self.glyph(control)).width()).unwrap_or(u16::MAX);
-        let total = controls
+        let gap = u16::from(self.inline_width() <= area.width);
+        let packed = controls
             .iter()
-            .copied()
-            .map(glyph_width)
+            .map(|control| self.glyph_width(*control))
             .fold(0, u16::saturating_add);
         let gaps = u16::try_from(controls.len().saturating_sub(1)).unwrap_or(u16::MAX);
-        let gap = u16::from(total.saturating_add(gaps) <= area.width);
         let mut x = area
             .right()
-            .saturating_sub(total.saturating_add(gaps * gap))
+            .saturating_sub(packed.saturating_add(gaps * gap))
             .max(area.x);
         let start = x;
         for control in controls {
-            let width = glyph_width(control);
+            let width = self.glyph_width(control);
             if x.saturating_add(width) > area.right() || area.height == 0 {
                 break;
             }
             let style = if self.hovered == Some(control) {
-                self.style.patch(if control == WindowControl::Close {
-                    self.close_hover
-                } else {
-                    self.hover
-                })
+                self.style.patch(self.hover_style(control))
             } else {
                 self.style
             };
@@ -437,12 +453,8 @@ impl WindowControls {
 
     /// The title action of `control`.
     fn action(&self, control: WindowControl) -> PaneTitleAction {
-        let hover = if control == WindowControl::Close {
-            self.close_hover
-        } else {
-            self.hover
-        };
-        PaneTitleAction::new(control.id(), self.label(control)).hover_style(hover)
+        PaneTitleAction::new(control.id(), self.label(control))
+            .hover_style(self.hover_style(control))
     }
 
     /// `pane` with the painted controls appended as its last title-row actions: one cluster

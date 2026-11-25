@@ -4,12 +4,13 @@ Bundled vertical status board of the tabs: what each one is running, where,
 on which git branch, and whether it needs you.
 
 Each tab is a card: a state glyph (a spinner while it works), the tab's name
-and, at the right, its state: a solid pill when it needs you or failed,
-otherwise the state or running command and how long it has been so. Below it,
-dimmed, what it asks you, or its directory and git status (branch, `*` when
-dirty, `↑`/`↓` ahead and behind); when space is short the directory shortens
-to its last part, then gives way to git. The tab you are looking at has a bar
-and a tinted background. The heading sums up what every listed tab is doing.
+and, at the right, its state: a solid pill when it needs you, failed or
+finished unseen, otherwise the state or running command and how long it has
+been so. Below it, dimmed, what it asks you, or its directory and git status
+(branch, `*` when dirty, `↑`/`↓` ahead and behind); when space is short the
+directory shortens to its last part, then gives way to git. The tab you are
+looking at has a bar, a bold name and, with a theme, a tinted background. The
+heading sums up what every listed tab is doing.
 
 The tabs listed, their order and their names come from this attachment's
 personal tab view (`bmux.tabs/personal-view`, delivered to it alone): each
@@ -36,7 +37,14 @@ the sidebar list the shared catalog as it is.
 Every color comes from your theme: cards and header bands are blends of its
 background toward its foreground or accent, so they read the same on light
 and dark themes, and states and workspaces use your terminal's own colors.
-Below 20 columns cards are one line and their state is their glyph.
+Without a theme the sidebar uses your terminal's default colors and tints
+nothing (a hovered row shows in reverse video), so it reads on any terminal
+background. Below 20 columns cards are one line and their state is their
+glyph.
+
+The directory and branch are marked with Nerd Font icons (folder `U+F07B` and
+branch `U+E0A0`). They need a Nerd Font in your terminal; without one they show
+as boxes or blanks, so set `icons = false` to leave them out.
 
 Sidebar states, most urgent first (see also the tabs plugin README):
 
@@ -46,14 +54,18 @@ Sidebar states, most urgent first (see also the tabs plugin README):
 | `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
 | `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
 | `◉` green   | working     | its agent is working (a spinner by default)                                                                                                                                          |
-| `›` magenta | shell       | a pane is running a foreground command, including quiet commands                                                                                                                     |
+| `›` magenta | shell       | a tab without an agent has a pane running a foreground command, including quiet commands; the command's name is its summary                                                          |
 | `■` blue    | stopped     | its agent returned to idle after observed work                                                                                                                                       |
 | `○` dim     | idle        | otherwise                                                                                                                                                                            |
 
+A tab with an agent always shows its agent's state: a command running in
+another of its panes (an editor beside the agent, say) does not replace it,
+and only adds to the shell counts.
+
 Looking at a tab means some attach client shows it while its terminal has
 focus; it counts for every client, and what was not yet seen is kept across
-detaching and restarts. The selected tab is marked by its tinted card and bar,
-never by its state glyph.
+detaching and restarts. The selected tab is marked by its bar (and tinted
+card), never by its state glyph.
 
 A tab's agent state comes from the agents plugin (`bmux.agents`, see
 `plugins/agents-plugin/README.md`), which recognizes coding agents in each
@@ -94,39 +106,49 @@ status_template = ""
 maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
-collapsed_width = 2
+collapsed_width = 2         # the strip; must be less than width
 visible = false            # closed when a client attaches
 remember_visibility = true  # start from the last state set on this machine
 remember_width = true       # start from the width last resized to on this machine
 remember_groups = true      # remember manual expansion and collapse choices
 working_indicator = "spinner" # or "static": a still ◉
 density = "comfortable"     # or "compact": one line per tab
+icons = true                # Nerd Font folder and branch icons
 
 [plugins.settings."bmux.sidebar".workspace_colors]
 bmux = "magenta"            # a terminal color name, or "#rrggbb"
 ```
 
+`minimum_width` was removed: the sidebar narrows down to `collapsed_width`,
+where it becomes its status strip. A configured `minimum_width` is ignored,
+with a warning in the log. `collapsed_width` must be less than `width`: a
+sidebar no wider than `collapsed_width` is drawn as the strip.
+
 With `grouping = "workspace"` and `scope = "all_workspaces"`, use
 `workspace_visibility = "follow_focus"` to expand the focused tab's workspace
 and collapse the other workspaces to their headers.
-`"follow_focus_and_attention"`
-also opens background workspaces with a blocked or failed tab. Add workspace
+`"follow_focus_and_attention"` also opens background workspaces with a tab
+that deserves a look: one that needs input, failed or is done. Add workspace
 names to `pinned_workspaces` to keep those groups open by default.
 
 `other_workspace_tabs = "active"` limits open background groups to tabs with
-working agents, foreground shell commands, blocked activity, or failures.
-Every workspace keeps its header and full status counts, and the focused
-workspace shows every tab. Click a header to expand or collapse
-it manually. In follow modes, manual overrides last until focus switches
-workspaces. With `remember_groups = true`, the sidebar reloads the manual
-choices
-you left in effect. In manual mode, those choices also survive focus changes.
+working agents, foreground shell commands, or a state that deserves a look
+(needs input, failed or done). Every workspace keeps its header and full status
+counts, and the focused workspace shows every tab. Click a header to expand or
+collapse it manually. In follow modes, manual overrides last until focus
+switches workspaces. With `remember_groups = true`, the sidebar reloads the
+manual choices you left in effect. In manual mode, those choices also survive
+focus changes. Switching tabs always scrolls the shown tab into view; other
+changes leave the scroll where it is.
 
 Templates support `{state_icon}`, `{state}`, `{name}`, `{command}`, `{cwd}`,
 `{branch}`, `{detail}`, `{marker}`, `{index}`, `{id}`, `{active}`, `{fact}`,
-`{fact_detail}` and `{fact_icon}`.
-Descriptions wrap to two display-cell-safe lines; status renders on a separate
-line when configured.
+`{fact_detail}`, `{fact_icon}`, `{folder_icon}` and `{branch_icon}`. The two
+icons expand to the Nerd Font icon and a space when the tab has a directory or
+branch to mark and `icons = true`, and to nothing otherwise, so a custom
+description such as `"{folder_icon}{cwd} {branch_icon}{branch}"` follows the
+setting. Descriptions wrap to two display-cell-safe lines; status renders on a
+separate line when configured.
 
 It is enabled by default but starts hidden; open it with `ctrl+alt+s`, or set
 `visible = true` to show it on attach. Disable it with
@@ -145,14 +167,13 @@ band across the sidebar marked with the workspace's color (one picked from
 its name unless `workspace_colors` sets it), which also runs down its tabs as
 a thin rail; a blank row sets each group off from the next. While a group's
 tabs scroll under the top, its header stays pinned there. The header sums up
-what its tabs are doing: how many need input (`◆`), failed (`▲`), are
-working (`◉`) and have stopped (`■`), most pressing first, or how many tabs
-it
-holds when none is doing anything. Click a header (or press Enter or space on
-it) to collapse or expand its group; left and right collapse and expand. A
-collapsed header still shows its sum, and is marked when it hides the tab you
-are looking at. Manual group choices are remembered on this machine unless
-`remember_groups = false`.
+what its tabs are doing: how many need input (`◆`), failed (`▲`), are done
+(`✓`), are working (`◉`), run a shell command (`›`) and have stopped (`■`),
+most pressing first, or how many tabs it holds when none is doing anything.
+Click a header (or press Enter or space on it) to collapse or expand its group;
+left and right collapse and expand. A collapsed header still shows its sum, and
+is marked when it hides the tab you are looking at. Manual group choices are
+remembered on this machine unless `remember_groups = false`.
 
 `scope = "current_workspace"` lists only the workspace of the tab you are
 looking at, grouped or not, and follows you as you switch tabs.
@@ -177,19 +198,23 @@ cursor there, on terminals that support OSC 22 pointer shapes), or with
 `plugin:bmux.sidebar:widen` and `plugin:bmux.sidebar:narrow` (`ctrl+a >` and
 `ctrl+a <` by default, two cells per press; hold to repeat). Resize between
 `collapsed_width` and `maximum_width`. The sidebar becomes a status strip at
-the floor, and dragging outward brings the tabs back. Its last expanded width
-is remembered on this machine unless `remember_width = false`.
+the floor, and dragging outward brings the tabs back; widening the strip starts
+from the last expanded width. Its last expanded width is remembered on this
+machine unless `remember_width = false`.
 
 Workspace and sidebar headers count each tab with a foreground shell command
 once. A split tab can also contribute to an agent count when the agent runs in
 a different pane.
 
-Use ▾ to minimize and ▸ to restore. The default strip has one column for
-restore and live status glyphs across all workspaces, plus a resize rail.
-Set a larger `collapsed_width` to show status counts as space allows.
-The strip also appears automatically below `collapse_below_width` and
-expands when space returns. You can restore it explicitly on a narrow terminal.
+Use ▾ to minimize and ▸ to restore. The strip shows the restore control and,
+below it, live status across all workspaces, even when the full sidebar is
+scoped to the current workspace, plus a resize rail. At the default
+`collapsed_width = 2` the strip has one column for them, so it shows each
+state's glyph without its count; set a larger `collapsed_width` to show counts
+(`◆2`) as space allows. The strip also appears automatically below
+`collapse_below_width` and expands when space returns. One restore always shows
+the tabs, on a narrow terminal too: there the sidebar keeps its width but leaves
+the panes at least 20 columns.
 
 Use × in the expanded header to close the sidebar and return its space to the
-terminal. Reopen it
-with the usual sidebar toggle (`ctrl+alt+s` by default).
+terminal. Reopen it with the usual sidebar toggle (`ctrl+alt+s` by default).

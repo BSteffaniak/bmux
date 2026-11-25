@@ -14,6 +14,11 @@
 //! - **stopped**: its agent returned to idle after observed work;
 //! - **idle**: otherwise.
 //!
+//! A tab without an agent whose pane runs a foreground command (the
+//! published `shell-command`) shows as **shell** instead of working or idle,
+//! with that command's name. A tab with an agent always shows its agent's
+//! state; a command running beside the agent only adds to the shell counts.
+//!
 //! This turns that into what a card says: its summary, detail and ages.
 //! Server times are compared with the server's own clock (`now-ms` at
 //! publication, advanced by the time since it arrived), never this client's.
@@ -51,16 +56,31 @@ impl From<tabs_status::TabState> for TabState {
 }
 
 impl TabState {
+    /// The state a card shows for `status`: the published one, except that a
+    /// tab without an agent running a foreground command shows as a shell.
     fn displayed(status: &TabStatus) -> Self {
         let state = Self::from(status.state);
-        if status.shell_command.is_some()
-            && (matches!(state, Self::Idle | Self::Stopped)
-                || (state == Self::Working && status.agent.is_none()))
+        if status.agent.is_none()
+            && status.shell_command.is_some()
+            && matches!(state, Self::Working | Self::Stopped | Self::Idle)
         {
             Self::Shell
         } else {
             state
         }
+    }
+
+    /// Whether a tab in this state deserves a look: it needs input, failed,
+    /// or finished unseen.
+    #[must_use]
+    pub const fn deserves_a_look(self) -> bool {
+        matches!(self, Self::Blocked | Self::Failed | Self::Done)
+    }
+
+    /// Whether a card in this state shows how long it has been in it.
+    #[must_use]
+    pub const fn shows_age(self) -> bool {
+        matches!(self, Self::Working | Self::Stopped | Self::Done)
     }
 
     #[must_use]
@@ -148,6 +168,7 @@ impl TabActivity {
 pub struct ActivityView {
     snapshot: Option<(TabStatusSnapshot, Instant)>,
     positions: std::collections::HashMap<Uuid, usize>,
+    generation: u64,
     home: Option<String>,
 }
 
@@ -156,12 +177,15 @@ impl Default for ActivityView {
         Self {
             snapshot: None,
             positions: std::collections::HashMap::new(),
+            generation: 0,
             home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
         }
     }
 }
 
-/// Shell integration reports the full command, including leading environment assignments.
+/// The program a command line runs, by its base name: the first shell word
+/// after any leading `NAME=value` assignments (shell integration reports the
+/// full command), with its quotes and backslash escapes removed.
 fn command_program(command: &str) -> Option<String> {
     fn is_assignment(word: &str) -> bool {
         let Some((name, _)) = word.split_once('=') else {
@@ -175,46 +199,67 @@ fn command_program(command: &str) -> Option<String> {
     }
 
     let mut remaining = command.trim_start();
-    let first = remaining.split_whitespace().next()?;
-    let program = if is_assignment(first) {
-        while remaining
-            .split_whitespace()
-            .next()
-            .is_some_and(is_assignment)
-        {
-            remaining = remaining.get(shell_word_end(remaining)?..)?.trim_start();
+    let word = loop {
+        let (word, rest) = remaining.split_at(shell_word_end(remaining));
+        remaining = rest.trim_start();
+        if !is_assignment(word) {
+            break word;
         }
-        let word = remaining.get(..shell_word_end(remaining)?)?;
-        let unquoted = word
-            .strip_prefix('"')
-            .and_then(|word| word.strip_suffix('"'))
-            .or_else(|| {
-                word.strip_prefix('\'')
-                    .and_then(|word| word.strip_suffix('\''))
-            });
-        unquoted.unwrap_or(word)
-    } else {
-        first
     };
-    (!program.is_empty()).then(|| program.rsplit('/').next().unwrap_or(program).to_string())
+    let program = unquote(word);
+    let name = program.rsplit('/').next().unwrap_or(&program);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Find the end of one shell word without expanding its contents or executing shell syntax.
-fn shell_word_end(command: &str) -> Option<usize> {
+/// Where the shell word `command` starts with ends: at the first unquoted,
+/// unescaped whitespace. Nothing is expanded or run. An unterminated quote or
+/// a trailing backslash runs to the end, the best guess at the word.
+fn shell_word_end(command: &str) -> usize {
     let mut quote = None;
     let mut chars = command.char_indices();
     while let Some((index, character)) = chars.next() {
         match (quote, character) {
             (Some(active), character) if active == character => quote = None,
             (None | Some('"'), '\\') => {
-                chars.next()?;
+                chars.next();
             }
             (None, '"' | '\'') => quote = Some(character),
-            (None, character) if character.is_whitespace() => return Some(index),
+            (None, character) if character.is_whitespace() => return index,
             _ => {}
         }
     }
-    quote.is_none().then_some(command.len())
+    command.len()
+}
+
+/// One shell word's text: its quotes removed and its backslash escapes
+/// resolved, as the shell would pass it to the program.
+fn unquote(word: &str) -> String {
+    let mut text = String::with_capacity(word.len());
+    let mut quote = None;
+    let mut chars = word.chars().peekable();
+    while let Some(character) = chars.next() {
+        match (quote, character) {
+            (Some(active), character) if active == character => quote = None,
+            (None, '"' | '\'') => quote = Some(character),
+            // An escaped character stands for itself; an escaped newline
+            // continues the line.
+            (None, '\\') => text.extend(chars.next().filter(|next| *next != '\n')),
+            // Within double quotes, a backslash escapes only these.
+            (Some('"'), '\\') => match chars.peek() {
+                Some(&next @ ('"' | '\\' | '$' | '`')) => {
+                    chars.next();
+                    text.push(next);
+                }
+                // A line continuation: both go.
+                Some('\n') => {
+                    chars.next();
+                }
+                _ => text.push('\\'),
+            },
+            (_, character) => text.push(character),
+        }
+    }
+    text
 }
 
 impl ActivityView {
@@ -225,6 +270,7 @@ impl ActivityView {
             self.positions.entry(status.tab_id).or_insert(index);
         }
         self.snapshot = Some((snapshot, Instant::now()));
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// The latest status snapshot.
@@ -289,12 +335,7 @@ impl ActivityView {
             .flatten();
         let since = status
             .state_since_ms
-            .filter(|_| {
-                matches!(
-                    state,
-                    TabState::Working | TabState::Stopped | TabState::Done
-                )
-            })
+            .filter(|_| state.shows_age())
             .map(|at| format_age(now.saturating_sub(at)));
         let cwd = status.cwd.as_deref().map(|cwd| self.shorten_home(cwd));
         let branch = status.git.as_ref().map(|git| {
@@ -340,24 +381,23 @@ impl ActivityView {
         })
     }
 
-    /// Whether any tab is working, so a working spinner may be on screen.
+    /// Whether any tab's shown age can change with time alone, so the view
+    /// should be refreshed: only working, stopped and done tabs show one.
     #[must_use]
-    pub fn any_working(&self) -> bool {
+    pub fn time_sensitive(&self) -> bool {
         self.snapshot.as_ref().is_some_and(|(snapshot, _)| {
             snapshot
                 .tabs
                 .iter()
-                .any(|tab| TabState::displayed(tab) == TabState::Working)
+                .any(|tab| tab.state_since_ms.is_some() && TabState::displayed(tab).shows_age())
         })
     }
 
-    /// Whether any tab's shown ages can change with time alone, so the view
-    /// should be refreshed.
+    /// How many times a snapshot was taken, so views derived from it know
+    /// when they are stale.
     #[must_use]
-    pub fn time_sensitive(&self) -> bool {
-        self.snapshot.as_ref().is_some_and(|(snapshot, _)| {
-            snapshot.tabs.iter().any(|tab| tab.state_since_ms.is_some())
-        })
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn shorten_home(&self, cwd: &str) -> String {
@@ -563,6 +603,96 @@ mod tests {
         assert_eq!(shown.state, TabState::Idle);
         assert_eq!(shown.summary.as_deref(), Some("claude"));
         assert!(shown.agent.is_none());
+    }
+
+    /// The program is the first word after any assignments, its quotes and
+    /// escapes resolved as the shell would, named by its base name.
+    #[test]
+    fn programs_are_named_by_their_first_shell_word() {
+        for (command, program) in [
+            ("make watch", Some("make")),
+            ("/usr/bin/claude --resume", Some("claude")),
+            ("'/opt/my tools/bcode' --x", Some("bcode")),
+            ("\"bcode\"", Some("bcode")),
+            ("\"/opt/my tools/bcode\" run", Some("bcode")),
+            ("/opt/my\\ tools/bcode --x", Some("bcode")),
+            ("b'co'\"de\" x", Some("bcode")),
+            ("\"/opt/a\\\"b/bcode\"", Some("bcode")),
+            ("FOO=1 BAR='a b' nvim file", Some("nvim")),
+            ("  FOO=1   /bin/zsh", Some("zsh")),
+            // Unterminated: the best guess at the word, not nothing.
+            ("'/opt/my tools/bcode --x", Some("bcode --x")),
+            ("bcode\\", Some("bcode")),
+            ("FOO=1", None),
+            ("", None),
+            ("\"\"", None),
+        ] {
+            assert_eq!(
+                command_program(command).as_deref(),
+                program,
+                "program of {command:?}"
+            );
+        }
+    }
+
+    /// Only a tab without an agent shows its foreground command as a shell;
+    /// an agent's tab keeps its agent's state.
+    #[test]
+    fn shell_commands_show_only_on_tabs_without_an_agent() {
+        let tab = Uuid::from_u128(3);
+        for state in [tabs_status::TabState::Working, tabs_status::TabState::Idle] {
+            let mut plain = status(3, state);
+            plain.shell_command = Some("cargo build --release".into());
+            let shown = view(vec![plain], 10_000).activity(tab).unwrap();
+            assert_eq!(shown.state, TabState::Shell);
+            assert_eq!(shown.summary.as_deref(), Some("cargo"));
+        }
+
+        // An agent that stopped, with nvim open in a side pane: stopped.
+        let mut stopped = status(3, tabs_status::TabState::Stopped);
+        stopped.agent = Some(agent(AgentActivity::Idle));
+        stopped.shell_command = Some("nvim".into());
+        let shown = view(vec![stopped.clone()], 10_000).activity(tab).unwrap();
+        assert_eq!(shown.state, TabState::Stopped);
+        assert_eq!(shown.summary.as_deref(), Some("stopped"));
+        // Its counts still include the side pane's command.
+        assert_eq!(
+            view(vec![stopped], 10_000).status_summary(tab),
+            Some((TabState::Stopped, true))
+        );
+
+        // An idle agent shows its name, not the side pane's command.
+        let mut idle = status(3, tabs_status::TabState::Idle);
+        idle.agent = Some(agent(AgentActivity::Idle));
+        idle.shell_command = Some("nvim".into());
+        let shown = view(vec![idle], 10_000).activity(tab).unwrap();
+        assert_eq!(shown.state, TabState::Idle);
+        assert_eq!(shown.summary.as_deref(), Some("claude"));
+    }
+
+    /// Only states that show an age make the view change with time.
+    #[test]
+    fn only_shown_ages_make_the_view_time_sensitive() {
+        let since = |state| {
+            let mut tab = status(4, state);
+            tab.state_since_ms = Some(1_000);
+            tab
+        };
+        for state in [
+            tabs_status::TabState::NeedsInput,
+            tabs_status::TabState::Failed,
+            tabs_status::TabState::Idle,
+        ] {
+            assert!(!view(vec![since(state)], 10_000).time_sensitive());
+        }
+        for state in [
+            tabs_status::TabState::Working,
+            tabs_status::TabState::Stopped,
+            tabs_status::TabState::Done,
+        ] {
+            assert!(view(vec![since(state)], 10_000).time_sensitive());
+        }
+        assert!(!view(vec![status(4, tabs_status::TabState::Working)], 10_000).time_sensitive());
     }
 
     #[test]

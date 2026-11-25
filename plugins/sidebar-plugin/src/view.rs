@@ -193,7 +193,9 @@ fn content_width(width: u64) -> u64 {
     width.saturating_sub(u64::from(CONTENT_X) + 1)
 }
 
-fn detail_width(width: u64) -> u64 {
+/// The width a card's description and status may use in a row `width` cells
+/// wide.
+pub fn detail_width(width: u64) -> u64 {
     width.saturating_sub(u64::from(DETAIL_X) + 2)
 }
 

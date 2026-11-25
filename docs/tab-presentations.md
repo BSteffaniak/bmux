@@ -194,7 +194,6 @@ See `plugins/tab-bar-plugin/README.md#plugin-contributions` for the API.
 [plugins.settings."bmux.sidebar"]
 placement = "left"              # "left" or "right"
 width = 28
-minimum_width = 16
 maximum_width = 60
 order = 200
 show_index = true
@@ -205,22 +204,26 @@ status_template = ""
 maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
-collapsed_width = 2
+collapsed_width = 2             # less than width
 visible = false
 remember_visibility = true
+icons = true                    # Nerd Font folder and branch icons
 ```
+
+`minimum_width` was removed (the sidebar narrows to `collapsed_width`, where it
+becomes a status strip); a configured value is ignored with a logged warning.
 
 Each tab is a card: a state glyph, the tab's name and, at the right, its
 running command or state; below it, dimmed, the focused pane's directory and
-git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you
-are
-looking at has an accent bar and a tinted background.
+git status (branch, `*` when dirty, `↑`/`↓` ahead and behind), marked with Nerd
+Font icons unless `icons = false`. The tab you are looking at has an accent
+bar and, with a theme, a tinted background.
 
 ```text
  TABS                         4
-▎ ● editor                 nvim
+▎ › editor                 nvim
 ▎   ~/bmux · main* ↑2
-  ◉ claude              working
+  ◉ claude           working 1m
     ~/bmux/plugins
   ▲ build              exit 101
     ~/build
@@ -230,19 +233,25 @@ looking at has an accent bar and a tinted background.
 
 States, most urgent first:
 
-| Glyph      | State   | When                                                                                                                                                                                         |
-| ---------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `◆` yellow | blocked | its agent needs you to answer or approve something, or (any other program) the tab rang the bell or sent a notification since you last looked at it; the message replaces the directory line |
-| `▲` red    | failed  | its last command exited non-zero (needs OSC 133 shell integration)                                                                                                                           |
-| `◉` green  | working | its agent is working, or another command is running and produced output in the last few seconds                                                                                              |
-| `●` blue   | done    | its agent finished since you last looked at the tab                                                                                                                                          |
-| `○` dim    | idle    | otherwise (the tab you are looking at shows a bright `●`)                                                                                                                                    |
+| Glyph       | State       | When                                                                                                                                                                                 |
+| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
+| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
+| `◉` green   | working     | its agent is working (a spinner by default)                                                                                                                                          |
+| `›` magenta | shell       | a tab without an agent has a pane running a foreground command; the command's name is its summary                                                                                    |
+| `■` blue    | stopped     | its agent returned to idle after observed work, and that was seen                                                                                                                    |
+| `○` dim     | idle        | otherwise                                                                                                                                                                            |
+
+A tab with an agent always shows its agent's state; a command in another of
+its panes only adds to the shell counts in the headers.
 
 A tab's agent state comes from the agents plugin (`bmux.agents`, see
 `plugins/agents-plugin/README.md`), which recognizes coding agents in each
 pane's foreground and reads what they are doing from their screens and their
-own reports; a tab with several shows its most pressing. "Since you last
-looked" is per attach client.
+own reports; a tab with several shows its most pressing. Looking at a tab
+means some attach client shows it while its terminal has focus; it counts for
+every client.
 
 The data comes from the tabs plugin's `bmux.tabs/tabs-status` state, which it
 derives on the server from each pane's terminal signals (title, OSC 7
@@ -261,8 +270,10 @@ only ever runs in the directory the shell itself reports, with
 
 Sidebar templates support `{state_icon}`, `{state}`, `{name}`, `{command}`,
 `{cwd}`, `{branch}`, `{detail}`, `{marker}`, `{index}`, `{id}`, `{active}`,
-`{fact}`, `{fact_detail}`, and `{fact_icon}`. The generic layout resolver
-composes it with the bar when enabled.
+`{fact}`, `{fact_detail}`, `{fact_icon}`, `{folder_icon}`, and `{branch_icon}`
+(the Nerd Font icons, empty with `icons = false` or when the tab has no
+directory or branch). The generic layout resolver composes it with the bar
+when enabled.
 
 ## Legacy configuration
 
