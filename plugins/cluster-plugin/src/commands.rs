@@ -221,14 +221,41 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
     Ok(EXIT_OK)
 }
 
+/// How long a membership read waits for an election in progress to settle.
+const MEMBERSHIP_ELECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn read_authoritative_members(context: &NativeCommandContext) -> Result<ClusterMemberList, String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("cluster membership read requires the host runtime: {error}"))?;
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     tokio::task::block_in_place(|| {
-        handle.block_on(
-            bmux_cluster_plugin_api::cluster_control_state::client::read_linearizable(&mut client),
-        )
+        handle.block_on(async {
+            // Wait out an election in progress (a voter that knows no leader yet)
+            // rather than failing a read that would succeed moments later. Any other
+            // answer is final: a known leader elsewhere, or `RuntimeUnavailable`,
+            // which a process without the consensus runtime always answers.
+            let deadline = tokio::time::Instant::now() + MEMBERSHIP_ELECTION_WAIT;
+            loop {
+                let result =
+                    bmux_cluster_plugin_api::cluster_control_state::client::read_linearizable(
+                        &mut client,
+                    )
+                    .await;
+                let electing = matches!(
+                    result,
+                    Ok(Err(
+                        bmux_cluster_plugin_api::cluster_types::ControlServiceError::NotLeader {
+                            leader_node_id: None,
+                            ..
+                        }
+                    ))
+                );
+                if !electing || tokio::time::Instant::now() >= deadline {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        })
     })
     .map_err(|error| format!("replicated membership dispatch failed: {error}"))?
     .map(|view| ClusterMemberList {

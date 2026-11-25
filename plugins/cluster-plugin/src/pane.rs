@@ -1106,8 +1106,10 @@ mod probe_authority_tests {
     use super::*;
     use bmux_connections_plugin_api::{
         connection_types::{ConnectionError, ServiceInvokeKind},
-        connections_commands, hosting_state, hosting_types::HostingStatus,
-        saved_host_types::SavedHost, saved_hosts_state,
+        connections_commands, hosting_state,
+        hosting_types::HostingStatus,
+        saved_host_types::SavedHost,
+        saved_hosts_state,
     };
     use bmux_plugin_sdk::{Result as PluginResult, ServiceKind};
     use std::sync::Mutex;
@@ -1162,8 +1164,8 @@ mod probe_authority_tests {
                 .push(invocation.target.clone());
             let answer = self.answers.lock().unwrap().remove(0);
             let result = match answer {
-                Answer::Status { endpoint_id } => Ok(bmux_plugin_sdk::encode_service_message(
-                    &HostingStatus {
+                Answer::Status { endpoint_id } => {
+                    Ok(bmux_plugin_sdk::encode_service_message(&HostingStatus {
                         enabled: true,
                         source: "remote enable".into(),
                         endpoint_id: endpoint_id.into(),
@@ -1171,8 +1173,8 @@ mod probe_authority_tests {
                         relay_mode: "disabled".into(),
                         relay: None,
                         warning: None,
-                    },
-                )?),
+                    })?)
+                }
                 Answer::Refused => Err(ConnectionError::ServiceFailed {
                     target: invocation.target,
                     reason: "remote principal may not use this route".into(),
@@ -1235,10 +1237,16 @@ mod probe_authority_tests {
         fn session_list(&self) -> Result<SessionListResponse, String> {
             unreachable!()
         }
-        fn session_create(&self, _: &SessionCreateRequest) -> Result<SessionCreateResponse, String> {
+        fn session_create(
+            &self,
+            _: &SessionCreateRequest,
+        ) -> Result<SessionCreateResponse, String> {
             unreachable!()
         }
-        fn session_select(&self, _: &SessionSelectRequest) -> Result<SessionSelectResponse, String> {
+        fn session_select(
+            &self,
+            _: &SessionSelectRequest,
+        ) -> Result<SessionSelectResponse, String> {
             unreachable!()
         }
         fn pane_list(&self, _: &PaneListRequest) -> Result<PaneListResponse, String> {
@@ -1301,7 +1309,11 @@ mod probe_authority_tests {
         assert_eq!(*port.invocations.lock().unwrap(), ["fixture"]);
         // `local` is refused even when named directly.
         let direct = crate::endpoint::probe_saved_host(&port, HealthProbe::Test, "local");
-        assert!(direct.unwrap_err().contains("not a cluster member endpoint"));
+        assert!(
+            direct
+                .unwrap_err()
+                .contains("not a cluster member endpoint")
+        );
         assert_eq!(port.invocations.lock().unwrap().len(), 1);
     }
 

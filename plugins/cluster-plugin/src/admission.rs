@@ -58,7 +58,11 @@ const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
 const REMOTE_QUERIES: &[(&str, &str, &[&str])] = &[
     // The leader's reconciler asks a worker for an execution before launching it again
     // (launch is idempotent per execution id; this only reads its state).
-    ("bmux.server_clusters.read", "cluster-worker-state/v2", &["get"]),
+    (
+        "bmux.server_clusters.read",
+        "cluster-worker-state/v2",
+        &["get"],
+    ),
     // An attaching client follows an execution's screen from its worker; every authority
     // is an observe lease the ingress signed, verified by the worker.
     (
@@ -94,19 +98,21 @@ pub fn remote_protocol(
 
 /// Every remote protocol operation, for tests.
 #[cfg(test)]
-pub fn remote_protocol_operations()
--> Vec<(ServiceKind, &'static str, &'static str, &'static str)> {
+pub fn remote_protocol_operations() -> Vec<(ServiceKind, &'static str, &'static str, &'static str)>
+{
     [
         (ServiceKind::Command, REMOTE_PROTOCOLS),
         (ServiceKind::Query, REMOTE_QUERIES),
     ]
     .into_iter()
     .flat_map(|(kind, table)| {
-        table.iter().flat_map(move |(capability, interface, operations)| {
-            operations
-                .iter()
-                .map(move |operation| (kind, *capability, *interface, *operation))
-        })
+        table
+            .iter()
+            .flat_map(move |(capability, interface, operations)| {
+                operations
+                    .iter()
+                    .map(move |operation| (kind, *capability, *interface, *operation))
+            })
     })
     .collect()
 }

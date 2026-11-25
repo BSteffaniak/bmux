@@ -3197,7 +3197,9 @@ mod tests {
         assert_eq!(operations.len(), 20);
         let declarations = plugin_definition().declarations().unwrap().services;
         for (kind, capability, interface, operation) in operations {
-            assert!(admission::remote_protocol(capability, kind, interface, operation));
+            assert!(admission::remote_protocol(
+                capability, kind, interface, operation
+            ));
             let service = declarations
                 .iter()
                 .find(|service| {
