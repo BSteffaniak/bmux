@@ -225,6 +225,21 @@ paths. A behaviour that differs between systems belongs in `switchy_pty`'s
 `Behavior` and personalities, checked by its `tests/conformance.rs` natively on each
 system, and in the platform layer's conformance scenarios.
 
+## Seeing Terminal Behavior (recommended)
+
+Tests show that code passes; to see what a terminal program actually does, drive
+it with `bmux drive` from this checkout's build. Every action waits until the
+program settles and reports the screen, styled cells, modes, exit status and
+terminal protocol problems; `bmux drive guide` explains the commands.
+
+- Any TUI or CLI: `$CARGO_TARGET_DIR/debug/bmux drive start -- PROGRAM ARGS...`,
+  then `press`, `type`, `click`, `resize`, `wait --text`, `expect`, `stop`.
+- This checkout's own bmux UI, isolated from yours:
+  `scripts/drive-bmux.sh start [--size 120x40] [--config FILE]`, then
+  `bmux drive -s bmux-ui ...`, and `scripts/drive-bmux.sh stop`.
+
+Check UI changes this way before finishing, and report what you saw.
+
 ## Minimum Required Commands (CLI/runtime work)
 
 For changes in `packages/cli/**` (runtime, input, pane/layout, protocol,

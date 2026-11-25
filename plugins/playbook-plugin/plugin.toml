@@ -2,7 +2,7 @@ component_roles = ["backend", "frontend"]
 execution_class = "native_fast"
 id = "bmux.playbook"
 name = "bmux Playbook"
-owns_namespaces = []
+owns_namespaces = ["drive"]
 owns_paths = [
     [
         "playbook",
@@ -261,7 +261,24 @@ long    = "json"
 name    = "json"
 summary = "Output as JSON"
 
+[[commands]]
+description   = "Run a terminal program (TUI or CLI) in a private terminal and drive it with keys, text, mouse and resizes; every action waits until the program settles and reports the screen, styled cells, modes, exit status and terminal protocol problems. Run `bmux drive --help` or `bmux drive guide`."
+execution     = "caller_process"
+expose_in_cli = true
+forward_help  = true
+name          = "drive"
+path          = ["drive"]
+summary       = "Drive a terminal program with feedback after every action (for agents)"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+
 [cli_help]
+"drive"                = { summary = "Drive a terminal program with feedback after every action (for agents)", order = 29 }
 "playbook"             = { summary = "Headless playbook execution and testing", order = 28 }
 "playbook cleanup"     = { order = 1 }
 "playbook diff"        = { order = 2 }

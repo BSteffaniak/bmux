@@ -7,6 +7,8 @@ pub mod diff;
 #[cfg(feature = "runtime")]
 pub mod display_track;
 #[cfg(feature = "runtime")]
+pub mod drive;
+#[cfg(feature = "runtime")]
 pub mod engine;
 mod escape;
 #[cfg(feature = "runtime")]

@@ -286,6 +286,11 @@ impl HostAdapter for CliHost {
         ))
     }
 
+    fn run_drive(self: Arc<Self>, arguments: Vec<String>) -> Result<u8> {
+        let bmux = self.executable()?;
+        Self::drive(bmux_playbook::drive::cli::run(bmux, arguments))
+    }
+
     fn selected_runtime(&self) -> Option<(BmuxConfig, ConfigPaths)> {
         self.selected.clone()
     }

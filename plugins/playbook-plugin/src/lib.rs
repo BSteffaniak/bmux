@@ -14,6 +14,7 @@ pub mod declaration {
 }
 
 mod batch;
+mod drive;
 mod interactive;
 mod offline;
 mod runner;
@@ -62,6 +63,7 @@ impl Plugin for PlaybookPlugin {
         d.blocking_command("cleanup", batch::cleanup);
         d.blocking_command("run", batch::run);
         d.blocking_command("interactive", interactive::run);
+        d.blocking_command("drive", drive::run);
         d.blocking_activate(|plugin, _, _| plugin.start_poller())
             .blocking_deactivate(|plugin, _| plugin.drain())
             .blocking_services(Self::service, None);

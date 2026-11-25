@@ -12,6 +12,10 @@ structured JSON.
 - CI regression tests: deterministic, repeatable terminal interaction tests.
 - Recording conversion: turn a captured bmux session into a re-runnable test.
 
+For an agent driving a single program interactively, with a settled report
+after every action, see [Driving Terminal Programs](agent-driving.md)
+(`bmux drive`).
+
 **Execution model:** By default, `bmux playbook run` spawns an isolated sandbox
 server in a temp directory, executes all steps, reports results, and tears down
 the server. Use `--target-server` to run against a live server instead.

@@ -333,14 +333,14 @@ impl Drop for SandboxServer {
 // ── Temp directory creation ──────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     // Exclusive creation: never adopt, follow or repair an existing root.
     std::fs::DirBuilder::new().mode(0o700).create(path)
 }
 
 #[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().create(path)
 }
 
@@ -408,7 +408,7 @@ fn write_playbook_manifest(
 /// - **Clean mode**: calls `env_clear()` first, then sets only `BMUX_*` paths,
 ///   deterministic defaults, `PATH`/`USER`/`SHELL` from the parent, and
 ///   explicit `@env` entries. Maximally deterministic.
-fn apply_sandbox_env(
+pub(crate) fn apply_sandbox_env(
     cmd: &mut ProcessCommand,
     paths: &ConfigPaths,
     root_dir: &Path,
@@ -488,7 +488,7 @@ fn apply_sandbox_env(
 
 // ── Config writing ───────────────────────────────────────────────────────────
 
-fn write_sandbox_config_with_options(
+pub(crate) fn write_sandbox_config_with_options(
     paths: &ConfigPaths,
     options: &SandboxStartOptions<'_>,
 ) -> Result<()> {
@@ -848,7 +848,7 @@ async fn start_daemon(
 
 // ── Server readiness and lifecycle helpers ────────────────────────────────────
 
-async fn wait_for_server_ready(
+pub(crate) async fn wait_for_server_ready(
     paths: &ConfigPaths,
     timeout: Duration,
     mut child: Option<&mut std::process::Child>,

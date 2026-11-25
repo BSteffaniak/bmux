@@ -138,6 +138,8 @@ pub trait HostAdapter: std::fmt::Debug + Send + Sync {
         shell: Option<&str>,
         timeout: Option<std::time::Duration>,
     ) -> Result<u8>;
+    /// Run `bmux drive ARGS...` on the invoking application's reactor.
+    fn run_drive(self: std::sync::Arc<Self>, arguments: Vec<String>) -> Result<u8>;
     /// Explicit caller-selected application runtime. None retains standalone defaults.
     fn selected_runtime(&self) -> Option<(BmuxConfig, ConfigPaths)> {
         None

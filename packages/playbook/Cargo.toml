@@ -11,14 +11,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+ab_glyph = { workspace = true, optional = true }
 bmux_appearance = { workspace = true, optional = true }
 bmux_attach_layout_protocol = { workspace = true, optional = true }
 bmux_attach_pipeline = { workspace = true, optional = true }
 bmux_attach_token_state = { workspace = true, optional = true }
+bmux_cell_geometry = { workspace = true, optional = true }
 bmux_client = { workspace = true, optional = true }
 bmux_clients_plugin_api = { workspace = true, optional = true }
 bmux_config = { workspace = true, optional = true }
 bmux_context_state = { workspace = true, optional = true }
+bmux_fonts = { workspace = true, optional = true }
 bmux_contexts_plugin_api = { workspace = true, optional = true }
 bmux_ipc = { workspace = true, optional = true }
 bmux_keybind = { workspace = true, optional = true }
@@ -27,6 +30,7 @@ bmux_pane_runtime_plugin_api = { workspace = true, optional = true }
 bmux_performance_plugin_api = { workspace = true, optional = true }
 bmux_performance_state = { workspace = true, optional = true }
 bmux_plugin_sdk = { workspace = true, optional = true }
+bmux_raster = { workspace = true, optional = true }
 bmux_recording_plugin_api = { workspace = true, optional = true }
 bmux_recording_protocol = { workspace = true, optional = true }
 bmux_session_models = { workspace = true, optional = true }
@@ -34,10 +38,20 @@ bmux_sessions_plugin_api = { workspace = true, optional = true }
 bmux_tabs_plugin_api = { workspace = true, optional = true }
 bmux_terminal = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
+fontdb = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "fs",
+    "io-std",
     "io-util",
     "signal",
     "macros",
@@ -67,6 +81,7 @@ fail-on-warnings = [
     "bmux_attach_layout_protocol?/fail-on-warnings",
     "bmux_attach_pipeline?/fail-on-warnings",
     "bmux_attach_token_state?/fail-on-warnings",
+    "bmux_cell_geometry?/fail-on-warnings",
     "bmux_client?/fail-on-warnings",
     "bmux_clients_plugin_api?/fail-on-warnings",
     "bmux_config?/fail-on-warnings",
@@ -79,6 +94,7 @@ fail-on-warnings = [
     "bmux_performance_plugin_api?/fail-on-warnings",
     "bmux_performance_state?/fail-on-warnings",
     "bmux_plugin_sdk?/fail-on-warnings",
+    "bmux_raster?/fail-on-warnings",
     "bmux_recording_plugin_api?/fail-on-warnings",
     "bmux_recording_protocol?/fail-on-warnings",
     "bmux_session_models?/fail-on-warnings",
@@ -87,6 +103,12 @@ fail-on-warnings = [
     "bmux_terminal_grid?/fail-on-warnings",
 ]
 runtime = [
+    "dep:ab_glyph",
+    "dep:bmux_cell_geometry",
+    "dep:bmux_fonts",
+    "dep:bmux_raster",
+    "dep:clap",
+    "dep:fontdb",
     "dep:bmux_unicode_segmentation",
     "dep:regex",
     "dep:bmux_appearance",

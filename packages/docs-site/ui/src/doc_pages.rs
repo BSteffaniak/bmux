@@ -114,6 +114,20 @@ pub static DOC_PAGES: &[DocPage] = &[
         nav_label: "Kiosk Access",
     },
     docs_markdown_page! {
+        source: "docs/agent-driving.md",
+        route: "/docs/agent-driving",
+        title: "Driving Terminal Programs (for Agents)",
+        section: REFERENCE,
+        nav_label: "Agent Driving",
+    },
+    docs_markdown_page! {
+        source: "docs/pane-execution.md",
+        route: "/docs/pane-execution",
+        title: "Pane Processes",
+        section: TECHNICAL_REFERENCE,
+        nav_label: "Pane Processes",
+    },
+    docs_markdown_page! {
         source: "docs/playbooks.md",
         route: "/docs/playbooks",
         title: "Playbooks",
