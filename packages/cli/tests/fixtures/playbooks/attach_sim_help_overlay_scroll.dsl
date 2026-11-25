@@ -13,7 +13,7 @@ assert-state path='help_overlay.scroll' equals='18'
 
 send-attach key='end'
 assert-state path='help_overlay.open' equals='true'
-assert-state path='help_overlay.scroll' equals='89'
+assert-state path='help_overlay.scroll' equals='94'
 
 send-attach key='home'
 assert-state path='help_overlay.scroll' equals='0'

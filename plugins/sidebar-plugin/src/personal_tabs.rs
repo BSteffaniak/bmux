@@ -163,4 +163,36 @@ mod tests {
             shown.revision
         );
     }
+
+    /// An explicitly emptied arrangement lists nothing for its workspace,
+    /// even though the shared catalog still has its tabs.
+    #[test]
+    fn an_emptied_arrangement_never_falls_back_to_the_catalog() {
+        let catalog = TabListSnapshot {
+            tabs: vec![
+                entry(1, "one", 10),
+                entry(2, "two", 10),
+                entry(4, "four", 20),
+            ],
+            revision: 2,
+        };
+        let view = PersonalViewProjection {
+            last_removed: None,
+            following: None,
+            is_default: true,
+            view_id: Uuid::from_u128(0xF1),
+            name: "default".into(),
+            view_revision: 3,
+            binding_revision: 1,
+            active_workspace_id: Uuid::from_u128(10),
+            workspaces: vec![PersonalViewWorkspace {
+                workspace_id: Uuid::from_u128(10),
+                members: Vec::new(),
+            }],
+        };
+        assert_eq!(
+            listed(&arrange(&catalog, Some(&view), None)),
+            [("ws20".into(), "four".into(), false)]
+        );
+    }
 }

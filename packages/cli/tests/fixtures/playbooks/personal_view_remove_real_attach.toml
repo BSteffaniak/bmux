@@ -7,7 +7,9 @@ initial_mode = "normal"
 [keybindings.global]
 "alt+a" = "plugin:bmux.tabs:new-tab --name=alpha"
 "alt+b" = "plugin:bmux.tabs:new-tab --name=beta"
+"alt+l" = "plugin:bmux.tabs:next-tab"
 "alt+u" = "plugin:bmux.tabs:undo-remove-from-view"
+"alt+v" = "plugin:bmux.finder:add-to-view"
 "alt+x" = "plugin:bmux.tabs:remove-from-view"
 
 [keybindings.modes.normal]

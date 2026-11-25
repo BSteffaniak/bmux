@@ -72,7 +72,7 @@ value_name = "TARGET_CLIENT_ID"
 kind    = "boolean"
 long    = "global"
 name    = "global"
-summary = "Keep following across target session switches"
+summary = "Keep following as the target switches tabs and sessions"
 
 [[commands]]
 aliases       = [["session", "unfollow"]]

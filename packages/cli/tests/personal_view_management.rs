@@ -2,8 +2,8 @@
 //! daemon: one principal with two views on two attachments keeps independent
 //! arrangements, a personal label renames a tab for one view while a shared
 //! rename reaches everyone, following another client shows its tab without
-//! adding it to the follower's view (ending the follow restores the
-//! follower's own tab), and deleting a view rebinds its attachment to the
+//! adding it to the follower's view, also as the leader switches tabs (ending
+//! the follow restores the follower's own tab), and deleting a view rebinds its attachment to the
 //! default view, which itself cannot be deleted.
 #![cfg(unix)]
 
@@ -472,6 +472,20 @@ async fn exercise() -> Result<()> {
                     .iter()
                     .any(|(name, _, members)| name == "work" && *members == [alpha, gamma]),
                 "work view: {before:?}"
+            );
+            // The leader's later tab switches carry the follower along, still
+            // without touching its views: B goes to alpha (`alt+1`).
+            b.try_send(key('1', true, false))?;
+            wait_attached(&b, alpha_session, "b").await?;
+            wait_attached(&a, alpha_session, "a").await?;
+            wait_without(&frame_a, "a", "(not in your view)").await?;
+            ensure!(
+                views(&mut owner_one).await? == before,
+                "following the leader's switch changed the follower's views"
+            );
+            ensure!(
+                attached_session(&c) == Some(alpha_session),
+                "the leader's switch moved an attachment that does not follow it"
             );
             // Ending the follow returns A to its own tab.
             a.try_send(key('g', true, false))?;

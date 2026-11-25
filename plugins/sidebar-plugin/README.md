@@ -11,6 +11,13 @@ dirty, `↑`/`↓` ahead and behind); when space is short the directory shortens
 to its last part, then gives way to git. The tab you are looking at has a bar
 and a tinted background. The heading sums up what every listed tab is doing.
 
+The tabs listed, their order and their names come from this attachment's
+personal tab view (`bmux.tabs/personal-view`, delivered to it alone): each
+workspace the view arranges lists its tabs in the view's order with their
+personal labels, and a workspace the view has not arranged yet lists its tabs
+in the shared order the view will start from. Only without a personal view does
+the sidebar list the shared catalog as it is.
+
 ```text
  TABS                ◆1 ▲1 ⠹2 ■1
 ▌ bmux                ◆1 ▲1 ⠹1 ▾
@@ -34,14 +41,14 @@ Below 20 columns cards are one line and their state is their glyph.
 States, most urgent first, as the tabs plugin decides them for every view
 (see its README):
 
-| Glyph       | State       | When                                                                                                                                       |
-| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `◆` yellow  | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line |
-| `▲` red     | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
-| `✓` cyan    | done        | its agent finished since anyone looked at the tab                                                                                          |
-| `◉` green   | working     | its agent is working (a spinner by default), or another command is running and produced output in the last few seconds                    |
-| `■` blue    | stopped     | its agent finished or waits at its prompt, and someone has looked since                                                                    |
-| `○` dim     | idle        | otherwise                                                                                                                                  |
+| Glyph      | State       | When                                                                                                                                                                                 |
+| ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `◆` yellow | needs input | its agent needs you to answer or approve something, or a pane rang the bell or sent a notification since anyone looked at the tab; the message replaces the directory line           |
+| `▲` red    | failed      | a command exited non-zero (needs OSC 133 shell integration), until someone looks at the tab (or, with the tabs plugin's `failed_clears = "on_next_command"`, until the next command) |
+| `✓` cyan   | done        | its agent finished since anyone looked at the tab                                                                                                                                    |
+| `◉` green  | working     | its agent is working (a spinner by default), or another command is running and produced output in the last few seconds                                                               |
+| `■` blue   | stopped     | its agent finished or waits at its prompt, and someone has looked since                                                                                                              |
+| `○` dim    | idle        | otherwise                                                                                                                                                                            |
 
 Looking at a tab means some attach client shows it while its terminal has
 focus; it counts for every client, and what was not yet seen is kept across
@@ -121,7 +128,8 @@ its name unless `workspace_colors` sets it), which also runs down its tabs as
 a thin rail; a blank row sets each group off from the next. While a group's
 tabs scroll under the top, its header stays pinned there. The header sums up
 what its tabs are doing: how many need input (`◆`), failed (`▲`), are
-working (`◉`) and have stopped (`■`), most pressing first, or how many tabs it
+working (`◉`) and have stopped (`■`), most pressing first, or how many tabs
+it
 holds when none is doing anything. Click a header (or press Enter or space on
 it) to collapse or expand its group; left and right collapse and expand. A
 collapsed header still shows its sum, and is marked when it hides the tab you

@@ -4882,6 +4882,7 @@ dependencies = [
  "bmux_snapshot_runtime",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 

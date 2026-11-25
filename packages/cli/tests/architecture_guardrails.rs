@@ -3756,3 +3756,175 @@ fn every_workspace_plugin_packages_itself() {
         );
     }
 }
+
+/// Personal tab views are a tabs-plugin domain: no core architecture crate
+/// (nor the attach runtime) names them. Core only carries the neutral
+/// recipient-scoped retained delivery and suspended-input primitives they
+/// use.
+#[test]
+fn core_crates_have_no_personal_tab_view_types() {
+    let root = repo_root();
+    let core = [
+        "packages/server",
+        "packages/client",
+        "packages/ipc",
+        "packages/session",
+        "packages/event",
+        "packages/plugin-sdk",
+        "packages/plugin",
+        "packages/plugin-schema/src",
+        "packages/plugin-schema-macros",
+        "packages/cli/src",
+    ];
+    let markers = [
+        "personalview",
+        "personal_view",
+        "personal-view",
+        "personal view",
+        "tabs-personal",
+        "tabs_personal",
+        "personal_tabs",
+        "personaltab",
+    ];
+    let mut leaks = Vec::new();
+    for dir in core {
+        for path in rust_source_files_under(&root.join(dir)) {
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lower = source.to_ascii_lowercase();
+            for marker in markers {
+                if lower.contains(marker) {
+                    leaks.push(format!("{} names {marker}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "personal tab views belong to the tabs plugin, not core:\n  - {}",
+        leaks.join("\n  - ")
+    );
+}
+
+/// Each attachment's personal view projection is owner-scoped: the tabs
+/// plugin declares its kind as never forwarded to streaming clients, and
+/// only ever delivers or clears it for one recipient. No plugin broadcasts
+/// it.
+#[test]
+fn personal_view_projections_are_never_broadcast() {
+    let root = repo_root();
+    let manifest = std::fs::read_to_string(root.join("plugins/tabs-plugin/plugin.toml"))
+        .expect("tabs plugin manifest");
+    let publication = manifest
+        .split("[[event_publications]]")
+        .find(|block| block.contains("kind                         = \"bmux.tabs/personal-view\""))
+        .expect("tabs plugin declares the personal-view publication");
+    let publication = publication.split("\n[[").next().unwrap_or(publication);
+    assert!(
+        publication
+            .lines()
+            .any(|line| line.split_whitespace().collect::<String>()
+                == "forward_to_streaming_clients=false"),
+        "bmux.tabs/personal-view must not be forwarded to every streaming client:\n{publication}"
+    );
+    for manifest in iter_plugin_dirs()
+        .into_iter()
+        .filter(|dir| !dir.ends_with("tabs-plugin"))
+        .filter_map(|dir| std::fs::read_to_string(dir.join("plugin.toml")).ok())
+    {
+        for block in manifest.split("[[event_publications]]").skip(1) {
+            assert!(
+                !block.contains("bmux.tabs/personal-view"),
+                "only the tabs plugin publishes personal view projections"
+            );
+        }
+    }
+
+    let mut failures = Vec::new();
+    for plugin_dir in iter_plugin_dirs() {
+        for path in rust_source_files(&plugin_dir) {
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Code only: comments may describe the delivery.
+            let production: String = production_section(&source)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Statements that publish something and name the projection kind.
+            for statement in production.split(';') {
+                let names_kind = statement.contains("personal_view::STATE_KIND")
+                    || statement.contains("bmux.tabs/personal-view")
+                    || (path.ends_with("personal_views/attachments.rs")
+                        && statement.contains("STATE_KIND"));
+                let publishes = statement.contains("publish");
+                let scoped = statement.contains("publish_retained_to(")
+                    || statement.contains("clear_retained_to(");
+                if names_kind && publishes && !scoped {
+                    failures.push(format!(
+                        "{}: {}",
+                        path.display(),
+                        statement.trim().lines().next().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "personal view projections may only be published with publish_retained_to:\n  - {}",
+        failures.join("\n  - ")
+    );
+    let attachments =
+        std::fs::read_to_string(root.join("plugins/tabs-plugin/src/personal_views/attachments.rs"))
+            .expect("tabs attachment bindings");
+    assert!(
+        production_section(&attachments).contains("publish_retained_to(client, STATE_KIND"),
+        "the tabs plugin delivers each projection to its own attachment"
+    );
+}
+
+/// Presentations show the attachment's personal arrangement: the shared
+/// `tabs-list` catalog decides the tab bar's strip only when there is no
+/// projection, and the sidebar always arranges the catalog through it.
+#[test]
+fn presentations_take_tab_order_from_the_personal_projection() {
+    let root = repo_root();
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path)).unwrap_or_else(|error| panic!("{path}: {error}"))
+    };
+    let tab_bar = read("plugins/tab-bar-plugin/src/lib.rs");
+    let tab_bar = production_section(&tab_bar);
+    let fallbacks = tab_bar.matches("from_catalog(").count();
+    assert_eq!(
+        fallbacks, 1,
+        "the tab bar may derive its strip from the catalog in one place only"
+    );
+    assert!(
+        tab_bar.contains(
+            "personal_tabs::from_projection(self.personal.as_ref(), &self.catalog, selected)\n                .unwrap_or_else(|| personal_tabs::from_catalog(&self.catalog, selected))"
+        ),
+        "the tab bar must use the catalog only when it has no personal projection"
+    );
+    let sidebar = read("plugins/sidebar-plugin/src/lib.rs");
+    let sidebar = production_section(&sidebar);
+    assert_eq!(
+        sidebar.matches("self.snapshot = ").count(),
+        1,
+        "the sidebar's listing must have a single writer"
+    );
+    assert!(
+        sidebar.contains(
+            "personal_tabs::arrange(&catalog, self.personal.as_ref(), self.selected_context_id)"
+        ),
+        "the sidebar must arrange the catalog through the personal projection"
+    );
+    let finder = read("plugins/finder-plugin/src/lib.rs");
+    assert!(
+        production_section(&finder)
+            .contains("tabs_personal_views::client::get_view(&mut client, binding.view_id)"),
+        "the finder must read view membership from the attachment's own view"
+    );
+}

@@ -117,12 +117,28 @@ whether a tab runs.
   renames a tab in one view only; Rename for everyone… (`rename-tab`) renames
   the tab itself. `bmux tab clear-label` (Clear my label) shows the shared
   name again. The finder shows the label and searches both names.
+- Removing a tab from your view (`bmux tab remove-from-view`, prefix `X`, or
+  Remove from view in the tab bar) leaves it running and findable; undo
+  (`bmux tab undo-remove`, prefix `u`) puts it back in place. Closing a tab for
+  everyone (Close for everyone…, which asks first, or `kill-tab`) ends it and
+  drops it from every view. No tab ever ends because no view holds it.
+- When the last tab of a workspace leaves your view, the attachment stays
+  connected with no input target: the tab bar says "View empty", and typing
+  reaches no tab until you open or add one from the finder or undo.
+- The finder lists every tab and marks whether your view holds it. Choosing a
+  tab adds it to your view when absent, then switches to it;
+  `plugin:bmux.finder:add-to-view` adds a tab without switching.
+- Views, their order, labels and default are stored by the server and survive
+  reconnecting and restarting it. Every attach starts on your default view;
+  removed tabs stay removed and closed tabs are gone.
+- Commands run without an attachment (the CLI) act on your default view.
 - Following another client (`plugin:bmux.clients:follow CLIENT --global` from
-  an attachment, or `bmux attach --follow`) shows the leader's tab without
-  adding it to your view, and the tab bar says so ("Following … (not in your
-  view)"). While you follow, removals and deletions in your view do not move
-  you. Ending the follow (`plugin:bmux.clients:unfollow`, or the leader
-  disconnecting) returns you to the tab you had when the follow began.
+  an attachment, or `bmux attach --follow`) shows the leader's tab, and each
+  tab the leader switches to, without adding it to your view; the tab bar says
+  so ("Following … (not in your view)"). While you follow, removals and
+  deletions in your view do not move you. Ending the follow
+  (`plugin:bmux.clients:unfollow`, or the leader disconnecting) returns you to
+  the tab you had when the follow began.
 
 Visit history belongs to the invoking client, not other attachments. It is
 transient, cleared on disconnect, and not restored across server restarts.

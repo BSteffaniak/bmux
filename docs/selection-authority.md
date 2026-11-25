@@ -1,7 +1,13 @@
 # ADR: exact tab activation and effective workspace selection
 
 Status: authority decision accepted by the repository owner; implementation
-pending.
+pending. One part has shipped with personal tab views (2026-11-25): the explicit
+suspended target (item 4 of the commit contract below) for a client that a
+plugin leaves with no selection. Contexts `clear-for-client` removes the
+client's selection and announces `cleared` on `contexts-selection-events`; the
+attach stays connected with no input target, delivers no input to any pane, and
+resumes only when something selects a context for that client. The shared commit
+contract and its remaining items are still pending.
 
 ## Decision
 

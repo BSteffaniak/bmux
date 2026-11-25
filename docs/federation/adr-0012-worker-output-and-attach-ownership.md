@@ -63,10 +63,20 @@ recovery, and rejects unknown or corrupt authoritative representations.
 Introducing arrangement support does not silently promote local resources into
 federation.
 
-Local durable arrangements remain windows-plugin-owned and independently usable
-without federation. They use local crash-safe storage rather than cluster
-consensus; local single-user fallback does not bypass federated authentication
-or authorization.
+Local durable arrangements remain tabs-plugin-owned (formerly the windows
+plugin) and independently usable without federation. They use local crash-safe
+storage rather than cluster consensus; local single-user fallback does not
+bypass federated authentication or authorization.
+
+Implementation status (2026-11-25): the local mode is implemented as personal
+tab views in `bmux.tabs`, with typed `tabs-personal-*` interfaces and a
+`personal-view` projection delivered only to its own attachment (see
+`docs/concepts.md`, "Personal tab views"). Local attach never resumes a
+connection: every attach is a fresh attach on the owner's default view, and an
+explicit choice persists by making that view the default, so no resume
+metadata exists locally. The federated mode (cluster-authoritative
+arrangements, federated attach resolution and resume) is not implemented; the
+semantics above still govern it.
 
 The reason for this extension is reconnectable personal organization over shared
 running work: attachment-local files cannot provide one durable authority across
@@ -96,7 +106,8 @@ first release and cannot silently replace the v1 contract.
 ### Worker frame push (2026-11-20 amendment)
 
 This supersedes the long-poll transport above, which is removed (`output` and
-`snapshot` are gone from `cluster-worker-state` and `cluster-attach-state`, both now v2).
+`snapshot` are gone from `cluster-worker-state` and `cluster-attach-state`, both
+now v2).
 Workers push frames, not output bytes:
 
 - `cluster-attach-state/v2` `routes(workspace_id, principal_id, executions)` names each execution generation's worker endpoint and signs a short-lived `observe`-class lease for it.

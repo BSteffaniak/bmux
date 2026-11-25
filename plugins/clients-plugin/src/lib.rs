@@ -502,7 +502,7 @@ impl ClientsPlugin {
     fn activate(
         &self,
         context: &NativeLifecycleContext,
-        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+        tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         *slot_mut(&self.events)? = ClientEvents::new(
             bmux_plugin::activation_event_bus(context),
@@ -553,6 +553,14 @@ impl ClientsPlugin {
 
         if let Some(bus) = &self.events().bus {
             bus.register_channel::<ClientEvent>(clients_events::EVENT_KIND);
+            if let Some(tasks) = tasks {
+                spawn_follow_observer(
+                    &tasks,
+                    Arc::clone(bus),
+                    self.events(),
+                    Arc::new(TypedServiceCaller::from_lifecycle_context(context)),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1284,6 +1292,158 @@ fn set_following_via_ipc(
 
 /// The leader's current tab and its session, from the contexts selection
 /// authority's published reader, when it has a selection.
+/// Keep global followers on their leader's tab. Contexts announces every
+/// change of a client's current tab as `session-active-context-changed`
+/// naming that client as initiator (its own tab switch, or a plugin
+/// selecting for it). When the client leads global followers, each of them
+/// is selected onto the same tab for itself, so its attach retargets exactly
+/// as for its own selection. Follow state alone changes only through
+/// `set-current-session`, which tab switches never call.
+fn spawn_follow_observer(
+    tasks: &bmux_plugin_sdk::HostAsyncHandle,
+    bus: Arc<EventBus>,
+    events: ClientEvents,
+    caller: Arc<TypedServiceCaller>,
+) -> std::result::Result<(), PluginCommandError> {
+    use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
+    use tokio::sync::broadcast::error::RecvError;
+    let worker = tasks.clone();
+    tasks
+        .spawn_background(
+            "clients-follow-observer",
+            move |mut cancellation| async move {
+                let kind = contexts_events::EVENT_KIND;
+                let mut receiver = tokio::select! {
+                    () = cancellation.cancelled() => return Ok(()),
+                    ready = bus.subscribe_when_registered::<ContextEvent>(&kind) => {
+                        ready.map_err(|error| error.to_string())?
+                    }
+                };
+                loop {
+                    let event = tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        event = receiver.recv() => event,
+                    };
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => return Ok(()),
+                    };
+                    let ContextEvent::SessionActiveContextChanged {
+                        session_id,
+                        context_id,
+                        initiator_client_id: Some(leader),
+                    } = *event
+                    else {
+                        continue;
+                    };
+                    let events = events.clone();
+                    let caller = Arc::clone(&caller);
+                    worker
+                        .spawn_blocking(move || {
+                            follow_leader(
+                                &events,
+                                caller.as_ref(),
+                                ClientId(leader),
+                                context_id,
+                                SessionId(session_id),
+                            );
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            },
+        )
+        .map_err(PluginCommandError::failed)
+}
+
+/// Move every global follower of `leader` to the leader's new tab.
+fn follow_leader(
+    events: &ClientEvents,
+    caller: &(impl ServiceCaller + Sync),
+    leader: ClientId,
+    context_id: Uuid,
+    session_id: SessionId,
+) {
+    let Some(state) = events.states.get::<FollowState>() else {
+        return;
+    };
+    let (previous_sessions, updates) = {
+        let Ok(mut state) = state.write() else {
+            return;
+        };
+        let previous_sessions: Vec<(ClientId, Option<SessionId>)> = state
+            .follows
+            .iter()
+            .filter(|(_, entry)| entry.leader_client_id == leader && entry.global)
+            .map(|(follower, _)| {
+                (
+                    *follower,
+                    state.selected_sessions.get(follower).copied().flatten(),
+                )
+            })
+            .collect();
+        if previous_sessions.is_empty() {
+            return;
+        }
+        let updates = state.sync_followers_from_leader(leader, Some(context_id), Some(session_id));
+        (previous_sessions, updates)
+    };
+    for update in updates {
+        let follower = update.follower_client_id;
+        if let Err(error) = select_for_client_via_typed_dispatch(caller, follower.0, context_id) {
+            let _ = bmux_plugin::HostRuntimeApi::log_write(
+                caller,
+                &bmux_plugin_sdk::LogWriteRequest {
+                    level: bmux_plugin_sdk::LogWriteLevel::Warn,
+                    message: format!(
+                        "follower {} could not follow its leader to tab {context_id}: {error}",
+                        follower.0
+                    ),
+                    target: Some("bmux.clients.follow".to_string()),
+                },
+            );
+            continue;
+        }
+        let previous = previous_sessions
+            .iter()
+            .find_map(|(client, previous)| (*client == follower).then_some(*previous))
+            .flatten();
+        if previous != Some(session_id) {
+            let _ = reconcile_client_membership_via_typed_dispatch(
+                caller,
+                follower.0,
+                previous.map(|session| session.0),
+                Some(session_id.0),
+            );
+        }
+        events.emit(ClientEvent::FollowTargetChanged {
+            follower_client_id: follower.0,
+            leader_client_id: leader.0,
+            context_id: Some(context_id),
+            session_id: session_id.0,
+        });
+    }
+}
+
+fn select_for_client_via_typed_dispatch(
+    caller: &(impl ServiceCaller + Sync),
+    client_id: Uuid,
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_contexts_plugin_api::contexts_client_selection_v1::client::select_for_client(
+            &mut client,
+            client_id,
+            context_id,
+        ),
+    )
+    .map_err(|error| error.to_string())?
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
 fn leader_selection(
     events: &ClientEvents,
     leader: ClientId,

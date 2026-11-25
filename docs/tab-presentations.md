@@ -10,6 +10,16 @@ BMUX ships two independent tab presentation plugins for normal `bmux attach`:
 Both consume the authoritative ordered tab state from `bmux.tabs`;
 presentation enablement does not change tab lifecycle or ordering.
 
+That order is the attachment's personal tab view (see
+[Personal tab views](concepts.md#personal-tab-views)). The tabs plugin sends
+each attachment its own view's projection (`bmux.tabs/personal-view`), and
+only to that attachment. The tab bar shows that view's tabs of the current
+workspace, in its order and with its personal labels; the sidebar lists every
+workspace, each arranged workspace in the view's order and the others in the
+shared order the view will start from. Only without a projection (a tabs
+plugin without personal views, or a client without a principal) do they fall
+back to the shared catalog (`tabs-list`). Neither keeps an order of its own.
+
 ## Enablement combinations
 
 By default both are loaded: the tab/status bar is shown and the sidebar is
@@ -161,7 +171,14 @@ values. Use `tab_template`, `tab_label_max_width`, `max_tabs`, `show_tab_index`,
 and `show_facts`; former aliases are rejected with an explicit error.
 
 Interactions include click switching, hover, drag reorder, wheel navigation,
-middle-click inline rename, and a right-click Switch/Rename/Close menu. Domain
+middle-click inline rename, and a right-click menu: Switch, Rename for
+everyone…, Rename for me… (a personal label), Clear my label, Remove from
+view
+and Close for everyone… (confirmed). Drag reorder and the group menu's Move
+left/right reorder your personal view, never anyone else's. The bar also shows
+hints: "View empty: open the finder to add tabs", "Removed NAME (prefix u:
+undo)" for a few seconds after a removal, "View: NAME" when the view is not
+your default, and "Following …" while following another client. Domain
 mutations use generated `bmux.tabs` service clients.
 
 Other plugins, including dynamically loaded native plugins, can add right-side
@@ -195,7 +212,8 @@ remember_visibility = true
 
 Each tab is a card: a state glyph, the tab's name and, at the right, its
 running command or state; below it, dimmed, the focused pane's directory and
-git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you are
+git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you
+are
 looking at has an accent bar and a tinted background.
 
 ```text
@@ -212,13 +230,13 @@ looking at has an accent bar and a tinted background.
 
 States, most urgent first:
 
-| Glyph | State | When |
-| --- | --- | --- |
+| Glyph      | State   | When                                                                                                                                                                                         |
+| ---------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `◆` yellow | blocked | its agent needs you to answer or approve something, or (any other program) the tab rang the bell or sent a notification since you last looked at it; the message replaces the directory line |
-| `▲` red | failed | its last command exited non-zero (needs OSC 133 shell integration) |
-| `◉` green | working | its agent is working, or another command is running and produced output in the last few seconds |
-| `●` blue | done | its agent finished since you last looked at the tab |
-| `○` dim | idle | otherwise (the tab you are looking at shows a bright `●`) |
+| `▲` red    | failed  | its last command exited non-zero (needs OSC 133 shell integration)                                                                                                                           |
+| `◉` green  | working | its agent is working, or another command is running and produced output in the last few seconds                                                                                              |
+| `●` blue   | done    | its agent finished since you last looked at the tab                                                                                                                                          |
+| `○` dim    | idle    | otherwise (the tab you are looking at shows a bright `●`)                                                                                                                                    |
 
 A tab's agent state comes from the agents plugin (`bmux.agents`, see
 `plugins/agents-plugin/README.md`), which recognizes coding agents in each

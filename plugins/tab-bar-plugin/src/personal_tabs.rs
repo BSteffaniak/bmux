@@ -318,6 +318,71 @@ mod tests {
         );
     }
 
+    /// With a projection the strip is the view's arrangement: its order,
+    /// its membership and its names, never the shared catalog's, even when
+    /// the arrangement is empty. The catalog decides only without one.
+    #[test]
+    fn a_projection_alone_decides_the_strips_order_and_membership() {
+        use bmux_tabs_plugin_api::personal_view::PersonalViewMember;
+        let workspace = Uuid::from_u128(10);
+        let entry = |id: u128, name: &str| TabListEntry {
+            id: Uuid::from_u128(id),
+            name: name.into(),
+            active: false,
+            workspace: "main".into(),
+            workspace_id: workspace,
+        };
+        let catalog = TabListSnapshot {
+            tabs: vec![entry(1, "one"), entry(2, "two"), entry(3, "three")],
+            revision: 3,
+        };
+        let member = |id: u128, name: &str| PersonalViewMember {
+            member_id: Uuid::from_u128(0x100 + id),
+            context_id: Uuid::from_u128(id),
+            name: name.into(),
+            label: None,
+            active: false,
+        };
+        let mut view = projection(None);
+        view.active_workspace_id = workspace;
+        view.workspaces = vec![PersonalViewWorkspace {
+            workspace_id: workspace,
+            members: vec![member(3, "three"), member(1, "mine")],
+        }];
+        let shown = |projected: &ProjectedTabs| {
+            projected
+                .tabs
+                .tabs
+                .iter()
+                .map(|tab| (tab.id.as_u128(), tab.name.clone(), tab.active))
+                .collect::<Vec<_>>()
+        };
+        let strip = from_projection(Some(&view), &catalog, Some(Uuid::from_u128(1)))
+            .expect("a projection decides the strip");
+        assert_eq!(
+            shown(&strip),
+            [(3, "three".into(), false), (1, "mine".into(), true)]
+        );
+        assert_eq!(strip.workspace_label.as_deref(), Some("main"));
+
+        // An emptied arrangement stays empty; it never falls back.
+        view.workspaces[0].members.clear();
+        let empty = from_projection(Some(&view), &catalog, None).expect("still a projection");
+        assert_eq!(shown(&empty), Vec::new());
+
+        // No projection (or the nil view) leaves the catalog in charge.
+        assert!(from_projection(None, &catalog, None).is_none());
+        assert!(from_projection(Some(&no_projection()), &catalog, None).is_none());
+        assert_eq!(
+            shown(&from_catalog(&catalog, Some(Uuid::from_u128(2)))),
+            [
+                (1, "one".into(), false),
+                (2, "two".into(), true),
+                (3, "three".into(), false)
+            ]
+        );
+    }
+
     #[test]
     fn labels_are_read_from_the_projection_members() {
         use bmux_tabs_plugin_api::personal_view::PersonalViewMember;

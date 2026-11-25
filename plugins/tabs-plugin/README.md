@@ -59,8 +59,9 @@ attachment starts on its user's default view; attachments sharing a view
 share its arrangement and labels but each keeps its own selection.
 
 While an attachment follows another client (`bmux.clients` `follow`), it shows
-the leader's tab without adding it to its view, its projection says so, and
-removals or deletions in its view do not move it. When the follow ends, the
+the leader's tab (and, for a global follow, each tab the leader switches to)
+without adding it to its view, its projection says so, and removals or
+deletions in its view do not move it. When the follow ends, the
 tabs plugin selects the tab the attachment had before following again.
 
 A tab is never terminated because no view references it: removing a reference
