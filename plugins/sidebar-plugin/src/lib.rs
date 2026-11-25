@@ -2599,6 +2599,8 @@ fn subscribe_personal_view(
         kind.clone(),
         personal_view::PersonalViewProjection {
             last_removed: None,
+            following: None,
+            is_default: true,
             view_id: Uuid::nil(),
             name: String::new(),
             view_revision: 0,
@@ -3807,10 +3809,13 @@ mod tests {
             member_id: Uuid::new_v4(),
             context_id: id,
             name: name.to_string(),
+            label: None,
             active: false,
         };
         let payload = serde_json::to_vec(&personal_view::PersonalViewProjection {
             last_removed: None,
+            following: None,
+            is_default: true,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 2,

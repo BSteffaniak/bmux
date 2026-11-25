@@ -23,6 +23,14 @@ owns_namespaces = [
     "undo-remove-from-view",
     "open-tab",
     "add-tab-to-view",
+    "list-views",
+    "create-view",
+    "switch-view",
+    "rename-view",
+    "delete-view",
+    "set-default-view",
+    "set-tab-label",
+    "clear-tab-label",
     "reset-order",
     "focus-pane-in-direction",
     "split-pane",
@@ -384,6 +392,132 @@ kind       = "string"
 name       = "tab"
 position   = 0
 required   = true
+value_name = "TAB_ID"
+
+[[commands]]
+aliases       = [["tab", "view", "list"]]
+expose_in_cli = true
+name          = "list-views"
+path          = ["list-views"]
+summary       = "List your tab views (the default and this attachment's are marked)"
+
+[[commands]]
+aliases       = [["tab", "view", "create"]]
+expose_in_cli = true
+name          = "create-view"
+path          = ["create-view"]
+summary       = "Create a tab view, empty or (--copy) copied from this one, and switch this attachment to it"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "name"
+position   = 0
+required   = true
+value_name = "NAME"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "copy"
+name    = "copy"
+summary = "Start from a copy of this attachment's view (its tabs, order and labels) instead of empty"
+
+[[commands]]
+aliases       = [["tab", "view", "switch"]]
+expose_in_cli = true
+name          = "switch-view"
+path          = ["switch-view"]
+summary       = "Show another of your tab views in this attachment"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "view"
+position   = 0
+required   = true
+summary    = "View name or id"
+value_name = "VIEW"
+
+[[commands]]
+aliases       = [["tab", "view", "rename"]]
+expose_in_cli = true
+name          = "rename-view"
+path          = ["rename-view"]
+summary       = "Rename this attachment's tab view (or --view VIEW)"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "name"
+position   = 0
+required   = true
+value_name = "NAME"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "view"
+name       = "view"
+summary    = "View name or id (default: this attachment's view)"
+value_name = "VIEW"
+
+[[commands]]
+aliases       = [["tab", "view", "delete"]]
+expose_in_cli = true
+name          = "delete-view"
+path          = ["delete-view"]
+summary       = "Delete a tab view (tabs keep running); its attachments switch to the default view"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "view"
+position   = 0
+summary    = "View name or id (default: this attachment's view)"
+value_name = "VIEW"
+
+[[commands]]
+aliases       = [["tab", "view", "set-default"]]
+expose_in_cli = true
+name          = "set-default-view"
+path          = ["set-default-view"]
+summary       = "Make a tab view the default that new attachments show"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "view"
+position   = 0
+summary    = "View name or id (default: this attachment's view)"
+value_name = "VIEW"
+
+[[commands]]
+aliases       = [["tab", "label"]]
+expose_in_cli = true
+name          = "set-tab-label"
+path          = ["set-tab-label"]
+summary       = "Rename a tab for you only: a label in this attachment's tab view"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "label"
+position   = 0
+required   = true
+value_name = "LABEL"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "tab"
+name       = "tab"
+summary    = "Tab id (default: the current tab)"
+value_name = "TAB_ID"
+
+[[commands]]
+aliases       = [["tab", "clear-label"]]
+expose_in_cli = true
+name          = "clear-tab-label"
+path          = ["clear-tab-label"]
+summary       = "Clear your label of a tab so this view shows its shared name again"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "tab"
+name       = "tab"
+summary    = "Tab id (default: the current tab)"
 value_name = "TAB_ID"
 
 [[commands]]

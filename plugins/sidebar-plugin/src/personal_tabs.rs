@@ -122,10 +122,13 @@ mod tests {
             member_id: Uuid::from_u128(0xE00 + id),
             context_id: Uuid::from_u128(id),
             name: name.into(),
+            label: None,
             active: false,
         };
         let view = PersonalViewProjection {
             last_removed: None,
+            following: None,
+            is_default: true,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 7,

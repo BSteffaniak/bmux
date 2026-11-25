@@ -62,6 +62,10 @@ fn interface_ids_match_bpdl_source() {
         "tabs-personal-actions/v1"
     );
     assert_eq!(
+        bmux_tabs_plugin_api::tabs_personal_labels::INTERFACE_ID,
+        "tabs-personal-labels/v1"
+    );
+    assert_eq!(
         bmux_tabs_plugin_api::personal_view::STATE_KIND,
         "bmux.tabs/personal-view"
     );
@@ -70,7 +74,7 @@ fn interface_ids_match_bpdl_source() {
 #[test]
 fn personal_attachment_contracts_take_no_client_and_round_trip() {
     use bmux_tabs_plugin_api::personal_view::{
-        PersonalViewMember, PersonalViewProjection, PersonalViewWorkspace,
+        PersonalViewFollow, PersonalViewMember, PersonalViewProjection, PersonalViewWorkspace,
     };
     use bmux_tabs_plugin_api::tabs_personal_attachment::PersonalAttachmentError;
     use bmux_tabs_plugin_api::tabs_personal_attachment::client::{
@@ -99,8 +103,15 @@ fn personal_attachment_contracts_take_no_client_and_round_trip() {
     }
     let projection = PersonalViewProjection {
         last_removed: None,
+        following: Some(PersonalViewFollow {
+            leader_client_id: uuid::Uuid::from_u128(8),
+            context_id: uuid::Uuid::from_u128(9),
+            name: "theirs".into(),
+            in_view: false,
+        }),
         view_id: uuid::Uuid::from_u128(1),
         name: "default".into(),
+        is_default: true,
         view_revision: 4,
         binding_revision: 2,
         active_workspace_id: uuid::Uuid::nil(),
@@ -110,6 +121,7 @@ fn personal_attachment_contracts_take_no_client_and_round_trip() {
                 member_id: uuid::Uuid::from_u128(5),
                 context_id: uuid::Uuid::from_u128(6),
                 name: "mine".into(),
+                label: Some("mine".into()),
                 active: true,
             }],
         }],
@@ -216,9 +228,16 @@ fn personal_actions_address_tabs_without_client_owner_or_revision() {
         })
         .unwrap(),
     ];
+    let label = serde_json::to_value(
+        bmux_tabs_plugin_api::tabs_personal_labels::client::SetLabelRequest {
+            context_id: tab,
+            label: Some("mine".into()),
+        },
+    )
+    .unwrap();
     // The tabs plugin resolves the attachment, its view, the members and the
     // revision itself.
-    for request in &requests {
+    for request in requests.iter().chain([&label]) {
         assert!(
             request.as_object().unwrap().keys().all(|key| {
                 !key.contains("client")

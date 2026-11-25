@@ -567,6 +567,21 @@ interface tabs-personal-actions {
         -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
 }
 
+// Personal labels of the invoking attachment's bound view, addressed by tab
+// (context id). A label overrides the tab's shared name in this view only;
+// renaming the tab itself (`tabs-commands.rename-tab-by-id`) changes the name
+// everyone sees. The tabs plugin resolves the member and the current view
+// revision itself, retrying when another attachment edits the same view.
+@capability(TABS_WRITE)
+@interface-version(1)
+interface tabs-personal-labels {
+    // Set the tab's personal label, or clear it (`label` absent or empty) so
+    // the view shows the shared name again. The tab must be a member of the
+    // bound view; setting the label it already has changes nothing.
+    command set-label(context-id: uuid, label: string?)
+        -> result<tabs-personal-commands.personal-ack, tabs-personal-attachment.personal-attachment-error>;
+}
+
 // One attachment's projection of its bound personal view, published by the
 // tabs plugin only to that attachment (recipient-scoped retained delivery,
 // never broadcast). Each publication is complete: members whose tabs are not
@@ -575,13 +590,16 @@ interface tabs-personal-actions {
 // selection. A projection with the nil `view-id` means none is available.
 //
 // v2: `last-removed` carries the attachment's last removal for undo.
-@interface-version(2)
+// v3: `is-default`, each member's `label`, and `following`.
+@interface-version(3)
 interface personal-view {
     record personal-view-member {
         member-id: uuid,
         context-id: uuid,
         // The personal label when set, otherwise the tab's shared name.
         name: string,
+        // The personal label, when this view overrides the shared name.
+        label: string?,
         active: bool,
     }
 
@@ -599,9 +617,25 @@ interface personal-view {
         removed-at-ms: u64,
     }
 
+    // The attachment follows another client and shows that client's tab,
+    // without adding it to this view. Ending the follow restores the
+    // selection the attachment had when it began.
+    record personal-view-follow {
+        leader-client-id: uuid,
+        // The tab shown for the leader.
+        context-id: uuid,
+        // Its personal label in this view when it is a member, otherwise its
+        // shared name.
+        name: string,
+        // Whether the tab is a member of this view's arrangement.
+        in-view: bool,
+    }
+
     record personal-view-projection {
         view-id: uuid,
         name: string,
+        // Whether the bound view is the owner's default view.
+        is-default: bool,
         view-revision: u64,
         binding-revision: u64,
         // The workspace of the attachment's selected tab (nil: the default
@@ -612,6 +646,7 @@ interface personal-view {
         // last live tab), `active-workspace-id` is the workspace it was in.
         workspaces: list<personal-view-workspace>,
         last-removed: personal-view-removal?,
+        following: personal-view-follow?,
     }
 
     @state events personal-view-projection;
@@ -810,6 +845,7 @@ world tabs {
     provide tabs-personal-commands;
     provide tabs-personal-attachment;
     provide tabs-personal-actions;
+    provide tabs-personal-labels;
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;

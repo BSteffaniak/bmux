@@ -16,8 +16,10 @@ use uuid::Uuid;
 pub const fn no_projection() -> PersonalViewProjection {
     PersonalViewProjection {
         last_removed: None,
+        following: None,
         view_id: Uuid::nil(),
         name: String::new(),
+        is_default: true,
         view_revision: 0,
         binding_revision: 0,
         active_workspace_id: Uuid::nil(),
@@ -125,6 +127,22 @@ pub fn from_catalog(catalog: &TabListSnapshot, selected: Option<Uuid>) -> Projec
     }
 }
 
+/// The personal label this attachment's view gives `tab`, when it has one.
+pub fn label_of(projection: Option<&PersonalViewProjection>, tab: Uuid) -> Option<&str> {
+    projection?
+        .workspaces
+        .iter()
+        .flat_map(|arrangement| &arrangement.members)
+        .find(|member| member.context_id == tab)?
+        .label
+        .as_deref()
+}
+
+/// The first eight hex digits of a client id, enough to tell clients apart.
+fn short_id(id: Uuid) -> String {
+    id.simple().to_string().chars().take(8).collect()
+}
+
 /// How long the bar offers to undo a removal.
 pub const UNDO_HINT_MS: u64 = 8_000;
 
@@ -139,10 +157,12 @@ fn hint(id: &str, text: String, severity: Severity, priority: i32) -> StatusItem
     }
 }
 
-/// The personal view's hints, shown before contributed status items: an
-/// emptied view says how to add tabs, and a recent removal says how to undo
-/// it (for [`UNDO_HINT_MS`] after the removal, by wall clock, so a replayed
-/// projection never shows an old one again).
+/// The personal view's hints, shown before contributed status items: a
+/// follow names the leader and whether the tab it shows is in this view, an
+/// emptied view says how to add tabs, a recent removal says how to undo it
+/// (for [`UNDO_HINT_MS`] after the removal, by wall clock, so a replayed
+/// projection never shows an old one again), and a view other than the
+/// default is named.
 pub fn view_hints(
     projection: Option<&PersonalViewProjection>,
     no_tabs_shown: bool,
@@ -152,8 +172,29 @@ pub fn view_hints(
         return Vec::new();
     };
     let mut hints = Vec::new();
-    // The empty view's hint outranks the undo hint when space runs out.
-    if no_tabs_shown {
+    if let Some(follow) = &projection.following {
+        hints.push(hint(
+            "personal-view-following",
+            if follow.in_view {
+                format!(
+                    "Following {} on {}",
+                    short_id(follow.leader_client_id),
+                    follow.name
+                )
+            } else {
+                format!(
+                    "Following {} on {} (not in your view)",
+                    short_id(follow.leader_client_id),
+                    follow.name
+                )
+            },
+            Severity::Info,
+            i32::MAX,
+        ));
+    }
+    // The empty view's hint outranks the undo hint when space runs out. A
+    // follow shows a tab even while the view has none here.
+    if no_tabs_shown && projection.following.is_none() {
         hints.push(hint(
             "personal-view-empty",
             "View empty: open the finder to add tabs".into(),
@@ -171,6 +212,14 @@ pub fn view_hints(
             format!("Removed {} (prefix u: undo)", removal.name),
             Severity::Info,
             i32::MAX - 1,
+        ));
+    }
+    if !projection.is_default {
+        hints.push(hint(
+            "personal-view-name",
+            format!("View: {}", projection.name),
+            Severity::Info,
+            i32::MAX - 2,
         ));
     }
     hints
@@ -192,11 +241,12 @@ pub fn undo_hint_expiry_ms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_tabs_plugin_api::personal_view::PersonalViewRemoval;
+    use bmux_tabs_plugin_api::personal_view::{PersonalViewFollow, PersonalViewRemoval};
 
     fn projection(last_removed: Option<PersonalViewRemoval>) -> PersonalViewProjection {
         PersonalViewProjection {
             view_id: Uuid::from_u128(1),
+            name: "Default".into(),
             last_removed,
             ..no_projection()
         }
@@ -236,5 +286,63 @@ mod tests {
         let later = 10_000 + UNDO_HINT_MS;
         assert_eq!(view_hints(Some(&removed), false, later), Vec::new());
         assert_eq!(undo_hint_expiry_ms(Some(&removed), later), None);
+    }
+
+    #[test]
+    fn hints_name_a_view_other_than_the_default_and_a_follow() {
+        let named = PersonalViewProjection {
+            name: "review".into(),
+            is_default: false,
+            ..projection(None)
+        };
+        assert_eq!(texts(&view_hints(Some(&named), false, 0)), ["View: review"]);
+
+        let leader = Uuid::parse_str("1234abcd-0000-0000-0000-000000000000").unwrap();
+        let following = |in_view| PersonalViewProjection {
+            following: Some(PersonalViewFollow {
+                leader_client_id: leader,
+                context_id: Uuid::from_u128(9),
+                name: "logs".into(),
+                in_view,
+            }),
+            ..projection(None)
+        };
+        // A followed tab outside the view is shown without the empty hint.
+        assert_eq!(
+            texts(&view_hints(Some(&following(false)), true, 0)),
+            ["Following 1234abcd on logs (not in your view)"]
+        );
+        assert_eq!(
+            texts(&view_hints(Some(&following(true)), false, 0)),
+            ["Following 1234abcd on logs"]
+        );
+    }
+
+    #[test]
+    fn labels_are_read_from_the_projection_members() {
+        use bmux_tabs_plugin_api::personal_view::PersonalViewMember;
+        let mut labelled = projection(None);
+        labelled.workspaces = vec![PersonalViewWorkspace {
+            workspace_id: Uuid::nil(),
+            members: vec![
+                PersonalViewMember {
+                    member_id: Uuid::from_u128(1),
+                    context_id: Uuid::from_u128(11),
+                    name: "mine".into(),
+                    label: Some("mine".into()),
+                    active: true,
+                },
+                PersonalViewMember {
+                    member_id: Uuid::from_u128(2),
+                    context_id: Uuid::from_u128(12),
+                    name: "shared".into(),
+                    label: None,
+                    active: false,
+                },
+            ],
+        }];
+        assert_eq!(label_of(Some(&labelled), Uuid::from_u128(11)), Some("mine"));
+        assert_eq!(label_of(Some(&labelled), Uuid::from_u128(12)), None);
+        assert_eq!(label_of(None, Uuid::from_u128(11)), None);
     }
 }

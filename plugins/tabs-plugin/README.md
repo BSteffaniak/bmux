@@ -37,6 +37,31 @@ client can navigate tabs independently.
   switch to it (the finder's choice)
 - `tab add-to-view <TAB_ID>` -- add a tab to this attachment's view without
   switching
+- `tab view list` / `list-views` -- your views, marking the default and this
+  attachment's
+- `tab view create <NAME> [--copy]` / `create-view` -- create an empty view
+  (`--copy`: a copy of this attachment's view, with its order and labels);
+  an attachment switches to it
+- `tab view switch <VIEW>` / `switch-view` -- show another of your views in
+  this attachment (keeping its tab when that view holds it, else moving to the
+  view's first tab of the workspace)
+- `tab view rename <NAME> [--view VIEW]`, `tab view delete [VIEW]`,
+  `tab view set-default [VIEW]` -- manage views (default: this attachment's,
+  or a CLI caller's default view). Deleting never touches tabs; attachments of
+  the deleted view move to the default view. The default view cannot be
+  deleted until another view is the default.
+- `tab label <LABEL> [--tab TAB_ID]` / `set-tab-label`, `tab clear-label`
+  / `clear-tab-label` -- rename a tab for this view only, or show its shared
+  name again (`rename-tab` renames it for everyone)
+
+Views are named by id or exact name; names are unique per user. Every
+attachment starts on its user's default view; attachments sharing a view
+share its arrangement and labels but each keeps its own selection.
+
+While an attachment follows another client (`bmux.clients` `follow`), it shows
+the leader's tab without adding it to its view, its projection says so, and
+removals or deletions in its view do not move it. When the follow ends, the
+tabs plugin selects the tab the attachment had before following again.
 
 A tab is never terminated because no view references it: removing a reference
 only changes that view. Closing a tab for everyone (`kill-tab`, the tab bar's

@@ -20,5 +20,13 @@ name          = "add-to-view"
 path          = ["finder", "add-to-view"]
 summary       = "Add a tab from any workspace to this attachment's tab view"
 
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "views"
+path          = ["finder", "views"]
+summary       = "Switch this attachment to another of your tab views, or create one"
+
 [keybindings.runtime]
 "shift+f" = "plugin:bmux.finder:show"
+"shift+v" = "plugin:bmux.finder:views"

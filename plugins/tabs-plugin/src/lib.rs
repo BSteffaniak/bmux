@@ -49,6 +49,7 @@ use bmux_tabs_plugin_api::tabs_commands::{
 use bmux_tabs_plugin_api::tabs_personal_actions as personal_actions;
 use bmux_tabs_plugin_api::tabs_personal_attachment as personal_attachment;
 use bmux_tabs_plugin_api::tabs_personal_commands as personal_commands;
+use bmux_tabs_plugin_api::tabs_personal_labels as personal_labels;
 use bmux_tabs_plugin_api::tabs_personal_views;
 use bmux_tabs_plugin_api::tabs_state::{
     self, ActiveTabPaneQueryError, ActiveTabPaneSet, FloatingPaneState, PaneState, TabEntry,
@@ -1342,6 +1343,14 @@ impl Plugin for TabsPlugin {
             .blocking_command("undo-remove-from-view", Self::run_command)
             .blocking_command("open-tab", Self::run_command)
             .blocking_command("add-tab-to-view", Self::run_command)
+            .blocking_command("list-views", Self::run_command)
+            .blocking_command("create-view", Self::run_command)
+            .blocking_command("switch-view", Self::run_command)
+            .blocking_command("rename-view", Self::run_command)
+            .blocking_command("delete-view", Self::run_command)
+            .blocking_command("set-default-view", Self::run_command)
+            .blocking_command("set-tab-label", Self::run_command)
+            .blocking_command("clear-tab-label", Self::run_command)
             .blocking_command("reset-order", Self::run_command)
             .blocking_command("focus-pane-in-direction", Self::run_command)
             .blocking_command("split-pane", Self::run_command)
@@ -1522,6 +1531,11 @@ impl TabsPlugin {
                     self.attachments.select_member(env, ctx.caller_client_id, req.member_id, req.expected_binding_revision, |context_id| {
                         switch_tab(ctx, &self.runtime_state, context_selector_by_id(context_id), &self.last_selected_by_client, ctx.caller_client_id).map(|_| ())
                     })
+                }))
+            },
+            "tabs-personal-labels/v1", "set-label" => |req: personal_labels::client::SetLabelRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.with_attachment_env(ctx, |env| {
+                    self.attachments.set_label(env, ctx.caller_client_id, req.context_id, req.label.as_deref())
                 }))
             },
             "tabs-personal-actions/v1", "add-tab" => |req: personal_actions::client::AddTabRequest, ctx| {
@@ -2635,6 +2649,10 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             }
             Ok(())
         }
+        "list-views" | "create-view" | "switch-view" | "rename-view" | "delete-view"
+        | "set-default-view" | "set-tab-label" | "clear-tab-label" => {
+            handle_view_command(plugin, context, emit_to_stdout)
+        }
         "reset-order" => {
             let count = reset_tab_order(context, &plugin.runtime_state)?;
             if emit_to_stdout {
@@ -2856,6 +2874,249 @@ fn record_selected_context_outcome(ack: &TabAck) {
             COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
             serde_json::json!(context_id),
         );
+    }
+}
+
+/// The `n`th positional argument, skipping the values of `options`.
+fn positional_skipping(arguments: &[String], options: &[&str], n: usize) -> Option<String> {
+    let mut skip_next = false;
+    arguments
+        .iter()
+        .filter(|argument| {
+            if std::mem::take(&mut skip_next) {
+                return false;
+            }
+            if let Some(name) = argument.strip_prefix("--") {
+                skip_next = options.contains(&name);
+                return false;
+            }
+            !argument.starts_with('-')
+        })
+        .nth(n)
+        .cloned()
+}
+
+/// A user-facing message for a failed view command.
+fn view_command_error(
+    command: &str,
+    error: personal_attachment::PersonalAttachmentError,
+    invalid: &str,
+) -> String {
+    use personal_attachment::PersonalAttachmentError as E;
+    match error {
+        E::NoAttachment => format!("{command} needs an attached client"),
+        E::NoPrincipal => "this client has no principal, so it has no tab views".into(),
+        E::NotFound => "no such tab view".into(),
+        E::InvalidReference => invalid.into(),
+        E::RevisionConflict { .. } => "the tab view changed meanwhile; try again".into(),
+        E::Unavailable { reason } => format!("{command} failed: {reason}"),
+    }
+}
+
+/// The caller owner's views, for name lookup.
+fn caller_views(
+    context: &NativeCommandContext,
+) -> Result<Vec<tabs_personal_views::PersonalViewSummary>, String> {
+    personal_views::list_views_for_caller(context).map_err(|error| match error {
+        tabs_personal_views::PersonalViewError::NoPrincipal => {
+            "this client has no principal, so it has no tab views".to_string()
+        }
+        other => format!("listing tab views failed: {other:?}"),
+    })
+}
+
+/// A view named by id or by its exact name among the caller owner's views.
+fn resolve_view(context: &NativeCommandContext, selector: &str) -> Result<Uuid, String> {
+    if let Ok(id) = Uuid::parse_str(selector) {
+        return Ok(id);
+    }
+    let views = caller_views(context)?;
+    let mut matches = views.iter().filter(|view| view.name == selector);
+    match (matches.next(), matches.next()) {
+        (Some(view), None) => Ok(view.view_id),
+        (Some(_), Some(_)) => Err(format!(
+            "more than one tab view is named '{selector}'; use its id (list-views)"
+        )),
+        (None, _) => Err(format!("no tab view named '{selector}'")),
+    }
+}
+
+/// Refuse a name another of the caller owner's views already has, so views
+/// stay addressable by name.
+fn require_unused_view_name(
+    context: &NativeCommandContext,
+    name: &str,
+    except: Option<Uuid>,
+) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("a tab view name must not be empty".into());
+    }
+    if caller_views(context)?
+        .iter()
+        .any(|view| view.name == name && Some(view.view_id) != except)
+    {
+        return Err(format!("a tab view named '{name}' already exists"));
+    }
+    Ok(())
+}
+
+/// View management and personal label commands. Each acts on the caller's
+/// view: the invoking attachment's bound view, or, for a caller without an
+/// attachment (the CLI), its owner's default view.
+#[allow(clippy::too_many_lines)] // One arm per view command keeps each rule beside its message.
+fn handle_view_command(
+    plugin: &TabsPlugin,
+    context: &NativeCommandContext,
+    emit_to_stdout: bool,
+) -> Result<(), String> {
+    let client = context.caller_client_id;
+    let attachments = &plugin.attachments;
+    let command = context.command.as_str();
+    let arguments = &context.arguments;
+    let view_option = option_value(arguments, "view")
+        .map(|selector| resolve_view(context, &selector))
+        .transpose()?;
+    match command {
+        "list-views" => {
+            let views = caller_views(context)?;
+            // Reading never creates a binding or a default view.
+            let bound = plugin
+                .with_attachment_env(context, |env| attachments.current_binding(env, client))
+                .ok()
+                .map(|binding| binding.view_id);
+            if emit_to_stdout {
+                for view in views {
+                    println!(
+                        "{}  {}{}{}",
+                        view.view_id,
+                        view.name,
+                        if view.is_default { " (default)" } else { "" },
+                        if bound == Some(view.view_id) {
+                            " (current)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        "create-view" => {
+            let name = positional_skipping(arguments, &["view"], 0)
+                .ok_or_else(|| "missing required NAME argument".to_string())?;
+            require_unused_view_name(context, &name, None)?;
+            let copy = has_flag(arguments, "copy");
+            let view = plugin
+                .with_attachment_env(context, |env| {
+                    attachments.create_view(env, client, &name, copy)
+                })
+                .map_err(|error| view_command_error(command, error, "invalid tab view"))?;
+            if emit_to_stdout {
+                println!("created tab view {} ({})", view.name, view.view_id);
+            }
+            Ok(())
+        }
+        "switch-view" => {
+            let selector = positional_skipping(arguments, &["view"], 0)
+                .ok_or_else(|| "missing required VIEW argument".to_string())?;
+            let view_id = resolve_view(context, &selector)?;
+            plugin
+                .with_attachment_env(context, |env| attachments.switch_view(env, client, view_id))
+                .map_err(|error| view_command_error(command, error, "invalid tab view"))?;
+            if emit_to_stdout {
+                println!("switched to tab view {view_id}");
+            }
+            Ok(())
+        }
+        "rename-view" => {
+            let name = positional_skipping(arguments, &["view"], 0)
+                .ok_or_else(|| "missing required NAME argument".to_string())?;
+            let target = match view_option {
+                Some(view) => view,
+                None => {
+                    plugin
+                        .with_attachment_env(context, |env| attachments.caller_view(env, client))
+                        .map_err(|error| view_command_error(command, error, "invalid tab view"))?
+                        .1
+                }
+            };
+            require_unused_view_name(context, &name, Some(target))?;
+            plugin
+                .with_attachment_env(context, |env| {
+                    attachments.rename_view(env, client, Some(target), &name)
+                })
+                .map_err(|error| view_command_error(command, error, "invalid tab view"))?;
+            if emit_to_stdout {
+                println!("renamed tab view {target} to {name}");
+            }
+            Ok(())
+        }
+        "delete-view" | "set-default-view" => {
+            let target = positional_skipping(arguments, &["view"], 0)
+                .map(|selector| resolve_view(context, &selector))
+                .transpose()?
+                .or(view_option);
+            if command == "delete-view" {
+                let default = plugin
+                    .with_attachment_env(context, |env| {
+                        attachments.delete_view(env, client, target)
+                    })
+                    .map_err(|error| {
+                        view_command_error(
+                            command,
+                            error,
+                            "the default tab view cannot be deleted; make another view the default first (set-default-view)",
+                        )
+                    })?;
+                if emit_to_stdout {
+                    println!(
+                        "deleted the tab view; its attachments now use the default view {default}"
+                    );
+                }
+            } else {
+                let ack = plugin
+                    .with_attachment_env(context, |env| {
+                        attachments.set_default_view(env, client, target)
+                    })
+                    .map_err(|error| view_command_error(command, error, "invalid tab view"))?;
+                if emit_to_stdout {
+                    println!("tab view {} is now the default", ack.view_id);
+                }
+            }
+            Ok(())
+        }
+        "set-tab-label" | "clear-tab-label" => {
+            let label = if command == "set-tab-label" {
+                Some(
+                    positional_skipping(arguments, &["tab", "view"], 0)
+                        .ok_or_else(|| "missing required LABEL argument".to_string())?,
+                )
+            } else {
+                None
+            };
+            let tab = match option_value(arguments, "tab") {
+                Some(tab) => Uuid::parse_str(&tab)
+                    .map_err(|error| format!("invalid tab id '{tab}': {error}"))?,
+                None => current_context(context)?
+                    .map(|tab| tab.id)
+                    .ok_or_else(|| "no current tab; pass --tab TAB_ID".to_string())?,
+            };
+            plugin
+                .with_attachment_env(context, |env| {
+                    attachments.set_label(env, client, tab, label.as_deref())
+                })
+                .map_err(|error| {
+                    view_command_error(command, error, "the tab is not in this tab view")
+                })?;
+            if emit_to_stdout {
+                match label {
+                    Some(label) => println!("labelled tab context {tab} '{label}' in this view"),
+                    None => println!("cleared the label of tab context {tab} in this view"),
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown view command '{other}'")),
     }
 }
 
@@ -5560,6 +5821,10 @@ fn interface_ids_match_bpdl_constants() {
     assert_eq!(
         personal_actions::INTERFACE_ID.as_str(),
         "tabs-personal-actions/v1"
+    );
+    assert_eq!(
+        personal_labels::INTERFACE_ID.as_str(),
+        "tabs-personal-labels/v1"
     );
 }
 

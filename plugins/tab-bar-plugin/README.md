@@ -78,17 +78,23 @@ The strip shows this attachment's personal tab view (delivered to it alone by
 labels. Without one (no principal) it shows the shared order.
 
 Interactions include click switching, hover feedback, drag reorder, wheel
-navigation, middle-click inline rename, and a right-click menu: Switch, Rename,
-Remove from view (only with a personal view; the tab keeps running) and Close
-for everyone… (asks for confirmation, Cancel first, then terminates the tab
-for
-every user). Drag reorder and the selection menu's Move left/right reorder the
+navigation, middle-click inline rename (of the shared name), and a right-click
+menu: Switch, Rename for everyone… (the tab's shared name), Rename for me…
+(a
+label only this personal view shows; an empty label clears it), Clear my label
+(when the tab has one), Remove from view (the personal entries only with a
+personal view; the tab keeps running) and Close for everyone… (asks for
+confirmation, Cancel first, then terminates the tab for every user). Drag
+reorder and the selection menu's Move left/right reorder the
 personal view, never the shared order; the selection menu also offers Remove
 selected from view next to the confirmed Close selected tabs…. A refused or
 failed close (or removal) is shown on the status line. After a removal the bar
 offers to undo it for a few seconds ("Removed NAME (prefix u: undo)"), and a
 view whose workspace has no tab left says "View empty: open the finder to add
-tabs" (that attachment has no input target meanwhile). Rename and menu
+tabs" (that attachment has no input target meanwhile). A view other than the
+default is named ("View: NAME"), and while the attachment follows another
+client the bar says which tab it shows and whether that tab is in the view
+("Following CLIENT on NAME (not in your view)"). Rename and menu
 keyboard input is captured by the plugin and mutations go through generated
 `bmux.tabs` clients.
 

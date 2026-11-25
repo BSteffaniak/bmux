@@ -43,8 +43,8 @@ use bmux_contexts_plugin_api::contexts_state::ContextSummary;
 use bmux_plugin::{HostRuntimeApi, PluginStateRegistry};
 use bmux_plugin_sdk::WireEventSink;
 use bmux_tabs_plugin_api::personal_view::{
-    PersonalViewMember, PersonalViewProjection, PersonalViewRemoval, PersonalViewWorkspace,
-    STATE_KIND,
+    PersonalViewFollow, PersonalViewMember, PersonalViewProjection, PersonalViewRemoval,
+    PersonalViewWorkspace, STATE_KIND,
 };
 use bmux_tabs_plugin_api::tabs_personal_attachment::{PersonalAttachmentError, PersonalBinding};
 use bmux_tabs_plugin_api::tabs_personal_commands::PersonalAck;
@@ -70,6 +70,8 @@ pub trait AttachmentHost: Send + Sync {
     fn principal(&self, client: Uuid) -> Option<Uuid>;
     /// The client's selected tab (its contexts selection).
     fn selected_context(&self, client: Uuid) -> Option<Uuid>;
+    /// The client `client` follows, when it follows one.
+    fn following(&self, client: Uuid) -> Option<Uuid>;
 }
 
 /// The production host: neutral state handles in the activation's registry.
@@ -130,6 +132,13 @@ impl AttachmentHost for RegistryHost<'_> {
             })
             .map(|context| context.id)
     }
+
+    fn following(&self, client: Uuid) -> Option<Uuid> {
+        self.follow()?
+            .0
+            .follow_target(bmux_session_models::ClientId(client))
+            .map(|entry| entry.leader_client_id.0)
+    }
 }
 
 /// Selection of attached clients on their behalf, through the selection
@@ -183,6 +192,30 @@ pub struct Removal {
     pub removed_at_ms: u64,
 }
 
+/// What ending a follow restores: the attachment's own selection from before
+/// it began following.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Restore {
+    /// Nothing is known (the attachment followed from its start): it keeps
+    /// the tab the follow left it on.
+    #[default]
+    Keep,
+    /// Select this tab again (no selection, still showing its workspace,
+    /// when it is gone).
+    Select { context: Uuid, workspace: Uuid },
+    /// It had no selection (its arrangement there was empty).
+    Clear { workspace: Uuid },
+}
+
+/// The attachment follows another client. The follow shows the leader's
+/// tab without adding it to this attachment's view, and suspends the
+/// view's own reselection (removal, deletion and view switches) for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FollowOverlay {
+    leader: Uuid,
+    restore: Restore,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Binding {
     owner: Owner,
@@ -193,6 +226,9 @@ struct Binding {
     /// its arrangement there lost its last live tab.
     held_workspace: Option<Uuid>,
     last_removed: Option<Removal>,
+    /// The attachment's own selection, kept current while it follows no one.
+    own: Restore,
+    follow: Option<FollowOverlay>,
     /// The last payload published to this client.
     published: Option<Vec<u8>>,
 }
@@ -272,8 +308,30 @@ fn project(
     active_workspace: Uuid,
     selected: Option<Uuid>,
     last_removed: Option<&Removal>,
+    leader: Option<Uuid>,
 ) -> PersonalViewProjection {
+    let member_of = |context: Uuid| {
+        view.workspaces
+            .iter()
+            .filter(|arrangement| arrangement.initialized)
+            .flat_map(|arrangement| &arrangement.members)
+            .find(|member| member.context_id == context)
+    };
+    let following = leader.zip(selected).map(|(leader, context)| {
+        let member = member_of(context);
+        PersonalViewFollow {
+            leader_client_id: leader,
+            context_id: context,
+            name: member
+                .and_then(|member| member.label.clone())
+                .or_else(|| live.get(&context).and_then(|tab| tab.name.clone()))
+                .unwrap_or_else(|| "tab".into()),
+            in_view: member.is_some(),
+        }
+    });
     PersonalViewProjection {
+        is_default: view.is_default,
+        following,
         last_removed: last_removed
             .filter(|removal| removal.view_id == view.view_id)
             .map(|removal| PersonalViewRemoval {
@@ -309,6 +367,7 @@ fn project(
                             .clone()
                             .or_else(|| context.name.clone())
                             .unwrap_or_else(|| format!("tab-{}", index + 1)),
+                        label: member.label.clone(),
                         active: selected == Some(member.context_id),
                     })
                     .collect(),
@@ -377,6 +436,8 @@ impl Attachments {
             selected_member: None,
             held_workspace: None,
             last_removed: None,
+            own: Restore::Keep,
+            follow: None,
             published: None,
         })
     }
@@ -624,6 +685,9 @@ impl Attachments {
             }
         };
         for client in clients {
+            if let Err(error) = self.track_follow(env, client, &contexts) {
+                failures.push(format!("follow of {client}: {error}"));
+            }
             if let Err(error) = self.publish(env, client, &contexts) {
                 failures.push(format!("projection for {client}: {error}"));
             }
@@ -705,8 +769,11 @@ impl Attachments {
             |context| workspace_of(context),
         );
         // Seed the attachment's active workspace once, from the canonical
-        // order, on first access. Only a live selection names a workspace.
+        // order, on first access. Only a live selection names a workspace,
+        // and only the attachment's own: a followed tab is shown, never
+        // arranged.
         if selected.is_some()
+            && binding.follow.is_none()
             && !view
                 .workspaces
                 .iter()
@@ -724,6 +791,7 @@ impl Attachments {
             active_workspace,
             selected,
             binding.last_removed.as_ref(),
+            binding.follow.map(|follow| follow.leader),
         ))?;
         let mut bindings = self
             .bindings
@@ -1012,17 +1080,28 @@ impl Attachments {
         displacement: &Displacement,
         select: impl FnOnce(Uuid) -> std::result::Result<(), String>,
     ) -> Result<()> {
-        let displaced: Vec<Uuid> = self
-            .bindings
-            .lock()
-            .map_err(|_| unavailable("attachment bindings poisoned"))?
-            .iter()
-            .filter(|(_, binding)| {
+        let displaced: Vec<Uuid> = {
+            let mut bindings = self
+                .bindings
+                .lock()
+                .map_err(|_| unavailable("attachment bindings poisoned"))?;
+            let mut displaced = Vec::new();
+            for (client, binding) in bindings.iter_mut().filter(|(_, binding)| {
                 binding.owner == displacement.owner && binding.view_id == displacement.view_id
-            })
-            .map(|(client, _)| *client)
-            .filter(|client| env.host.selected_context(*client) == Some(displacement.removed))
-            .collect();
+            }) {
+                // A follower keeps showing the leader's tab; what it returns
+                // to when the follow ends moves instead.
+                if let Some(follow) = binding.follow.as_mut() {
+                    follow.restore = follow.restore.displaced(displacement);
+                    continue;
+                }
+                if env.host.selected_context(*client) == Some(displacement.removed) {
+                    displaced.push(*client);
+                }
+            }
+            drop(bindings);
+            displaced
+        };
         let mut select = Some(select);
         let mut outcome = Ok(());
         for client in displaced {
@@ -1103,6 +1182,29 @@ impl Attachments {
             }) else {
                 continue;
             };
+            if binding.follow.is_some() {
+                // The follow decides what a follower shows; only what it
+                // returns to afterwards moves within its own view.
+                let order = arrangement_order(&view, workspace).unwrap_or_default();
+                let live: BTreeSet<Uuid> = contexts
+                    .iter()
+                    .filter(|context| workspace_of(context) == workspace)
+                    .map(|context| context.id)
+                    .collect();
+                let displacement = Displacement {
+                    owner: binding.owner,
+                    view_id: binding.view_id,
+                    workspace,
+                    removed: deleted,
+                    neighbour: removal_neighbour(&order, &live, deleted),
+                };
+                self.with_binding(client, |current| {
+                    if let Some(follow) = current.follow.as_mut() {
+                        follow.restore = follow.restore.displaced(&displacement);
+                    }
+                });
+                continue;
+            }
             if binding.selected_member != Some(member) {
                 continue;
             }
@@ -1193,6 +1295,430 @@ impl Attachments {
         )?;
         forget(self);
         Ok((removal, ack))
+    }
+}
+
+/// Following another client.
+impl Attachments {
+    /// Track whether `client` follows another client. While it follows no
+    /// one, its own selection is remembered; when a follow begins, that
+    /// selection is kept as what to restore; when the follow ends (stopped,
+    /// or the leader left), it is restored.
+    fn track_follow<C: ?Sized>(
+        &self,
+        env: &Env<'_, C>,
+        client: Uuid,
+        contexts: &[ContextSummary],
+    ) -> std::result::Result<(), String> {
+        let Some(binding) = self.binding(client).map_err(|error| format!("{error:?}"))? else {
+            return Ok(());
+        };
+        // The selection is read before the follow: a follow is recorded
+        // before it moves the follower's selection, so a selection read
+        // while no follow is seen is the attachment's own.
+        let selected = env.host.selected_context(client).and_then(|id| {
+            contexts
+                .iter()
+                .find(|context| context.id == id)
+                .map(|context| (id, workspace_of(context)))
+        });
+        match (env.host.following(client), binding.follow) {
+            (Some(leader), None) => self.with_binding(client, |current| {
+                current.follow = Some(FollowOverlay {
+                    leader,
+                    restore: current.own,
+                });
+            }),
+            (Some(leader), Some(follow)) if follow.leader != leader => {
+                self.with_binding(client, |current| {
+                    if let Some(follow) = current.follow.as_mut() {
+                        follow.leader = leader;
+                    }
+                });
+            }
+            (Some(_), Some(_)) => {}
+            (None, Some(follow)) => {
+                self.with_binding(client, |current| current.follow = None);
+                self.restore_after_follow(env, client, follow.restore, contexts)?;
+            }
+            (None, None) => {
+                let own = selected.map_or_else(
+                    || {
+                        binding
+                            .held_workspace
+                            .map_or(Restore::Keep, |workspace| Restore::Clear { workspace })
+                    },
+                    |(context, workspace)| Restore::Select { context, workspace },
+                );
+                self.with_binding(client, |current| current.own = own);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a client whose follow ended to its own selection.
+    fn restore_after_follow<C: ?Sized>(
+        &self,
+        env: &Env<'_, C>,
+        client: Uuid,
+        restore: Restore,
+        contexts: &[ContextSummary],
+    ) -> std::result::Result<(), String> {
+        let live = |tab: Uuid| contexts.iter().any(|context| context.id == tab);
+        match restore {
+            Restore::Keep => Ok(()),
+            Restore::Select { context, .. } if live(context) => {
+                env.selection.select_for(client, context)
+            }
+            Restore::Select { workspace, .. } | Restore::Clear { workspace } => {
+                self.with_binding(client, |current| {
+                    current.held_workspace = Some(workspace);
+                });
+                env.selection.clear_for(client)
+            }
+        }
+    }
+}
+
+/// View management: creating, switching, renaming, deleting views, the
+/// default view, and personal labels.
+impl Attachments {
+    /// The caller's owner and the view its commands address: the invoking
+    /// attachment's bound view, or (for a caller without an attachment, such
+    /// as the CLI) the owner's default view, created when it has none.
+    ///
+    /// # Errors
+    /// `no-principal`, or the repository failed.
+    pub fn caller_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+    ) -> Result<(Owner, Uuid, Option<Uuid>)> {
+        let attached = client.filter(|id| {
+            !id.is_nil()
+                && (self.binding(*id).ok().flatten().is_some() || env.host.is_attached(*id))
+        });
+        if let Some(client) = attached {
+            let (client, binding) = self.invoking_binding(env, Some(client))?;
+            return Ok((binding.owner, binding.view_id, Some(client)));
+        }
+        let owner = match resolve_caller(env.caller) {
+            OwnerResolution::Owner(owner) => owner,
+            OwnerResolution::NoPrincipal => return Err(PersonalAttachmentError::NoPrincipal),
+            OwnerResolution::Unavailable(reason) => return Err(unavailable(reason)),
+        };
+        Ok((owner, Self::new_binding(env, owner)?.view_id, None))
+    }
+
+    /// Apply the command `build` makes from the current view, retrying when
+    /// another attachment edited the view meanwhile.
+    fn apply_to_view<C: HostRuntimeApi + Sync>(
+        env: &Env<'_, C>,
+        owner: Owner,
+        view_id: Uuid,
+        build: impl Fn(&PersonalView) -> Result<Option<Command>>,
+    ) -> Result<PersonalAck> {
+        let repository = Repository::new(env.caller, env.states);
+        let catalog = LiveCatalog::new(env.caller);
+        for _ in 0..4 {
+            let view = repository.get_view(owner, view_id).map_err(view_error)?;
+            let Some(command) = build(&view)? else {
+                return Ok(PersonalAck {
+                    view_id,
+                    revision: view.revision,
+                    member_id: None,
+                });
+            };
+            match repository.apply(
+                owner,
+                Uuid::new_v4(),
+                &command,
+                &catalog as &dyn Catalog,
+                env.now_ms,
+            ) {
+                Ok(ack) => return Ok(ack),
+                Err(PersonalViewError::RevisionConflict { .. }) => {}
+                Err(error) => return Err(view_error(error)),
+            }
+        }
+        Err(unavailable("the view kept changing; try again"))
+    }
+
+    /// Create a view for the caller's owner: a copy of the caller's view
+    /// (members, order and labels), or an empty one, whose arrangements of
+    /// every workspace that has tabs start empty (workspaces created later
+    /// are seeded on first visit, as in any view). An attached caller is
+    /// switched to it.
+    ///
+    /// # Errors
+    /// `no-principal`, or the repository refused (a limit, or the name is
+    /// too long).
+    pub fn create_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        name: &str,
+        copy: bool,
+    ) -> Result<PersonalView> {
+        let (owner, current, attached) = self.caller_view(env, client)?;
+        let empty_workspaces = if copy {
+            Vec::new()
+        } else {
+            let mut workspaces: Vec<Uuid> = crate::list_contexts(env.caller)
+                .map_err(unavailable)?
+                .iter()
+                .map(workspace_of)
+                .collect();
+            workspaces.sort_unstable();
+            workspaces.dedup();
+            workspaces
+        };
+        let view_id = Uuid::new_v4();
+        let repository = Repository::new(env.caller, env.states);
+        repository
+            .apply(
+                owner,
+                Uuid::new_v4(),
+                &Command::CreateViewFrom {
+                    view_id,
+                    name: name.to_string(),
+                    copy_from: copy.then_some(current),
+                    empty_workspaces,
+                },
+                &LiveCatalog::new(env.caller),
+                env.now_ms,
+            )
+            .map_err(view_error)?;
+        if let Some(client) = attached {
+            self.rebind(env, client, owner, view_id)?;
+        }
+        self.schedule();
+        repository.get_view(owner, view_id).map_err(view_error)
+    }
+
+    /// Switch the invoking attachment to another view of its owner.
+    ///
+    /// # Errors
+    /// `no-attachment`, `no-principal`, `not-found`, or `unavailable`.
+    pub fn switch_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        view_id: Uuid,
+    ) -> Result<PersonalBinding> {
+        let (client, binding) = self.invoking_binding(env, client)?;
+        Repository::new(env.caller, env.states)
+            .get_view(binding.owner, view_id)
+            .map_err(view_error)?;
+        self.rebind(env, client, binding.owner, view_id)
+            .map(|binding| binding.to_wire())
+    }
+
+    /// Bind `client` to `view_id` of `owner`, then keep its selection a tab
+    /// of that view: the selected tab when the view arranges it, else the
+    /// first live tab of the view's arrangement of that workspace (seeded on
+    /// first visit), else no selection. A following client is only rebound.
+    fn rebind<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Uuid,
+        owner: Owner,
+        view_id: Uuid,
+    ) -> Result<Binding> {
+        let seen = self
+            .binding(client)?
+            .ok_or(PersonalAttachmentError::NoAttachment)?;
+        let binding = self.commit(client, &seen, |current| {
+            current.update(view_id, None);
+            current.published = None;
+        })?;
+        if binding.owner != owner || binding.follow.is_some() {
+            return Ok(binding);
+        }
+        let contexts = crate::list_contexts(env.caller).map_err(unavailable)?;
+        let selected = env
+            .host
+            .selected_context(client)
+            .and_then(|id| contexts.iter().find(|context| context.id == id));
+        let workspace = selected
+            .map(workspace_of)
+            .or(binding.held_workspace)
+            .unwrap_or_else(Uuid::nil);
+        let view = self.arranged_view(env, &binding, workspace)?;
+        let order = arrangement_order(&view, workspace).unwrap_or_default();
+        if selected.is_some_and(|tab| order.contains(&tab.id)) {
+            return Ok(binding);
+        }
+        let first = order.iter().copied().find(|tab| {
+            contexts
+                .iter()
+                .any(|context| context.id == *tab && workspace_of(context) == workspace)
+        });
+        self.with_binding(client, |current| {
+            current.held_workspace = first.is_none().then_some(workspace);
+        });
+        let outcome = match (first, selected) {
+            (Some(tab), _) => env.selection.select_for(client, tab),
+            (None, Some(_)) => env.selection.clear_for(client),
+            (None, None) => Ok(()),
+        };
+        outcome.map_err(unavailable)?;
+        self.schedule();
+        self.binding(client)?
+            .ok_or(PersonalAttachmentError::NoAttachment)
+    }
+
+    /// Rename one of the caller's views (its bound or default view when
+    /// `view_id` is `None`).
+    ///
+    /// # Errors
+    /// `no-principal`, `not-found`, or the repository refused.
+    pub fn rename_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        view_id: Option<Uuid>,
+        name: &str,
+    ) -> Result<PersonalAck> {
+        let (owner, current, _) = self.caller_view(env, client)?;
+        let view_id = view_id.unwrap_or(current);
+        let ack = Self::apply_to_view(env, owner, view_id, |view| {
+            Ok((view.name != name).then(|| Command::RenameView {
+                view_id,
+                expected_revision: view.revision,
+                name: name.to_string(),
+            }))
+        })?;
+        self.schedule();
+        Ok(ack)
+    }
+
+    /// Make one of the caller's views (its bound view when `None`) the
+    /// owner's default view, which every new attachment is bound to.
+    ///
+    /// # Errors
+    /// `no-principal`, `not-found`, or the repository refused.
+    pub fn set_default_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        view_id: Option<Uuid>,
+    ) -> Result<PersonalAck> {
+        let (owner, current, _) = self.caller_view(env, client)?;
+        let ack = Repository::new(env.caller, env.states)
+            .apply(
+                owner,
+                Uuid::new_v4(),
+                &Command::SetDefaultView {
+                    view_id: view_id.unwrap_or(current),
+                },
+                &LiveCatalog::new(env.caller),
+                env.now_ms,
+            )
+            .map_err(view_error)?;
+        self.schedule();
+        Ok(ack)
+    }
+
+    /// Delete one of the caller's views (its bound view when `None`). Tabs
+    /// are never affected. The default view is refused (`invalid-reference`):
+    /// make another view the default first. Every attachment bound to the
+    /// deleted view is rebound to the default view, as by `switch_view`.
+    /// Returns the default view the attachments moved to.
+    ///
+    /// # Errors
+    /// `no-principal`, `not-found`, `invalid-reference` for the default view,
+    /// or the repository refused.
+    pub fn delete_view<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        view_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let (owner, current, _) = self.caller_view(env, client)?;
+        let view_id = view_id.unwrap_or(current);
+        Self::apply_to_view(env, owner, view_id, |view| {
+            if view.is_default {
+                return Err(PersonalAttachmentError::InvalidReference);
+            }
+            Ok(Some(Command::DeleteView {
+                view_id,
+                expected_revision: view.revision,
+            }))
+        })?;
+        let default = Self::new_binding(env, owner)?.view_id;
+        let bound: Vec<Uuid> = self
+            .bindings
+            .lock()
+            .map_err(|_| unavailable("attachment bindings poisoned"))?
+            .iter()
+            .filter(|(_, binding)| binding.owner == owner && binding.view_id == view_id)
+            .map(|(client, _)| *client)
+            .collect();
+        for client in bound {
+            if let Err(error) = self.rebind(env, client, owner, default) {
+                tracing::warn!(%client, ?error, "rebinding after a view was deleted failed");
+            }
+        }
+        self.schedule();
+        Ok(default)
+    }
+
+    /// Set or clear (`None` or blank) the personal label of `context` in the
+    /// caller's view. The tab must be a member of that view.
+    ///
+    /// # Errors
+    /// `no-principal`, `invalid-reference` for a tab the view does not hold,
+    /// or the repository refused (a label too long).
+    pub fn set_label<C: HostRuntimeApi + Sync>(
+        &self,
+        env: &Env<'_, C>,
+        client: Option<Uuid>,
+        context: Uuid,
+        label: Option<&str>,
+    ) -> Result<PersonalAck> {
+        let label = label
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string);
+        let (owner, view_id, _) = self.caller_view(env, client)?;
+        let ack = Self::apply_to_view(env, owner, view_id, |view| {
+            let member = view
+                .workspaces
+                .iter()
+                .flat_map(|arrangement| &arrangement.members)
+                .find(|member| member.context_id == context)
+                .ok_or(PersonalAttachmentError::InvalidReference)?;
+            Ok((member.label != label).then(|| Command::SetLabel {
+                view_id,
+                expected_revision: view.revision,
+                member_id: member.member_id,
+                label: label.clone(),
+            }))
+        })?;
+        self.schedule();
+        Ok(ack)
+    }
+}
+
+impl Restore {
+    /// What to restore once `displacement`'s tab left the view: its
+    /// neighbour, or no selection.
+    const fn displaced(self, displacement: &Displacement) -> Self {
+        match self {
+            Self::Select { context, .. } if context.as_u128() == displacement.removed.as_u128() => {
+                match displacement.neighbour {
+                    Some(neighbour) => Self::Select {
+                        context: neighbour,
+                        workspace: displacement.workspace,
+                    },
+                    None => Self::Clear {
+                        workspace: displacement.workspace,
+                    },
+                }
+            }
+            other => other,
+        }
     }
 }
 

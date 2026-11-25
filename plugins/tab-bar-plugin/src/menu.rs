@@ -23,13 +23,18 @@ use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuOutcome, MenuPolicy
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing, ModalTheme};
 use uuid::Uuid;
 
-/// One entry of a tab's context menu. "Remove from view" is offered only
-/// while the strip shows this attachment's personal view; it leaves the tab
-/// running, unlike "Close for everyone…", which asks for confirmation first.
+/// One entry of a tab's context menu. The personal entries are offered only
+/// while the strip shows this attachment's personal view: "Rename for me…"
+/// sets a label only this view shows (unlike "Rename for everyone…", which
+/// renames the tab itself), "Clear my label" (when the tab has one) shows the
+/// shared name again, and "Remove from view" leaves the tab running, unlike
+/// "Close for everyone…", which asks for confirmation first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabAction {
     Switch,
-    Rename,
+    RenameForEveryone,
+    RenameForMe,
+    ClearLabel,
     RemoveFromView,
     CloseForEveryone,
 }
@@ -38,16 +43,24 @@ impl TabAction {
     const fn label(self) -> &'static str {
         match self {
             Self::Switch => "Switch",
-            Self::Rename => "Rename",
+            Self::RenameForEveryone => "Rename for everyone…",
+            Self::RenameForMe => "Rename for me…",
+            Self::ClearLabel => "Clear my label",
             Self::RemoveFromView => "Remove from view",
             Self::CloseForEveryone => "Close for everyone…",
         }
     }
 }
 
-fn tab_actions(companion: &CompanionState) -> Vec<TabAction> {
-    let mut actions = vec![TabAction::Switch, TabAction::Rename];
+fn tab_actions(companion: &CompanionState, target: Option<Uuid>) -> Vec<TabAction> {
+    let mut actions = vec![TabAction::Switch, TabAction::RenameForEveryone];
     if companion.personal.is_some() {
+        actions.push(TabAction::RenameForMe);
+        if target.is_some_and(|tab| {
+            super::personal_tabs::label_of(companion.personal.as_ref(), tab).is_some()
+        }) {
+            actions.push(TabAction::ClearLabel);
+        }
         actions.push(TabAction::RemoveFromView);
     }
     actions.push(TabAction::CloseForEveryone);
@@ -122,7 +135,7 @@ fn popup_geometry(companion: &CompanionState) -> Option<PopupGeometry> {
     let width = (if !companion.menu.group.is_empty() || companion.menu.confirming {
         48
     } else {
-        22
+        26
     })
     .min(cols);
     let height = u16::try_from(items(companion).len().saturating_add(2))
@@ -205,7 +218,7 @@ fn items(companion: &CompanionState) -> Vec<MenuItem> {
     } else if companion.menu.confirming {
         vec!["Cancel", "Close for everyone (terminate processes)"]
     } else {
-        tab_actions(companion)
+        tab_actions(companion, companion.menu_tab_id)
             .into_iter()
             .map(TabAction::label)
             .collect()
@@ -619,23 +632,21 @@ fn activate_selection(
         }
         return;
     }
-    result.service_invocation = match tab_actions(companion).get(index).copied() {
+    result.service_invocation = match tab_actions(companion, Some(target)).get(index).copied() {
         Some(TabAction::Switch) => command_invocation::<tabs_commands::client::SwitchTabEndpoint>(
             &tabs_commands::client::SwitchTabRequest {
                 target: target.to_string(),
             },
         ),
-        Some(TabAction::Rename) => {
-            if let Some(tab) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) {
-                companion.editing_tab_id = Some(target);
-                companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
-                companion.edit_buffer.select_all();
+        Some(action @ (TabAction::RenameForEveryone | TabAction::RenameForMe)) => {
+            let personal = action == TabAction::RenameForMe;
+            if super::start_tab_editor(companion, target, personal) {
                 result.release_capture = false;
                 result.capture_keyboard = vec!["*".to_string()];
             }
             None
         }
+        Some(TabAction::ClearLabel) => super::label_invocation(target, None),
         Some(TabAction::RemoveFromView) => {
             command_invocation::<super::tabs_personal_actions::client::RemoveTabEndpoint>(
                 &super::tabs_personal_actions::client::RemoveTabRequest { context_id: target },
@@ -923,7 +934,7 @@ mod tests {
             let selected = index.parse::<usize>().unwrap();
             assert_eq!(companion.menu.state.focused(), Some(selected));
             assert_eq!(companion.menu.state.selected(), Some(selected));
-            for (row, label) in ["Switch", "Rename", "Close for everyone"]
+            for (row, label) in ["Switch", "Rename for everyone", "Close for everyone"]
                 .iter()
                 .enumerate()
             {
@@ -1104,11 +1115,14 @@ mod tests {
                 member_id: Uuid::from_u128(0xE0 + index as u128),
                 context_id: tab.id,
                 name: tab.name.clone(),
+                label: None,
                 active: tab.active,
             })
             .collect();
         companion.replace_personal(crate::personal_view::PersonalViewProjection {
             last_removed: None,
+            following: None,
+            is_default: true,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
             view_revision: 1,
@@ -1131,13 +1145,14 @@ mod tests {
             labels,
             [
                 "Switch",
-                "Rename",
+                "Rename for everyone…",
+                "Rename for me…",
                 "Remove from view",
                 "Close for everyone…"
             ]
         );
         let mut result = AttachInputResult::default();
-        activate_selection(&mut companion, &mut result, 2);
+        activate_selection(&mut companion, &mut result, 3);
         let invocation = result.service_invocation.take().unwrap();
         assert_eq!(
             invocation.endpoint.interface_id,
@@ -1149,7 +1164,7 @@ mod tests {
 
         // Closing for everyone is destructive: confirm, Cancel first.
         open(&mut companion);
-        activate_selection(&mut companion, &mut result, 3);
+        activate_selection(&mut companion, &mut result, 4);
         assert!(companion.menu.confirming && result.service_invocation.is_none());
         assert_eq!(label(&items(&companion)[0]), "Cancel");
         activate_selection(&mut companion, &mut result, 1);
@@ -1187,6 +1202,68 @@ mod tests {
                 .any(|item| label(item).contains("view"))
         );
         assert_eq!(group(&mut shared, 1).as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn renaming_for_me_sets_a_label_apart_from_renaming_for_everyone() {
+        let mut companion = with_personal_view(companion());
+        // The shared name is what a rename for everyone edits.
+        companion.catalog.tabs[0].name = "shared".into();
+        let mut result = AttachInputResult::default();
+
+        // "Rename for everyone…" edits the shared name and renames the tab.
+        open(&mut companion);
+        activate_selection(&mut companion, &mut result, 1);
+        assert_eq!(companion.edit_buffer.text(), "shared");
+        assert!(!companion.editing_label);
+        crate::cancel_rename(&mut companion);
+
+        // "Rename for me…" edits the shown name and sets this view's label.
+        open(&mut companion);
+        activate_selection(&mut companion, &mut result, 2);
+        assert!(companion.editing_label);
+        assert_eq!(companion.editing_tab_id, Some(Uuid::from_u128(7)));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion)));
+        let typed = |owner: &CompanionHandle, key: &str| {
+            let mut input = event("key", "press", Some(key), None, String::new());
+            input.hook_id = "bmux.tab_bar:strip".into();
+            crate::update_editor_local(owner, &input).unwrap()
+        };
+        // The editor starts from the shown name.
+        let invocation = typed(&owner, "enter").service_invocation.unwrap();
+        assert_eq!(
+            invocation.endpoint.interface_id,
+            crate::tabs_personal_labels::INTERFACE_ID.as_str()
+        );
+        let request: crate::tabs_personal_labels::client::SetLabelRequest =
+            crate::decode_action_payload(&invocation).unwrap();
+        assert_eq!(request.context_id, Uuid::from_u128(7));
+        assert_eq!(request.label.as_deref(), Some("test"));
+        let mut companion = owner.lock().unwrap().take().unwrap();
+        assert!(!companion.editing_label && companion.editing_tab_id.is_none());
+
+        // An emptied label clears it (an emptied shared name is refused).
+        open(&mut companion);
+        activate_selection(&mut companion, &mut result, 2);
+        companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(String::new()).into();
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion)));
+        let invocation = typed(&owner, "enter").service_invocation.unwrap();
+        let request: crate::tabs_personal_labels::client::SetLabelRequest =
+            crate::decode_action_payload(&invocation).unwrap();
+        assert_eq!(request.label, None);
+        let mut companion = owner.lock().unwrap().take().unwrap();
+
+        // With a label, the menu offers to clear it.
+        let mut labelled = companion.personal.clone().unwrap();
+        labelled.workspaces[0].members[0].label = Some("m".into());
+        companion.replace_personal(labelled);
+        open(&mut companion);
+        let labels: Vec<String> = items(&companion).iter().map(label).collect();
+        assert_eq!(labels[3], "Clear my label");
+        activate_selection(&mut companion, &mut result, 3);
+        let request: crate::tabs_personal_labels::client::SetLabelRequest =
+            crate::decode_action_payload(&result.service_invocation.take().unwrap()).unwrap();
+        assert_eq!(request.label, None);
     }
 
     #[test]

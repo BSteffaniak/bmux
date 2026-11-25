@@ -552,6 +552,16 @@ pub enum Command {
         member_id: Uuid,
         label: Option<String>,
     },
+    /// Create a view holding a copy of another view's arrangements (members,
+    /// order and labels), or, without a source, with `empty_workspaces`
+    /// initialized as empty arrangements so they are never seeded. Not a
+    /// BPDL operation: the view management commands build it.
+    CreateViewFrom {
+        view_id: Uuid,
+        name: String,
+        copy_from: Option<Uuid>,
+        empty_workspaces: Vec<Uuid>,
+    },
 }
 
 impl Command {
@@ -606,6 +616,47 @@ impl Command {
                     name: name.clone(),
                     revision: 1,
                     workspaces: Vec::new(),
+                });
+                Ok(ack(*view_id, 1, None))
+            }
+            Self::CreateViewFrom {
+                view_id,
+                name,
+                copy_from,
+                empty_workspaces,
+            } => {
+                check_text(name)?;
+                if view_id.is_nil() {
+                    return Err(PersonalViewError::InvalidReference);
+                }
+                if document.view(*view_id).is_ok() {
+                    return Err(PersonalViewError::AlreadyExists);
+                }
+                if document.views.len() >= MAX_VIEWS {
+                    return Err(limit("views"));
+                }
+                let workspaces = if let Some(source) = copy_from {
+                    document.view(*source)?.workspaces.clone()
+                } else {
+                    let mut seen = BTreeSet::new();
+                    empty_workspaces
+                        .iter()
+                        .filter(|workspace| seen.insert(**workspace))
+                        .map(|workspace_id| StoredWorkspace {
+                            workspace_id: *workspace_id,
+                            initialized: true,
+                            members: Vec::new(),
+                        })
+                        .collect()
+                };
+                if workspaces.len() > MAX_WORKSPACES_PER_VIEW {
+                    return Err(limit("workspace-arrangements"));
+                }
+                document.views.push(StoredView {
+                    view_id: *view_id,
+                    name: name.clone(),
+                    revision: 1,
+                    workspaces,
                 });
                 Ok(ack(*view_id, 1, None))
             }

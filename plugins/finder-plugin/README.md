@@ -6,7 +6,15 @@ search-select prompt. Entries say whether a tab is in this attachment's
 personal view, and those that are come first. Choosing a tab dispatches
 `plugin:bmux.tabs:open-tab`, which adds it to the view when absent and switches
 to it. `finder add-to-view` lists the tabs the view lacks and adds the chosen
-one without switching (`plugin:bmux.tabs:add-tab-to-view`).
+one without switching (`plugin:bmux.tabs:add-tab-to-view`). A tab your view
+labels shows its label, with the shared name in its detail; search matches
+both.
+
+`finder views` (`plugin:bmux.finder:views`, prefix `V`) is the tab view
+picker: it lists your views (marking the current and the default one) and
+switches this attachment to the chosen one (`plugin:bmux.tabs:switch-view`).
+Its "New empty view…" and "New view from this one…" entries ask for a name,
+then create the view and switch to it (`plugin:bmux.tabs:create-view`).
 
 Defaults search every workspace, order by caller-local last visit before typing,
 rank filtered results by relevance, and hide the current tab. Use

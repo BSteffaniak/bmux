@@ -52,7 +52,9 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRegistry, PresentationFactRole,
 };
 use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
-use bmux_tabs_plugin_api::{personal_view, tabs_commands, tabs_list, tabs_personal_actions};
+use bmux_tabs_plugin_api::{
+    personal_view, tabs_commands, tabs_list, tabs_personal_actions, tabs_personal_labels,
+};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -328,6 +330,9 @@ struct CompanionState {
     drag_target: Option<projection::ResolvedInsertion>,
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_tab_id: Option<Uuid>,
+    /// The editor sets this view's personal label of the tab instead of
+    /// renaming it for everyone.
+    editing_label: bool,
     edit_buffer: rename_input::RenameInput,
     multi_selection: std::collections::BTreeSet<Uuid>,
     workspace_choices: Vec<workspaces_state::WorkspaceSummary>,
@@ -404,6 +409,7 @@ impl CompanionState {
             drag_target: None,
             last_left_click: None,
             editing_tab_id: None,
+            editing_label: false,
             edit_buffer: rename_input::RenameInput::default(),
             multi_selection: std::collections::BTreeSet::new(),
             workspace_choices: Vec::new(),
@@ -2155,10 +2161,8 @@ fn update_drag_local(
                 companion.pointer_source = None;
                 companion.pointer_moved = false;
                 companion.drag_target = None;
-                companion.editing_tab_id = Some(source);
-                companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
-                companion.edit_buffer.select_all();
+                let source = tab.id;
+                start_tab_editor(companion, source, false);
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
                     consumed: true,
@@ -2304,18 +2308,50 @@ fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let Some(tab) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) else {
+    if !start_tab_editor(companion, target, false) {
+        return false;
+    }
+    republish_companion(companion)
+}
+
+/// Open the inline editor on `target`: for its shared name (a rename for
+/// everyone), or, with `personal`, for this view's personal label of it.
+/// Returns whether the tab is shown.
+fn start_tab_editor(companion: &mut CompanionState, target: Uuid, personal: bool) -> bool {
+    let Some(shown) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) else {
         return false;
     };
+    // The strip shows labels; a rename for everyone edits the shared name.
+    let text = if personal {
+        shown.name.clone()
+    } else {
+        companion
+            .catalog
+            .tabs
+            .iter()
+            .find(|tab| tab.id == target)
+            .map_or_else(|| shown.name.clone(), |tab| tab.name.clone())
+    };
     companion.editing_tab_id = Some(target);
-    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
+    companion.editing_label = personal;
+    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(text).into();
     companion.edit_buffer.select_all();
-    republish_companion(companion)
+    true
 }
 
 fn rename_tab_invocation(tab_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
     command_invocation::<tabs_commands::client::RenameTabByIdEndpoint>(
         &tabs_commands::client::RenameTabByIdRequest { id: tab_id, name },
+    )
+}
+
+/// Set (or, with `None`, clear) this view's personal label of `tab`.
+fn label_invocation(tab: Uuid, label: Option<String>) -> Option<AttachInputServiceInvocation> {
+    command_invocation::<tabs_personal_labels::client::SetLabelEndpoint>(
+        &tabs_personal_labels::client::SetLabelRequest {
+            context_id: tab,
+            label,
+        },
     )
 }
 
@@ -2343,7 +2379,9 @@ fn update_editor_local(
         }
         "enter" => {
             let name = companion.edit_buffer.text().trim().to_string();
-            if name.is_empty() {
+            // An empty label clears it; a name is never empty.
+            let label = companion.editing_label && !workspace;
+            if name.is_empty() && !label {
                 return Some(AttachInputResult {
                     consumed: true,
                     status_message: Some(format!(
@@ -2355,9 +2393,12 @@ fn update_editor_local(
             }
             service_invocation = if workspace {
                 workspace_rename::invocation(editing, name)
+            } else if label {
+                label_invocation(editing, (!name.is_empty()).then_some(name))
             } else {
                 rename_tab_invocation(editing, name)
             };
+            companion.editing_label = false;
             companion.editing_tab_id = None;
             companion.editing_workspace_id = None;
             companion.edit_buffer.clear();
@@ -2381,6 +2422,7 @@ fn update_editor_local(
 }
 
 fn cancel_rename(companion: &mut CompanionState) -> bool {
+    companion.editing_label = false;
     let editing =
         companion.editing_tab_id.take().is_some() | companion.editing_workspace_id.take().is_some();
     if editing {
@@ -2561,6 +2603,9 @@ fn decode_action_payload<T: serde::de::DeserializeOwned>(
         }
         id if id == tabs_personal_actions::INTERFACE_ID.as_str() => {
             tabs_personal_actions::SERVICE_CONTRACT
+        }
+        id if id == tabs_personal_labels::INTERFACE_ID.as_str() => {
+            tabs_personal_labels::SERVICE_CONTRACT
         }
         id if id == contract::presentation_actions::INTERFACE_ID.as_str() => {
             contract::presentation_actions::SERVICE_CONTRACT
@@ -4454,8 +4499,10 @@ bar_bg = "#112233"
     ) -> personal_view::PersonalViewProjection {
         personal_view::PersonalViewProjection {
             last_removed: None,
+            following: None,
             view_id: Uuid::from_u128(0xF1),
             name: "default".into(),
+            is_default: true,
             view_revision: 3,
             binding_revision: 1,
             active_workspace_id: workspace,
@@ -4469,6 +4516,7 @@ bar_bg = "#112233"
                             member_id: Uuid::from_u128(0xE0 + index as u128),
                             context_id: *id,
                             name: (*name).to_string(),
+                            label: None,
                             active: *active,
                         },
                     )

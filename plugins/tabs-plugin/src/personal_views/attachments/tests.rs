@@ -28,6 +28,8 @@ struct FakeHost {
     /// Selections made on attachments' behalf: `(client, tab)`, `None` for
     /// a cleared selection.
     moved: Mutex<Vec<(Uuid, Option<Uuid>)>>,
+    /// Follower to leader.
+    follows: Mutex<BTreeMap<Uuid, Uuid>>,
 }
 
 impl FakeHost {
@@ -85,6 +87,10 @@ impl AttachmentHost for FakeHost {
 
     fn selected_context(&self, client: Uuid) -> Option<Uuid> {
         self.selected.lock().unwrap().get(&client).copied()
+    }
+
+    fn following(&self, client: Uuid) -> Option<Uuid> {
+        self.follows.lock().unwrap().get(&client).copied()
     }
 }
 
@@ -1060,4 +1066,352 @@ fn deletion_moves_attachments_that_showed_the_tab_within_their_own_views() {
         .reconcile_deleted(&fixture.env(&fixture.storage), tab(3));
     assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(fixture.host.take_moved(), [(client(2), None)]);
+}
+
+/// The latest projection published to `client` in `published`.
+fn latest(published: &[(Uuid, PersonalViewProjection)], client: Uuid) -> PersonalViewProjection {
+    published
+        .iter()
+        .rev()
+        .find(|(recipient, _)| *recipient == client)
+        .map(|(_, projection)| projection.clone())
+        .expect("a projection for the client")
+}
+
+#[test]
+fn one_owner_keeps_independent_arrangements_in_two_views_on_two_attachments() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.host.attach(client(2), Some(principal(1)), tab(1));
+    fixture.refresh();
+    let default = fixture.sink.take()[0].1.view_id;
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+
+    // A copy of the current view switches only the creating attachment.
+    let work = fixture
+        .attachments
+        .create_view(&env, Some(client(1)), "work", true)
+        .unwrap();
+    assert_eq!(work.name, "work");
+    assert!(!work.is_default);
+    assert_eq!(
+        fixture.attachments.bound_view(Some(client(1))),
+        Some((owner(1), work.view_id))
+    );
+    assert_eq!(
+        fixture.attachments.bound_view(Some(client(2))),
+        Some((owner(1), default))
+    );
+    // Its selection is a tab of the copy, so it stays.
+    assert_eq!(fixture.host.take_moved(), []);
+
+    // Editing one view leaves the other alone.
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(1)), tab(2), ViewEdit::Remove, |_| Ok(()))
+        .unwrap();
+    fixture.refresh();
+    let first = fixture.sink.only_to(client(1));
+    assert_eq!(names(&first), ["t1", "t3"]);
+    assert_eq!((first.name.as_str(), first.is_default), ("work", false));
+    // The second attachment's (default) view did not change, so nothing was
+    // republished to it.
+    assert_eq!(
+        fixture.view(owner(1), default).workspaces[0].members.len(),
+        3
+    );
+
+    // Switching the second attachment shows the copy's arrangement there.
+    fixture
+        .attachments
+        .switch_view(&env, Some(client(2)), work.view_id)
+        .unwrap();
+    fixture.refresh();
+    assert_eq!(names(&fixture.sink.only_to(client(2))), ["t1", "t3"]);
+}
+
+#[test]
+fn an_empty_view_starts_with_no_tabs_and_switching_moves_off_tabs_it_lacks() {
+    let fixture = Fixture::new(2);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.refresh();
+    fixture.sink.take();
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+
+    // An empty view arranges every workspace with tabs as empty: switching
+    // to it leaves the attachment with no input target in that workspace.
+    let empty = fixture
+        .attachments
+        .create_view(&env, Some(client(1)), "scratch", false)
+        .unwrap();
+    assert!(
+        empty
+            .workspaces
+            .iter()
+            .all(|arrangement| { arrangement.initialized && arrangement.members.is_empty() })
+    );
+    assert_eq!(fixture.host.take_moved(), [(client(1), None)]);
+    fixture.refresh();
+    let projection = fixture.sink.only_to(client(1));
+    assert_eq!(projection.view_id, empty.view_id);
+    assert_eq!(names(&projection), Vec::<String>::new());
+
+    // Adding a tab, then switching back: the default view holds the tab
+    // again; a view without the selected tab moves to its first tab.
+    fixture.host.select(client(1), tab(2));
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(1)), tab(2), ViewEdit::Add, |_| Ok(()))
+        .unwrap();
+    let default = fixture.repo().default_view(owner(1)).unwrap().view_id;
+    fixture
+        .attachments
+        .switch_view(&env, Some(client(1)), default)
+        .unwrap();
+    assert_eq!(fixture.host.take_moved(), [], "t2 is in the default view");
+    fixture.host.select(client(1), tab(1));
+    fixture
+        .attachments
+        .switch_view(&env, Some(client(1)), empty.view_id)
+        .unwrap();
+    assert_eq!(fixture.host.take_moved(), [(client(1), Some(tab(2)))]);
+
+    // Another owner's view is not found.
+    let b = fixture.as_client(Some(2));
+    let other = fixture.env(&b);
+    fixture.host.attach(client(2), Some(principal(2)), tab(1));
+    assert_eq!(
+        fixture
+            .attachments
+            .switch_view(&other, Some(client(2)), empty.view_id),
+        Err(PersonalAttachmentError::NotFound)
+    );
+}
+
+#[test]
+fn deleting_a_view_rebinds_its_attachments_to_the_default_and_refuses_the_default() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(2));
+    fixture.host.attach(client(2), Some(principal(1)), tab(2));
+    fixture.refresh();
+    let default = fixture.sink.take()[0].1.view_id;
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    let work = fixture
+        .attachments
+        .create_view(&env, Some(client(1)), "work", true)
+        .unwrap();
+    fixture
+        .attachments
+        .switch_view(&env, Some(client(2)), work.view_id)
+        .unwrap();
+    // Both attachments show t2, which the work view then drops.
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(1)), tab(2), ViewEdit::Remove, |tab| {
+            fixture.host.select(client(1), tab);
+            Ok(())
+        })
+        .unwrap();
+    fixture.host.take_moved();
+
+    // The default view cannot be deleted; the rule is explicit.
+    assert_eq!(
+        fixture
+            .attachments
+            .delete_view(&env, Some(client(1)), Some(default)),
+        Err(PersonalAttachmentError::InvalidReference)
+    );
+
+    // Deleting the bound view rebinds both attachments to the default view,
+    // with a fresh projection each; tabs are untouched.
+    assert_eq!(
+        fixture.attachments.delete_view(&env, Some(client(1)), None),
+        Ok(default)
+    );
+    for n in [1, 2] {
+        assert_eq!(
+            fixture.attachments.bound_view(Some(client(n))),
+            Some((owner(1), default))
+        );
+    }
+    assert_eq!(
+        fixture.repo().get_view(owner(1), work.view_id),
+        Err(PersonalViewError::NotFound)
+    );
+    assert_eq!(crate::list_contexts(&fixture.storage).unwrap().len(), 3);
+    fixture.refresh();
+    let published = fixture.sink.take();
+    for n in [1, 2] {
+        let projection = latest(&published, client(n));
+        assert_eq!(projection.view_id, default);
+        assert_eq!(names(&projection), ["t1", "t2", "t3"]);
+    }
+
+    // Renaming and making a view the default.
+    let other = fixture
+        .attachments
+        .create_view(&env, None, "other", false)
+        .unwrap();
+    fixture
+        .attachments
+        .rename_view(&env, None, Some(other.view_id), "renamed")
+        .unwrap();
+    fixture
+        .attachments
+        .set_default_view(&env, None, Some(other.view_id))
+        .unwrap();
+    let now_default = fixture.repo().default_view(owner(1)).unwrap();
+    assert_eq!(
+        (now_default.view_id, now_default.name.as_str()),
+        (other.view_id, "renamed")
+    );
+}
+
+#[test]
+fn labels_rename_a_tab_for_one_view_only_and_clear_back_to_the_shared_name() {
+    let fixture = Fixture::new(2);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.host.attach(client(2), Some(principal(2)), tab(1));
+    fixture.refresh();
+    fixture.sink.take();
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    fixture
+        .attachments
+        .set_label(&env, Some(client(1)), tab(1), Some("  mine  "))
+        .unwrap();
+    // Setting the label it has changes nothing.
+    let before = fixture.repo().default_view(owner(1)).unwrap().revision;
+    fixture
+        .attachments
+        .set_label(&env, Some(client(1)), tab(1), Some("mine"))
+        .unwrap();
+    assert_eq!(
+        fixture.repo().default_view(owner(1)).unwrap().revision,
+        before
+    );
+    fixture.refresh();
+    let published = fixture.sink.take();
+    let mine = latest(&published, client(1));
+    assert_eq!(names(&mine), ["mine", "t2"]);
+    assert_eq!(mine.workspaces[0].members[0].label.as_deref(), Some("mine"));
+    assert!(
+        published
+            .iter()
+            .all(|(recipient, _)| *recipient == client(1)),
+        "another owner's view is untouched"
+    );
+
+    // A tab outside the view cannot be labelled; a blank label clears.
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(1)), tab(2), ViewEdit::Remove, |_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .attachments
+            .set_label(&env, Some(client(1)), tab(2), Some("x")),
+        Err(PersonalAttachmentError::InvalidReference)
+    );
+    fixture
+        .attachments
+        .set_label(&env, Some(client(1)), tab(1), Some(" "))
+        .unwrap();
+    fixture.refresh();
+    let cleared = fixture.sink.only_to(client(1));
+    assert_eq!(names(&cleared), ["t1"]);
+    assert_eq!(cleared.workspaces[0].members[0].label, None);
+}
+
+#[test]
+fn following_shows_the_leaders_tab_without_changing_the_view_and_ending_restores() {
+    let fixture = Fixture::new(2);
+    fixture.add_tab(tab(3), Some("elsewhere"), OTHER_WS);
+    fixture.host.attach(client(1), Some(principal(1)), tab(1));
+    fixture.host.attach(client(9), Some(principal(2)), tab(3));
+    fixture.refresh();
+    let view_id = latest(&fixture.sink.take(), client(1)).view_id;
+    let a = fixture.as_client(Some(1));
+    let env = fixture.env(&a);
+    // The follower's view lacks t2, and has never arranged OTHER_WS.
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(1)), tab(2), ViewEdit::Remove, |_| Ok(()))
+        .unwrap();
+    fixture.refresh();
+    fixture.sink.take();
+    let arranged = fixture.view(owner(1), view_id);
+
+    // A follow is recorded before it moves the follower's selection.
+    fixture
+        .host
+        .follows
+        .lock()
+        .unwrap()
+        .insert(client(1), client(9));
+    fixture.host.select(client(1), tab(3));
+    fixture.refresh();
+    let following = fixture.sink.only_to(client(1));
+    let follow = following.following.unwrap();
+    assert_eq!(
+        (follow.leader_client_id, follow.context_id, follow.in_view),
+        (client(9), tab(3), false)
+    );
+    assert_eq!(follow.name, "elsewhere");
+    // Shown, never arranged: the followed workspace is not seeded.
+    assert_eq!(fixture.view(owner(1), view_id), arranged);
+
+    // The leader's tab is closed for everyone while followed: the follow
+    // decides what the follower shows; the view does not move it.
+    fixture.host.select(client(1), tab(2));
+    assert_eq!(
+        fixture.attachments.reconcile_deleted(&env, tab(2)),
+        Vec::<String>::new()
+    );
+    assert_eq!(fixture.host.take_moved(), []);
+
+    // Ending the follow restores the follower's own selection.
+    fixture.host.follows.lock().unwrap().clear();
+    fixture.refresh();
+    assert_eq!(fixture.host.take_moved(), [(client(1), Some(tab(1)))]);
+    let restored = latest(&fixture.sink.take(), client(1));
+    assert_eq!(restored.following, None);
+    assert_eq!(active(&restored), [tab(1)]);
+    assert_eq!(fixture.view(owner(1), view_id), arranged);
+}
+
+#[test]
+fn a_follower_whose_own_tab_leaves_its_view_returns_to_the_neighbour() {
+    let fixture = Fixture::new(3);
+    fixture.host.attach(client(1), Some(principal(1)), tab(2));
+    fixture.host.attach(client(2), Some(principal(1)), tab(2));
+    fixture.host.attach(client(9), Some(principal(2)), tab(1));
+    fixture.refresh();
+    fixture.sink.take();
+    fixture
+        .host
+        .follows
+        .lock()
+        .unwrap()
+        .insert(client(1), client(9));
+    fixture.host.select(client(1), tab(1));
+    fixture.refresh();
+    // The other attachment of the view removes the tab the follower will
+    // return to: the follower is not moved now, but returns to t3 later.
+    let c = fixture.as_client(Some(1));
+    let env = fixture.env(&c);
+    fixture
+        .attachments
+        .edit_view(&env, Some(client(2)), tab(2), ViewEdit::Remove, |tab| {
+            fixture.host.select(client(2), tab);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fixture.host.take_moved(), []);
+    fixture.host.follows.lock().unwrap().clear();
+    fixture.refresh();
+    assert_eq!(fixture.host.take_moved(), [(client(1), Some(tab(3)))]);
 }

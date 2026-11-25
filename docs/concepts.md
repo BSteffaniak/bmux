@@ -89,6 +89,41 @@ the attachment stays connected with no input target: nothing you type reaches
 a tab until you open one from the finder, create one or undo. Closing a tab
 for everyone terminates it and removes it from every view.
 
+### Personal tab views
+
+Each user (principal) arranges the shared tabs in one or more personal tab
+views. A view decides which tabs you see and in what order; it never decides
+whether a tab runs.
+
+- Your default view is the one every new attachment shows; it is created the
+  first time you attach. `bmux tab view set-default VIEW` makes another view
+  the default. The default view cannot be deleted: make another view the
+  default first.
+- Attachments of one principal bound to the same view share its arrangement:
+  adding, removing and reordering tabs and setting labels show in all of them.
+  They do not share selection: each keeps its own current tab and history.
+- `bmux tab view create NAME` creates an empty view (every workspace that has
+  tabs starts empty), or with `--copy` a copy of your current view's tabs,
+  order and labels; from an attachment it also switches that attachment to
+  it. `bmux tab view switch VIEW`, `rename`, `delete` and `list` manage views
+  by name or id. The view picker (`plugin:bmux.finder:views`, prefix `V`)
+  switches views or creates one. The tab bar names the view when it is not
+  the default.
+- Switching or deleting a view never touches tabs. An attachment keeps its tab
+  when the view it moves to holds it, otherwise moves to that view's first tab
+  in the workspace, or has no input target when there is none. Attachments of
+  a deleted view move to the default view.
+- A personal label (`bmux tab label LABEL`, or Rename for me… in the tab bar)
+  renames a tab in one view only; Rename for everyone… (`rename-tab`) renames
+  the tab itself. `bmux tab clear-label` (Clear my label) shows the shared
+  name again. The finder shows the label and searches both names.
+- Following another client (`plugin:bmux.clients:follow CLIENT --global` from
+  an attachment, or `bmux attach --follow`) shows the leader's tab without
+  adding it to your view, and the tab bar says so ("Following … (not in your
+  view)"). While you follow, removals and deletions in your view do not move
+  you. Ending the follow (`plugin:bmux.clients:unfollow`, or the leader
+  disconnecting) returns you to the tab you had when the follow began.
+
 Visit history belongs to the invoking client, not other attachments. It is
 transient, cleared on disconnect, and not restored across server restarts.
 Unvisited tabs follow visited tabs in arrangement order. Opening or cancelling

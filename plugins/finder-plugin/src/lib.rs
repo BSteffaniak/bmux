@@ -20,7 +20,7 @@ use bmux_plugin_sdk::{
     PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
 use bmux_tabs_plugin_api::tabs_list::TabListEntry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
@@ -84,6 +84,11 @@ impl FinderPlugin {
         let (prompt, actions) = self.binding.ports()?;
         show_finder(context, &self.tasks, &prompt, actions, mode)
     }
+
+    fn views(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        let (prompt, actions) = self.binding.ports()?;
+        show_views(context, &self.tasks, prompt, actions)
+    }
 }
 
 /// What the finder is opened for.
@@ -104,11 +109,17 @@ enum FinderMode {
 struct ViewMembership {
     arranged: BTreeSet<Uuid>,
     members: BTreeSet<Uuid>,
+    /// The view's personal labels of its member tabs.
+    labels: BTreeMap<Uuid, String>,
 }
 
 impl ViewMembership {
     fn contains(&self, tab: &TabListEntry) -> bool {
         !self.arranged.contains(&tab.workspace_id) || self.members.contains(&tab.id)
+    }
+
+    fn label(&self, tab: Uuid) -> Option<&str> {
+        self.labels.get(&tab).map(String::as_str)
     }
 }
 
@@ -137,8 +148,13 @@ fn load_view(context: &NativeCommandContext) -> Option<ViewMembership> {
             .map(|arrangement| arrangement.workspace_id)
             .collect(),
         members: arranged
+            .clone()
             .flat_map(|arrangement| &arrangement.members)
             .map(|member| member.context_id)
+            .collect(),
+        labels: arranged
+            .flat_map(|arrangement| &arrangement.members)
+            .filter_map(|member| Some((member.context_id, member.label.clone()?)))
             .collect(),
     })
 }
@@ -152,6 +168,147 @@ fn finder_action(mode: FinderMode, view: bool, context_id: Uuid) -> String {
         (FinderMode::Open, false) => format!("plugin:bmux.workspaces:activate-tab {context_id}"),
         (FinderMode::AddToView, _) => format!("plugin:bmux.tabs:add-tab-to-view {context_id}"),
     }
+}
+
+/// The view picker's choice that creates an empty view.
+const NEW_EMPTY_VIEW: &str = "new:empty";
+/// The view picker's choice that creates a copy of the current view.
+const NEW_COPIED_VIEW: &str = "new:copy";
+
+/// An action argument quoted for the action parser's shell-style splitting.
+fn quote_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The view picker's options: every view of the caller's owner (marking the
+/// current and the default one), then the two ways to create a view.
+fn view_options(
+    views: &[bmux_tabs_plugin_api::tabs_personal_views::PersonalViewSummary],
+    current: Option<Uuid>,
+) -> Vec<PromptOption> {
+    views
+        .iter()
+        .map(|view| {
+            let marks: Vec<&str> = [
+                (current == Some(view.view_id)).then_some("current"),
+                view.is_default.then_some("default"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            PromptOption::new(view.view_id.to_string(), view.name.clone()).detail(
+                if marks.is_empty() {
+                    "tab view".to_string()
+                } else {
+                    format!("tab view · {}", marks.join(" · "))
+                },
+            )
+        })
+        .chain([
+            PromptOption::new(NEW_EMPTY_VIEW, "New empty view…")
+                .detail("create a view with no tabs and switch to it"),
+            PromptOption::new(NEW_COPIED_VIEW, "New view from this one…")
+                .detail("copy this view's tabs, order and labels, and switch to it"),
+        ])
+        .collect()
+}
+
+/// The action a view picker choice dispatches, once a new view is named.
+fn view_action(choice: &str, name: Option<&str>) -> Option<String> {
+    match (choice, name) {
+        (NEW_EMPTY_VIEW, Some(name)) => Some(format!(
+            "plugin:bmux.tabs:create-view {}",
+            quote_argument(name)
+        )),
+        (NEW_COPIED_VIEW, Some(name)) => Some(format!(
+            "plugin:bmux.tabs:create-view {} --copy",
+            quote_argument(name)
+        )),
+        (NEW_EMPTY_VIEW | NEW_COPIED_VIEW, None) => None,
+        (view, _) => Uuid::parse_str(view)
+            .ok()
+            .map(|view| format!("plugin:bmux.tabs:switch-view {view}")),
+    }
+}
+
+/// The view picker: a searchable list of the caller's tab views. Choosing
+/// one switches this attachment to it; the two "New …" choices ask for a
+/// name, then create the view and switch to it.
+fn show_views(
+    context: &NativeCommandContext,
+    tasks: &FinderTasks,
+    prompt: prompt::PromptPort,
+    actions: action_dispatch::ActionDispatchPort,
+) -> Result<i32, PluginCommandError> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| PluginCommandError::unavailable("finder requires a frontend async runtime"))?;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let current = bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_personal_attachment::client::current_binding(&mut client),
+    )
+    .ok()
+    .and_then(Result::ok)
+    .map(|binding| binding.view_id)
+    .ok_or_else(|| PluginCommandError::unavailable("this attachment has no personal tab view"))?;
+    let views = bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_personal_views::client::list_views(&mut client),
+    )
+    .map_err(|error| PluginCommandError::unavailable(format!("tab views unavailable: {error}")))?
+    .map_err(|error| {
+        PluginCommandError::unavailable(format!("tab views unavailable: {error:?}"))
+    })?;
+    let request = PromptRequest::search_select("Tab Views", view_options(&views, Some(current)))
+        .width_range(60, 60)
+        .max_height(20)
+        .message("Switch this attachment to another tab view")
+        .submit_label("Switch")
+        .search_placeholder("Search views");
+    let mut running = tasks
+        .running
+        .lock()
+        .map_err(|_| PluginCommandError::unavailable("finder task owner requires recovery"))?;
+    running.retain(|task| !task.is_finished());
+    if tasks.open.swap(true, Ordering::AcqRel) {
+        return Err(PluginCommandError::unavailable("finder is already open"));
+    }
+    let open = OpenFinder(tasks.open.clone());
+    let response = prompt.submit(request).map_err(|error| {
+        PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
+    })?;
+    running.push(handle.spawn(async move {
+        let Ok(PromptResponse::Submitted(PromptValue::Single(choice))) = response.await else {
+            return;
+        };
+        let name = if choice == NEW_EMPTY_VIEW || choice == NEW_COPIED_VIEW {
+            let named = prompt
+                .request(
+                    PromptRequest::text_input("New Tab View")
+                        .message("Name the new tab view")
+                        .input_placeholder("view name")
+                        .input_required(true)
+                        .submit_label("Create"),
+                )
+                .await;
+            match named {
+                Ok(PromptResponse::Submitted(PromptValue::Text(name)))
+                    if !name.trim().is_empty() =>
+                {
+                    Some(name.trim().to_string())
+                }
+                _ => return,
+            }
+        } else {
+            None
+        };
+        drop(open);
+        if let Some(action) = view_action(&choice, name.as_deref())
+            && let Err(error) = actions.dispatch(&action)
+        {
+            warn!(%error, "finder: tab view switch failed");
+        }
+    }));
+    drop(running);
+    Ok(EXIT_OK)
 }
 
 // Commands may run outside the process owning the reactive catalog. Query
@@ -485,10 +642,7 @@ fn ordered_options(
             let mut option = PromptOption::new(entry.context_id.to_string(), entry.label.clone())
                 .search_text(entry.search_text.clone())
                 .detail(entry.detail.clone());
-            option.search_primary = tabs
-                .iter()
-                .find(|tab| tab.id == entry.context_id)
-                .map(|tab| tab.name.clone());
+            option.search_primary = Some(entry.search_primary.clone());
             // Tabs in this attachment's view come first, then the other
             // shared tabs, then (when placed last) the current tab.
             option.search_order = Some(PromptSearchOrder {
@@ -517,6 +671,8 @@ struct FinderEntry {
     label: String,
     detail: String,
     search_text: String,
+    /// The name shown: this view's label of the tab, else its shared name.
+    search_primary: String,
     /// Whether this attachment's view holds the tab; `None` without a view.
     in_view: Option<bool>,
 }
@@ -534,14 +690,22 @@ fn build_entries(
                 || active_workspace_id == Some(tab.workspace_id)
         })
         .map(|entry| {
+            // This view's label for the tab, when it has one, shows in place
+            // of the shared name; both stay searchable.
+            let personal = view.and_then(|view| view.label(entry.id));
+            let shown = personal.unwrap_or(&entry.name);
             let label = settings
                 .entry_format
                 .replace("{workspace}", &entry.workspace)
-                .replace("{tab}", &entry.name);
+                .replace("{tab}", shown);
+            let names = personal.map_or_else(
+                || entry.name.clone(),
+                |personal| format!("{personal} {}", entry.name),
+            );
             let search_source = if settings.include_workspace_name {
-                format!("{}/{}", entry.workspace, entry.name)
+                format!("{}/{names}", entry.workspace)
             } else {
-                entry.name.clone()
+                names
             };
             let in_view = view.map(|view| view.contains(entry));
             let membership = match in_view {
@@ -549,14 +713,17 @@ fn build_entries(
                 Some(false) => " · not in your view",
                 None => "",
             };
+            let shared =
+                personal.map_or_else(String::new, |_| format!(" (shared name {})", entry.name));
             FinderEntry {
                 context_id: entry.id,
                 label,
                 detail: format!(
-                    "workspace {} · tab {}{membership}",
-                    entry.workspace, entry.name
+                    "workspace {} · tab {shown}{shared}{membership}",
+                    entry.workspace
                 ),
                 search_text: search_source,
+                search_primary: shown.to_string(),
                 in_view,
             }
         })
@@ -599,13 +766,23 @@ impl Plugin for FinderPlugin {
         d.native_command(
             "show",
             |plugin: &Self, cx: &Call, context: NativeCommandContext| {
-                std::future::ready(plugin.command_now(cx, &context, FinderMode::Open))
+                std::future::ready(plugin.command_now(cx, &context, |plugin, context| {
+                    plugin.show(context, FinderMode::Open)
+                }))
             },
         );
         d.native_command(
             "add-to-view",
             |plugin: &Self, cx: &Call, context: NativeCommandContext| {
-                std::future::ready(plugin.command_now(cx, &context, FinderMode::AddToView))
+                std::future::ready(plugin.command_now(cx, &context, |plugin, context| {
+                    plugin.show(context, FinderMode::AddToView)
+                }))
+            },
+        );
+        d.native_command(
+            "views",
+            |plugin: &Self, cx: &Call, context: NativeCommandContext| {
+                std::future::ready(plugin.command_now(cx, &context, Self::views))
             },
         );
     }
@@ -636,7 +813,7 @@ impl FinderPlugin {
         &self,
         cx: &Call,
         context: &NativeCommandContext,
-        mode: FinderMode,
+        run: impl FnOnce(&Self, &NativeCommandContext) -> Result<i32, PluginCommandError>,
     ) -> author::Result<i32> {
         if cx
             .cancellation()
@@ -650,7 +827,7 @@ impl FinderPlugin {
             cx.invocation()
                 .and_then(|call| call.callback_execution.as_ref()),
         )?;
-        let result = self.show(context, mode);
+        let result = run(self, context);
         drop(entry);
         result
     }
@@ -747,6 +924,7 @@ mod tests {
                 label: "other/tab".into(),
                 detail: String::new(),
                 search_text: String::new(),
+                search_primary: String::new(),
                 in_view: None,
             }],
             selection,
@@ -786,6 +964,7 @@ mod tests {
                 label: "other/tab".into(),
                 detail: String::new(),
                 search_text: String::new(),
+                search_primary: String::new(),
                 in_view: None,
             }],
             selection,
@@ -882,6 +1061,7 @@ mod tests {
         let view = ViewMembership {
             arranged: [Uuid::from_u128(10)].into(),
             members: [Uuid::from_u128(1), Uuid::from_u128(3)].into(),
+            labels: BTreeMap::new(),
         };
         let entries = build_entries(&tabs, &settings, None, Some(&view));
         assert_eq!(entries.len(), 4, "discovery lists every shared tab");
@@ -1096,6 +1276,86 @@ mod tests {
         assert!(FinderSettings::parse(Some(&invalid_scope)).is_err());
         let invalid_format = toml::toml! { entry_format = "{session}/{tab}" }.into();
         assert!(FinderSettings::parse(Some(&invalid_format)).is_err());
+    }
+    #[test]
+    fn labelled_tabs_show_their_label_and_match_both_names() {
+        let tabs = vec![
+            window(1, 10, "a", "server", false),
+            window(2, 10, "a", "logs", false),
+        ];
+        let view = ViewMembership {
+            arranged: [Uuid::from_u128(10)].into(),
+            members: [Uuid::from_u128(1), Uuid::from_u128(2)].into(),
+            labels: [(Uuid::from_u128(1), "api".to_string())].into(),
+        };
+        let settings = FinderSettings::default();
+        let entries = build_entries(&tabs, &settings, None, Some(&view));
+        assert_eq!(entries[0].label, "a/api");
+        assert!(entries[0].detail.contains("tab api (shared name server)"));
+        assert_eq!(entries[0].search_primary, "api");
+        let options = ordered_options(&entries, &tabs, &[], &settings);
+        for query in ["api", "server"] {
+            let matched = options
+                .iter()
+                .filter(|option| {
+                    option
+                        .search_text
+                        .as_deref()
+                        .is_some_and(|text| text.contains(query))
+                })
+                .count();
+            assert_eq!(matched, 1, "{query} matches the labelled tab");
+        }
+        assert_eq!(entries[1].label, "a/logs");
+        assert!(!entries[1].detail.contains("shared name"));
+    }
+
+    #[test]
+    fn the_view_picker_switches_or_creates_named_views() {
+        use bmux_tabs_plugin_api::tabs_personal_views::PersonalViewSummary;
+        let view = |n: u128, name: &str, is_default| PersonalViewSummary {
+            view_id: Uuid::from_u128(n),
+            owner: Uuid::from_u128(99),
+            name: name.into(),
+            revision: 1,
+            is_default,
+        };
+        let options = view_options(
+            &[view(1, "default", true), view(2, "work", false)],
+            Some(Uuid::from_u128(2)),
+        );
+        let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "default",
+                "work",
+                "New empty view…",
+                "New view from this one…"
+            ]
+        );
+        assert_eq!(options[0].detail.as_deref(), Some("tab view · default"));
+        assert_eq!(options[1].detail.as_deref(), Some("tab view · current"));
+        assert_eq!(
+            view_action(&Uuid::from_u128(2).to_string(), None),
+            Some(format!(
+                "plugin:bmux.tabs:switch-view {}",
+                Uuid::from_u128(2)
+            ))
+        );
+        assert_eq!(
+            view_action(NEW_EMPTY_VIEW, None),
+            None,
+            "a new view needs a name"
+        );
+        assert_eq!(
+            view_action(NEW_EMPTY_VIEW, Some("it's mine")).as_deref(),
+            Some("plugin:bmux.tabs:create-view 'it'\\''s mine'")
+        );
+        assert_eq!(
+            view_action(NEW_COPIED_VIEW, Some("copy")).as_deref(),
+            Some("plugin:bmux.tabs:create-view 'copy' --copy")
+        );
     }
 }
 

@@ -443,6 +443,31 @@ impl ClientsPlugin {
         }
     }
 
+    /// `set-following` for an attachment's command (key binding or palette,
+    /// run by the server's instance) against this instance's own follow
+    /// state, or `None` for a standalone CLI invocation, which dispatches.
+    fn set_following_here(
+        &self,
+        ctx: &NativeCommandContext,
+        target: Option<Uuid>,
+        global: bool,
+    ) -> Option<Result<ClientAck, SetFollowingError>> {
+        if ctx.invocation_source.is_cli() {
+            return None;
+        }
+        let events = self.events();
+        events.states.get::<FollowState>()?;
+        Some(set_following_via_ipc(
+            &events,
+            ctx,
+            ctx.caller_client_id,
+            &SetFollowingArgs {
+                target_client_id: target,
+                global,
+            },
+        ))
+    }
+
     fn events(&self) -> ClientEvents {
         self.events
             .read()
@@ -455,8 +480,16 @@ impl Plugin for ClientsPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
             .blocking_command("list-clients", |_, ctx| cli::list(ctx))
-            .blocking_command("follow", |_, ctx| cli::follow(ctx))
-            .blocking_command("unfollow", |_, ctx| cli::unfollow(ctx))
+            .blocking_command("follow", |plugin, ctx| {
+                cli::follow(ctx, &|target, global| {
+                    plugin.set_following_here(ctx, target, global)
+                })
+            })
+            .blocking_command("unfollow", |plugin, ctx| {
+                cli::unfollow(ctx, &|target, global| {
+                    plugin.set_following_here(ctx, target, global)
+                })
+            })
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
                 plugin.register_typed_services(&context, registry);
@@ -1160,6 +1193,15 @@ fn set_following_via_ipc(
             }
         }
     };
+    // The leader's tab is its contexts selection, which tab switches update;
+    // the follow state's record of it is written only on session changes and
+    // can be stale. Prefer the selection authority when it has one.
+    let (initial_target_context, initial_target_session) = if req.global {
+        leader_selection(events, leader_client_id)
+            .unwrap_or((initial_target_context, initial_target_session))
+    } else {
+        (initial_target_context, initial_target_session)
+    };
 
     // For global follow, mirror the leader's selection onto the
     // follower: select the leader's context and reconcile session
@@ -1238,6 +1280,25 @@ fn set_following_via_ipc(
     }
 
     Ok(ClientAck { client_id: self_id })
+}
+
+/// The leader's current tab and its session, from the contexts selection
+/// authority's published reader, when it has a selection.
+fn leader_selection(
+    events: &ClientEvents,
+    leader: ClientId,
+) -> Option<(Option<Uuid>, Option<SessionId>)> {
+    let handle = events
+        .states
+        .get::<bmux_context_state::ContextStateHandle>()?
+        .read()
+        .ok()?
+        .clone();
+    let context = handle.0.current_for_client(leader)?;
+    Some((
+        Some(context.id),
+        handle.0.current_session_for_client(leader),
+    ))
 }
 
 fn select_context_via_typed_dispatch(

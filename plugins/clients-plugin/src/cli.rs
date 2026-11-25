@@ -111,11 +111,21 @@ pub fn list(ctx: &NativeCommandContext) -> Result<i32, PluginCommandError> {
     Ok(0)
 }
 
+/// Set or stop following for the invoking client: through the server's own
+/// follow state when this command runs in the server's clients plugin (an
+/// attachment's key binding or palette, where dispatching back into this
+/// plugin would re-enter it), else through `clients-commands`.
 fn set_following(
     ctx: &NativeCommandContext,
+    local: &SetFollowingHere<'_>,
     target: Option<Uuid>,
     global: bool,
 ) -> Result<(), PluginCommandError> {
+    if let Some(result) = local(target, global) {
+        return result.map(|_| ()).map_err(|err| {
+            PluginCommandError::failed(format!("clients-commands set-following failed: {err:?}"))
+        });
+    }
     block_on_typed_dispatch(clients_commands::client::set_following(
         &mut dispatch_client(ctx),
         target,
@@ -132,6 +142,14 @@ fn set_following(
     Ok(())
 }
 
+/// Sets following in this process's follow state, or `None` when this
+/// process has none (the command runs outside the server).
+pub type SetFollowingHere<'a> = dyn Fn(
+        Option<Uuid>,
+        bool,
+    ) -> Option<Result<clients_commands::ClientAck, clients_commands::SetFollowingError>>
+    + 'a;
+
 fn follow_target(args: &[String]) -> Result<(Uuid, bool), PluginCommandError> {
     let raw = args
         .iter()
@@ -144,22 +162,34 @@ fn follow_target(args: &[String]) -> Result<(Uuid, bool), PluginCommandError> {
     Ok((target, global))
 }
 
-pub fn follow(ctx: &NativeCommandContext) -> Result<i32, PluginCommandError> {
-    require_cli(ctx)?;
+/// Follow another client. Usable from an attachment (a key binding or the
+/// command palette), which is what follows; only a standalone CLI
+/// invocation prints, since an attachment's terminal is in raw mode.
+pub fn follow(
+    ctx: &NativeCommandContext,
+    local: &SetFollowingHere<'_>,
+) -> Result<i32, PluginCommandError> {
     let (target, global) = follow_target(&ctx.arguments)?;
-    set_following(ctx, Some(target), global)?;
-    println!(
-        "following client: {}{}",
-        target,
-        if global { " (global)" } else { "" }
-    );
+    set_following(ctx, local, Some(target), global)?;
+    if ctx.invocation_source.is_cli() {
+        println!(
+            "following client: {}{}",
+            target,
+            if global { " (global)" } else { "" }
+        );
+    }
     Ok(0)
 }
 
-pub fn unfollow(ctx: &NativeCommandContext) -> Result<i32, PluginCommandError> {
-    require_cli(ctx)?;
-    set_following(ctx, None, false)?;
-    println!("follow stopped");
+/// Stop following. Usable from an attachment, like [`follow`].
+pub fn unfollow(
+    ctx: &NativeCommandContext,
+    local: &SetFollowingHere<'_>,
+) -> Result<i32, PluginCommandError> {
+    set_following(ctx, local, None, false)?;
+    if ctx.invocation_source.is_cli() {
+        println!("follow stopped");
+    }
     Ok(0)
 }
 
