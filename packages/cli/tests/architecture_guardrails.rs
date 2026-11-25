@@ -3006,6 +3006,128 @@ fn every_plugin_declares_capabilities_it_calls() {
     );
 }
 
+/// Every capability the host grants a selected plugin instance: its
+/// required, optional and provided capabilities, as the selected runtime
+/// binds them.
+fn granted_capabilities(plugin_dir: &std::path::Path) -> Vec<bmux_plugin_sdk::HostScope> {
+    let source = generated_manifest::generated_manifest(plugin_dir);
+    let parsed: toml::Value = toml::from_str(&source).expect("generated manifest is TOML");
+    [
+        "required_capabilities",
+        "optional_capabilities",
+        "provided_capabilities",
+    ]
+    .iter()
+    .filter_map(|key| parsed.get(*key).and_then(toml::Value::as_array))
+    .flatten()
+    .filter_map(toml::Value::as_str)
+    .map(|capability| bmux_plugin_sdk::HostScope::new(capability).expect("valid capability"))
+    .collect()
+}
+
+/// Changing or clearing another client's selection redirects someone else's
+/// attachment, so it has its own capability: only the plugins that act on
+/// another client's behalf (tabs for personal-view reconcile and undo,
+/// clients for follow) hold it, and a plugin with plain contexts write
+/// access is refused by the host before the provider runs.
+#[test]
+fn only_view_and_follow_plugins_may_select_for_other_clients() {
+    use bmux_contexts_plugin_api::capabilities::{CONTEXTS_CLIENT_SELECTION_V1, CONTEXTS_WRITE};
+    use bmux_contexts_plugin_api::contexts_client_selection_v1;
+    let capability_id = CONTEXTS_CLIENT_SELECTION_V1;
+    let capability = capability_id.as_str();
+    assert_ne!(capability, CONTEXTS_WRITE.as_str());
+
+    let holders: Vec<String> = iter_plugin_dirs()
+        .into_iter()
+        .filter(|dir| {
+            granted_capabilities(dir)
+                .iter()
+                .any(|granted| granted.as_str() == capability)
+        })
+        .filter_map(|dir| dir.file_name()?.to_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        holders,
+        ["clients-plugin", "contexts-plugin", "tabs-plugin"],
+        "only the provider, tabs and clients may change another client's selection"
+    );
+
+    let plugins = repo_root().join("plugins");
+    let services = vec![bmux_plugin_sdk::RegisteredService {
+        capability: bmux_plugin_sdk::HostScope::new(capability).expect("valid capability"),
+        kind: bmux_plugin_sdk::ServiceKind::Command,
+        interface_id: contexts_client_selection_v1::INTERFACE_ID.to_string(),
+        provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.contexts".to_string()),
+    }];
+    let instance =
+        bmux_plugin_runtime::InstanceScope::new(bmux_plugin_runtime::PluginRuntimeScopeId::new());
+    let activation = instance
+        .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+        .expect("activation");
+    activation.mark_active().expect("active");
+    let invocation = activation.begin_invocation().expect("invocation");
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().display().to_string();
+    let invoke = |plugin: &str, id: &str| {
+        let granted = granted_capabilities(&plugins.join(plugin));
+        let builtins = bmux_plugin::InvocationHostBuiltins::new(
+            bmux_plugin::PluginId::new(id).expect("plugin id"),
+            bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: dir.clone(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: dir.clone(),
+                data_dir: dir.clone(),
+                state_dir: dir.clone(),
+            },
+            services.clone(),
+            granted,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("builtins");
+        builtins.try_invoke(
+            &invocation,
+            &bmux_plugin_sdk::HostServiceRequest {
+                capability,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface: contexts_client_selection_v1::INTERFACE_ID.as_str(),
+                operation: "clear-for-client",
+                payload: &[],
+            },
+        )
+    };
+    // Workspaces and sessions hold contexts write access but not this one.
+    for (plugin, id) in [
+        ("workspaces-plugin", "bmux.workspaces"),
+        ("sessions-plugin", "bmux.sessions"),
+    ] {
+        assert!(
+            granted_capabilities(&plugins.join(plugin))
+                .iter()
+                .any(|granted| granted.as_str() == CONTEXTS_WRITE.as_str()),
+            "{plugin} no longer holds contexts write; pick another witness"
+        );
+        let error = invoke(plugin, id).expect_err("a plugin without the capability is refused");
+        assert!(
+            error.to_string().contains("not granted"),
+            "{plugin}: unexpected refusal {error}"
+        );
+    }
+    // The holders are routed on to the provider.
+    for (plugin, id) in [
+        ("tabs-plugin", "bmux.tabs"),
+        ("clients-plugin", "bmux.clients"),
+    ] {
+        assert!(
+            matches!(invoke(plugin, id), Ok(None)),
+            "{plugin} must reach the provider"
+        );
+    }
+    invocation.close().expect("close");
+    invocation.finish().expect("finish");
+}
+
 #[cfg(test)]
 mod capability_guardrail_helpers {
     use super::{

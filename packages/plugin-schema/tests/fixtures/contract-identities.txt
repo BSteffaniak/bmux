@@ -66,7 +66,7 @@ plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-spawn-v1 93e07110
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-visits-v1 c7c2d63a52098d0b822c8764b3d46de40d8059d45344d208b166992ad3b834ed
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-state fc54b83c834e4dd5c1dc342aa68e13e32138167f9759d1ad03777b4c67787a1a
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-commands f6213903d68430094dc3fa032b6cada4dddb79ff476f526338c26ab4f05d55fc
-plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-client-selection-v1 812b9fad20479ff9ca2c42df6c0d29ac935194d8026ff0acc5dbf43f15900308
+plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-client-selection-v1 61ccb15dbf4b580b4bea5f1c05039a9077fcc8b7eb22e9a950187ba54b4c3459
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-activation-v1 b46f9cb352020d1b62f9b41f06fd60af8bb4e24cb4bd73eed288fcb0070c1ee5
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-events 64e5f99f72d36c813a1f3968ef0f9c547ccaf53b50a689e7a4ed6357e8883c4e
 plugins/contexts-plugin-api/bpdl/contexts-plugin.bpdl contexts-selection-events/v1 6dab900e1f392790dfdae73682b95443cdb93d977ab3ad41dbda29dd2e3fc2a7

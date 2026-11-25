@@ -13,6 +13,11 @@ plugin bmux.contexts version 1;
 
 capability CONTEXTS_READ = bmux.contexts.read;
 capability CONTEXTS_WRITE = bmux.contexts.write;
+// Changing or clearing the selection of a client other than the caller. Kept
+// apart from `bmux.contexts.write` so only plugins that act on another
+// client's behalf (tabs reconciling a personal view, clients moving a
+// follower) can redirect someone else's attachment.
+capability CONTEXTS_CLIENT_SELECTION_V1 = bmux.contexts.client_selection.v1;
 
 // Fresh-shell options are explicit; older creation contracts retain their meaning.
 @capability(CONTEXTS_WRITE)
@@ -136,7 +141,9 @@ interface contexts-commands {
 // behalf: for example when the tab an attachment shows leaves what that
 // attachment arranges. The client's attach reacts exactly as it does to its
 // own selection. Neither operation allocates or replaces an execution.
-@capability(CONTEXTS_WRITE)
+// Gated by its own capability, not `bmux.contexts.write`: holding write access
+// to contexts does not let a plugin move another client's attachment.
+@capability(CONTEXTS_CLIENT_SELECTION_V1)
 interface contexts-client-selection-v1 {
     // Select a context that has an execution for `client-id`. Emits
     // `selected` and `session-active-context-changed` naming the client as

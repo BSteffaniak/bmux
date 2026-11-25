@@ -213,6 +213,7 @@ world clients {
     provide clients-presence-commands-v1;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;
+    require capability bmux.contexts.client_selection.v1;
     require capability bmux.sessions.write;
     require optional capability bmux.sessions.policy;
 }

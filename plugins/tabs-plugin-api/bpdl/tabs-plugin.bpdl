@@ -855,6 +855,7 @@ world tabs {
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.contexts.write;
+    require capability bmux.contexts.client_selection.v1;
     require capability bmux.clients.read;
     require capability bmux.pane_runtime.read;
     require capability bmux.pane_runtime.write;

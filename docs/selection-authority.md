@@ -11,8 +11,12 @@ enforces it as well: the pane-runtime plugin refuses `pane-direct-input` and
 `attach-input` from a cleared client with a `denied` "no input target" error
 (the stream stays open), reading the neutral
 `ContextStateReader::selection_cleared_for_client`. A client that was never
-cleared, or a server without the contexts plugin, is not gated. The shared
-commit contract and its remaining items are still pending.
+cleared, or a server without the contexts plugin, is not gated. Selecting or
+clearing for another client (`contexts-client-selection-v1`) requires its own
+capability, `bmux.contexts.client_selection.v1`, which only the tabs (view
+reconcile and undo) and clients (follow) plugins declare; plain
+`bmux.contexts.write` does not grant it. The shared commit contract and its
+remaining items are still pending.
 
 ## Decision
 
