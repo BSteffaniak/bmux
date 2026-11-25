@@ -1320,11 +1320,17 @@ pub struct TabsPlugin {
     runtime_state: TabRuntimeStateHandle,
     /// Per-attachment personal view bindings; transient, never stored.
     attachments: AttachmentsHandle,
+    /// The live activation's status board, for its last attention write at
+    /// deactivation (the observer's task scope is closed by then).
+    status_board: Arc<Mutex<Option<StatusBoardHandle>>>,
 }
+
+type StatusBoardHandle = Arc<Mutex<status::StatusBoard>>;
 
 impl Plugin for TabsPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate_with_async)
+            .blocking_deactivate(Self::deactivate)
             .blocking_command("explain-spawn-directory", Self::run_command)
             .blocking_command("new-tab", Self::run_command)
             .blocking_command("rename-tab", Self::run_command)
@@ -1813,7 +1819,13 @@ impl TabsPlugin {
             runtime_state: self.runtime_state.clone(),
             attachments: self.attachments.clone(),
         };
-        spawn_status_observer(&async_handle, shared.clone())?;
+        let board = StatusBoardHandle::default();
+        *self
+            .status_board
+            .lock()
+            .map_err(|_| PluginCommandError::failed("tabs status board lock poisoned"))? =
+            Some(Arc::clone(&board));
+        spawn_status_observer(&async_handle, shared.clone(), board)?;
         spawn_attachment_refresher(&async_handle, shared.clone())?;
         let worker = async_handle.clone();
         async_handle.spawn_background("tabs-catalog-observer", move |mut cancellation| async move {
@@ -1871,6 +1883,31 @@ impl TabsPlugin {
                 if ran.is_none() { return Ok(()); }
             }
         }).map_err(PluginCommandError::failed)?;
+        Ok(())
+    }
+
+    /// Write the attention changes the status observer has not written yet:
+    /// it writes at most once per save interval, and by now teardown has
+    /// stopped it and closed its task scope.
+    fn deactivate(
+        &self,
+        context: &NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
+        self.flush_attention(&TypedServiceCaller::from_lifecycle_context(context))
+    }
+
+    fn flush_attention(
+        &self,
+        caller: &(impl ServiceCaller + Sync),
+    ) -> std::result::Result<(), PluginCommandError> {
+        let board = self
+            .status_board
+            .lock()
+            .map_err(|_| PluginCommandError::failed("tabs status board lock poisoned"))?
+            .take();
+        if let Some(board) = board {
+            save_attention_if_due(caller, &board, status::now_ms(), true);
+        }
         Ok(())
     }
 
@@ -3259,10 +3296,10 @@ async fn publish_on_worker(
 fn spawn_status_observer(
     async_handle: &bmux_plugin_sdk::HostAsyncHandle,
     shared: TabsSharedState,
+    board: StatusBoardHandle,
 ) -> std::result::Result<(), PluginCommandError> {
     use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, PaneEvent};
     use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{self, TerminalEvent};
-    let board = Arc::new(Mutex::new(status::StatusBoard::default()));
     let worker = async_handle.clone();
     async_handle
         .spawn_background("tabs-status-observer", move |mut cancellation| async move {
@@ -3285,22 +3322,9 @@ fn spawn_status_observer(
             let mut dirty = false;
             loop {
                 tokio::select! {
-                    () = cancellation.cancelled() => {
-                        // Write what changed since the last write.
-                        let shared = shared.clone();
-                        let board = Arc::clone(&board);
-                        let _ = worker
-                            .spawn_blocking(move || {
-                                save_attention_if_due(
-                                    shared.caller.as_ref(),
-                                    &board,
-                                    status::now_ms(),
-                                    true,
-                                );
-                            })
-                            .await;
-                        return Ok(());
-                    }
+                    // Deactivation writes what changed since the last write:
+                    // the task scope refuses blocking work once cancelled.
+                    () = cancellation.cancelled() => return Ok(()),
                     ready = bus.subscribe_when_registered::<TerminalEvent>(&terminal_kind), if terminal.is_none() => {
                         terminal = ready.ok();
                     }
@@ -9252,6 +9276,68 @@ mod tests {
         assert_eq!(history.lock().unwrap().get(&(b, Uuid::nil())), Some(&alpha));
         assert_eq!(history.lock().unwrap().get(&(a, Uuid::nil())), Some(&alpha));
         assert_eq!(history.lock().unwrap().len(), 2);
+    }
+
+    /// The status observer writes attention at most once per save interval
+    /// and is stopped before deactivation, which writes what it had not.
+    #[test]
+    // TestServiceRouter requires the SDK's unboxed PluginError.
+    #[allow(clippy::result_large_err)]
+    fn deactivation_writes_the_attention_the_observer_had_not_written() {
+        let storage = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+        let router = InvocationTestHost(checked_test_router({
+            let storage = Arc::clone(&storage);
+            Arc::new(move |_, _, _, _, interface, operation, payload| {
+                match (interface, operation) {
+                    ("storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)?;
+                        storage
+                            .lock()
+                            .unwrap()
+                            .insert(request.key.to_string(), request.value);
+                        encode_service_message(&())
+                    }
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "attention_flush_router",
+                    }),
+                }
+            })
+        }));
+        let plugin = TabsPlugin::default();
+        let board = StatusBoardHandle::default();
+        {
+            let mut board = board.lock().unwrap();
+            board.load_attention(attention::Loaded::Nothing);
+            // The observer's last write failed just now: the next one waits
+            // for the save interval.
+            let now = status::now_ms();
+            let bytes = board.attention_to_save(now, false).expect("first write");
+            board.attention_written(bytes, false);
+            assert_eq!(board.attention_to_save(now, false), None, "throttled");
+        }
+        *plugin.status_board.lock().unwrap() = Some(Arc::clone(&board));
+        let context = service_test_context(
+            Some(&router),
+            "tabs-state",
+            "list-tabs",
+            Vec::new(),
+            "bmux.tabs.read",
+            ServiceKind::Query,
+        );
+        let caller = TypedServiceCaller::from_service_context(&context);
+
+        plugin.flush_attention(&caller).unwrap();
+
+        assert!(
+            storage.lock().unwrap().contains_key(attention::STORAGE_KEY),
+            "the pending attention was written"
+        );
+        assert!(plugin.status_board.lock().unwrap().is_none());
+        // Written: nothing is left for a later flush.
+        assert_eq!(
+            board.lock().unwrap().attention_to_save(u64::MAX, true),
+            None
+        );
     }
 
     /// The byte routes resolve the owner through a nested
