@@ -114,8 +114,6 @@ fn captured_paths_expand_exactly_once_and_keep_origin_and_missing_tokens() {
         assets = "~/browser"
         [recording]
         dir = "${ASSET}"
-        [connections.targets.remote]
-        identity_file = "~/key"
     "#,
     );
     let mut captured = context();
@@ -140,10 +138,6 @@ fn captured_paths_expand_exactly_once_and_keep_origin_and_missing_tokens() {
     assert_eq!(
         first.bmux.recording.dir,
         Some(PathBuf::from("/original/relative-assets"))
-    );
-    assert_eq!(
-        first.bmux.connections.targets["remote"].identity_file,
-        Some(PathBuf::from("/captured/home/key"))
     );
     let empty = resolve(&family, &ConfigEvaluationContext::default());
     assert_eq!(

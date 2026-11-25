@@ -572,12 +572,6 @@ fn resolve_origin_paths(
             ["plugins", "search_paths"]
                 | ["presenter", "web", "assets"]
                 | ["recording", "dir" | "auto_export_dir"]
-                | [
-                    "connections",
-                    "targets",
-                    _,
-                    "identity_file" | "known_hosts_file" | "ca_file"
-                ]
                 | ["kiosk", "files", "sshd_include_path" | "wrapper_dir"]
         );
         if !is_path {

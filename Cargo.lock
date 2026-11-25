@@ -4719,6 +4719,7 @@ dependencies = [
  "bmux_config",
  "bmux_connections_admin",
  "bmux_connections_plugin",
+ "bmux_connections_plugin_api",
  "bmux_context_state",
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
@@ -5077,11 +5078,9 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "bmux_config",
- "bmux_remote_ssh",
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "toml 1.2.2+spec-1.1.0",
  "uuid",
 ]
 
@@ -6229,14 +6228,6 @@ dependencies = [
  "bmux_recording_protocol",
  "serde",
  "uuid",
-]
-
-[[package]]
-name = "bmux_remote_ssh"
-version = "0.0.1-alpha.4"
-dependencies = [
- "anyhow",
- "bmux_config",
 ]
 
 [[package]]

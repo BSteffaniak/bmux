@@ -229,11 +229,6 @@ enabled = true
 # Options: auto, none, zstd, lz4
 images = "auto"
 
-# Stream compression for remote connections. Currently unused: connections
-# from paired devices (`bmux connect`) are not stream-compressed.
-# Options: auto, none, zstd
-remote = "auto"
-
 # Compression level for zstd (1-19, ignored for lz4).
 # 1 = fastest, 3 = good balance (default), 9+ = diminishing returns.
 level = 3

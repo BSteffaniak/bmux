@@ -219,11 +219,10 @@ fn resolve_target_reference(
         Ok(_) => Ok(ActiveTarget::Connector(target.to_owned())),
         Err(error @ TransportConnectorResolutionError::Ambiguous { .. }) => Err(error.into()),
         Err(TransportConnectorResolutionError::NoConnector { .. }) => {
-            if let Some(configured) = configured {
+            if configured.is_some() {
                 anyhow::bail!(
-                    "target '{target}' is configured with the {:?} transport, which bmux no longer dials; \
-                     remove it from [connections.targets] and connect to a paired host by its saved name",
-                    configured.transport
+                    "target '{target}' is configured with a transport bmux no longer dials (ssh, tls or iroh); \
+                     remove it from [connections.targets] and connect to a paired host by its saved name"
                 );
             }
             anyhow::bail!(
@@ -912,8 +911,7 @@ mod tests {
         config.connections.targets.insert(
             "old".into(),
             bmux_config::ConnectionTargetConfig {
-                transport: bmux_config::ConnectionTransport::Tls,
-                ..bmux_config::ConnectionTargetConfig::default()
+                transport: bmux_config::ConnectionTransport::Unsupported,
             },
         );
         assert!(

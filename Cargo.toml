@@ -107,7 +107,6 @@ members = [
     "packages/raster",
     "packages/connections-admin",
     "packages/recording-bootstrap",
-    "packages/remote-ssh",
     "packages/docs-site",
     "packages/docs-site/ui",
     "plugins/clients-plugin",
@@ -373,7 +372,6 @@ bmux_prompted_actions_plugin             = { version = "0.0.1-alpha.4", default-
 bmux_recording_bootstrap                 = { version = "0.0.1-alpha.4", default-features = false, path = "packages/recording-bootstrap" }
 bmux_recording_plugin                    = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/recording-plugin" }
 bmux_recording_plugin_api                = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/recording-plugin-api" }
-bmux_remote_ssh                          = { version = "0.0.1-alpha.4", default-features = false, path = "packages/remote-ssh" }
 bmux_sessions_plugin                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/sessions-plugin" }
 bmux_sessions_plugin_api                 = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/sessions-plugin-api" }
 bmux_sidebar_plugin                      = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/sidebar-plugin" }

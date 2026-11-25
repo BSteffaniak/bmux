@@ -1510,132 +1510,29 @@ pub struct ConnectionsConfig {
     pub recent_targets: Vec<String>,
     /// Most recently used sessions per target (newest first).
     pub recent_sessions: BTreeMap<String, Vec<String>>,
-    /// Declarative TLS gateway trust policy and pins.
-    #[config_doc(nested)]
-    pub tls_trust: TlsTrustConfig,
 }
 
-/// TLS gateway trust policy and declarative pins.
+/// A named connection target. Remote hosts are paired with `bmux connect --pair`
+/// and saved by the connections plugin, not configured here; a configured target is
+/// an alias for the local server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
-#[serde(default)]
-pub struct TlsTrustConfig {
-    /// Trust mode for TLS gateways without CA validation or a known pin.
-    pub mode: TlsTrustMode,
-    /// Endpoint (`host:port`) -> pinned gateway metadata map.
-    #[config_doc(nested, map_key = "<host:port>")]
-    pub known_gateways: BTreeMap<String, TlsKnownGatewayConfig>,
-}
-
-/// TLS trust behavior for unknown gateways.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum TlsTrustMode {
-    /// Prompt in interactive terminals; require a known pin otherwise.
-    #[default]
-    Prompt,
-    /// Refuse gateways unless CA validation or a known pin succeeds.
-    RequireKnown,
-    /// Automatically trust and pin first-seen gateway certificates.
-    TrustNew,
-}
-
-/// Declarative TLS gateway pin metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
-#[serde(default)]
-pub struct TlsKnownGatewayConfig {
-    /// Pinned SHA-256 fingerprint of the gateway leaf certificate.
-    pub fingerprint_sha256: String,
-    /// Expected TLS server name for display/auditing.
-    pub server_name: Option<String>,
-    /// Human-readable target label.
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(default)]
 pub struct ConnectionTargetConfig {
     /// Transport backend for this target.
     pub transport: ConnectionTransport,
-    /// SSH host for `transport = "ssh"`.
-    pub host: Option<String>,
-    /// SSH username override.
-    pub user: Option<String>,
-    /// SSH port override.
-    pub port: Option<u16>,
-    /// Private key file path.
-    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
-    pub identity_file: Option<PathBuf>,
-    /// Known hosts file path.
-    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
-    pub known_hosts_file: Option<PathBuf>,
-    /// Optional CA certificate bundle used for TLS transport.
-    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
-    pub ca_file: Option<PathBuf>,
-    /// Optional TLS server name override (defaults to host).
-    pub server_name: Option<String>,
-    /// Iroh endpoint id for hosted transport.
-    pub endpoint_id: Option<String>,
-    /// Optional Iroh relay URL for hosted transport.
-    pub relay_url: Option<String>,
-    /// Optional direct Iroh socket address for explicit/LAN endpoints.
-    pub iroh_ip_addr: Option<std::net::SocketAddr>,
-    /// Require SSH auth handshake when connecting to this iroh target.
-    pub iroh_ssh_auth: bool,
-    /// Require strict host key checking.
-    pub strict_host_key_checking: bool,
-    /// SSH jump host (`ProxyJump`) value.
-    pub jump: Option<String>,
-    /// Remote bmux executable path.
-    pub remote_bmux_path: String,
-    /// Connection timeout in milliseconds.
-    pub connect_timeout_ms: u64,
-    /// Remote server startup behavior.
-    pub server_start_mode: RemoteServerStartMode,
-    /// Default session name used by clients.
-    pub default_session: Option<String>,
 }
 
-impl Default for ConnectionTargetConfig {
-    fn default() -> Self {
-        Self {
-            transport: ConnectionTransport::Local,
-            host: None,
-            user: None,
-            port: None,
-            identity_file: None,
-            known_hosts_file: None,
-            ca_file: None,
-            server_name: None,
-            endpoint_id: None,
-            relay_url: None,
-            iroh_ip_addr: None,
-            iroh_ssh_auth: false,
-            strict_host_key_checking: true,
-            jump: None,
-            remote_bmux_path: "bmux".to_string(),
-            connect_timeout_ms: 8_000,
-            server_start_mode: RemoteServerStartMode::Auto,
-            default_session: None,
-        }
-    }
-}
-
+/// Transport of a configured connection target.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionTransport {
+    /// The local server.
     #[default]
     Local,
-    Ssh,
-    Tls,
-    Iroh,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteServerStartMode {
-    #[default]
-    Auto,
-    RequireRunning,
+    /// A transport bmux no longer dials (`ssh`, `tls`, `iroh`). Such a target is
+    /// refused with a pointer to pairing, never treated as local.
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ConfigDocEnum)]
@@ -2261,7 +2158,7 @@ pub struct BehaviorConfig {
     /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
     #[config_doc(nested)]
     pub images: ImageBehaviorConfig,
-    /// IPC compression settings (image payloads and remote connections).
+    /// IPC compression settings for image payloads.
     #[config_doc(nested)]
     pub compression: CompressionConfig,
     /// Pane text the attach client never shows: regular expressions whose
@@ -2469,38 +2366,25 @@ impl ImageBehaviorConfig {
     }
 }
 
-/// IPC compression settings.
+/// IPC compression settings for image payloads (zstd/lz4 on raw image data
+/// before IPC transport). Remote connections negotiate their own compression.
 ///
-/// Controls two user-facing compression layers:
-/// - **images**: Per-image payload compression (zstd/lz4 on raw image data
-///   before IPC transport).
-/// - **remote**: Stream-level compression for remote connections (TLS gateway,
-///   Iroh P2P).  Local Unix socket connections are never compressed.
-///
-/// Default is `enabled = true`, `images = auto`, `remote = auto`.
+/// Default is `enabled = true`, `images = auto`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
 #[config_doc(section = "behavior.compression")]
 #[serde(default)]
 pub struct CompressionConfig {
-    /// Master switch for all compression.  When false, image payloads are
-    /// sent uncompressed and remote connections are not wrapped in streaming
-    /// compression.
+    /// Master switch for image compression.  When false, image payloads are
+    /// sent uncompressed.
     pub enabled: bool,
     /// Compress image payloads (Sixel, Kitty graphics, iTerm2) before IPC
     /// transport.  Typical reduction: 5-15x for sixel text, 3-20x for kitty
     /// raw pixels.  Pre-compressed formats (e.g. kitty PNG) are automatically
     /// detected and skipped.  `auto` selects zstd when available.
     pub images: CompressionMode,
-    /// Compress remote connections (TLS gateway, Iroh P2P) with streaming
-    /// compression.  Local Unix socket connections are never compressed.
-    /// Both the client and the server gateway must use the same setting;
-    /// a mismatch will cause the connection to fail.  If SSH is already
-    /// compressing the tunnel, set this to `none` to avoid double work.
-    pub remote: CompressionMode,
     /// Zstd compression level for image payloads (1-19, ignored for lz4).
     /// Level 1 is fastest (~500 MB/s), level 3 (default) balances speed and
-    /// ratio, level 9+ gives diminishing returns.  Remote streaming always
-    /// uses level 1 internally for low latency regardless of this setting.
+    /// ratio, level 9+ gives diminishing returns.
     pub level: i32,
 }
 
@@ -2509,7 +2393,6 @@ impl Default for CompressionConfig {
         Self {
             enabled: true,
             images: CompressionMode::Auto,
-            remote: CompressionMode::Auto,
             level: 3,
         }
     }
@@ -2959,24 +2842,6 @@ impl BmuxConfig {
             &mut warnings,
         );
 
-        for (name, target) in &mut self.connections.targets {
-            let identity_field = format!("connections.targets.{name}.identity_file");
-            Self::interpolate_optional_path_field(
-                &mut target.identity_file,
-                &identity_field,
-                &mut warnings,
-            );
-
-            let known_hosts_field = format!("connections.targets.{name}.known_hosts_file");
-            Self::interpolate_optional_path_field(
-                &mut target.known_hosts_file,
-                &known_hosts_field,
-                &mut warnings,
-            );
-
-            let ca_field = format!("connections.targets.{name}.ca_file");
-            Self::interpolate_optional_path_field(&mut target.ca_file, &ca_field, &mut warnings);
-        }
 
         for (index, search_path) in self.plugins.search_paths.iter_mut().enumerate() {
             let field = format!("plugins.search_paths[{index}]");
@@ -4019,23 +3884,28 @@ mod tests {
     }
 
     #[test]
-    fn load_parses_connection_targets() {
+    fn load_parses_connection_targets_and_refuses_removed_transports() {
         let path = temp_config_path();
         std::fs::write(
             &path,
-            "[connections]\ndefault_target = 'prod'\n[connections.targets.prod]\ntransport = 'ssh'\nhost = 'prod.example.com'\nport = 2222\n",
+            "[connections]\ndefault_target = 'here'\n[connections.targets.here]\ntransport = 'local'\n[connections.targets.prod]\ntransport = 'ssh'\nhost = 'prod.example.com'\nport = 2222\n",
         )
         .expect("write temp config");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(config.connections.default_target.as_deref(), Some("prod"));
-        let prod = config
-            .connections
-            .targets
-            .get("prod")
-            .expect("prod target missing");
-        assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
-        assert_eq!(prod.port, Some(2222));
+        assert_eq!(config.connections.default_target.as_deref(), Some("here"));
+        let target = |name: &str| {
+            config
+                .connections
+                .targets
+                .get(name)
+                .expect("target missing")
+                .transport
+        };
+        assert_eq!(target("here"), crate::ConnectionTransport::Local);
+        // A removed transport still loads, so the rest of the config works, but it is
+        // never mistaken for the local server.
+        assert_eq!(target("prod"), crate::ConnectionTransport::Unsupported);
     }
 
     #[test]
@@ -4397,39 +4267,6 @@ server_timeout = 1234
                 .iter()
                 .any(|path| path == "general.server_timeout")
         );
-    }
-
-    #[test]
-    fn load_expands_connection_target_path_fields() {
-        let Some(home) = switchy::fs::directories::home_dir() else {
-            return;
-        };
-
-        let path = temp_config_path();
-        let dir = path.parent().expect("temp dir").to_path_buf();
-        std::fs::write(
-            &path,
-            "[connections.targets.prod]\ntransport = 'ssh'\nidentity_file = '$HOME/.ssh/id_ed25519'\nknown_hosts_file = '${HOME}/.ssh/known_hosts'\nca_file = '~/certs/prod-ca.pem'\n",
-        )
-        .expect("write temp config");
-
-        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        let prod = config
-            .connections
-            .targets
-            .get("prod")
-            .expect("prod target missing");
-        assert_eq!(
-            prod.identity_file,
-            Some(home.join(".ssh").join("id_ed25519"))
-        );
-        assert_eq!(
-            prod.known_hosts_file,
-            Some(home.join(".ssh").join("known_hosts"))
-        );
-        assert_eq!(prod.ca_file, Some(home.join("certs").join("prod-ca.pem")));
-
-        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 
     #[test]

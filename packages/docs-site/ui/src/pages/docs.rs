@@ -112,7 +112,7 @@ mod tests {
 
         assert!(doc.contains("## `[connections]`"));
         assert!(doc.contains("targets.<name>.transport"));
-        assert!(doc.contains("tls_trust.known_gateways.<host:port>.fingerprint_sha256"));
+        assert!(!doc.contains("tls_trust"));
     }
 
     #[test]
@@ -121,7 +121,8 @@ mod tests {
 
         assert!(doc.contains("mouse.enabled"));
         assert!(doc.contains("images.max_image_bytes"));
-        assert!(doc.contains("compression.remote"));
+        assert!(doc.contains("compression.images"));
+        assert!(!doc.contains("compression.remote"));
         assert!(doc.contains("export.cursor"));
         assert!(doc.contains("routing.conflict_mode"));
         assert!(doc.contains("routing.required_paths.<index>.path"));
