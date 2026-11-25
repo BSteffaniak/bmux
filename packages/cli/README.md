@@ -142,10 +142,12 @@ bmux --target desk list-sessions
 bmux remote hosts
 bmux remote rename desk desktop
 bmux remote forget desktop
+bmux remote doctor desktop               # timed steps; names the failing one
 
-# host: devices and live connections
+# host: devices, live connections and the audit log
 bmux remote list
-bmux remote status
+bmux remote status                       # --json; works without a server
+bmux remote log                          # pairings, revocations, connections
 bmux remote role laptop view-only
 bmux remote revoke laptop
 bmux remote disable

@@ -20,5 +20,11 @@ design.
 - `host`: hosting policy, pairing approval (pending -> role -> active), revoke
   and role changes.
 - `connector`: the saved-host `TransportConnector` for `--target <alias>`.
-- `cli`: `connect`, `remote …` and `kiosk …` commands.
+- `audit`: the host's audit log (pairings, revocations, role changes,
+  connections and refusals), stored bounded in the trust store's database,
+  with refusals rate-limited and no secrets.
+- `cli`: `connect`, `remote …` and `kiosk …` commands; `cli::status` is
+  `remote status` and `remote log` (both also work without a server, from
+  stored state), and `cli::doctor` is `remote doctor <host>`, the timed
+  step-by-step diagnosis of a saved host.
 - `invoke`: `connections-commands.invoke-service` on `local` or a saved host.

@@ -114,8 +114,36 @@ interface hosting-types {
         bound_addrs: list<string>,
         relay_mode: string,
         relay: string?,
+        // Whether the endpoint is connected to its home relay.
+        relay_connected: bool,
+        // Latest measured latency to the home relay.
+        relay_latency_ms: u64?,
         // Hosting failed to start; local terminals still work.
         warning: string?,
+    }
+
+    enum audit-event-kind {
+        paired,
+        pair-rejected,
+        revoked,
+        role-changed,
+        connected,
+        disconnected,
+        refused,
+    }
+
+    // One audit log entry. Never carries secrets (no links, keys' secrets or
+    // pairing phrases).
+    record audit-event {
+        // Unix seconds.
+        at: u64,
+        kind: audit-event-kind,
+        device_key: string?,
+        // Untrusted display label.
+        device_name: string?,
+        role: device-role?,
+        // For example the path of a connection or why it was refused.
+        detail: string?,
     }
 
     record pairing-session {
@@ -161,6 +189,8 @@ interface hosting-commands {
 interface hosting-admin-state {
     query list-devices() -> list<hosting-types.device>;
     query live-connections() -> list<hosting-types.live-connection>;
+    // The newest `limit` audit events, oldest first.
+    query audit-log(limit: u32) -> list<hosting-types.audit-event>;
 }
 
 @capability(CONNECTIONS_READ)

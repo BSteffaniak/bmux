@@ -7,8 +7,8 @@ use crate::identity::DeviceKey;
 use crate::known_hosts::{KnownHost, KnownHosts, host_key_changed};
 use crate::transport::manager::{ClientTransport, ConnectionManager, HostRoute, Refused, refused};
 use anyhow::{Context, Result};
-use bmux_connections_plugin_api::saved_host_types::SavedHost;
 use bmux_client::{BmuxClient, ClientError, TransportConnectFuture, TransportConnector};
+use bmux_connections_plugin_api::saved_host_types::SavedHost;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ impl SavedHostConnector {
             .join(format!("{CLIENT_PROFILE}.json"))
     }
 
-    fn saved(&self, alias: &str) -> Result<Option<KnownHost>> {
+    pub fn saved(&self, alias: &str) -> Result<Option<KnownHost>> {
         // Never create client state just to answer `supports`.
         if !self.known_hosts_file().is_file() {
             return Ok(None);
@@ -118,14 +118,19 @@ pub fn explain(alias: &str, error: anyhow::Error) -> anyhow::Error {
     error.context(format!("{alias}: could not connect"))
 }
 
-/// This client's endpoint settings (`remote.relay`, `remote.bind_addr`),
-/// from the connections plugin settings.
-pub fn client_transport(paths: &bmux_config::ConfigPaths) -> Result<ClientTransport> {
+/// The connections plugin settings of the configuration at `paths`.
+pub fn remote_settings(paths: &bmux_config::ConfigPaths) -> Result<RemoteSettings> {
     let config = bmux_config::BmuxConfig::load_isolated_with_paths_and_overrides(
         paths,
         &bmux_config::ConfigLoadOverrides::default(),
     )?;
-    let settings = RemoteSettings::load(config.plugins.settings.get("bmux.connections"))?;
+    RemoteSettings::load(config.plugins.settings.get("bmux.connections"))
+}
+
+/// This client's endpoint settings (`remote.relay`, `remote.bind_addr`),
+/// from the connections plugin settings.
+pub fn client_transport(paths: &bmux_config::ConfigPaths) -> Result<ClientTransport> {
+    let settings = remote_settings(paths)?;
     Ok(ClientTransport {
         relay: settings.relay,
         bind_addr: settings.bind_addr,

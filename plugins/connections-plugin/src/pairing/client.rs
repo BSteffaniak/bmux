@@ -1,8 +1,8 @@
 //! The connecting side of `bmux/pair/1`.
 use super::protocol::{self, DeviceMessage, HostMessage};
 use crate::link::PairingLink;
-use crate::transport::manager::{ConnectionManager, HostRoute, refusal};
 use crate::transport::PAIR_ALPN;
+use crate::transport::manager::{ConnectionManager, HostRoute, refusal};
 use crate::trust::Role;
 use anyhow::{Result, bail};
 use std::time::Duration;

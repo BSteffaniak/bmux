@@ -23,7 +23,7 @@ bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 clap = { workspace = true, features = ["derive", "std", "help", "usage"] }
 getrandom = { workspace = true }
-iroh = { workspace = true }
+iroh = { workspace = true, features = ["unstable-net-report"] }
 libc = { workspace = true }
 qrcode = { workspace = true }
 redb = { workspace = true }

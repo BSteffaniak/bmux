@@ -2,13 +2,13 @@
 //! logical pane is placed on the worker through the ingress's control service.
 use std::time::Duration;
 
+use bmux_client::BmuxClient;
 use bmux_cluster_plugin_api::cluster_types::{
     CommandId, ControlCommand, ControlCommandRequest, ControlCommandResult, ExecutionAssignment,
     ExecutionId, LogicalPaneId, LogicalPaneRecord, LogicalTabId, LogicalTabRecord,
     PaneAvailability, PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec, WorkspaceId,
 };
 use bmux_cluster_plugin_api::{cluster_control_command, cluster_control_state, cluster_query};
-use bmux_client::BmuxClient;
 
 use crate::harness::Host;
 

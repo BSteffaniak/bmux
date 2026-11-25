@@ -1,18 +1,20 @@
-//! Host commands: `bmux remote enable|disable|pair|list|revoke|role|status`.
+//! Host commands: `bmux remote enable|disable|pair|list|revoke|role`.
 //! They call the running server's owner-local services over the local socket.
+//! (`remote status` and `remote log` also work without a server: see
+//! `status`.)
 use super::{blocking, confirm, flag, option, positional, qr};
 use anyhow::{Context, Result, bail, ensure};
 use bmux_client::BmuxClient;
 use bmux_connections_plugin_api::hosting_types::{
     Device, DeviceRole, DeviceState, PairingEventKind,
 };
-use bmux_connections_plugin_api::{hosting_admin_state, hosting_commands, hosting_state};
+use bmux_connections_plugin_api::{hosting_admin_state, hosting_commands};
 use std::time::Duration;
 
 const PAIR_TTL_SECS: u64 = 600;
 const EVENT_WAIT_MS: u64 = 10_000;
 
-async fn connect(paths: &bmux_config::ConfigPaths) -> Result<BmuxClient> {
+pub(super) async fn connect(paths: &bmux_config::ConfigPaths) -> Result<BmuxClient> {
     let mut client = BmuxClient::connect_with_paths(paths, "bmux-remote-admin")
         .await
         .context("the bmux server for this runtime is not running; start bmux first")?;
@@ -35,7 +37,7 @@ fn parse_role(text: &str) -> Result<DeviceRole> {
     }
 }
 
-const fn state_name(state: DeviceState) -> &'static str {
+pub(super) const fn state_name(state: DeviceState) -> &'static str {
     match state {
         DeviceState::Pending => "pending",
         DeviceState::Active => "active",
@@ -43,11 +45,11 @@ const fn state_name(state: DeviceState) -> &'static str {
     }
 }
 
-fn short(key: &str) -> &str {
+pub(super) fn short(key: &str) -> &str {
     &key[..key.len().min(12)]
 }
 
-fn ago(timestamp: Option<u64>) -> String {
+pub(super) fn ago(timestamp: Option<u64>) -> String {
     timestamp.map_or_else(
         || "never".to_owned(),
         |at| {
@@ -62,7 +64,7 @@ fn ago(timestamp: Option<u64>) -> String {
     )
 }
 
-fn print_devices(devices: &[Device]) {
+pub(super) fn print_devices(devices: &[Device]) {
     if devices.is_empty() {
         println!("No paired devices. Pair one with `bmux remote pair`.");
         return;
@@ -128,61 +130,9 @@ pub async fn run(paths: &bmux_config::ConfigPaths, command: &str, args: &[String
                     .await?;
             println!("{} is now {}.", device.name, role_name(device.role));
         }
-        "remote-status" => status(&mut client).await?,
         _ => bail!("unknown remote command"),
     }
     Ok(0)
-}
-
-async fn status(client: &mut BmuxClient) -> Result<()> {
-    let status = hosting_state::client::status(client).await?;
-    println!(
-        "Remote access: {} ({})",
-        if status.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        status.source
-    );
-    println!("Host key: {}", status.endpoint_id);
-    if !status.bound_addrs.is_empty() {
-        println!("Bound: {}", status.bound_addrs.join(", "));
-    }
-    println!(
-        "Relay: {}{}",
-        status.relay_mode,
-        status
-            .relay
-            .as_deref()
-            .map_or_else(String::new, |relay| format!(" ({relay})"))
-    );
-    if let Some(warning) = status.warning {
-        println!("Warning: {warning}");
-    }
-    let devices = hosting_admin_state::client::list_devices(client).await?;
-    println!();
-    print_devices(&devices);
-    let live = hosting_admin_state::client::live_connections(client).await?;
-    println!();
-    if live.is_empty() {
-        println!("No live remote connections.");
-    } else {
-        println!("Live connections:");
-        for connection in live {
-            println!(
-                "  {} ({}) via {}{}, connected {}s",
-                connection.name,
-                short(&connection.device_key),
-                connection.path,
-                connection
-                    .rtt_ms
-                    .map_or_else(String::new, |rtt| format!(", rtt {rtt}ms")),
-                connection.connected_secs
-            );
-        }
-    }
-    Ok(())
 }
 
 async fn pair(client: &mut BmuxClient, args: &[String]) -> Result<()> {
@@ -243,9 +193,7 @@ async fn wait_for_requests(
                     "Approve this device with {} access? [y/N] ",
                     role_name(role)
                 );
-                let approve = blocking(move || confirm(&question))
-                    .await
-                    .unwrap_or(false);
+                let approve = blocking(move || confirm(&question)).await.unwrap_or(false);
                 let device = hosting_commands::client::decide_pairing(
                     client,
                     session_id.to_owned(),

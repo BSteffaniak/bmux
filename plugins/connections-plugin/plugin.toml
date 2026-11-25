@@ -142,7 +142,64 @@ value_name    = "ROLE"
 expose_in_cli = true
 name          = "remote-status"
 path          = ["remote", "status"]
-summary       = "Show remote access, paired devices and live connections (host)"
+summary       = "Show remote access, paired devices, live connections and saved hosts"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "json"
+name     = "json"
+required = false
+summary  = "Print output as JSON"
+
+[[commands]]
+expose_in_cli = true
+name          = "remote-log"
+path          = ["remote", "log"]
+summary       = "Show the remote access audit log: pairings, revocations, connections (host)"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "limit"
+name       = "limit"
+required   = false
+summary    = "Newest events to show (default 50, at most 1000)"
+value_name = "N"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "json"
+name     = "json"
+required = false
+summary  = "Print output as JSON"
+
+[[commands]]
+expose_in_cli = true
+name          = "remote-doctor"
+path          = ["remote", "doctor"]
+summary       = "Diagnose the connection to a saved host step by step"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "host"
+position   = 0
+required   = true
+summary    = "Saved host (see `bmux remote hosts`)"
+value_name = "HOST"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "timeout"
+name       = "timeout"
+required   = false
+summary    = "Seconds to wait for the host (default 10)"
+value_name = "SECS"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "json"
+name     = "json"
+required = false
+summary  = "Print output as JSON"
 
 [[commands]]
 expose_in_cli = true
@@ -346,10 +403,12 @@ summary        = "Print all configured profiles"
 "kiosk status"           = { order = 0 }
 "remote"                 = { summary = "Remote access: pairing, devices and saved hosts", order = 19 }
 "remote disable"         = { order = 1 }
+"remote doctor"          = { order = 12 }
 "remote enable"          = { order = 0 }
 "remote forget"          = { order = 10 }
 "remote hosts"           = { order = 8 }
 "remote list"            = { order = 3 }
+"remote log"             = { order = 11 }
 "remote pair"            = { order = 2 }
 "remote rename"          = { order = 9 }
 "remote revoke"          = { order = 5 }

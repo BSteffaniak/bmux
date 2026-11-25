@@ -53,7 +53,8 @@ bmux remote enable
 bmux remote pair                 # prints a one-time link and waits to approve
 bmux remote pair --role view-only --name laptop
 bmux remote list
-bmux remote status
+bmux remote status               # add --json; works without a server too
+bmux remote log                  # audit log of pairings, revocations, connections
 bmux remote role laptop view-only
 bmux remote revoke laptop
 bmux remote disable
@@ -67,6 +68,7 @@ bmux --target desk list-sessions
 bmux remote hosts
 bmux remote rename desk desktop
 bmux remote forget desktop
+bmux remote doctor desktop       # step-by-step timings and the failing step
 
 # Optional runtime instance selection (for parallel local runtimes)
 bmux --runtime dev server start --daemon

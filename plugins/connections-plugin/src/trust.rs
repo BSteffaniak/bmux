@@ -5,7 +5,7 @@
 //! before it becomes visible, and published to subscribers (the listener's
 //! live-connection registry).
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,6 +13,8 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 const DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("devices");
+/// The audit log (see `crate::audit`), keyed by a growing sequence number.
+const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const EVENT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +94,7 @@ impl TrustStore {
         {
             let write = database.begin_write()?;
             write.open_table(DEVICES)?;
+            write.open_table(AUDIT)?;
             write.commit()?;
             let read = database.begin_read()?;
             let table = read.open_table(DEVICES)?;
@@ -285,6 +288,46 @@ impl TrustStore {
         }
     }
 
+    /// Append `event` to the audit log, dropping the oldest entries beyond
+    /// [`crate::audit::CAPACITY`]. Best effort: a failure is logged only.
+    pub fn record(&self, event: &crate::audit::Event) {
+        if let Err(error) = self.append(event) {
+            tracing::warn!("audit log write failed: {error:#}");
+        }
+    }
+
+    fn append(&self, event: &crate::audit::Event) -> Result<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut table = write.open_table(AUDIT)?;
+            let next = table.last()?.map_or(0, |(key, _)| key.value() + 1);
+            table.insert(next, serde_json::to_vec(event)?.as_slice())?;
+            while table.len()? > crate::audit::CAPACITY {
+                if table.pop_first()?.is_none() {
+                    break;
+                }
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` audit events, oldest first. Unreadable entries
+    /// are skipped.
+    pub fn audit(&self, limit: usize) -> Result<Vec<crate::audit::Event>> {
+        let read = self.database.begin_read()?;
+        let table = read.open_table(AUDIT)?;
+        let mut events = Vec::new();
+        for entry in table.iter()?.rev().take(limit) {
+            let (_, value) = entry?;
+            if let Ok(event) = serde_json::from_slice(value.value()) {
+                events.push(event);
+            }
+        }
+        events.reverse();
+        Ok(events)
+    }
+
     /// Finish approvals interrupted between their steps: a pending device whose
     /// grant exists becomes active; one without a grant is removed.
     pub fn recover(&self, grant_exists: impl Fn(Uuid) -> Result<bool>) -> Result<()> {
@@ -353,6 +396,32 @@ mod tests {
             .unwrap();
         assert_eq!(store.active_principal(&key(1)), Some(granted.principal));
         assert!(store.get(&key(2)).is_none());
+    }
+
+    #[test]
+    fn audit_log_is_bounded_and_persists() {
+        use crate::audit::{CAPACITY, Event, Kind};
+        let root = tempfile::tempdir().unwrap();
+        let store = TrustStore::open(root.path()).unwrap();
+        assert_eq!(store.audit(10).unwrap(), Vec::new());
+        for n in 0..CAPACITY + 5 {
+            store.record(
+                &Event::new(Kind::Connected)
+                    .key(&key(1))
+                    .detail(n.to_string()),
+            );
+        }
+        drop(store);
+        let store = TrustStore::open(root.path()).unwrap();
+        let all = store.audit(usize::MAX).unwrap();
+        assert_eq!(all.len() as u64, CAPACITY);
+        assert_eq!(all.first().unwrap().detail.as_deref(), Some("5"));
+        let newest = store.audit(2).unwrap();
+        let details: Vec<_> = newest.iter().map(|e| e.detail.clone().unwrap()).collect();
+        assert_eq!(
+            details,
+            [(CAPACITY + 3).to_string(), (CAPACITY + 4).to_string()]
+        );
     }
 
     #[test]

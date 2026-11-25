@@ -256,6 +256,12 @@ impl Refused {
     pub const fn is_permanent(&self) -> bool {
         matches!(self.code, close::NOT_PAIRED | close::REVOKED)
     }
+
+    /// Whether the host revoked this device (as opposed to never pairing it).
+    #[must_use]
+    pub const fn is_revoked(&self) -> bool {
+        self.code == close::REVOKED
+    }
 }
 
 impl std::fmt::Display for Refused {

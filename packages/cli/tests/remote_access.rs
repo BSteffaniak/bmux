@@ -13,6 +13,9 @@
 #[allow(dead_code)] // Shared process fixture; this target uses the host-runtime part.
 mod support;
 
+#[cfg(feature = "bundled-plugin-cluster")]
+#[path = "remote_access/cluster.rs"]
+mod cluster;
 #[path = "remote_access/harness.rs"]
 mod harness;
 #[path = "remote_access/probe.rs"]
@@ -21,9 +24,6 @@ mod probe;
 mod relay;
 #[path = "remote_access/udp_proxy.rs"]
 mod udp_proxy;
-#[cfg(feature = "bundled-plugin-cluster")]
-#[path = "remote_access/cluster.rs"]
-mod cluster;
 
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
@@ -773,8 +773,13 @@ fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
         let mut ingress = cluster::owner(&node_a).await;
         let (_, cluster_id) = cluster::identity(&mut ingress).await;
         let mut nodes = cluster::Nodes(vec![ingress, worker]);
-        cluster::place_pane(&mut nodes, "gate9", &worker_node, &word.to_ascii_lowercase())
-            .await;
+        cluster::place_pane(
+            &mut nodes,
+            "gate9",
+            &worker_node,
+            &word.to_ascii_lowercase(),
+        )
+        .await;
         cluster_id.expect("initialized node has a cluster id")
     });
 
@@ -786,6 +791,244 @@ fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
     let typed = marker("typed");
     attach.send(format!("{}\r", typed.to_ascii_lowercase()).as_bytes());
     attach.wait_text(&format!("SEEN:{typed}"), STEP);
+}
+
+// ---------------------------------------------------------------------------------------
+// Operations: `remote status`, `remote doctor`, `remote log` (architecture section 8).
+// ---------------------------------------------------------------------------------------
+
+/// Stdout of a successful command, parsed as JSON.
+fn json_of(output: &std::process::Output, what: &str) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{what}: stdout is not JSON ({error}): {}",
+            support::combined_output(output)
+        )
+    })
+}
+
+/// `bmux remote doctor <alias> --json` on `client`: its exit success and report.
+fn doctor(client: &Client, alias: &str) -> (bool, serde_json::Value) {
+    let output = client.run(&["remote", "doctor", alias, "--json", "--timeout", "3"]);
+    let report = json_of(&output, "remote doctor");
+    assert_eq!(
+        output.status.success(),
+        report["ok"] == true,
+        "the exit status must match the report: {report}"
+    );
+    (output.status.success(), report)
+}
+
+fn failure_kind(report: &serde_json::Value) -> &str {
+    report["failure"]["kind"].as_str().unwrap_or("none")
+}
+
+#[test]
+fn operations_status_shows_hosting_devices_live_connections_and_saved_hosts() {
+    let fixture = paired("opstatus", Role::Full);
+    let mut viewer = fixture.client.connect(ALIAS, "work");
+    let typed = marker("status");
+    viewer.type_marker(&typed);
+    viewer.wait_text(&typed, STEP);
+
+    let output = fixture.host.run(&["remote", "status", "--json"]);
+    support::assert_success(&output, "host status --json");
+    let status = json_of(&output, "host status");
+    let host = &status["host"];
+    assert_eq!(host["server_running"], true, "{status}");
+    assert_eq!(host["enabled"], true, "{status}");
+    assert_eq!(host["source"], "remote enable", "{status}");
+    assert!(
+        host["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("remote enable")),
+        "{status}"
+    );
+    assert!(
+        host["endpoint_id"]
+            .as_str()
+            .is_some_and(|id| id.len() >= 52),
+        "{status}"
+    );
+    assert_eq!(host["relay_mode"], "disabled", "{status}");
+    let devices = host["devices"].as_array().expect("devices");
+    assert!(
+        devices.iter().any(|device| device["name"] == DEVICE
+            && device["role"] == "full"
+            && device["state"] == "active"
+            && device["last_seen"].is_u64()),
+        "{status}"
+    );
+    let live = host["live_connections"]
+        .as_array()
+        .expect("live connections");
+    assert!(
+        live.iter().any(|connection| connection["name"] == DEVICE
+            && connection["path"] == "direct"
+            && connection["rtt_ms"].is_u64()),
+        "{status}"
+    );
+    let text = fixture.host.ok(&["remote", "status"], "host status");
+    for needle in [
+        "Remote access: enabled (remote enable)",
+        "Host key: ",
+        DEVICE,
+        "via direct",
+    ] {
+        assert!(text.contains(needle), "`{needle}` missing: {text}");
+    }
+    drop(viewer);
+
+    // A bare `bmux connect` offers the saved hosts with their online state.
+    let mut picker = fixture.client.terminal("picker", &["connect"]);
+    picker.expect(&format!("1\\) {ALIAS} +online \\(direct"), STEP);
+    picker.expect("Host \\[1-1\\]: ", STEP);
+    picker.send(b"1\r");
+    picker.wait_attached();
+    drop(picker);
+
+    // The connecting side has no server: status shows its saved hosts, creates nothing.
+    let output = fixture.client.run(&["remote", "status", "--json"]);
+    support::assert_success(&output, "client status --json");
+    let status = json_of(&output, "client status");
+    assert_eq!(status["host"]["server_running"], false, "{status}");
+    assert_eq!(status["host"]["enabled"], false, "{status}");
+    assert!(status["client"]["device_key"].is_string(), "{status}");
+    let saved = status["client"]["saved_hosts"]
+        .as_array()
+        .expect("saved hosts");
+    assert!(
+        saved
+            .iter()
+            .any(|host| host["alias"] == ALIAS && host["last_path"] == "direct"),
+        "{status}"
+    );
+    let text = fixture.client.ok(&["remote", "status"], "client status");
+    assert!(text.contains("not running"), "{text}");
+    assert!(text.contains(ALIAS), "{text}");
+    let log = fixture.client.ok(&["remote", "log"], "client log");
+    assert!(log.contains("No remote access events"), "{log}");
+    fixture.client.assert_daemonless();
+}
+
+#[test]
+fn operations_doctor_times_each_step_and_names_offline_revoked_and_changed_hosts() {
+    let fixture = paired("opdoctor", Role::ViewOnly);
+
+    // Healthy: every step passes, in order, over a direct path.
+    let (ok, report) = doctor(&fixture.client, ALIAS);
+    assert!(ok, "{report}");
+    let steps: Vec<_> = report["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|step| step["step"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "resolve",
+            "endpoint",
+            "relay",
+            "dial",
+            "handshake",
+            "hello",
+            "round-trip"
+        ],
+        "{report}"
+    );
+    assert!(
+        report["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .all(|step| step["ok"] == true && step["ms"].is_u64()),
+        "{report}"
+    );
+    assert_eq!(report["path"], "direct", "{report}");
+    let text = fixture
+        .client
+        .ok(&["remote", "doctor", ALIAS], "doctor text");
+    assert!(text.contains("is reachable via direct"), "{text}");
+
+    // Unknown saved host.
+    let (ok, report) = doctor(&fixture.client, "nowhere");
+    assert!(!ok);
+    assert_eq!(failure_kind(&report), "unknown_host", "{report}");
+
+    // Host offline: hosting off, nothing answers.
+    fixture.host.ok(&["remote", "disable"], "disable hosting");
+    let (ok, report) = doctor(&fixture.client, ALIAS);
+    assert!(!ok);
+    assert_eq!(failure_kind(&report), "host_offline", "{report}");
+    let text = support::combined_output(&fixture.client.run(&[
+        "remote",
+        "doctor",
+        ALIAS,
+        "--timeout",
+        "2",
+    ]));
+    assert!(text.contains("host_offline"), "{text}");
+    fixture
+        .host
+        .ok(&["remote", "enable", "--yes"], "enable hosting again");
+
+    // Host key changed: the saved host's pinned key no longer matches.
+    let known = fixture
+        .client
+        .root()
+        .join("state/connections/known-hosts/default.json");
+    let original = std::fs::read_to_string(&known).expect("read known hosts");
+    let record: serde_json::Value = serde_json::from_str(&original).expect("known hosts JSON");
+    let pinned = record["hosts"][ALIAS]["host_key"]
+        .as_str()
+        .expect("pinned host key")
+        .to_owned();
+    let other = iroh::SecretKey::generate().public().to_string();
+    std::fs::write(&known, original.replace(&pinned, &other)).expect("change pinned key");
+    let (ok, report) = doctor(&fixture.client, ALIAS);
+    assert!(!ok);
+    assert_eq!(failure_kind(&report), "host_key_changed", "{report}");
+    std::fs::write(&known, &original).expect("restore pinned key");
+    let (ok, report) = doctor(&fixture.client, ALIAS);
+    assert!(ok, "{report}");
+
+    // Revoked: the host tells the device, and the doctor names it.
+    fixture.host.ok(&["remote", "revoke", DEVICE], "revoke");
+    let (ok, report) = doctor(&fixture.client, ALIAS);
+    assert!(!ok);
+    assert_eq!(failure_kind(&report), "device_revoked", "{report}");
+    fixture.client.assert_daemonless();
+
+    // The audit log recorded it all, with no secrets.
+    let output = fixture.host.run(&["remote", "log", "--json"]);
+    support::assert_success(&output, "remote log --json");
+    let events = json_of(&output, "remote log");
+    let kinds: Vec<_> = events
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for kind in ["paired", "connected", "disconnected", "revoked", "refused"] {
+        assert!(
+            kinds.iter().any(|k| k == kind),
+            "`{kind}` missing: {events}"
+        );
+    }
+    assert!(
+        events
+            .as_array()
+            .expect("events")
+            .iter()
+            .all(|event| { event["device_name"] == DEVICE && event["at"].is_u64() }),
+        "{events}"
+    );
+    let text = fixture
+        .host
+        .ok(&["remote", "log", "--limit", "5"], "remote log");
+    assert!(text.contains("refused") && text.contains(DEVICE), "{text}");
+    assert!(!text.contains("bmux-pair:"), "{text}");
 }
 
 // ---------------------------------------------------------------------------------------

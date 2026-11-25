@@ -4,9 +4,10 @@
 //! after the handshake, before any bmux bytes are read. `bmux/pair/1` is
 //! served only while a pairing session is open.
 use super::{PAIR_ALPN, SESSION_ALPN, close, erased, path_of};
+use crate::audit::{Event as AuditEvent, Kind as AuditKind, RefusalLimiter};
 use crate::pairing::protocol::{self, DeviceMessage, HostMessage, Refusal};
 use crate::pairing::{Decision, Sessions};
-use crate::trust::{TrustChange, TrustStore};
+use crate::trust::{DeviceState, TrustChange, TrustStore};
 use anyhow::{Context, Result};
 use bmux_plugin::stream_admission::{
     StreamAdmissionBinding, StreamIngressError, StreamIngressHandle, StreamRevocation,
@@ -44,6 +45,17 @@ pub struct ListenerContext {
     pub ingress: StreamIngressHandle,
     /// The host key; pairing transcripts bind it.
     pub host_key: iroh::PublicKey,
+    /// Bounds refusals written to the audit log.
+    pub refusals: Arc<RefusalLimiter>,
+}
+
+/// Append `event` to the audit log off the runtime workers (a redb commit).
+fn audit(trust: &Arc<TrustStore>, event: AuditEvent) {
+    let trust = Arc::clone(trust);
+    drop(bmux_plugin_sdk::rt::spawn_blocking_named(
+        "remote-audit",
+        move || trust.record(&event),
+    ));
 }
 
 struct LiveConnection {
@@ -275,6 +287,37 @@ async fn accept(
     Ok(())
 }
 
+/// Close the connection of a key that is not an active device. A revoked
+/// device learns that it was revoked (it knows its own key); any other key is
+/// simply not paired.
+fn refuse(connection: &iroh::endpoint::Connection, context: &ListenerContext, device_key: &str) {
+    let known = context.trust.get(device_key);
+    let revoked = known
+        .as_ref()
+        .is_some_and(|device| device.state == DeviceState::Revoked);
+    if revoked {
+        connection.close(close::REVOKED.into(), b"device revoked");
+    } else {
+        connection.close(close::NOT_PAIRED.into(), b"device not paired");
+    }
+    if context.refusals.admit() {
+        let event = known.as_ref().map_or_else(
+            || AuditEvent::new(AuditKind::Refused).key(device_key),
+            |device| AuditEvent::new(AuditKind::Refused).device(device),
+        );
+        audit(
+            &context.trust,
+            event.detail(if revoked {
+                "revoked device"
+            } else if known.is_some() {
+                "device not active"
+            } else {
+                "unknown device"
+            }),
+        );
+    }
+}
+
 async fn serve_session(
     connection: iroh::endpoint::Connection,
     context: &ListenerContext,
@@ -284,16 +327,31 @@ async fn serve_session(
     let device_key = connection.remote_id().to_string();
     // The only check before bmux bytes: the TLS-proven key is an active device.
     let Some(principal) = context.trust.active_principal(&device_key) else {
-        connection.close(close::NOT_PAIRED.into(), b"device not paired");
+        refuse(&connection, context, &device_key);
         return;
     };
     let connection_id = Uuid::new_v4();
     let (binding, revocation) = StreamAdmissionBinding::new(principal, connection_id);
-    let device_name = context
-        .trust
-        .get(&device_key)
-        .map(|device| device.name)
+    let device = context.trust.get(&device_key);
+    let device_name = device
+        .as_ref()
+        .map(|device| device.name.clone())
         .unwrap_or_default();
+    let since = Instant::now();
+    let audited = |kind: AuditKind| {
+        device.as_ref().map_or_else(
+            || AuditEvent::new(kind).key(&device_key),
+            |device| AuditEvent::new(kind).device(device),
+        )
+    };
+    let (path, rtt) = path_of(&connection);
+    audit(
+        &context.trust,
+        audited(AuditKind::Connected).detail(format!(
+            "via {path}{}",
+            rtt.map_or_else(String::new, |rtt| format!(", rtt {}ms", rtt.as_millis()))
+        )),
+    );
     live.lock().insert(
         connection_id,
         LiveConnection {
@@ -301,7 +359,7 @@ async fn serve_session(
             device_name,
             connection: connection.clone(),
             revocation: revocation.clone(),
-            since: Instant::now(),
+            since,
         },
     );
     // A revocation between the check and registration must not be missed.
@@ -332,15 +390,28 @@ async fn serve_session(
     }
     live.lock().remove(&connection_id);
     revocation.revoke();
+    let device_revoked =
+        binding.is_revoked() && context.trust.active_principal(&device_key).is_none();
+    let reason = if device_revoked {
+        "device revoked"
+    } else if *stopped.borrow() {
+        "remote access stopped"
+    } else {
+        "connection closed"
+    };
     if connection.close_reason().is_none() {
-        let code = if binding.is_revoked() && context.trust.active_principal(&device_key).is_none()
-        {
+        let code = if device_revoked {
             close::REVOKED
         } else {
             close::STOPPING
         };
         connection.close(code.into(), b"closed");
     }
+    audit(
+        &context.trust,
+        audited(AuditKind::Disconnected)
+            .detail(format!("{reason} after {}s", since.elapsed().as_secs())),
+    );
 }
 
 async fn serve_pairing(

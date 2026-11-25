@@ -17,6 +17,7 @@ pub mod declaration {
     }
 }
 
+mod audit;
 mod cli;
 mod config;
 mod connector;
@@ -140,6 +141,9 @@ impl ConnectionsInstance {
             "remote-hosts" => cli::client::hosts(&context),
             "remote-rename" => cli::client::rename(&context),
             "remote-forget" => cli::client::forget(&context),
+            "remote-status" => cli::status::status(&context).await,
+            "remote-log" => cli::status::log(&context).await,
+            "remote-doctor" => cli::doctor::run(&context).await,
             _ => cli::host::run(&cli::paths(&context), name, &context.arguments).await,
         };
         result.map_err(failed)
@@ -168,6 +172,8 @@ impl Plugin for ConnectionsInstance {
             "remote-revoke",
             "remote-role",
             "remote-status",
+            "remote-log",
+            "remote-doctor",
             "remote-hosts",
             "remote-rename",
             "remote-forget",

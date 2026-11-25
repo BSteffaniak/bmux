@@ -1,15 +1,20 @@
 //! Client commands: `bmux connect --pair`, `bmux connect <host> [session]`,
-//! `bmux remote hosts|rename|forget`. None of them needs or starts a server.
+//! `bmux remote hosts|rename|forget`, and the saved-host picker of a bare
+//! `bmux connect`. None of them needs or starts a server.
 use super::{CLIENT_PROFILE, flag, option, positional, prompt};
 use crate::identity::DeviceKey;
 use crate::known_hosts::{KnownHost, KnownHosts, valid_alias};
 use crate::link::PairingLink;
 use crate::pairing::client::pair;
-use crate::transport::manager::ConnectionManager;
+use crate::transport::manager::{ConnectionManager, HostRoute, refused};
+use crate::transport::path_of;
 use crate::trust::Role;
 use anyhow::{Context, Result, bail, ensure};
 use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
 use bmux_plugin_sdk::{CoreCliCommandRequest, NativeCommandContext};
+use std::io::IsTerminal;
+use std::sync::Arc;
+use std::time::Duration;
 
 const CONNECT_VALUE_FLAGS: &[&str] = &["--name", "--device-name"];
 
@@ -21,10 +26,12 @@ async fn attach(context: &NativeCommandContext, alias: &str, session: Option<&st
     arguments.extend(session.map(ToOwned::to_owned));
     let caller = TypedServiceCaller::from_command_context(context);
     let response = super::blocking(move || {
-        Ok(caller.core_cli_command_run_path(&CoreCliCommandRequest::new(
-            vec!["attach".to_owned()],
-            arguments,
-        ))?)
+        Ok(
+            caller.core_cli_command_run_path(&CoreCliCommandRequest::new(
+                vec!["attach".to_owned()],
+                arguments,
+            ))?,
+        )
     })
     .await?;
     if let Some(error) = response.error {
@@ -60,16 +67,92 @@ pub async fn connect(context: &NativeCommandContext) -> Result<i32> {
         if saved.is_empty() {
             bail!("no saved hosts; pair one with `bmux connect --pair`");
         }
-        bail!(
-            "choose a host: bmux connect <host> [session]\nSaved hosts: {}",
-            saved.keys().cloned().collect::<Vec<_>>().join(", ")
-        );
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "choose a host: bmux connect <host> [session]\nSaved hosts: {}",
+                saved.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        let alias = pick_host(&paths, saved).await?;
+        return attach(context, &alias, None).await;
     };
     ensure!(positions.len() <= 2, "usage: bmux connect <host> [session]");
     hosts
         .get(alias)?
         .with_context(|| format!("no saved host named '{alias}'; see `bmux remote hosts`"))?;
     attach(context, alias, positions.get(1).map(String::as_str)).await
+}
+
+/// How long the picker waits for each saved host to answer.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether a saved host answers now: a QUIC connection to it (kept in this
+/// process's connection manager, so the attach that follows reuses it).
+async fn probe(manager: Arc<ConnectionManager>, host: KnownHost) -> String {
+    let Ok(host_key) = host.host_key.parse::<iroh::PublicKey>() else {
+        return "invalid host key".to_owned();
+    };
+    let route = HostRoute {
+        host_key,
+        addrs: host.addrs,
+        relay: host.relay,
+    };
+    match manager.connection(&route, PROBE_TIMEOUT).await {
+        Ok(connection) => {
+            // A host that refuses this device closes right after the handshake.
+            let _ = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
+            if let Some(refused) = refused(&connection) {
+                return format!("refused: {refused}");
+            }
+            let (path, rtt) = path_of(&connection);
+            format!(
+                "online ({path}{})",
+                rtt.map_or_else(String::new, |rtt| format!(", rtt {}ms", rtt.as_millis()))
+            )
+        }
+        Err(_) => "offline".to_owned(),
+    }
+}
+
+/// Offer the saved hosts with their online state; returns the chosen alias.
+async fn pick_host(
+    paths: &bmux_config::ConfigPaths,
+    saved: std::collections::BTreeMap<String, KnownHost>,
+) -> Result<String> {
+    let device = DeviceKey::load_or_create(&paths.state_dir, CLIENT_PROFILE)?;
+    let manager =
+        ConnectionManager::shared(device.secret(), &crate::connector::client_transport(paths)?);
+    println!("Checking {} saved host(s)...", saved.len());
+    let probes: Vec<_> = saved
+        .iter()
+        .map(|(alias, host)| {
+            (
+                alias.clone(),
+                bmux_plugin_sdk::rt::spawn_named(
+                    "connections-host-probe",
+                    probe(Arc::clone(&manager), host.clone()),
+                ),
+            )
+        })
+        .collect();
+    let mut aliases = Vec::with_capacity(probes.len());
+    println!("Saved hosts:");
+    for (index, (alias, probe)) in probes.into_iter().enumerate() {
+        let state = probe.await.unwrap_or_else(|_| "unknown".to_owned());
+        println!("  {}) {alias:<20} {state}", index + 1);
+        aliases.push(alias);
+    }
+    let count = aliases.len();
+    let answer = super::blocking(move || prompt(&format!("Host [1-{count}]: "), false)).await?;
+    if let Some(alias) = aliases.iter().find(|alias| **alias == answer) {
+        return Ok(alias.clone());
+    }
+    answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| aliases.get(index).cloned())
+        .with_context(|| format!("no saved host '{answer}'"))
 }
 
 /// Pair with the host whose link is pasted at a hidden prompt; returns the alias.

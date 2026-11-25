@@ -138,7 +138,8 @@ async fn pair_device(
             .host
             .next_pairing_event(&opened.session_id, Duration::from_secs(10))
     })
-    .unwrap() else {
+    .unwrap()
+    else {
         panic!("expected a pairing request");
     };
     let decided = fixture
@@ -230,8 +231,40 @@ async fn pairing_then_session_streams_reach_the_server_as_the_principal() {
     tokio::time::timeout(Duration::from_secs(2), reconnect.closed())
         .await
         .unwrap();
-    assert!(refusal(&reconnect).unwrap().contains("not paired"));
+    // A revoked device is told so (it knows its own key), not "not paired".
+    assert!(refusal(&reconnect).unwrap().contains("revoked"));
     assert!(fixture.accepted.try_recv().is_err());
+
+    // The audit log saw the whole story, oldest first, without secrets.
+    // Connection events are written off the runtime workers: wait for them.
+    let wanted = [
+        AuditKind::Paired,
+        AuditKind::Connected,
+        AuditKind::RoleChanged,
+        AuditKind::Revoked,
+        AuditKind::Disconnected,
+        AuditKind::Refused,
+    ];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let events = loop {
+        let events = blocking(|| fixture.host.audit_log(100, &fixture.grants)).unwrap();
+        let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
+        if wanted.iter().all(|kind| kinds.contains(kind)) || std::time::Instant::now() > deadline {
+            break events;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
+    for kind in wanted {
+        assert!(kinds.contains(&kind), "{kind:?} missing from {kinds:?}");
+    }
+    let position = |kind| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position(AuditKind::Paired) < position(AuditKind::Revoked));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.device_name.as_deref() == Some("laptop"))
+    );
     blocking(|| fixture.host.stop()).unwrap();
 }
 
@@ -338,7 +371,7 @@ async fn hosting_policy_and_single_host_lock() {
     )
     .unwrap();
     assert!(blocking(|| prohibited.set_enabled(true, &fixture.grants)).is_err());
-    assert_eq!(prohibited.status().source, "config");
+    assert_eq!(prohibited.status().source, "config: prohibited");
     // Pairing needs hosting.
     assert!(
         prohibited

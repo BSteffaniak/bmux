@@ -82,10 +82,56 @@ bmux remote list                      # paired devices
 bmux remote role laptop view-only     # takes effect on the next request
 bmux remote revoke laptop             # closes its connections now
 bmux remote status                    # hosting, host key, devices, live connections
+bmux remote log                       # audit log: pairings, revocations, connections
 bmux remote disable                   # stops hosting and closes every remote connection
 ```
 
-A revoked device is refused at the QUIC handshake when it reconnects.
+A revoked device is refused right after the QUIC handshake when it reconnects,
+and is told that it was revoked.
+
+## Status, diagnosis and the audit log
+
+`bmux remote status` (add `--json` for scripts) shows:
+
+- whether hosting is on, and why: `remote enable` / `remote disable` (the CLI
+  opt-in), `config: auto_start`, `config: allowed`, `config: prohibited`
+  (`allow_full_runtime_ingress = false`), or `default` (off);
+- this machine's host key (its endpoint id) and bound addresses;
+- the relay mode, the home relay, whether it is connected, and its latency;
+- paired devices with role, state and when each was last seen;
+- live remote connections with their path (`direct` or `relay`) and RTT;
+- this device's key and the hosts it has saved.
+
+It also works without a running server: it then shows what this machine stored
+(the hosting choice, host key and paired devices) and the saved hosts, and
+creates nothing.
+
+`bmux remote doctor <host>` (on the connecting device; `--json`,
+`--timeout SECS`) checks a saved host step by step and times each step:
+`resolve` (the saved host and this device's key), `endpoint`, `relay`, `dial`,
+`handshake` (proves the pinned host key; shows the path and RTT), `hello` (the
+host admits this device) and `round-trip` (one typed call). It stops at the
+first failure and names it:
+
+| Failure | Meaning |
+| --- | --- |
+| `unknown_host` | no saved host by that name (`bmux remote hosts`) |
+| `host_offline` | nothing answered: the host is off, unreachable, or has remote access disabled |
+| `relay_unreachable` | this device reaches no relay and the host's direct addresses did not answer |
+| `host_key_changed` | the host presents a different key than the pinned one |
+| `device_revoked` | the host revoked this device; pair again |
+| `device_not_paired` | the host does not know this device |
+| `incompatible_version` | the host speaks a different remote protocol; update bmux on both machines |
+
+It exits non-zero on a failure, needs no local server, and changes nothing.
+
+`bmux remote log [--limit N] [--json]` (on the host) lists the newest audit
+events, oldest first: `paired`, `pair-rejected`, `revoked`, `role-changed`,
+`connected` (with path and RTT), `disconnected` (with why and how long) and
+`refused` (an unpaired or revoked device), each with the time, device name and
+key, and role. The log keeps the newest 1000 events in the trust store,
+holds no secrets (no pairing links or phrases), records at most 20 refusals a
+minute, and can be read without a running server.
 
 ## Saved hosts (on the connecting device)
 
@@ -93,6 +139,8 @@ A revoked device is refused at the QUIC handshake when it reconnects.
 bmux remote hosts
 bmux remote rename desk desktop
 bmux remote forget desktop
+bmux remote status                    # also lists saved hosts and this device's key
+bmux remote doctor desktop            # why can't I connect?
 ```
 
 These never need a server. `forget` only removes the host from this device; the
@@ -130,7 +178,7 @@ mode = "default"          # the public Iroh relays
 - Host key: `<state dir>/connections/host.key` (one per machine and user; only
   one runtime hosts at a time).
 - Device key: `<state dir>/connections/devices/<profile>.key`.
-- Paired devices (host): `<state dir>/connections/trust.redb`.
+- Paired devices and the audit log (host): `<state dir>/connections/trust.redb`.
 - Saved hosts (device): `<state dir>/connections/known-hosts/<profile>.json`.
 
 All of these are owner-only. Keys and link secrets never appear in listings,

@@ -1,8 +1,10 @@
 //! Command-line workflows. Host commands talk to the local server's
 //! owner-local services; client commands never need or start a server.
 pub mod client;
+pub mod doctor;
 pub mod host;
 pub mod kiosk;
+pub mod status;
 
 #[cfg(unix)]
 #[path = "echo_unix.rs"]

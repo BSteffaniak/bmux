@@ -1,5 +1,6 @@
 //! Hosting on this machine: the host key, the persisted enable preference, the
 //! trust store and listener while hosting, and pairing sessions.
+use crate::audit::{Event as AuditEvent, Kind as AuditKind};
 use crate::config::{RelayPolicy, RemoteSettings};
 use crate::identity::{HostKey, HostLock};
 use crate::link::PairingLink;
@@ -31,6 +32,8 @@ pub struct Status {
     pub bound_addrs: Vec<String>,
     pub relay_mode: &'static str,
     pub relay: Option<String>,
+    pub relay_connected: bool,
+    pub relay_latency: Option<Duration>,
     pub warning: Option<String>,
 }
 
@@ -161,22 +164,13 @@ impl Host {
     }
 
     fn source(&self, preference: Option<bool>) -> &'static str {
-        if self.settings.allow_full_runtime_ingress == Some(false) {
-            "config"
-        } else {
-            match preference {
-                Some(true) => "remote enable",
-                Some(false) => "remote disable",
-                None if self.settings.allow_full_runtime_ingress == Some(true) => "config",
-                None => "default",
-            }
-        }
+        source(&self.settings, preference)
     }
 
     pub fn status(&self) -> Status {
         let hosting = lock(&self.hosting);
         let (bound_addrs, relay) = hosting.as_ref().map_or_else(
-            || (Vec::new(), None),
+            || (Vec::new(), RelayState::default()),
             |hosting| {
                 let endpoint = hosting.listener.endpoint();
                 let mut bound: Vec<_> = endpoint
@@ -185,8 +179,7 @@ impl Host {
                     .map(|addr| addr.to_string())
                     .collect();
                 bound.sort();
-                let relay = endpoint.addr().relay_urls().next().map(ToString::to_string);
-                (bound, relay)
+                (bound, relay_state(endpoint))
             },
         );
         Status {
@@ -199,7 +192,9 @@ impl Host {
                 RelayPolicy::Disabled => "disabled",
                 RelayPolicy::Custom { .. } => "custom",
             },
-            relay,
+            relay: relay.url,
+            relay_connected: relay.connected,
+            relay_latency: relay.latency,
             warning: lock(&self.warning).clone(),
         }
     }
@@ -236,6 +231,7 @@ impl Host {
             sessions: Arc::clone(&self.sessions),
             ingress,
             host_key: self.key.public(),
+            refusals: Arc::default(),
         };
         let listener = wait(Listener::start(builder, context))??;
         *hosting = Some(Hosting {
@@ -331,6 +327,11 @@ impl Host {
         self.with_trust(grants, |trust| Ok(trust.list()))
     }
 
+    /// The newest `limit` audit events, oldest first.
+    pub fn audit_log(&self, limit: usize, grants: &dyn RoleGrants) -> Result<Vec<AuditEvent>> {
+        self.with_trust(grants, |trust| trust.audit(limit))
+    }
+
     pub fn live_connections(&self) -> Vec<LiveSummary> {
         lock(&self.hosting)
             .as_ref()
@@ -345,6 +346,7 @@ impl Host {
             if let Err(error) = grants.clear(device.principal) {
                 tracing::warn!("revoked device keeps a stale role grant: {error:#}");
             }
+            trust.record(&AuditEvent::new(AuditKind::Revoked).device(&revoked));
             Ok(revoked)
         })
     }
@@ -358,7 +360,13 @@ impl Host {
                 device.name
             );
             grants.set(device.principal, role)?;
-            trust.set_role(&device.key, role)
+            let changed = trust.set_role(&device.key, role)?;
+            trust.record(
+                &AuditEvent::new(AuditKind::RoleChanged)
+                    .device(&changed)
+                    .detail(format!("was {}", role_name(device.role))),
+            );
+            Ok(changed)
         })
     }
 
@@ -456,7 +464,16 @@ impl Host {
     ) -> Result<Option<Device>> {
         let approval = self.sessions.take(session_id, request_id)?;
         if !approve {
+            let mut event = AuditEvent::new(AuditKind::PairRejected)
+                .key(&approval.device_key.to_string())
+                .detail("rejected by the owner");
+            event.device_name = Some(approval.name.clone());
+            event.role = Some(approval.role);
             approval.resolve(Decision::Refused(Refusal::Rejected));
+            let _ = self.with_trust(grants, |trust| {
+                trust.record(&event);
+                Ok(())
+            });
             return Ok(None);
         }
         let key = approval.device_key.to_string();
@@ -466,7 +483,9 @@ impl Host {
                 trust.discard_pending(&key)?;
                 return Err(error.context("granting the role failed; the device was not paired"));
             }
-            trust.activate(&key)
+            let device = trust.activate(&key)?;
+            trust.record(&AuditEvent::new(AuditKind::Paired).device(&device));
+            Ok(device)
         });
         match result {
             Ok(device) => {
@@ -490,6 +509,127 @@ impl Host {
         self.sessions.close(session_id);
         self.set_pairing(false);
     }
+}
+
+/// Where the hosting choice comes from, in the order the policy applies.
+pub fn source(settings: &RemoteSettings, preference: Option<bool>) -> &'static str {
+    if settings.allow_full_runtime_ingress == Some(false) {
+        return "config: prohibited";
+    }
+    match preference {
+        Some(true) => "remote enable",
+        Some(false) => "remote disable",
+        None if settings.startup_enabled(None) => "config: auto_start",
+        None if settings.allow_full_runtime_ingress == Some(true) => "config: allowed",
+        None => "default",
+    }
+}
+
+/// A sentence for `source`: why hosting is on or off.
+pub fn explain_source(enabled: bool, source: &str) -> &'static str {
+    match (enabled, source) {
+        (_, "config: prohibited") => {
+            "prohibited by allow_full_runtime_ingress = false in the connections plugin settings"
+        }
+        (true, "remote enable") => "turned on with `bmux remote enable`",
+        (false, "remote enable") => {
+            "turned on with `bmux remote enable`, but not running here (see the warning, or start bmux)"
+        }
+        (_, "remote disable") => "turned off with `bmux remote disable`",
+        (true, "config: auto_start") => "started by remote.auto_start in the configuration",
+        (false, "config: auto_start") => {
+            "remote.auto_start is set, but hosting is not running here (see the warning, or start bmux)"
+        }
+        (_, "config: allowed") => "allowed by configuration; turn it on with `bmux remote enable`",
+        _ => "off by default; turn it on with `bmux remote enable`",
+    }
+}
+
+pub const fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Full => "full",
+        Role::ViewOnly => "view-only",
+    }
+}
+
+/// The home relay, whether the endpoint reaches it, and its latency.
+#[derive(Clone, Debug, Default)]
+pub struct RelayState {
+    pub url: Option<String>,
+    pub connected: bool,
+    pub latency: Option<Duration>,
+}
+
+/// The relay state of `endpoint`, from its home relay status and its latest
+/// network report.
+pub fn relay_state(endpoint: &iroh::Endpoint) -> RelayState {
+    use iroh::Watcher as _;
+    let home = endpoint.home_relay_status().get();
+    let connected = home.iter().find(|relay| relay.is_connected());
+    let url = connected
+        .or_else(|| home.first())
+        .map(|relay| relay.url().clone())
+        .or_else(|| endpoint.addr().relay_urls().next().cloned());
+    let latency = endpoint.net_report().get().and_then(|report| {
+        let wanted = url.as_ref().or(report.preferred_relay.as_ref())?;
+        report
+            .relay_latency
+            .iter()
+            .filter(|(_, relay, _)| *relay == wanted)
+            .map(|(_, _, latency)| latency)
+            .min()
+    });
+    RelayState {
+        url: url.map(|url| url.to_string()),
+        connected: connected.is_some(),
+        latency,
+    }
+}
+
+/// What this machine has stored about hosting, read without a server and
+/// without creating anything: `None` fields were never written.
+pub struct Stored {
+    pub host_key: Option<iroh::PublicKey>,
+    pub preference: Option<bool>,
+}
+
+/// Read the stored host key and hosting choice; creates nothing.
+pub fn stored(state_dir: &Path) -> Result<Stored> {
+    let directory = state_dir.join("connections");
+    if !directory.is_dir() {
+        return Ok(Stored {
+            host_key: None,
+            preference: None,
+        });
+    }
+    let host_key = if directory.join("host.key").is_file() {
+        Some(HostKey::load_or_create(state_dir)?.public())
+    } else {
+        None
+    };
+    let preference = if directory.join("hosting.json").is_file() {
+        preference(state_dir)?
+    } else {
+        None
+    };
+    Ok(Stored {
+        host_key,
+        preference,
+    })
+}
+
+/// Run `f` on this machine's trust store while no server hosts, under the
+/// host lock. `None` when this machine never hosted (nothing is created).
+pub fn offline_trust<T>(
+    state_dir: &Path,
+    f: impl FnOnce(&TrustStore) -> Result<T>,
+) -> Result<Option<T>> {
+    if !state_dir.join("connections").join("trust.redb").is_file() {
+        return Ok(None);
+    }
+    let _lock = HostLock::acquire(state_dir)?;
+    let trust = TrustStore::open(&storage::connections_dir(state_dir)?)?;
+    f(&trust).map(Some)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

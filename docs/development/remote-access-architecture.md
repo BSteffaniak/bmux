@@ -289,6 +289,27 @@ about pairing, devices or Iroh.
 - **Client commands without a server:** `remote list`, `rename`, `forget` and `status`.
   `forget` is local only and is not revocation.
 
+Lane G state:
+
+- Done: `remote status [--json]` (the `hosting-state.status` record carries the relay's
+  connection and latency; the source names the CLI opt-in, `config: auto_start`,
+  `config: allowed` or `config: prohibited`); `remote doctor <host> [--json]` with timed
+  `resolve`, `endpoint`, `relay`, `dial`, `handshake`, `hello` and `round-trip` steps;
+  `remote log [--limit N] [--json]` over the owner-local `hosting-admin-state.audit-log`
+  query (paired, pair-rejected, revoked, role-changed, connected, disconnected, refused;
+  bounded to 1000 entries in `trust.redb`, refusals rate-limited); a revoked device is
+  closed with the `revoked` code, so it learns why; a bare `bmux connect` on a terminal
+  offers the saved hosts with their online state.
+- Without a server: the saved-host list is `remote hosts` (with `rename` and `forget`),
+  and `remote status` and `remote log` read stored state. `remote list` (paired devices)
+  still asks the server: host commands do not see `--target`, so a stored-state fallback
+  would answer `bmux --target <host> remote list` with this machine's devices.
+- Reconnecting overlay: decided as a one-line notice on the restored terminal
+  (`attach::reconnect`), since the attachment's view is torn down while it reconnects.
+- Not done: the attached client's path and RTT status item. It needs a generic way for
+  a `TransportConnector`-provided client to report connection facts to the attach
+  chrome; no such generic channel exists yet.
+
 ## Deletions
 
 All of these are deleted, not deprecated:
@@ -475,7 +496,8 @@ required checks from `AGENTS.md` all pass.
 ## Open items
 
 - Whether to show the reconnecting overlay through the existing presentation layer or a
-  dedicated status surface (decided in lane G).
+  dedicated status surface. Decided in lane G: a one-line notice on the restored
+  terminal for now (see Operations).
 - Exact BPDL syntax for access classes (decided in lane B against `docs/bpdl-spec.md`).
 - Default pairing link lifetime (10 minutes proposed).
 - Usage policy of the public Iroh relays for this traffic, and a documented self-hosted

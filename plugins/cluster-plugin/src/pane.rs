@@ -1172,6 +1172,8 @@ mod probe_authority_tests {
                         bound_addrs: Vec::new(),
                         relay_mode: "disabled".into(),
                         relay: None,
+                        relay_connected: false,
+                        relay_latency_ms: None,
                         warning: None,
                     })?)
                 }

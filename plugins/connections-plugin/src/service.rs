@@ -63,7 +63,7 @@ const fn api_role(role: Role) -> DeviceRole {
     }
 }
 
-fn device(device: Device) -> api::Device {
+pub fn device(device: Device) -> api::Device {
     api::Device {
         device_key: device.key,
         principal: device.principal,
@@ -89,7 +89,36 @@ fn status(host: &Host) -> api::HostingStatus {
         bound_addrs: status.bound_addrs,
         relay_mode: status.relay_mode.to_owned(),
         relay: status.relay,
+        relay_connected: status.relay_connected,
+        relay_latency_ms: status.relay_latency.map(millis),
         warning: status.warning,
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Most audit events one call returns.
+const MAX_AUDIT_EVENTS: u32 = 1_000;
+
+pub fn audit_event(event: crate::audit::Event) -> api::AuditEvent {
+    use crate::audit::Kind;
+    api::AuditEvent {
+        at: event.at,
+        kind: match event.kind {
+            Kind::Paired => api::AuditEventKind::Paired,
+            Kind::PairRejected => api::AuditEventKind::PairRejected,
+            Kind::Revoked => api::AuditEventKind::Revoked,
+            Kind::RoleChanged => api::AuditEventKind::RoleChanged,
+            Kind::Connected => api::AuditEventKind::Connected,
+            Kind::Disconnected => api::AuditEventKind::Disconnected,
+            Kind::Refused => api::AuditEventKind::Refused,
+        },
+        device_key: event.device_key,
+        device_name: event.device_name,
+        role: event.role.map(api_role),
+        detail: event.detail,
     }
 }
 
@@ -158,11 +187,20 @@ pub fn invoke(owner: Option<&Host>, context: &NativeServiceContext) -> ServiceRe
                         device_key: live.device_key,
                         name: live.device_name,
                         path: live.path.to_owned(),
-                        rtt_ms: live.rtt.map(|rtt| u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
+                        rtt_ms: live.rtt.map(millis),
                         connected_secs: live.connected_secs,
                     })
                     .collect::<Vec<_>>(),
             )
+        },
+        hosting_admin_state::client::AuditLogEndpoint => |request, ctx| {
+            require_local(ctx)?;
+            let caller = bmux_plugin::TypedServiceCaller::from_service_context(ctx);
+            let limit = request.limit.min(MAX_AUDIT_EVENTS) as usize;
+            let events = host(owner)?
+                .audit_log(limit, &PermissionsGrants { caller: &caller })
+                .map_err(failed("trust_store"))?;
+            Ok::<_, ServiceResponse>(events.into_iter().map(audit_event).collect::<Vec<_>>())
         },
         hosting_commands::client::SetEnabledEndpoint => |request, ctx| {
             require_local(ctx)?;
