@@ -9,7 +9,6 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_pty           = { workspace = true, features = ["simulator"] }
-bmux_simvar_tui    = { workspace = true }
 sim_support        = { workspace = true }
 simvar             = { workspace = true, features = ["random", "thread", "time"] }
 switchy_pty        = { workspace = true, features = ["simulator"] }

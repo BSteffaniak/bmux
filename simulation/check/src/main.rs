@@ -4,8 +4,8 @@
 //! in `simulation/determinism.toml`.
 //!
 //! `sim-check NAME... --coverage EXPORT` (run by `cargo sim NAME --coverage`) checks the
-//! `runs = false` claims of what NAME links instead, against an `llvm-cov export` of its
-//! coverage-instrumented runs.
+//! claims that crates NAME links never run (local crates' `runs = false`, external crates'
+//! `not-run` audits) instead, against an `llvm-cov export` of its coverage-instrumented runs.
 //!
 //! A separate program, so the check's own dependencies stay out of the simulations' graphs.
 
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Check the `runs = false` claims of what each simulation links against the coverage export.
+/// Check the claims that crates each simulation links never run against the coverage export.
 fn check_claims(manifest: &Path, names: &[String], export: &Path) -> ExitCode {
     let executed = match std::fs::read_to_string(export)
         .map_err(|e| e.to_string())
@@ -75,7 +75,7 @@ fn check_claims(manifest: &Path, names: &[String], export: &Path) -> ExitCode {
         {
             Ok(broken) => {
                 for (krate, files) in &broken {
-                    println!("{name}: {krate} is marked `runs = false`, but ran:");
+                    println!("{name}: {krate} is claimed never to run, but ran:");
                     for (file, lines) in files {
                         println!("  {} ({lines} lines)", file.display());
                     }
@@ -90,14 +90,15 @@ fn check_claims(manifest: &Path, names: &[String], export: &Path) -> ExitCode {
     }
     if passed {
         println!(
-            "`runs = false` claims held ({} source files in the profile)",
+            "claims that crates never run held ({} source files in the profile)",
             executed.files()
         );
         ExitCode::SUCCESS
     } else {
         println!(
-            "`runs = false` claims BROKEN: remove those crates' `runs = false` (so the check \
-             scans them) and make what runs deterministic"
+            "claims that crates never run BROKEN: drop the claim (a local crate's `runs = false`, \
+             so the check scans it; an external crate's `not-run` audit, for a real verdict) and \
+             make what runs deterministic"
         );
         ExitCode::FAILURE
     }
