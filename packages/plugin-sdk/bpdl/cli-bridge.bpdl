@@ -3,6 +3,7 @@ plugin bmux.cli-bridge version 1;
 capability COMMANDS = bmux.commands;
 @capability(COMMANDS)
 @interface-version(1)
+@access(owner-local)
 interface cli-command {
     record core-cli-command-response {
         protocol-version: u16,

@@ -10,8 +10,6 @@ pub enum BuiltInHandlerId {
     ServerAutostartUninstall,
     ServerAutostartStatus,
     ServerAutostartPrint,
-    ServerGateway,
-    ServerBridge,
     Logs,
     LogsPath,
     LogsLevel,
@@ -144,16 +142,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerAutostartPrint,
             &["server", "autostart", "print"],
             "Print the native server autostart declaration",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerGateway,
-            &["server", "gateway"],
-            "Run TLS gateway for remote clients",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerBridge,
-            &["server", "bridge"],
-            "Internal stdio bridge used by SSH transport",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Logs,

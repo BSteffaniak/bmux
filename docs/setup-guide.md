@@ -14,12 +14,26 @@ bmux new-session dev
 bmux attach dev
 ```
 
-## Hosted Quick Start
+## Remote Access Quick Start
+
+Reach this machine's sessions from another device. On the host, enable remote
+access once and print a one-time pairing link:
 
 ```bmux-cli
-bmux setup
-bmux host --status
+bmux remote enable
+bmux remote pair
 ```
+
+On the other device, run `bmux connect --pair` and paste the link. Both sides
+show a phrase; approve on the host only when they match. The device saves the
+host under a name and attaches; afterwards it reconnects by that name:
+
+```bmux-cli
+bmux connect --pair
+bmux connect desk
+```
+
+See the full guide: [Remote Access and Pairing](/docs/remote-pairing)
 
 ## SSH Kiosk Setup
 
@@ -38,12 +52,6 @@ See the full guide: [Kiosk Access](/docs/kiosk)
 ## Baseline Config Example
 
 ```bmux-config
-[connections]
-default_target = "local"
-
-[connections.targets.prod]
-transport = "ssh"
-host = "prod.example.com"
-user = "bmux"
-port = 22
+[general]
+scrollback_limit = 10000
 ```

@@ -115,8 +115,13 @@ fn marked_snapshot_still_repairs_and_validates_without_value_diagnostics() {
         .unwrap()
         .0;
     assert_eq!(repaired.general.scrollback_limit, 10_000);
-    raw["server"]["gateway"]["enabled"] = toml::Value::Boolean(true);
-    raw["server"]["gateway"]["listen"] = toml::Value::String("SECRET-CANARY".to_owned());
+    raw.as_table_mut().unwrap().insert(
+        "appearance".into(),
+        toml::Value::Table(toml::Table::from_iter([(
+            "pane_border_style".to_owned(),
+            toml::Value::String("SECRET-CANARY".to_owned()),
+        )])),
+    );
     let error = BmuxConfig::load_from_raw_value_with_resolution(Some(raw), None).unwrap_err();
     assert!(!format!("{error:?} {error}").contains("SECRET-CANARY"));
 }

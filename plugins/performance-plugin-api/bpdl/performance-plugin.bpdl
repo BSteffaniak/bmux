@@ -152,6 +152,7 @@ interface performance-types {
 }
 
 @capability(PERFORMANCE_READ)
+@access(observe)
 interface performance-state {
     query get-settings() -> performance-types.performance-runtime-settings;
     query list-watches() -> list<performance-types.metric-watch>;
@@ -162,6 +163,7 @@ interface performance-state {
 }
 
 @capability(PERFORMANCE_WRITE)
+@access(manage)
 interface performance-commands {
     command reset-theme-header-settings() -> unit;
     command set-settings(settings: performance-types.performance-runtime-settings)

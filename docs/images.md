@@ -229,9 +229,8 @@ enabled = true
 # Options: auto, none, zstd, lz4
 images = "auto"
 
-# Remote connection compression.
-# Wraps TLS gateway and Iroh P2P connections in streaming compression.
-# Local Unix socket connections are never compressed.
+# Stream compression for remote connections. Currently unused: connections
+# from paired devices (`bmux connect`) are not stream-compressed.
 # Options: auto, none, zstd
 remote = "auto"
 
@@ -253,20 +252,6 @@ enabled = false
 [behavior.compression]
 images = "none"
 ```
-
-```toml
-# Disable only remote connection compression
-# (useful when SSH already compresses the tunnel)
-[behavior.compression]
-remote = "none"
-```
-
-### Remote Compression Matching
-
-Both the client and the server gateway must have the same `remote` setting. If
-one side compresses and the other doesn't, the connection will fail. The default
-`auto` setting works correctly when both sides use the same bmux version and
-config.
 
 ## Image Configuration
 
@@ -300,10 +285,3 @@ server with correct positions on the next render cycle.
 - Reduce `max_images_per_pane` to limit memory usage per pane.
 - Compression is on by default and significantly reduces IPC bandwidth for image-heavy sessions.
 - Consider `behavior.compression.level = 1` for faster compression if CPU is the bottleneck.
-
-### Remote connections failing with compression
-
-If TLS or Iroh connections fail immediately after connecting, the most likely
-cause is a compression mismatch. Ensure both the client and server gateway have
-the same `behavior.compression.remote` setting. Set both to `"none"` to
-diagnose.

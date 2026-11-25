@@ -89,20 +89,25 @@ fn snapshot_value(mut value: toml::Value, roots: Vec<PathBuf>) -> Result<toml::V
                     .collect(),
             ),
         );
-    let server = value
+    // A sandbox never hosts remote access: the connections plugin's hard
+    // prohibition overrides any opt-in the inherited config has, and an
+    // inherited auto-start is dropped (the plugin refuses auto-start without
+    // permission, which would fail the sandbox server's startup).
+    let mut table = value
         .as_table_mut()
-        .context("configuration must be a table")?
-        .entry("server")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let gateway = server
-        .as_table_mut()
-        .context("server must be a table")?
-        .entry("gateway")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    gateway
-        .as_table_mut()
-        .context("gateway must be a table")?
-        .insert("enabled".into(), toml::Value::Boolean(false));
+        .context("configuration must be a table")?;
+    for key in ["plugins", "settings", "bmux.connections", "remote"] {
+        table = table
+            .entry(key)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .with_context(|| format!("{key} must be a table"))?;
+    }
+    table.insert(
+        "allow_full_runtime_ingress".into(),
+        toml::Value::Boolean(false),
+    );
+    table.insert("auto_start".into(), toml::Value::Boolean(false));
     Ok(value)
 }
 
@@ -163,7 +168,7 @@ pub async fn run_inherited_sandbox(
         &serde_json::to_vec(&descriptor)?,
     )?;
     eprintln!(
-        "Sandbox: {}\nConfig: inherited snapshot; gateway disabled\nBinary: {}\nRuntime, data, state, logs: isolated\nExternal paths and services in configuration remain shared.\nReconnect: bmux sandbox attach {}\nStop: bmux sandbox stop {}",
+        "Sandbox: {}\nConfig: inherited snapshot; remote access disabled\nBinary: {}\nRuntime, data, state, logs: isolated\nExternal paths and services in configuration remain shared.\nReconnect: bmux sandbox attach {}\nStop: bmux sandbox stop {}",
         sandbox.root_dir.display(),
         descriptor.binary.display(),
         sandbox.root_dir.display(),
@@ -331,17 +336,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_preserves_unknown_settings_and_disables_gateway() {
+    fn snapshot_preserves_unknown_settings_and_disables_remote_access() {
         let original: toml::Value = toml::from_str(
-            "[server.gateway]\nenabled = true\nlisten = '0.0.0.0:7443'\n[plugins.custom]\nopaque = ['one', 'two']\n",
+            "[plugins.settings.\"bmux.connections\".remote]\nallow_full_runtime_ingress = true\nauto_start = true\n[plugins.custom]\nopaque = ['one', 'two']\n",
         ).unwrap();
         let value = snapshot_value(original.clone(), vec![PathBuf::from("/plugins")]).unwrap();
+        let remote = &value["plugins"]["settings"]["bmux.connections"]["remote"];
         assert_eq!(value["plugins"]["custom"], original["plugins"]["custom"]);
-        assert_eq!(value["server"]["gateway"]["enabled"].as_bool(), Some(false));
-        assert_eq!(
-            value["server"]["gateway"]["listen"],
-            original["server"]["gateway"]["listen"]
-        );
+        assert_eq!(remote["allow_full_runtime_ingress"].as_bool(), Some(false));
+        assert_eq!(remote["auto_start"].as_bool(), Some(false));
     }
 
     #[cfg(windows)]

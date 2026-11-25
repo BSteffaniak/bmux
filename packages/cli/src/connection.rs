@@ -1,31 +1,21 @@
-#[cfg(feature = "remote-iroh")]
-use crate::ssh_access::authenticate_client_connection;
-use crate::ssh_access::{IrohTargetCompression, parse_iroh_target as parse_iroh_target_parts};
+//! Connection-target resolution for CLI commands.
+//!
+//! A command reaches the local server by default. A selected target (the
+//! `--target` override, `BMUX_TARGET`, or `connections.default_target`) is
+//! handed to the transport connectors plugins registered in this process;
+//! core never parses a connector's targets.
+
 use anyhow::{Context, Result};
-use bmux_client::{AttachEndpointConnectFuture, AttachEndpointConnector, BmuxClient, ClientError};
-use bmux_config::{
-    BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
+use bmux_client::{
+    AttachEndpointConnectFuture, AttachEndpointConnector, BmuxClient, ClientError,
+    TransportConnectError, TransportConnector, TransportConnectorRegistry,
+    TransportConnectorResolutionError,
 };
+use bmux_config::{BmuxConfig, ConfigPaths, ConnectionTransport, StaleBuildAction};
 use bmux_ipc::IncompatibilityReason;
-#[cfg(feature = "remote-iroh")]
-use bmux_ipc::compressed_stream::CompressedStream;
-use bmux_ipc::transport::ErasedIpcStream;
-#[cfg(feature = "remote-iroh")]
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
-use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
-use std::sync::Arc;
-#[cfg(feature = "remote-iroh")]
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
-const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bmux.run";
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct AuthState {
-    access_token: String,
-}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ServerRuntimeMetadata {
     pub pid: u32,
@@ -61,6 +51,35 @@ impl<'a> ConnectionContext<'a> {
     }
 }
 
+/// This CLI process's transport-connector registry. Registration needs no
+/// server, socket or runtime directory, so daemonless clients use it too.
+pub fn host_transport_connectors() -> Arc<TransportConnectorRegistry> {
+    static REGISTRY: OnceLock<Arc<TransportConnectorRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(TransportConnectorRegistry::new())))
+}
+
+/// Keep a plugin-supplied connector registered for this process's lifetime.
+/// A plugin registers at most one connector; repeated installs are ignored.
+#[cfg_attr(
+    not(feature = "bundled-plugins"),
+    allow(dead_code, reason = "only bundled plugins supply transport connectors")
+)]
+pub fn register_plugin_transport_connector(
+    plugin_id: &str,
+    connector: Arc<dyn TransportConnector>,
+) {
+    static REGISTERED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let Ok(mut registered) = REGISTERED.get_or_init(Mutex::default).lock() else {
+        tracing::warn!(plugin_id, "transport connector registration lock poisoned");
+        return;
+    };
+    if registered.insert(plugin_id.to_owned()) {
+        host_transport_connectors().register(connector).forget();
+    }
+}
+
+/// Dials opaque attach endpoints for attach providers (for example cluster
+/// attach) through the same connectors as `--target`.
 #[derive(Debug, Default)]
 pub struct CliAttachEndpointConnector;
 
@@ -72,27 +91,14 @@ impl AttachEndpointConnector for CliAttachEndpointConnector {
     ) -> AttachEndpointConnectFuture<'a> {
         Box::pin(async move {
             let config = BmuxConfig::load().map_err(|error| error.to_string())?;
-            let expanded = expand_bmux_target_if_needed(&config, target)
+            let selected = resolve_target_reference(&config, &host_transport_connectors(), target)
+                .map_err(|error| format!("{error:#}"))?;
+            SelectedTarget(selected)
+                .connect(client_name)
                 .await
-                .map_err(|error| error.to_string())?;
-            if !is_explicit_connection_target(&config, &expanded) {
-                return Err(format!(
-                    "attach endpoint target '{target}' is not a configured alias or direct endpoint"
-                ));
-            }
-            connect_raw_with_context(client_name, ConnectionContext::new(Some(&expanded)))
-                .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| format!("{error:#}"))
         })
     }
-}
-
-#[cfg(feature = "bundled-plugin-connections")]
-pub async fn connect(
-    scope: ConnectionPolicyScope,
-    client_name: &'static str,
-) -> Result<BmuxClient> {
-    connect_with_context(scope, client_name, ConnectionContext::default()).await
 }
 
 pub async fn connect_with_context(
@@ -100,8 +106,13 @@ pub async fn connect_with_context(
     client_name: &'static str,
     context: ConnectionContext<'_>,
 ) -> Result<BmuxClient> {
-    apply_stale_build_policy(scope)?;
-    connect_for_active_target(client_name, context).await
+    let selected = SelectedTarget::resolve(context).await?;
+    // The stale-build policy compares this CLI with the local server's
+    // recorded build; it says nothing about a connector's server.
+    if selected.is_local() {
+        apply_stale_build_policy(scope)?;
+    }
+    selected.connect(client_name).await
 }
 
 #[cfg(feature = "bundled-plugin-sessions")]
@@ -110,19 +121,15 @@ pub async fn connect_if_running_with_context(
     client_name: &'static str,
     context: ConnectionContext<'_>,
 ) -> Result<Option<BmuxClient>> {
+    let selected = SelectedTarget::resolve(context).await?;
+    if !selected.is_local() {
+        return selected.connect(client_name).await.map(Some);
+    }
     apply_stale_build_policy(scope)?;
-    match connect_for_active_target(client_name, context).await {
+    match BmuxClient::connect_default(client_name).await {
         Ok(client) => Ok(Some(client)),
-        Err(error)
-            if error
-                .to_string()
-                .contains("server is not running (IPC endpoint unavailable)")
-                || error.to_string().contains("TLS target unreachable")
-                || error.to_string().contains("iroh target unreachable") =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
+        Err(error) if is_server_unavailable_client_error(&error) => Ok(None),
+        Err(error) => Err(map_client_connect_error(error)),
     }
 }
 
@@ -134,45 +141,19 @@ pub async fn connect_raw_with_context(
     client_name: &'static str,
     context: ConnectionContext<'_>,
 ) -> Result<BmuxClient> {
-    connect_for_active_target(client_name, context).await
+    SelectedTarget::resolve(context)
+        .await?
+        .connect(client_name)
+        .await
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ActiveTarget {
+    /// The local server for this runtime.
     Local,
-    Tls(TlsTarget),
-    Iroh(IrohTarget),
+    /// An opaque target owned by exactly one registered transport connector.
+    Connector(String),
 }
-
-#[derive(Debug, Clone)]
-struct TlsTarget {
-    label: String,
-    host: String,
-    port: u16,
-    server_name: String,
-    ca_file: Option<std::path::PathBuf>,
-    connect_timeout_ms: u64,
-}
-
-#[cfg_attr(
-    not(feature = "remote-iroh"),
-    expect(
-        dead_code,
-        reason = "Iroh targets are parsed and validated in every build, but only the `remote-iroh` transport reads their connection details"
-    )
-)]
-#[derive(Debug, Clone)]
-struct IrohTarget {
-    label: String,
-    endpoint_id: String,
-    relay_url: Option<String>,
-    require_ssh_auth: bool,
-    transport_compression: IrohTargetCompression,
-    connect_timeout_ms: u64,
-}
-
-#[cfg(feature = "remote-iroh")]
-const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
 /// A resolved connection target, pinned across a multi-step operation.
 pub struct SelectedTarget(ActiveTarget);
@@ -181,8 +162,24 @@ pub struct SelectedTarget(ActiveTarget);
 pub type StopTarget = SelectedTarget;
 
 impl SelectedTarget {
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "shared resolution entry point that callers await; connector resolution may become asynchronous"
+    )]
     pub async fn resolve(context: ConnectionContext<'_>) -> Result<Self> {
-        Ok(Self(resolve_active_target(context).await?))
+        let config = BmuxConfig::load().context("failed loading bmux config")?;
+        let selected = context
+            .target_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| std::env::var("BMUX_TARGET").ok())
+            .or_else(|| config.connections.default_target.clone());
+        let Some(target) = selected else {
+            return Ok(Self(ActiveTarget::Local));
+        };
+        resolve_target_reference(&config, &host_transport_connectors(), target.trim()).map(Self)
     }
 
     pub const fn is_local(&self) -> bool {
@@ -194,417 +191,60 @@ impl SelectedTarget {
             ActiveTarget::Local => BmuxClient::connect_default(client_name)
                 .await
                 .map_err(map_client_connect_error),
-            ActiveTarget::Tls(target) => connect_tls_target(target, client_name).await,
-            ActiveTarget::Iroh(target) => connect_iroh_target(target, client_name).await,
+            ActiveTarget::Connector(target) => host_transport_connectors()
+                .connect(target, client_name)
+                .await
+                .map_err(map_transport_connect_error),
         }
     }
 }
 
-async fn connect_for_active_target(
-    client_name: &'static str,
-    context: ConnectionContext<'_>,
-) -> Result<BmuxClient> {
-    match resolve_active_target(context).await? {
-        ActiveTarget::Local => BmuxClient::connect_default(client_name)
-            .await
-            .map_err(map_client_connect_error),
-        ActiveTarget::Tls(target) => connect_tls_target(&target, client_name).await,
-        ActiveTarget::Iroh(target) => connect_iroh_target(&target, client_name).await,
-    }
-}
-
-async fn connect_tls_target(target: &TlsTarget, client_name: &'static str) -> Result<BmuxClient> {
-    let connector = build_tls_connector(target)?;
-    let address = format!("{}:{}", target.host, target.port);
-    let connect_future = TcpStream::connect(&address);
-    let tcp_stream = tokio::time::timeout(
-        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
-        connect_future,
-    )
-    .await
-    .with_context(|| format!("TLS target '{}' connect timed out", target.label))?
-    .with_context(|| format!("TLS target unreachable: {}", target.label))?;
-    let server_name = ServerName::try_from(target.server_name.clone())
-        .map_err(|_| anyhow::anyhow!("invalid TLS server_name '{}'", target.server_name))?;
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
-        .await
-        .with_context(|| format!("TLS handshake failed for target '{}'", target.label))?;
-    let principal_id = load_or_create_local_principal_id()?;
-    BmuxClient::connect_with_bridge_stream(
-        ErasedIpcStream::new(Box::new(tls_stream)),
-        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
-        client_name.to_string(),
-        principal_id,
-    )
-    .await
-    .map_err(map_client_connect_error)
-}
-
-#[cfg(not(feature = "remote-iroh"))]
-fn connect_iroh_target(_: &IrohTarget, _: &'static str) -> std::future::Ready<Result<BmuxClient>> {
-    std::future::ready(Err(crate::ssh_access::iroh_unavailable()))
-}
-
-#[cfg(feature = "remote-iroh")]
-async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> Result<BmuxClient> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
-        .bind()
-        .await
-        .context("failed binding iroh client endpoint")?;
-    endpoint.online().await;
-    let endpoint_id: EndpointId = target
-        .endpoint_id
-        .parse()
-        .with_context(|| format!("invalid iroh endpoint id '{}'", target.endpoint_id))?;
-    let remote_addr = if let Some(relay_url) = target.relay_url.as_deref() {
-        let relay = relay_url
-            .parse()
-            .with_context(|| format!("invalid iroh relay url '{relay_url}'"))?;
-        EndpointAddr::new(endpoint_id).with_relay_url(relay)
-    } else {
-        EndpointAddr::new(endpoint_id)
-    };
-    let connection = tokio::time::timeout(
-        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
-        endpoint.connect(remote_addr, BMUX_IROH_ALPN),
-    )
-    .await
-    .with_context(|| format!("iroh target '{}' connect timed out", target.label))?
-    .with_context(|| format!("iroh target unreachable: {}", target.label))?;
-
-    if target.require_ssh_auth {
-        authenticate_client_connection(&connection)
-            .await
-            .context("iroh SSH auth handshake failed")?;
-    }
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("failed opening iroh stream")?;
-    let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut recv, &mut bridge_write).await;
-        let _ = bridge_write.shutdown().await;
-    });
-    tokio::spawn(async move {
-        let _endpoint_keepalive = endpoint;
-        let _connection_keepalive = connection;
-        let _ = tokio::io::copy(&mut bridge_read, &mut send).await;
-        let _ = send.finish();
-    });
-    let principal_id = load_or_create_local_principal_id()?;
-    let use_transport_compression = iroh_target_uses_compression(target);
-    let erased = if use_transport_compression {
-        ErasedIpcStream::new(Box::new(CompressedStream::new(client_stream, 1)))
-    } else {
-        ErasedIpcStream::new(Box::new(client_stream))
-    };
-    BmuxClient::connect_with_bridge_stream(
-        erased,
-        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
-        client_name.to_string(),
-        principal_id,
-    )
-    .await
-    .map_err(map_client_connect_error)
-}
-
-fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
-    let mut roots = RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = roots.add(cert);
-    }
-
-    if let Some(ca_file) = target.ca_file.as_ref() {
-        let pem = std::fs::read(ca_file)
-            .with_context(|| format!("failed reading CA bundle {}", ca_file.display()))?;
-        let mut reader = std::io::Cursor::new(pem);
-        let certs = rustls_pemfile::certs(&mut reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| format!("failed parsing CA bundle {}", ca_file.display()))?;
-        for cert in certs {
-            roots.add(cert).with_context(|| {
-                format!("failed adding CA certificate from {}", ca_file.display())
-            })?;
-        }
-    }
-
-    if roots.is_empty() {
-        anyhow::bail!(
-            "no TLS trust roots available for target '{}'; install system certs or set ca_file",
-            target.label
-        );
-    }
-
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .context("configuring TLS protocol versions")?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-async fn resolve_active_target(context: ConnectionContext<'_>) -> Result<ActiveTarget> {
-    let config = BmuxConfig::load().context("failed loading bmux config")?;
-    let selected = context
-        .target_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| std::env::var("BMUX_TARGET").ok())
-        .or_else(|| config.connections.default_target.clone());
-    let Some(target) = selected else {
-        return Ok(ActiveTarget::Local);
-    };
-    let expanded = expand_bmux_target_if_needed(&config, target.trim()).await?;
-    resolve_target_reference(&config, &expanded)
-}
-
-pub async fn expand_bmux_target_if_needed(config: &BmuxConfig, target: &str) -> Result<String> {
-    let Some(name) = target.strip_prefix("bmux://") else {
-        return Ok(target.to_string());
-    };
-    if let Some(mapped) = config.connections.share_links.get(name) {
-        return Ok(mapped.clone());
-    }
-    let Some(auth_state) = load_auth_state_optional(&ConfigPaths::default())? else {
-        return Ok(target.to_string());
-    };
-    let control_plane = control_plane_url(config);
-    let client = crate::reqwest_client();
-    let response = client
-        .get(format!("{control_plane}/v1/share-links/{name}"))
-        .bearer_auth(auth_state.access_token)
-        .send()
-        .await
-        .with_context(|| format!("failed contacting {control_plane}"))?;
-    if !response.status().is_success() {
-        return Ok(target.to_string());
-    }
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .context("failed parsing share lookup response")?;
-    Ok(payload
-        .get("target")
-        .and_then(|value| value.as_str())
-        .map_or_else(|| target.to_string(), ToString::to_string))
-}
-
-fn control_plane_url(config: &BmuxConfig) -> String {
-    std::env::var("BMUX_CONTROL_PLANE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| config.connections.control_plane_url.clone())
-        .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_URL.to_string())
-}
-
-fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
-    let path = paths.runtime_dir.join("auth-state.json");
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let state = serde_json::from_str::<AuthState>(&content)
-                .with_context(|| format!("failed parsing auth state {}", path.display()))?;
-            Ok(Some(state))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
-    }
-}
-
-fn is_explicit_connection_target(config: &BmuxConfig, target: &str) -> bool {
-    target == "local"
-        || config.connections.targets.contains_key(target)
-        || target.starts_with("https://")
-        || target.starts_with("iroh://")
-        || target.starts_with("tls://")
-}
-
-fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveTarget> {
+/// Resolve one selected target. `local` (or a configured alias whose
+/// transport is local) is the local server; anything else must be owned by
+/// exactly one registered connector.
+fn resolve_target_reference(
+    config: &BmuxConfig,
+    connectors: &TransportConnectorRegistry,
+    target: &str,
+) -> Result<ActiveTarget> {
+    let target = target.trim();
     if target.is_empty() || target == "local" {
         return Ok(ActiveTarget::Local);
     }
-    if let Some(name) = target.strip_prefix("bmux://") {
-        let mapped = config.connections.share_links.get(name).ok_or_else(|| {
-            anyhow::anyhow!("share link not found: bmux://{name}; run 'bmux share' or 'bmux hosts'")
-        })?;
-        return resolve_target_reference(config, mapped);
+    let configured = config.connections.targets.get(target);
+    if configured.is_some_and(|configured| configured.transport == ConnectionTransport::Local) {
+        return Ok(ActiveTarget::Local);
     }
-    if let Some(named) = config.connections.targets.get(target) {
-        return resolve_named_target(target, named);
-    }
-    if target.starts_with("https://") {
-        return parse_https_target(target);
-    }
-    if target.starts_with("iroh://") {
-        return parse_iroh_target(target);
-    }
-    if target.starts_with("tls://") {
-        return parse_inline_tls_target(target);
-    }
-    Ok(ActiveTarget::Local)
-}
-
-fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<ActiveTarget> {
-    match target.transport {
-        ConnectionTransport::Local => Ok(ActiveTarget::Local),
-        ConnectionTransport::Tls => {
-            let host = target
-                .host
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("TLS target '{name}' requires host"))?
-                .to_string();
-            let port = target.port.unwrap_or(443);
-            let server_name = target.server_name.clone().unwrap_or_else(|| host.clone());
-            Ok(ActiveTarget::Tls(TlsTarget {
-                label: name.to_string(),
-                host,
-                port,
-                server_name,
-                ca_file: target.ca_file.clone(),
-                connect_timeout_ms: target.connect_timeout_ms.max(1),
-            }))
-        }
-        ConnectionTransport::Ssh => {
+    match connectors.resolve(target) {
+        Ok(_) => Ok(ActiveTarget::Connector(target.to_owned())),
+        Err(error @ TransportConnectorResolutionError::Ambiguous { .. }) => Err(error.into()),
+        Err(TransportConnectorResolutionError::NoConnector { .. }) => {
+            if let Some(configured) = configured {
+                anyhow::bail!(
+                    "target '{target}' is configured with the {:?} transport, which bmux no longer dials; \
+                     remove it from [connections.targets] and connect to a paired host by its saved name",
+                    configured.transport
+                );
+            }
             anyhow::bail!(
-                "SSH targets require CLI target proxying; run command with --target {name}"
+                "no transport connector accepts target '{target}'; check the name, or enable the plugin that provides it"
             )
         }
-        ConnectionTransport::Iroh => {
-            let endpoint_id = target
-                .endpoint_id
-                .as_deref()
-                .or(target.host.as_deref())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("iroh target '{name}' requires endpoint_id"))?
-                .to_string();
-            Ok(ActiveTarget::Iroh(IrohTarget {
-                label: name.to_string(),
-                endpoint_id,
-                relay_url: target.relay_url.clone(),
-                require_ssh_auth: target.iroh_ssh_auth,
-                transport_compression: IrohTargetCompression::Auto,
-                connect_timeout_ms: target.connect_timeout_ms.max(1),
-            }))
-        }
     }
 }
 
-#[cfg(feature = "remote-iroh")]
-fn iroh_target_uses_compression(target: &IrohTarget) -> bool {
-    match target.transport_compression {
-        IrohTargetCompression::Zstd => true,
-        IrohTargetCompression::None => false,
-        IrohTargetCompression::Auto => {
-            let config = BmuxConfig::load().unwrap_or_default();
-            config.behavior.compression.enabled
-                && matches!(
-                    config.behavior.compression.remote,
-                    bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-                )
+fn map_transport_connect_error(error: TransportConnectError) -> anyhow::Error {
+    match error {
+        TransportConnectError::Resolution(error) => error.into(),
+        TransportConnectError::Connect { target, source } => {
+            let message = match &source {
+                ClientError::ProtocolIncompatible { reason } => {
+                    format_protocol_incompatibility(reason)
+                }
+                other => other.to_string(),
+            };
+            anyhow::anyhow!("failed connecting to target '{target}': {message}")
         }
-    }
-}
-
-fn parse_inline_tls_target(target: &str) -> Result<ActiveTarget> {
-    let raw = target
-        .strip_prefix("tls://")
-        .ok_or_else(|| anyhow::anyhow!("TLS target must start with tls://"))?;
-    let (host, port) = if let Some((host, port_raw)) = raw.rsplit_once(':') {
-        if port_raw.is_empty() {
-            (raw.to_string(), 443)
-        } else {
-            let parsed = port_raw
-                .parse::<u16>()
-                .with_context(|| format!("invalid TLS port in target '{target}'"))?;
-            (host.to_string(), parsed)
-        }
-    } else {
-        (raw.to_string(), 443)
-    };
-    if host.trim().is_empty() {
-        anyhow::bail!("TLS target must include a host");
-    }
-    Ok(ActiveTarget::Tls(TlsTarget {
-        label: target.to_string(),
-        host: host.clone(),
-        port,
-        server_name: host,
-        ca_file: None,
-        connect_timeout_ms: 8_000,
-    }))
-}
-
-fn parse_https_target(target: &str) -> Result<ActiveTarget> {
-    let raw = target
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("hosted target must start with https://"))?;
-    let host = raw.split('/').next().unwrap_or_default();
-    let (host, port) = if let Some((host, port_raw)) = host.rsplit_once(':') {
-        if port_raw.is_empty() {
-            (host.to_string(), 443)
-        } else {
-            let parsed = port_raw
-                .parse::<u16>()
-                .with_context(|| format!("invalid TLS port in target '{target}'"))?;
-            (host.to_string(), parsed)
-        }
-    } else {
-        (host.to_string(), 443)
-    };
-    if host.trim().is_empty() {
-        anyhow::bail!("hosted target must include a host");
-    }
-    Ok(ActiveTarget::Tls(TlsTarget {
-        label: target.to_string(),
-        host: host.clone(),
-        port,
-        server_name: host,
-        ca_file: None,
-        connect_timeout_ms: 8_000,
-    }))
-}
-
-fn parse_iroh_target(target: &str) -> Result<ActiveTarget> {
-    let parsed = parse_iroh_target_parts(target)?;
-    Ok(ActiveTarget::Iroh(IrohTarget {
-        label: target.to_string(),
-        endpoint_id: parsed.endpoint_id,
-        relay_url: parsed.relay_url,
-        require_ssh_auth: parsed.require_ssh_auth,
-        transport_compression: parsed.transport_compression,
-        connect_timeout_ms: 8_000,
-    }))
-}
-
-fn load_or_create_local_principal_id() -> Result<uuid::Uuid> {
-    let path = bmux_config::ConfigPaths::default().principal_id_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating principal id dir {}", parent.display()))?;
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let raw = content.trim();
-            uuid::Uuid::parse_str(raw)
-                .with_context(|| format!("invalid principal id in {}: {raw}", path.display()))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let principal_id = uuid::Uuid::new_v4();
-            std::fs::write(&path, principal_id.to_string())
-                .with_context(|| format!("failed writing principal id file {}", path.display()))?;
-            Ok(principal_id)
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed reading principal id file {}", path.display())),
     }
 }
 
@@ -657,7 +297,7 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "default".to_string());
         return anyhow::anyhow!(
-            "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach its local IPC endpoint.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
+            "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
             local_ipc_endpoint_label_for_error(&paths)
         );
     }
@@ -908,11 +548,14 @@ pub fn remove_server_runtime_metadata_file() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAttachEndpointConnector, ConnectionPolicyScope, ServerBuildPolicyEffect,
+        ActiveTarget, CliAttachEndpointConnector, ConnectionPolicyScope, ServerBuildPolicyEffect,
         ServerRuntimeMetadata, check_cross_slot_mismatch, evaluate_stale_build_policy,
-        expand_bmux_target_if_needed, is_server_unavailable_client_error, map_client_connect_error,
+        host_transport_connectors, is_server_unavailable_client_error, map_client_connect_error,
+        map_transport_connect_error, register_plugin_transport_connector, resolve_target_reference,
     };
-    use bmux_client::{AttachEndpointConnector, ClientError};
+    use bmux_client::{
+        AttachEndpointConnector, ClientError, TransportConnector, TransportConnectorRegistry,
+    };
     use bmux_config::{BmuxConfig, StaleBuildAction};
     use bmux_ipc::IncompatibilityReason;
     use bmux_ipc::frame::FrameDecodeError;
@@ -920,8 +563,6 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1205,85 +846,115 @@ mod tests {
         assert!(!runtime_source.contains("BmuxClient::connect_default"));
     }
 
-    #[tokio::test]
-    async fn expand_bmux_target_prefers_local_share_link_map() {
+    #[derive(Debug)]
+    struct AliasConnector(&'static str);
+
+    impl TransportConnector for AliasConnector {
+        fn supports(&self, target: &str) -> bool {
+            target == self.0
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a str,
+            _client_name: &'static str,
+        ) -> bmux_client::TransportConnectFuture<'a> {
+            Box::pin(async { Err(ClientError::UnexpectedResponse("alias connector")) })
+        }
+    }
+
+    #[test]
+    fn local_and_local_aliases_never_consult_connectors() {
+        let registry = TransportConnectorRegistry::new();
         let mut config = BmuxConfig::default();
-        config
-            .connections
-            .share_links
-            .insert("demo".to_string(), "iroh://local-endpoint".to_string());
-
-        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
-            .await
-            .expect("expand target");
-
-        assert_eq!(resolved, "iroh://local-endpoint");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn expand_bmux_target_without_auth_preserves_bmux_link() {
-        let runtime_dir = TempDirGuard::new("no-auth");
-        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
-        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", "http://127.0.0.1:9");
-
-        let config = BmuxConfig::default();
-        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
-            .await
-            .expect("expand target");
-
-        assert_eq!(resolved, "bmux://demo");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn expand_bmux_target_uses_control_plane_lookup() {
-        let runtime_dir = TempDirGuard::new("control-plane");
-        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
-
-        let auth_state_path = runtime_dir.path().join("auth-state.json");
-        std::fs::write(&auth_state_path, r#"{"access_token":"token-123"}"#)
-            .expect("write auth state");
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock control plane");
-        let address = listener.local_addr().expect("listener addr");
-        let control_plane_url = format!("http://{address}");
-        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", &control_plane_url);
-
-        let (request_tx, request_rx) = oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept connection");
-            let mut buffer = [0_u8; 4096];
-            let bytes_read = socket.read(&mut buffer).await.expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-            let _ = request_tx.send(request);
-
-            let body = r#"{"target":"iroh://remote-endpoint"}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
+        config.connections.targets.insert(
+            "here".into(),
+            bmux_config::ConnectionTargetConfig::default(),
+        );
+        for target in ["", "local", " local ", "here"] {
+            assert_eq!(
+                resolve_target_reference(&config, &registry, target).unwrap(),
+                ActiveTarget::Local
             );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-        });
+        }
+    }
 
+    #[test]
+    fn selected_target_uses_the_supporting_connector() {
+        let registry = std::sync::Arc::new(TransportConnectorRegistry::new());
+        let _desktop = registry.register(std::sync::Arc::new(AliasConnector("desktop")));
         let config = BmuxConfig::default();
-        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
-            .await
-            .expect("expand target");
-        assert_eq!(resolved, "iroh://remote-endpoint");
-
-        let request = request_rx.await.expect("capture request");
-        assert!(request.contains("GET /v1/share-links/demo HTTP/1.1"));
+        assert_eq!(
+            resolve_target_reference(&config, &registry, "desktop").unwrap(),
+            ActiveTarget::Connector("desktop".into())
+        );
+        let error = resolve_target_reference(&config, &registry, "laptop").unwrap_err();
         assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer token-123")
+            error
+                .to_string()
+                .contains("no transport connector accepts target 'laptop'"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_connectors_and_removed_transports_are_errors() {
+        let registry = std::sync::Arc::new(TransportConnectorRegistry::new());
+        let _one = registry.register(std::sync::Arc::new(AliasConnector("desktop")));
+        let _two = registry.register(std::sync::Arc::new(AliasConnector("desktop")));
+        let mut config = BmuxConfig::default();
+        assert!(
+            resolve_target_reference(&config, &registry, "desktop")
+                .unwrap_err()
+                .to_string()
+                .contains("more than one transport connector")
+        );
+        config.connections.targets.insert(
+            "old".into(),
+            bmux_config::ConnectionTargetConfig {
+                transport: bmux_config::ConnectionTransport::Tls,
+                ..bmux_config::ConnectionTargetConfig::default()
+            },
+        );
+        assert!(
+            resolve_target_reference(&config, &registry, "old")
+                .unwrap_err()
+                .to_string()
+                .contains("no longer dials")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_connector_registration_is_once_per_plugin_and_needs_no_runtime() {
+        let runtime_dir = TempDirGuard::new("daemonless");
+        let missing = runtime_dir.path().join("never-created");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", &missing);
+        register_plugin_transport_connector(
+            "test.connections",
+            std::sync::Arc::new(AliasConnector("registered-once")),
+        );
+        register_plugin_transport_connector(
+            "test.connections",
+            std::sync::Arc::new(AliasConnector("registered-once")),
+        );
+        assert!(host_transport_connectors().supports("registered-once"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn connector_failures_name_the_target() {
+        let registry = std::sync::Arc::new(TransportConnectorRegistry::new());
+        let _desktop = registry.register(std::sync::Arc::new(AliasConnector("desktop")));
+        let error = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(registry.connect("desktop", "test"))
+            .unwrap_err();
+        let message = map_transport_connect_error(error).to_string();
+        assert!(
+            message.contains("failed connecting to target 'desktop'"),
+            "{message}"
         );
     }
 }

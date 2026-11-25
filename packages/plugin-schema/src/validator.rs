@@ -331,6 +331,13 @@ fn validate_interface_shape(
             iface.name
         )));
     }
+    // Access classes govern routed operations only.
+    if iface.access.is_some() && !(has_queries || has_commands) {
+        return Err(invalid(format!(
+            "interface `{}` declares `@access` but has no query or command operations",
+            iface.name
+        )));
+    }
 
     Ok(())
 }
@@ -1233,6 +1240,31 @@ mod tests {
             matches!(&err, Error::Validate { message } if message.contains("must declare `@capability")),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn access_needs_operations_and_never_changes_contract_identity() {
+        let src = "plugin p version 1;\n\
+                   @access(observe) interface i { record e { id: uuid } events e; }";
+        let err = compile(src).unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message } if message.contains("declares `@access` but has no query or command")),
+            "got: {err:?}"
+        );
+        let plain = "plugin p version 1; capability R = p.r;\n\
+                     @capability(R) interface i { query q() -> u32; query w() -> u32; }";
+        let marked = plain
+            .replace("@capability(R)", "@capability(R) @access(observe)")
+            .replace("query w()", "@access(owner-local) query w()");
+        let identity = |source: &str| {
+            let schema = compile(source).expect("valid");
+            crate::canonical::interface_contract(
+                &schema,
+                &schema.interfaces[0],
+                &crate::codegen_rust::ImportMap::new(),
+            )
+        };
+        assert_eq!(identity(plain), identity(&marked));
     }
 
     #[test]

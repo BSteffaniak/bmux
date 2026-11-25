@@ -15,6 +15,7 @@ capability SESSIONS_WRITE = bmux.sessions.write;
 capability SESSIONS_SPAWN_V1 = bmux.sessions.spawn.v1;
 
 @capability(SESSIONS_PROGRAM_V1)
+@access(input)
 interface sessions-program-v1 {
     record program-options {
         program: string,
@@ -40,6 +41,7 @@ interface sessions-program-v1 {
 }
 
 @capability(SESSIONS_SPAWN_V1)
+@access(input)
 interface sessions-spawn-v1 {
     record initial-shell-options {
         cwd: string?,
@@ -51,6 +53,7 @@ interface sessions-spawn-v1 {
 }
 
 @capability(SESSIONS_READ)
+@access(observe)
 interface sessions-state {
     // Snapshot of a single session's public state. `client_count` is
     // the number of clients currently attached to this session; the
@@ -80,6 +83,7 @@ interface sessions-state {
 }
 
 @capability(SESSIONS_WRITE)
+@access(input)
 interface sessions-commands {
     // Errors a `new-session` command can produce.
     //
@@ -128,7 +132,7 @@ interface sessions-commands {
         -> result<session-ack, kill-session-error>;
     command select-session(selector: sessions-state.session-selector)
         -> result<session-ack, select-session-error>;
-    command rename-session(selector: sessions-state.session-selector, name: string)
+    @access(manage) command rename-session(selector: sessions-state.session-selector, name: string)
         -> result<session-ack, rename-session-error>;
 
     // Update which client is considered attached to which session. When

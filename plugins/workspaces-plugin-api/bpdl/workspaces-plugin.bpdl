@@ -5,6 +5,7 @@ capability WORKSPACES_READ = bmux.workspaces.read;
 capability WORKSPACES_WRITE = bmux.workspaces.write;
 
 @capability(WORKSPACES_READ)
+@access(observe)
 interface workspaces-state {
     record workspace-summary {
         id: uuid,
@@ -32,6 +33,7 @@ interface workspaces-state {
 }
 
 @capability(WORKSPACES_WRITE)
+@access(input)
 interface workspaces-commands {
     record workspace-ack {
         id: uuid,
@@ -48,7 +50,7 @@ interface workspaces-commands {
 
     command new-workspace(name: string?)
         -> result<workspace-ack, workspace-command-error>;
-    command rename-workspace(selector: workspaces-state.workspace-selector, name: string)
+    @access(manage) command rename-workspace(selector: workspaces-state.workspace-selector, name: string)
         -> result<workspace-ack, workspace-command-error>;
     command kill-workspace(selector: workspaces-state.workspace-selector)
         -> result<workspace-ack, workspace-command-error>;
@@ -67,6 +69,7 @@ interface workspaces-commands {
 }
 
 @capability(WORKSPACES_WRITE)
+@access(input)
 interface workspaces-activation-v1 {
     // Exact durable target activation, independent of the current workspace.
     // No fallback target is selected when this ID no longer exists.

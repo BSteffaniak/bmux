@@ -15,6 +15,7 @@ capability RECORDING_PROCESS_LIVE_PRESENTATION_V1 = bmux.recording.process.live.
 capability RECORDING_PROCESS_HUMAN_INPUT_V1 = bmux.recording.process.human.input.v1;
 
 @capability(RECORDING_PROCESS_ENVIRONMENT_V1)
+@access(owner-local)
 interface recording-process-environment-v1 {
     command capabilities() -> u32;
     command start(launch_mutation_id: uuid, options: recording-process-v4.program-options,
@@ -22,6 +23,7 @@ interface recording-process-environment-v1 {
 }
 
 @capability(RECORDING_PROCESS_LIVE_PRESENTATION_V1)
+@access(owner-local)
 interface recording-process-live-presentation-v1 {
     command capabilities() -> pane.live-capabilities;
     command read(run_id: uuid, after: pane.live-cursor?, max_bytes: u32) -> result<pane.live-frame?, pane.live-error>;
@@ -31,6 +33,7 @@ interface recording-process-live-presentation-v1 {
 // Volatile input receipts are NOT durable recording receipts. Unknown outcomes
 // must not be automatically replayed; finalization still drains durable capture.
 @capability(RECORDING_PROCESS_HUMAN_INPUT_V1)
+@access(owner-local)
 interface recording-process-human-input-v1 {
     command capabilities() -> pane.human-input-capabilities;
     command open(run_id: uuid) -> result<pane.human-input-stream, pane.human-input-error>;
@@ -40,6 +43,7 @@ interface recording-process-human-input-v1 {
 
 // Additive stateless wait; durable process v4 and presentation v1 are unchanged.
 @capability(RECORDING_PROCESS_PRESENTATION_WAIT_V1)
+@access(owner-local)
 interface recording-process-presentation-wait-v1 {
     command capabilities() -> pane.wait-capabilities;
     command wait-present(run_id: uuid, after: bytes?, timeout_ms: u32, max_bytes: u32)
@@ -48,6 +52,7 @@ interface recording-process-presentation-wait-v1 {
 
 // Optional retained presentation for the execution already owned by a v4 run.
 @capability(RECORDING_PROCESS_PRESENTATION_V1)
+@access(owner-local)
 interface recording-process-presentation-v1 {
     command capabilities() -> result<pane.presentation-capabilities, recording-process-v4.process-error>;
     command resize(run_id: uuid, format: pane.terminal-capture-format, cols: u16, rows: u16)
@@ -58,6 +63,7 @@ interface recording-process-presentation-v1 {
 
 // One process contract. Older process/storage representations are not accepted.
 @capability(RECORDING_PROCESS_V4)
+@access(owner-local)
 interface recording-process-v4 {
     record program-options {
         program: string,
@@ -271,6 +277,7 @@ interface recording-events {
 }
 
 @capability(RECORDING_READ)
+@access(observe)
 interface recording-state {
     query status() -> recording-types.recording-status;
     query list-recordings() -> list<recording-types.recording-summary>;
@@ -284,6 +291,11 @@ interface recording-state {
 // v2: `cut` and `queue-cut` take a wall-clock range.
 // v3: `cut` and `queue-cut` can leave out input.
 @interface-version(3)
+// Recording captures what is typed into every pane (with `capture_input`, the
+// owner's unechoed keystrokes too) and writes and deletes files on the host:
+// owner administration, never reachable remotely. Custom events only annotate
+// a recording the owner already started.
+@access(owner-local)
 interface recording-commands {
     command start(
         session_id: uuid?,
@@ -296,7 +308,7 @@ interface recording-commands {
     command stop(recording_id: uuid?)
         -> result<uuid, recording-types.recording-error>;
 
-    command write-custom-event(
+    @access(manage) command write-custom-event(
         session_id: uuid?,
         pane_id: uuid?,
         source: string,

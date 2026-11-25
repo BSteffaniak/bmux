@@ -1,297 +1,189 @@
-//! Neutral, host-trusted admission for opaque streams.
+//! Neutral, host-trusted ingress for already authenticated streams.
 //!
-//! An authority must atomically consume single-use tickets, fail closed, and
-//! validate current lease validity. Ticket issuance and policy belong to its
-//! provider. Never construct bindings from wire metadata. Providers may return
-//! the same `Arc<StreamAdmissionBinding>` for distinct tickets on one lease.
+//! A transport (for example a plugin's network listener) authenticates its
+//! peer itself, creates a [`StreamAdmissionBinding`] naming the principal, and
+//! hands the stream to the server through the [`StreamIngressHandle`] the
+//! server registered in [`crate::PluginStateRegistry`]. The server serves the
+//! stream as an ordinary connection whose provenance is
+//! [`StreamProvenance::Admitted`]. The transport keeps the [`StreamRevocation`]
+//! and calls [`StreamRevocation::revoke`] to end every connection using that
+//! binding at once; nothing is polled.
+//!
+//! Bindings are created only by in-process host code, never from wire data.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use bmux_ipc::transport::ErasedIpcStream;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
-/// Immutable identity supplied only by an in-process authority, not the wire.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default)]
+struct RevocationState {
+    revoked: AtomicBool,
+    notify: Notify,
+}
+
+/// Immutable identity of one remote stream, created only by in-process host code.
+#[derive(Debug)]
 pub struct StreamAdmissionBinding {
     subject_id: Uuid,
-    lease_id: Uuid,
+    connection_id: Uuid,
+    revocation: Arc<RevocationState>,
 }
 
 impl StreamAdmissionBinding {
-    /// Construct a binding after authenticating the ticket's issuer and scope.
+    /// Returns the binding and the only handle that can revoke it.
+    ///
+    /// `subject_id` is the authenticated principal; `connection_id` names the
+    /// transport connection the binding belongs to (several streams of one
+    /// connection may share a binding).
     #[must_use]
-    pub const fn new(subject_id: Uuid, lease_id: Uuid) -> Self {
-        Self {
-            subject_id,
-            lease_id,
-        }
+    pub fn new(subject_id: Uuid, connection_id: Uuid) -> (Arc<Self>, StreamRevocation) {
+        let revocation = Arc::new(RevocationState::default());
+        (
+            Arc::new(Self {
+                subject_id,
+                connection_id,
+                revocation: Arc::clone(&revocation),
+            }),
+            StreamRevocation { state: revocation },
+        )
     }
 
+    /// The authenticated principal this stream acts as.
     #[must_use]
     pub const fn subject_id(&self) -> Uuid {
         self.subject_id
     }
 
+    /// The transport connection this binding was issued for.
     #[must_use]
-    pub const fn lease_id(&self) -> Uuid {
-        self.lease_id
+    pub const fn connection_id(&self) -> Uuid {
+        self.connection_id
     }
-}
 
-/// Pure wire adapter for a provider's generated service contract. Implement this
-/// with generated BPDL payloads; no runtime state or policy crosses this boundary.
-pub trait StreamAdmissionProviderCodec: Send + Sync {
-    /// Encode the provider instance probe.
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn encode_probe(&self) -> Result<Vec<u8>, StreamAdmissionError>;
-    /// Decode a fresh non-nil authority instance UUID.
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn decode_probe(&self, bytes: &[u8]) -> Result<Uuid, StreamAdmissionError>;
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn encode_consume(&self, ticket: &[u8]) -> Result<Vec<u8>, StreamAdmissionError>;
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn decode_consume(&self, bytes: &[u8]) -> Result<StreamAdmissionBinding, StreamAdmissionError>;
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn encode_validate(
-        &self,
-        binding: &StreamAdmissionBinding,
-    ) -> Result<Vec<u8>, StreamAdmissionError>;
-    ///
-    /// # Errors
-    /// Rejects malformed or unsupported provider representations.
-    fn decode_validate(&self, bytes: &[u8]) -> Result<(), StreamAdmissionError>;
-}
-
-/// Exact route approvals contributed by providers after side-effect migration.
-pub const STREAM_ADMITTED_ROUTES_EXTENSION: &str = "bmux.stream-admitted-routes.v1";
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct StreamAdmittedRoute {
-    pub capability: String,
-    pub kind: bmux_plugin_sdk::ServiceKind,
-    pub interface_id: String,
-    pub operation: String,
-}
-
-/// Serialized activation extension point for explicitly selected admission.
-pub const STREAM_ADMISSION_PROVIDER_EXTENSION: &str = "bmux.stream-admission-provider.v1";
-
-/// Version-one neutral generated-service representation.
-///
-/// Each operation uses a checked BPDL frame. Providers must smoke-test their generated schema against
-/// this codec; incompatible representations fail closed rather than guessing.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct StreamAdmissionProviderDeclaration {
-    pub probe: StreamAdmissionProviderOperation,
-    pub consume: StreamAdmissionProviderOperation,
-    pub validate: StreamAdmissionProviderOperation,
-    pub deadline_ms: u64,
-    pub max_in_flight: usize,
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct StreamAdmissionProviderOperation {
-    pub capability: String,
-    pub interface_id: String,
-    pub operation: String,
-    pub contract: [u8; 32],
-}
-
-impl StreamAdmissionProviderDeclaration {
-    fn encode<T: serde::Serialize>(
-        operation: &StreamAdmissionProviderOperation,
-        value: &T,
-    ) -> Result<Vec<u8>, StreamAdmissionError> {
-        let bytes =
-            bmux_plugin_sdk::encode_service_message(value).map_err(|_| StreamAdmissionError)?;
-        bmux_plugin_sdk::service_contract::encode(
-            &operation.interface_id,
-            &operation.contract,
-            &bytes,
-        )
-        .map_err(|_| StreamAdmissionError)
+    /// Whether [`StreamRevocation::revoke`] has been called.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revocation.revoked.load(Ordering::Acquire)
     }
-    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StreamAdmissionError> {
-        let bytes = bmux_plugin_sdk::service_contract::decode_response(bytes)
-            .map_err(|_| StreamAdmissionError)?;
-        bmux_plugin_sdk::decode_service_message(bytes).map_err(|_| StreamAdmissionError)
-    }
-}
 
-impl StreamAdmissionProviderCodec for StreamAdmissionProviderDeclaration {
-    fn encode_probe(&self) -> Result<Vec<u8>, StreamAdmissionError> {
-        Self::encode(&self.probe, &())
-    }
-    fn decode_probe(&self, bytes: &[u8]) -> Result<Uuid, StreamAdmissionError> {
-        Self::decode(bytes)
-    }
-    fn encode_consume(&self, ticket: &[u8]) -> Result<Vec<u8>, StreamAdmissionError> {
-        #[derive(serde::Serialize)]
-        struct Ticket {
-            #[serde(with = "bmux_codec::serde_bytes_vec")]
-            ticket: Vec<u8>,
-        }
-        Self::encode(
-            &self.consume,
-            &Ticket {
-                ticket: ticket.to_vec(),
-            },
-        )
-    }
-    fn decode_consume(&self, bytes: &[u8]) -> Result<StreamAdmissionBinding, StreamAdmissionError> {
-        #[derive(serde::Deserialize)]
-        struct Binding {
-            subject_id: Uuid,
-            lease_id: Uuid,
-        }
-        let binding: Binding = Self::decode(bytes)?;
-        Ok(StreamAdmissionBinding::new(
-            binding.subject_id,
-            binding.lease_id,
-        ))
-    }
-    fn encode_validate(
-        &self,
-        binding: &StreamAdmissionBinding,
-    ) -> Result<Vec<u8>, StreamAdmissionError> {
-        #[derive(serde::Serialize)]
-        struct Binding {
-            subject_id: Uuid,
-            lease_id: Uuid,
-        }
-        Self::encode(
-            &self.validate,
-            &Binding {
-                subject_id: binding.subject_id(),
-                lease_id: binding.lease_id(),
-            },
-        )
-    }
-    fn decode_validate(&self, bytes: &[u8]) -> Result<(), StreamAdmissionError> {
-        if Self::decode::<bool>(bytes)? {
-            Ok(())
-        } else {
-            Err(StreamAdmissionError)
+    /// Resolves once revoked (immediately if already revoked). Cancel-safe:
+    /// dropping the future loses nothing, and a new one observes the same state.
+    pub async fn revoked(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.revocation.notify.notified());
+            // Register before checking so a concurrent revoke cannot be missed.
+            notified.as_mut().enable();
+            if self.is_revoked() {
+                return;
+            }
+            notified.await;
         }
     }
 }
 
-/// Admission failures intentionally expose no ticket or provider details.
+/// Cloneable; revoking is idempotent and wakes every `revoked()` waiter.
+#[derive(Debug, Clone)]
+pub struct StreamRevocation {
+    state: Arc<RevocationState>,
+}
+
+impl StreamRevocation {
+    /// Revoke the binding. Every connection using it ends; repeated calls do nothing.
+    pub fn revoke(&self) {
+        if !self.state.revoked.swap(true, Ordering::AcqRel) {
+            self.state.notify.notify_waiters();
+        }
+    }
+
+    /// Whether this revocation has been triggered.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.state.revoked.load(Ordering::Acquire)
+    }
+}
+
+/// Why the server refused an admitted stream. The stream is dropped (closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("stream admission denied")]
-pub struct StreamAdmissionError;
-
-/// Host-side provider of authenticated bindings and current lease validity.
-pub trait StreamAdmissionAuthority: Send + Sync {
-    /// Atomically consume an opaque, single-use ticket. Replays must fail.
-    ///
-    /// # Errors
-    /// Returns an error for invalid, expired, revoked, or already used tickets.
-    fn consume(&self, ticket: &[u8]) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError>;
-
-    /// Check current validity without trusting any caller-supplied metadata.
-    ///
-    /// # Errors
-    /// Returns an error when the binding is no longer authorized or unavailable.
-    fn validate(&self, binding: &StreamAdmissionBinding) -> Result<(), StreamAdmissionError>;
+pub enum StreamIngressError {
+    /// The server is at its connection limit; it fails closed.
+    #[error("server is at its connection limit")]
+    AtCapacity,
+    /// The server is shutting down or no longer running.
+    #[error("server is not accepting connections")]
+    Unavailable,
+    /// The binding was already revoked.
+    #[error("stream binding is revoked")]
+    Revoked,
 }
 
-/// Register this neutral handle in `PluginStateRegistry` during initialization.
-///
-/// In-process consumers resolve a host-generated stream UUID with `binding`;
-/// neither a Hello field nor service payload can install a trusted binding.
-#[derive(Clone)]
-pub struct StreamAdmissionAuthorityHandle {
-    authority: Arc<dyn StreamAdmissionAuthority>,
-    bindings: Arc<Mutex<BTreeMap<Uuid, Arc<StreamAdmissionBinding>>>>,
-}
-
-impl StreamAdmissionAuthorityHandle {
-    #[must_use]
-    pub fn new(authority: Arc<dyn StreamAdmissionAuthority>) -> Self {
-        Self {
-            authority,
-            bindings: Arc::default(),
-        }
-    }
-
-    /// Consume a ticket and retain its trusted binding until the guard drops.
-    /// The host must supply its own fresh stream UUID, never a wire UUID.
+/// Server side of [`StreamIngressHandle`]. Implemented by the server only.
+pub trait StreamIngress: Send + Sync {
+    /// See [`StreamIngressHandle::accept`].
     ///
     /// # Errors
-    /// Fails closed on provider failure, invalid binding, or duplicate stream ID.
-    pub fn admit(
+    /// See [`StreamIngressError`].
+    fn accept(
         &self,
-        stream_id: Uuid,
-        ticket: &[u8],
-    ) -> Result<AdmittedStream, StreamAdmissionError> {
-        let binding = self.authority.consume(ticket)?;
-        if binding.subject_id().is_nil() || binding.lease_id().is_nil() {
-            return Err(StreamAdmissionError);
-        }
-        self.authority.validate(&binding)?;
-        let mut bindings = self.bindings.lock().map_err(|_| StreamAdmissionError)?;
-        if bindings.contains_key(&stream_id) {
-            return Err(StreamAdmissionError);
-        }
-        bindings.insert(stream_id, Arc::clone(&binding));
-        drop(bindings);
-        Ok(AdmittedStream {
-            handle: self.clone(),
-            stream_id,
-            binding,
-        })
-    }
+        stream: ErasedIpcStream,
+        binding: Arc<StreamAdmissionBinding>,
+    ) -> Result<(), StreamIngressError>;
+}
 
-    /// Resolve and revalidate a host-retained immutable binding.
-    /// Absence means unadmitted, not authenticated local authority.
-    #[must_use]
-    pub fn binding(&self, stream_id: Uuid) -> Option<Arc<StreamAdmissionBinding>> {
-        let binding = self.bindings.lock().ok()?.get(&stream_id).cloned()?;
-        self.authority.validate(&binding).ok()?;
-        Some(binding)
+/// Registered in `PluginStateRegistry` by the server before plugins activate.
+#[derive(Clone)]
+pub struct StreamIngressHandle {
+    ingress: Arc<dyn StreamIngress>,
+}
+
+impl std::fmt::Debug for StreamIngressHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamIngressHandle(..)")
     }
 }
 
-/// Connection-scoped trusted state; dropping it removes the host lookup.
-pub struct AdmittedStream {
-    handle: StreamAdmissionAuthorityHandle,
-    stream_id: Uuid,
-    binding: Arc<StreamAdmissionBinding>,
-}
-
-impl AdmittedStream {
+impl StreamIngressHandle {
+    /// Wrap the server's ingress implementation.
     #[must_use]
-    pub fn binding(&self) -> &StreamAdmissionBinding {
-        &self.binding
+    pub fn new(ingress: Arc<dyn StreamIngress>) -> Self {
+        Self { ingress }
     }
 
-    /// Recheck immediately before dispatch. Providers remain responsible for
-    /// authorization at side effects and for cancelling ongoing work on revoke.
+    /// Resolve the handle the server registered, if any.
+    #[must_use]
+    pub fn from_host_registry(registry: &crate::PluginStateRegistry) -> Option<Self> {
+        registry
+            .get::<Self>()?
+            .read()
+            .ok()
+            .map(|handle| handle.clone())
+    }
+
+    /// Serve `stream` as one connection whose provenance is `Admitted(binding)`.
+    /// The server applies its normal connection limits; a full server fails
+    /// closed. The connection ends when the stream ends or the binding is revoked.
     ///
     /// # Errors
-    /// Fails closed if the authority no longer validates this binding.
-    pub fn validate(&self) -> Result<(), StreamAdmissionError> {
-        self.handle.authority.validate(&self.binding)
+    /// Returns an error (and drops the stream) when the server refuses it.
+    pub fn accept(
+        &self,
+        stream: ErasedIpcStream,
+        binding: Arc<StreamAdmissionBinding>,
+    ) -> Result<(), StreamIngressError> {
+        if binding.is_revoked() {
+            return Err(StreamIngressError::Revoked);
+        }
+        self.ingress.accept(stream, binding)
     }
 }
 
-impl Drop for AdmittedStream {
-    fn drop(&mut self) {
-        if let Ok(mut bindings) = self.handle.bindings.lock() {
-            bindings.remove(&self.stream_id);
-        }
-    }
-}
+/// Provenance bookkeeping failures; they expose no details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stream provenance rejected")]
+pub struct StreamAdmissionError;
 
 /// Positively recorded host provenance. Unknown and revoked streams are invalid.
 pub enum StreamProvenance {
@@ -302,7 +194,7 @@ pub enum StreamProvenance {
 
 enum RecordedOrigin {
     Local,
-    Admitted(StreamAdmissionAuthorityHandle, Arc<StreamAdmissionBinding>),
+    Admitted(Arc<StreamAdmissionBinding>),
 }
 
 /// Neutral host-only origin bookkeeping. Never populate from request metadata.
@@ -325,45 +217,35 @@ impl StreamProvenanceRegistry {
             .map(|handle| handle.clone())
     }
 
-    /// Resolve a host-generated stream UUID, checking current admission validity.
+    /// Resolve a host-generated stream UUID. A revoked binding is `Invalid`.
     #[must_use]
     pub fn lookup(&self, stream_id: Uuid) -> StreamProvenance {
         let Ok(origins) = self.origins.lock() else {
             return StreamProvenance::Invalid;
         };
-        let recorded = match origins.get(&stream_id) {
-            Some(RecordedOrigin::Local) => return StreamProvenance::Local,
-            Some(RecordedOrigin::Admitted(handle, binding)) => {
-                (handle.clone(), Arc::clone(binding))
+        match origins.get(&stream_id) {
+            Some(RecordedOrigin::Local) => StreamProvenance::Local,
+            Some(RecordedOrigin::Admitted(binding)) if !binding.is_revoked() => {
+                StreamProvenance::Admitted(Arc::clone(binding))
             }
-            None => return StreamProvenance::Invalid,
-        };
-        drop(origins);
-        if recorded.0.authority.validate(&recorded.1).is_ok() {
-            StreamProvenance::Admitted(recorded.1)
-        } else {
-            StreamProvenance::Invalid
+            Some(RecordedOrigin::Admitted(_)) | None => StreamProvenance::Invalid,
         }
     }
 
-    /// Host-only: record the result of the serial handshake, not a wire claim.
-    /// `None` is permitted only for an ordinary direct local Hello.
+    /// Host-only: record a connection's origin, never a wire claim.
+    /// `None` is permitted only for an ordinary direct local stream.
     ///
     /// # Errors
-    /// Rejects duplicate identities, poisoned bookkeeping, or revoked admission.
+    /// Rejects duplicate identities, poisoned bookkeeping, or revoked bindings.
     pub fn record(
         &self,
         stream_id: Uuid,
-        admitted: Option<&AdmittedStream>,
+        admitted: Option<Arc<StreamAdmissionBinding>>,
     ) -> Result<StreamProvenanceGuard, StreamAdmissionError> {
-        let origin = if let Some(admitted) = admitted {
-            if admitted.stream_id != stream_id {
-                return Err(StreamAdmissionError);
-            }
-            admitted.validate()?;
-            RecordedOrigin::Admitted(admitted.handle.clone(), Arc::clone(&admitted.binding))
-        } else {
-            RecordedOrigin::Local
+        let origin = match admitted {
+            Some(binding) if binding.is_revoked() => return Err(StreamAdmissionError),
+            Some(binding) => RecordedOrigin::Admitted(binding),
+            None => RecordedOrigin::Local,
         };
         let mut origins = self.origins.lock().map_err(|_| StreamAdmissionError)?;
         if origins.contains_key(&stream_id) {
@@ -395,120 +277,80 @@ impl Drop for StreamProvenanceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::Duration;
 
-    #[test]
-    fn provider_declaration_requires_checked_response_acceptance() {
-        #[derive(serde::Serialize)]
-        struct Binding {
-            subject_id: Uuid,
-            lease_id: Uuid,
+    #[tokio::test]
+    async fn revoke_wakes_every_waiter_and_is_idempotent() {
+        let (binding, revocation) =
+            StreamAdmissionBinding::new(Uuid::from_u128(1), Uuid::from_u128(2));
+        assert_eq!(binding.subject_id(), Uuid::from_u128(1));
+        assert_eq!(binding.connection_id(), Uuid::from_u128(2));
+        assert!(!binding.is_revoked());
+        let waiters = (0..4)
+            .map(|_| {
+                let binding = Arc::clone(&binding);
+                tokio::spawn(async move { binding.revoked().await })
+            })
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        let clone = revocation.clone();
+        revocation.revoke();
+        clone.revoke();
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter woken")
+                .unwrap();
         }
-        let operation = StreamAdmissionProviderOperation {
-            capability: "test.admission".into(),
-            interface_id: "test-admission/v1".into(),
-            operation: "probe".into(),
-            contract: [7; 32],
-        };
-        let codec = StreamAdmissionProviderDeclaration {
-            probe: operation.clone(),
-            consume: operation.clone(),
-            validate: operation.clone(),
-            deadline_ms: 100,
-            max_in_flight: 1,
-        };
-        let subject = Uuid::new_v4();
-        let lease = Uuid::new_v4();
-        let raw = bmux_plugin_sdk::encode_service_message(&subject).unwrap();
-        assert!(codec.decode_probe(&raw).is_err());
-        let request_frame = bmux_plugin_sdk::service_contract::encode(
-            &operation.interface_id,
-            &operation.contract,
-            &raw,
-        )
-        .unwrap();
-        assert!(codec.decode_probe(&request_frame).is_err());
-        assert_eq!(
-            codec
-                .decode_probe(&bmux_plugin_sdk::service_contract::encode_response(&raw))
-                .unwrap(),
-            subject
-        );
-        let binding = bmux_plugin_sdk::encode_service_message(&Binding {
-            subject_id: subject,
-            lease_id: lease,
-        })
-        .unwrap();
-        let binding = codec
-            .decode_consume(&bmux_plugin_sdk::service_contract::encode_response(
-                &binding,
-            ))
+        assert!(binding.is_revoked());
+        // Already revoked: resolves immediately.
+        tokio::time::timeout(Duration::from_millis(100), binding.revoked())
+            .await
             .unwrap();
-        assert_eq!((binding.subject_id(), binding.lease_id()), (subject, lease));
-        for valid in [true, false] {
-            let raw = bmux_plugin_sdk::encode_service_message(&valid).unwrap();
-            assert!(codec.decode_validate(&raw).is_err());
-            assert_eq!(
-                codec
-                    .decode_validate(&bmux_plugin_sdk::service_contract::encode_response(&raw))
-                    .is_ok(),
-                valid
-            );
-        }
     }
 
-    struct Authority {
-        binding: Arc<StreamAdmissionBinding>,
-        used: AtomicU8,
-    }
-
-    impl StreamAdmissionAuthority for Authority {
-        fn consume(
-            &self,
-            ticket: &[u8],
-        ) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError> {
-            let bit = match ticket {
-                [1] => 1,
-                [2] => 2,
-                _ => return Err(StreamAdmissionError),
-            };
-            if self.used.fetch_or(bit, Ordering::SeqCst) & bit != 0 {
-                return Err(StreamAdmissionError);
-            }
-            Ok(Arc::clone(&self.binding))
-        }
-
-        fn validate(&self, _: &StreamAdmissionBinding) -> Result<(), StreamAdmissionError> {
-            Ok(())
-        }
+    #[tokio::test]
+    async fn revoked_future_is_cancel_safe() {
+        let (binding, revocation) = StreamAdmissionBinding::new(Uuid::new_v4(), Uuid::new_v4());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), binding.revoked())
+                .await
+                .is_err()
+        );
+        revocation.revoke();
+        tokio::time::timeout(Duration::from_millis(100), binding.revoked())
+            .await
+            .unwrap();
     }
 
     #[test]
-    fn distinct_tickets_share_one_immutable_binding_and_drop_independently() {
-        let authority = Arc::new(Authority {
-            binding: Arc::new(StreamAdmissionBinding::new(
-                Uuid::from_u128(1),
-                Uuid::from_u128(2),
-            )),
-            used: AtomicU8::new(0),
-        });
-        let handle = StreamAdmissionAuthorityHandle::new(authority.clone());
-        let first_id = Uuid::from_u128(3);
-        let second_id = Uuid::from_u128(4);
-        let first = handle.admit(first_id, &[1]).unwrap();
-        let second = handle.admit(second_id, &[2]).unwrap();
-        assert!(Arc::ptr_eq(
-            &handle.binding(first_id).unwrap(),
-            &handle.binding(second_id).unwrap()
+    fn provenance_registry_tracks_revocation_and_guard_lifetime() {
+        let registry = StreamProvenanceRegistry::default();
+        let (binding, revocation) = StreamAdmissionBinding::new(Uuid::new_v4(), Uuid::new_v4());
+        let local = Uuid::new_v4();
+        let admitted = Uuid::new_v4();
+        let local_guard = registry.record(local, None).unwrap();
+        let admitted_guard = registry
+            .record(admitted, Some(Arc::clone(&binding)))
+            .unwrap();
+        assert!(registry.record(local, None).is_err());
+        assert!(matches!(registry.lookup(local), StreamProvenance::Local));
+        assert!(matches!(
+            registry.lookup(admitted),
+            StreamProvenance::Admitted(found) if Arc::ptr_eq(&found, &binding)
         ));
-        assert!(Arc::ptr_eq(
-            &handle.binding(first_id).unwrap(),
-            &authority.binding
+        revocation.revoke();
+        assert!(matches!(
+            registry.lookup(admitted),
+            StreamProvenance::Invalid
         ));
-        drop(first);
-        assert!(handle.binding(first_id).is_none());
-        assert!(handle.binding(second_id).is_some());
-        drop(second);
-        assert!(handle.binding(second_id).is_none());
+        assert!(
+            registry
+                .record(Uuid::new_v4(), Some(Arc::clone(&binding)))
+                .is_err()
+        );
+        drop(local_guard);
+        drop(admitted_guard);
+        assert!(matches!(registry.lookup(local), StreamProvenance::Invalid));
     }
 }

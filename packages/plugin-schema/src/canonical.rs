@@ -475,6 +475,7 @@ pub fn extension_point_identity(
         version: None,
         contract_major: None,
         capability: None,
+        access: None,
         docs: Vec::new(),
         stability: ir::Stability::default(),
         items: Vec::new(),

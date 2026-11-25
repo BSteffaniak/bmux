@@ -1540,6 +1540,7 @@ fn run_selected_core_command(
     argv.extend(request.command_path.clone());
     argv.extend(request.arguments.clone());
     let parsed = Cli::try_parse_from(argv).context("failed parsing selected core command")?;
+    let connection_target = parsed.target;
     match parsed.command.context("selected core command missing")? {
         bmux_cli_schema::Command::Terminal {
             command:
@@ -1577,7 +1578,11 @@ fn run_selected_core_command(
             command: bmux_cli_schema::LogsCommand::Level { json },
         } => run_logs_level(json).map(i32::from),
         command @ bmux_cli_schema::Command::Attach { .. } => {
-            super::attach_selected::run_selected(state, &command)
+            super::attach_selected::run_selected_with_target(
+                state,
+                &command,
+                connection_target.as_deref(),
+            )
         }
         _ => anyhow::bail!(
             "core command '{}' has no pinned runtime executor; ambient routing refused",
@@ -1967,6 +1972,20 @@ pub(super) fn register_plugin_service_handlers(
     let command_connection_info = connection_info.clone();
     let command_instances = Arc::clone(loaded_plugins);
 
+    // `run_plugin` runs a command on the host; an admitted (remote) stream may
+    // run only commands whose manifests declare an access class it holds.
+    for loaded in loaded_plugins.iter() {
+        for command in &loaded.declaration.commands {
+            if let Some(access) = command.access {
+                server.declare_command_access(
+                    loaded.declaration.id.as_str(),
+                    &command.name,
+                    access,
+                )?;
+            }
+        }
+    }
+
     server.register_checked_service_handler_with_metadata(
         CORE_CLI_COMMAND_CAPABILITY,
         InvokeServiceKind::Command,
@@ -2041,6 +2060,15 @@ pub(super) fn register_plugin_service_handlers(
         let Some(provider) = registry.get(&provider_plugin_id) else {
             continue;
         };
+        // The provider's BPDL access classes decide which of these routes an
+        // admitted (remote) stream may reach; undeclared routes stay local.
+        if let Some(declared) = provider.declaration.services.iter().find(|declared| {
+            declared.capability == service.capability
+                && declared.kind == service.kind
+                && declared.interface_id == service.interface_id
+        }) {
+            server.declare_service_access(declared)?;
+        }
 
         let index = loaded_plugins
             .iter()
@@ -3373,35 +3401,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlapping_retained_admitted_identities_remain_isolated() {
         use bmux_plugin::stream_admission::{
-            StreamAdmissionAuthority, StreamAdmissionAuthorityHandle, StreamAdmissionBinding,
-            StreamAdmissionError,
+            StreamAdmissionBinding, StreamIngressHandle, StreamRevocation,
         };
-        use std::sync::atomic::{AtomicBool, Ordering};
 
-        struct Authority {
-            bindings: [Arc<StreamAdmissionBinding>; 2],
-            revoked: [AtomicBool; 2],
-        }
-        impl StreamAdmissionAuthority for Authority {
-            fn consume(
-                &self,
-                ticket: &[u8],
-            ) -> Result<Arc<StreamAdmissionBinding>, StreamAdmissionError> {
-                match ticket {
-                    [index @ 0..=1] => Ok(self.bindings[usize::from(*index)].clone()),
-                    _ => Err(StreamAdmissionError),
-                }
-            }
-            fn validate(
-                &self,
-                binding: &StreamAdmissionBinding,
-            ) -> Result<(), StreamAdmissionError> {
-                self.bindings
-                    .iter()
-                    .position(|candidate| candidate.as_ref() == binding)
-                    .filter(|index| !self.revoked[*index].load(Ordering::SeqCst))
-                    .map(|_| ())
-                    .ok_or(StreamAdmissionError)
+        struct AllowAll;
+        impl bmux_plugin_sdk::RemoteAccessAuthorizer for AllowAll {
+            fn allows(&self, _: uuid::Uuid, _: bmux_plugin_sdk::RouteAccess) -> bool {
+                true
             }
         }
 
@@ -3412,29 +3418,29 @@ mod tests {
         let path = directory.path().join("private/s");
         let endpoint = bmux_ipc::IpcEndpoint::unix_socket(path.clone());
         let server = BmuxServer::new(endpoint.clone());
-        let authority = Arc::new(Authority {
-            bindings: std::array::from_fn(|_| {
-                Arc::new(StreamAdmissionBinding::new(
-                    uuid::Uuid::new_v4(),
-                    uuid::Uuid::new_v4(),
-                ))
-            }),
-            revoked: std::array::from_fn(|_| AtomicBool::new(false)),
-        });
+        let (bindings, revocations): (Vec<Arc<StreamAdmissionBinding>>, Vec<StreamRevocation>) = (0
+            ..2)
+            .map(|_| StreamAdmissionBinding::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4()))
+            .unzip();
         server
             .plugin_state_registry()
             .register(&Arc::new(std::sync::RwLock::new(
-                StreamAdmissionAuthorityHandle::new(authority.clone()),
+                bmux_plugin_sdk::RemoteAccessAuthorizerHandle::new(Arc::new(AllowAll)),
             )));
-        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::unbounded_channel();
         server
-            .approve_admitted_route(bmux_server::ServiceRoute {
-                capability: "test.overlap".into(),
-                kind: bmux_ipc::InvokeServiceKind::Query,
+            .declare_service_access(&bmux_plugin_sdk::PluginService {
+                capability: bmux_plugin_sdk::HostScope::new("test.overlap").unwrap(),
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "overlap/v1".into(),
-                operation: "capture".into(),
+                concurrency: None,
+                reentrant_operations: std::collections::BTreeSet::new(),
+                access: Some(bmux_plugin_sdk::RouteAccess::Observe),
+                operation_access: std::collections::BTreeMap::new(),
             })
             .unwrap();
+        let ingress =
+            StreamIngressHandle::from_host_registry(&server.plugin_state_registry()).unwrap();
+        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::unbounded_channel();
         server
             .register_service_handler(
                 "test.overlap",
@@ -3464,28 +3470,22 @@ mod tests {
         let task = tokio::spawn(async move { server.run().await });
         let mut peers = Vec::new();
         let mut captures = Vec::new();
-        for index in 0..2_u8 {
-            let mut peer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
-                        Ok(peer) => break peer,
-                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
-                    }
-                }
-            })
-            .await
-            .unwrap();
+        for binding in &bindings {
+            let (client, host) = tokio::io::duplex(1 << 16);
+            ingress
+                .accept(
+                    bmux_ipc::transport::ErasedIpcStream::new(Box::new(host)),
+                    Arc::clone(binding),
+                )
+                .unwrap();
+            let mut peer = bmux_ipc::transport::ErasedIpcStream::new(Box::new(client));
             for (id, request) in [
-                bmux_ipc::Request::AdmitStream {
-                    admission_version: 1,
-                    ticket: vec![index],
-                },
                 bmux_ipc::Request::Hello {
                     contract: bmux_ipc::ProtocolContract::current(
                         bmux_ipc::default_supported_capabilities(),
                     ),
                     client_name: "overlap-test".into(),
-                    principal_id: authority.bindings[usize::from(index)].subject_id(),
+                    principal_id: binding.subject_id(),
                 },
                 bmux_ipc::Request::InvokeService {
                     capability: "test.overlap".into(),
@@ -3505,13 +3505,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-                if id != 0 {
-                    let response = peer.recv_envelope().await.unwrap();
-                    assert!(matches!(
-                        bmux_ipc::decode::<bmux_ipc::Response>(&response.payload).unwrap(),
-                        bmux_ipc::Response::Ok(_)
-                    ));
-                }
+                let response = peer.recv_envelope().await.unwrap();
+                assert!(matches!(
+                    bmux_ipc::decode::<bmux_ipc::Response>(&response.payload).unwrap(),
+                    bmux_ipc::Response::Ok(_)
+                ));
             }
             // The handler has returned; only captured ownership keeps its token alive.
             captures.push(captured_rx.recv().await.unwrap());
@@ -3531,7 +3529,7 @@ mod tests {
             let other = captures[1 - index].0.clone();
             let own_context = captures[index].1.clone();
             let other_context = captures[1 - index].1.clone();
-            let expected = authority.bindings.clone();
+            let expected = bindings.clone();
             let done_tx = done_tx.clone();
             let (tx, rx) = std::sync::mpsc::channel::<[bool; 2]>();
             commands.push(tx);
@@ -3558,7 +3556,7 @@ mod tests {
                                     bmux_ipc::ResponsePayload::CurrentStreamProvenance {
                                         provenance: bmux_ipc::StreamProvenance::Admitted {
                                             subject_id: expected[subject_index].subject_id(),
-                                            lease_id: expected[subject_index].lease_id(),
+                                            connection_id: expected[subject_index].connection_id(),
                                         },
                                     }
                                 );
@@ -3593,7 +3591,7 @@ mod tests {
         }
         for valid in [[true, true], [true, true], [false, true], [false, false]] {
             if !valid[0] {
-                authority.revoked[0].store(true, Ordering::SeqCst);
+                revocations[0].revoke();
             }
             if !valid[1] {
                 retained_kernel_contexts()

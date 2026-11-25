@@ -17,6 +17,7 @@ capability CLIENTS_WRITE = bmux.clients.write;
 
 @capability(CLIENTS_READ)
 @interface-version(1)
+@access(observe)
 interface clients-identity {
     // Local single-user identity association, not federated authentication.
     record local-principal {
@@ -29,15 +30,14 @@ interface clients-identity {
         unsupported-context,
     }
 
-    // Host-bound stream origin. No caller-chosen ID, principal, or lease.
+    // Host-bound stream origin. No caller-chosen ID or principal.
     variant stream-provenance {
         host-internal,
         local,
-        admitted { subject-id: uuid, lease-id: uuid },
+        admitted { subject-id: uuid, connection-id: uuid },
         invalid,
     }
 
-    query stream-admission-backend() -> result<uuid?, identity-error>;
     // Stateless facade over a kernel request: takes no instance-exclusive
     // locks and never blocks on outbound plugin calls, so a call chain that
     // already holds a clients entry may safely query it again.
@@ -48,6 +48,7 @@ interface clients-identity {
 }
 
 @capability(CLIENTS_READ)
+@access(observe)
 interface clients-state {
     // Snapshot of a single client's public view state.
     record client-summary {
@@ -72,6 +73,7 @@ interface clients-state {
 }
 
 @capability(CLIENTS_WRITE)
+@access(input)
 interface clients-commands {
     // Errors a `set-current-session` command can produce.
     variant set-current-session-error {
@@ -105,6 +107,7 @@ interface clients-commands {
 // a command line (`bmux follow`, `bmux unfollow`) acts for the person's
 // attached terminal rather than for its own short-lived connection.
 @capability(CLIENTS_WRITE)
+@access(input)
 interface clients-follow-v1 {
     variant follow-for-error {
         // The caller's principal has no attached client besides the caller.
@@ -127,6 +130,7 @@ interface clients-follow-v1 {
 }
 
 @capability(CLIENTS_READ)
+@access(observe)
 interface clients-selection-state-v1 {
     record selection {
         revision: u64,
@@ -144,6 +148,7 @@ interface clients-selection-state-v1 {
 }
 
 @capability(CLIENTS_WRITE)
+@access(input)
 interface clients-selection-commands-v1 {
     // Explicitly abandon a suspended transition. This never restores a stale
     // input target: the caller must activate a target again after recovery.
@@ -159,6 +164,7 @@ interface clients-selection-commands-v1 {
 // person is looking at. A client's terminal counts as focused until it
 // reports otherwise.
 @capability(CLIENTS_READ)
+@access(observe)
 interface clients-presence-state-v1 {
     record presence {
         client-id: uuid,
@@ -169,6 +175,7 @@ interface clients-presence-state-v1 {
 }
 
 @capability(CLIENTS_WRITE)
+@access(input)
 interface clients-presence-commands-v1 {
     variant presence-error {
         no-current-client,

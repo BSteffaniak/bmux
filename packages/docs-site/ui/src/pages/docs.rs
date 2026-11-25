@@ -112,9 +112,7 @@ mod tests {
 
         assert!(doc.contains("## `[connections]`"));
         assert!(doc.contains("targets.<name>.transport"));
-        assert!(doc.contains("iroh_ssh_access.enabled"));
-        assert!(doc.contains("iroh_ssh_access.allowlist.<fingerprint>.public_key"));
-        assert!(doc.contains("iroh_ssh_access.allowlist.<fingerprint>.added_at_unix"));
+        assert!(doc.contains("tls_trust.known_gateways.<host:port>.fingerprint_sha256"));
     }
 
     #[test]

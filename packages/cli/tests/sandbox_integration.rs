@@ -192,8 +192,7 @@ fn sandbox_dev_uses_invoked_binary() {
 #[serial]
 fn inherited_config_snapshot_is_private_and_keeps_normal_state_untouched() {
     let sandbox = CommandSandbox::new("inherit-config");
-    let text =
-        "[server.gateway]\nenabled = true\nquick = true\n[plugins.custom]\nopaque = 'preserved'\n";
+    let text = "[plugins.settings.\"bmux.connections\".remote]\nallow_full_runtime_ingress = true\nauto_start = true\n[plugins.custom]\nopaque = 'preserved'\n";
     sandbox.write_config(text);
     let sentinel = sandbox.root.path().join("state/normal-state");
     std::fs::write(&sentinel, "unchanged").unwrap();
@@ -220,7 +219,8 @@ fn inherited_config_snapshot_is_private_and_keeps_normal_state_untouched() {
         toml::from_str(&std::fs::read_to_string(root.join("config/bmux/bmux.toml")).unwrap())
             .unwrap();
     assert_eq!(
-        config["server"]["gateway"]["enabled"].as_bool(),
+        config["plugins"]["settings"]["bmux.connections"]["remote"]["allow_full_runtime_ingress"]
+            .as_bool(),
         Some(false)
     );
     assert_eq!(
@@ -248,9 +248,10 @@ fn inherited_config_snapshot_is_private_and_keeps_normal_state_untouched() {
 #[serial]
 fn inherited_sandbox_server_survives_launcher_and_stops_independently() {
     let sandbox = CommandSandbox::new("inherit-lifecycle");
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // An inherited remote auto-start on an occupied port must not reach the sandbox.
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     sandbox.write_config(&format!(
-        "[server.gateway]\nenabled = true\nquick = true\nlisten = '{}'\n",
+        "[plugins.settings.\"bmux.connections\".remote]\nallow_full_runtime_ingress = true\nauto_start = true\nbind_addr = '{}'\n",
         occupied.local_addr().unwrap()
     ));
     let output = sandbox

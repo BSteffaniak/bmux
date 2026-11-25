@@ -1,6 +1,5 @@
 mod lifecycle;
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -83,7 +82,6 @@ pub struct ServerEnv {
     server_stderr: PathBuf,
     server_child: Option<Child>,
     shell_home: Option<PathBuf>,
-    gateway_child: Option<Child>,
 }
 
 impl ServerEnv {
@@ -123,7 +121,6 @@ impl ServerEnv {
             server_stderr,
             server_child: None,
             shell_home: None,
-            gateway_child: None,
         }
     }
 
@@ -359,41 +356,6 @@ impl ServerEnv {
         )
     }
 
-    pub fn start_iroh_gateway(&mut self) -> String {
-        assert!(self.gateway_child.is_none(), "iroh gateway already started");
-        let mut child = self
-            .command(&[
-                "server",
-                "gateway",
-                "--listen",
-                "127.0.0.1:0",
-                "--host",
-                "--host-mode",
-                "iroh",
-            ])
-            .env("BMUX_IROH_DIRECT_BIND", "127.0.0.1:0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn isolated direct iroh gateway");
-        let stdout = child.stdout.take().expect("capture iroh gateway stdout");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(url) = line.strip_prefix("connect URL: ") {
-                    let _ = sender.send(url.to_string());
-                    return;
-                }
-            }
-        });
-        let url = receiver
-            .recv_timeout(SERVER_READY_TIMEOUT)
-            .expect("direct iroh gateway publishes connect URL");
-        self.gateway_child = Some(child);
-        url
-    }
-
     fn wait_until_ready(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         let mut last_probe = None;
@@ -423,10 +385,6 @@ impl ServerEnv {
 
 impl Drop for ServerEnv {
     fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
         if self.server_child.is_some()
             && let Err(error) = self.retire()
         {
@@ -528,22 +486,4 @@ pub fn assert_success(output: &Output, operation: &str) {
         output.status.code(),
         combined_output(output)
     );
-}
-
-#[must_use]
-pub fn reserve_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve loopback port")
-        .local_addr()
-        .expect("read loopback address")
-        .port()
-}
-
-pub fn generate_ed25519_key(path: &Path) {
-    let output = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(path)
-        .output()
-        .expect("run ssh-keygen");
-    assert_success(&output, "generate SSH key");
 }

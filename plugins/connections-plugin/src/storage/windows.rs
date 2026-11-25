@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-    LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING,
 };
 
 #[path = "windows_security.rs"]
@@ -274,10 +274,7 @@ impl PrivateDirectory {
         private(&file, false)?;
         Ok(file)
     }
-    pub(crate) fn read(&self) -> Result<Option<Vec<u8>>> {
-        self.read_record(c"identity.json", 16_384)
-    }
-    pub(super) fn read_record(&self, name: &CStr, limit: u64) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_record(&self, name: &CStr, limit: u64) -> Result<Option<Vec<u8>>> {
         let mut file = match self.open_record(name, FILE_OPEN, false) {
             Ok(file) => file,
             Err(error)
@@ -296,7 +293,7 @@ impl PrivateDirectory {
         }
         Ok(Some(bytes))
     }
-    pub(super) fn lock(&self, name: &CStr) -> Result<File> {
+    pub(crate) fn lock(&self, name: &CStr) -> Result<File> {
         let file = self.open_record(name, FILE_OPEN_IF, true)?;
         let mut overlapped = unsafe { std::mem::zeroed() };
         // SAFETY: synchronous file handle; lock byte zero. A distinct handle per
@@ -316,7 +313,32 @@ impl PrivateDirectory {
         }
         Ok(file)
     }
-    pub(super) fn remove_record(&self, name: &CStr) -> Result<()> {
+    /// Take an exclusive lock without waiting; `None` when another holder has it.
+    pub(crate) fn try_lock(&self, name: &CStr) -> Result<Option<File>> {
+        let file = self.open_record(name, FILE_OPEN_IF, true)?;
+        let mut overlapped = unsafe { std::mem::zeroed() };
+        // SAFETY: synchronous file handle; lock byte zero without waiting.
+        if unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &raw mut overlapped,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            // ERROR_LOCK_VIOLATION
+            if error.raw_os_error() == Some(33) {
+                return Ok(None);
+            }
+            return Err(error).context("lock private record");
+        }
+        Ok(Some(file))
+    }
+    pub(crate) fn remove_record(&self, name: &CStr) -> Result<()> {
         let file = self.open_record(name, FILE_OPEN, true)?;
         // POSIX disposition removes the name while this writable handle stays
         // alive, allowing its namespace change to be flushed before success.
@@ -337,22 +359,23 @@ impl PrivateDirectory {
         file.sync_all()?;
         Ok(())
     }
-    pub(crate) fn publish(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let temporary = CString::new(format!(".identity-{}", uuid::Uuid::new_v4()))?;
+    /// Atomically create `name` unless it exists; returns the winning bytes.
+    pub(crate) fn publish_record(&self, name: &CStr, bytes: &[u8]) -> Result<Vec<u8>> {
+        let temporary = CString::new(format!(".publish-{}", uuid::Uuid::new_v4()))?;
         let mut file = self.open_record(&temporary, FILE_CREATE, true)?;
         let mut installed = false;
         let result: Result<Vec<u8>> = (|| {
             file.write_all(bytes)?;
             file.sync_all()?;
-            match rename(&file, &self.handle, c"identity.json", false) {
+            match rename(&file, &self.handle, name, false) {
                 Ok(()) => {
                     installed = true;
                     file.sync_all()?;
                     Ok(bytes.to_vec())
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    self.read()?.context("identity winner disappeared")
-                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self
+                    .read_record(name, 65_536)?
+                    .context("published record disappeared"),
                 Err(error) => Err(error.into()),
             }
         })();
@@ -364,7 +387,7 @@ impl PrivateDirectory {
 
         result
     }
-    pub(super) fn replace_record(&self, name: &CStr, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn replace_record(&self, name: &CStr, bytes: &[u8]) -> Result<()> {
         let temporary = CString::new(format!(".pairing-{}", uuid::Uuid::new_v4()))?;
         let mut file = self.open_record(&temporary, FILE_CREATE, true)?;
         let mut installed = false;

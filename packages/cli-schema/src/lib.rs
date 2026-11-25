@@ -380,9 +380,6 @@ pub enum Command {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
-        /// Run hosted-mode focused checks
-        #[arg(long)]
-        hosted: bool,
     },
     /// Keymap tools and diagnostics
     Keymap {
@@ -999,40 +996,6 @@ pub enum ServerCommand {
         #[command(subcommand)]
         command: ServerAutostartCommand,
     },
-    /// Run a TLS gateway that exposes bmux over TCP/TLS
-    Gateway {
-        /// Listen address (host:port)
-        #[arg(long)]
-        listen: String,
-        /// Expose gateway publicly via reverse SSH tunnel helper
-        #[arg(long)]
-        host: bool,
-        /// Hosting mode used by --host (iroh is default)
-        #[arg(long, value_enum, default_value_t = GatewayHostMode::Iroh)]
-        host_mode: GatewayHostMode,
-        /// Reverse SSH relay destination (user@host)
-        #[arg(long, default_value = "nokey@localhost.run")]
-        host_relay: String,
-        /// Generate and use self-signed cert/key in runtime dir for quick setup
-        #[arg(long)]
-        quick: bool,
-        /// PEM encoded certificate chain path
-        #[arg(long, requires = "key_file")]
-        cert_file: Option<String>,
-        /// PEM encoded private key path (PKCS8)
-        #[arg(long, requires = "cert_file")]
-        key_file: Option<String>,
-    },
-    /// Internal stdio bridge used by SSH transport
-    #[command(hide = true)]
-    Bridge {
-        /// Bridge framed IPC over stdin/stdout
-        #[arg(long)]
-        stdio: bool,
-        /// Validate bridge stdio cleanliness and readiness
-        #[arg(long, hide = true)]
-        preflight: bool,
-    },
 }
 }
 
@@ -1061,12 +1024,6 @@ pub enum ServerAutostartCommand {
         #[arg(long, value_name = "PATH")]
         executable: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub enum GatewayHostMode {
-    Iroh,
-    Ssh,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1308,8 +1265,8 @@ mod tests {
     }
 
     use super::{
-        Cli, Command, ConfigCommand, ConfigProfilesCommand, GatewayHostMode, KeymapCommand,
-        LogsCommand, RecordingEventKindArg, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
+        Cli, Command, ConfigCommand, ConfigProfilesCommand, KeymapCommand, LogsCommand,
+        RecordingEventKindArg, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
         SandboxStatusArg, ServerAutostartCommand, ServerCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
@@ -1396,16 +1353,6 @@ mod tests {
                 json,
             } if profile == "tmux_compat" && dry_run && json
         ));
-    }
-
-    #[test]
-    fn parses_doctor_hosted_flag() {
-        let cli = Cli::try_parse_from(["bmux", "doctor", "--hosted"]).expect("valid CLI args");
-        let Some(Command::Doctor { hosted, json }) = cli.command else {
-            panic!("expected doctor command");
-        };
-        assert!(hosted);
-        assert!(!json);
     }
 
     #[test]
@@ -1824,77 +1771,6 @@ mod tests {
                     command: ServerAutostartCommand::Print { executable: None },
                 },
             })
-        ));
-    }
-
-    #[test]
-    fn parses_server_gateway_command() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "server",
-            "gateway",
-            "--listen",
-            "0.0.0.0:7443",
-            "--cert-file",
-            "cert.pem",
-            "--key-file",
-            "key.pem",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Server { command }) = cli.command else {
-            panic!("expected server subcommand");
-        };
-        assert!(matches!(
-            command,
-            ServerCommand::Gateway {
-                listen,
-                host,
-                host_mode,
-                host_relay,
-                quick,
-                cert_file,
-                key_file,
-            } if listen == "0.0.0.0:7443"
-                && !host
-                && host_mode == GatewayHostMode::Iroh
-                && host_relay == "nokey@localhost.run"
-                && !quick
-                && cert_file.as_deref() == Some("cert.pem")
-                && key_file.as_deref() == Some("key.pem")
-        ));
-    }
-
-    #[test]
-    fn parses_server_gateway_quick_mode() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "server",
-            "gateway",
-            "--listen",
-            "0.0.0.0:7443",
-            "--quick",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Server { command }) = cli.command else {
-            panic!("expected server subcommand");
-        };
-        assert!(matches!(
-            command,
-            ServerCommand::Gateway {
-                listen,
-                host,
-                host_mode,
-                host_relay,
-                quick,
-                cert_file,
-                key_file,
-            } if listen == "0.0.0.0:7443"
-                && !host
-                && host_mode == GatewayHostMode::Iroh
-                && host_relay == "nokey@localhost.run"
-                && quick
-                && cert_file.is_none()
-                && key_file.is_none()
         ));
     }
 

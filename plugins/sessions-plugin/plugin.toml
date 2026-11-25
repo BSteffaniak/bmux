@@ -48,6 +48,7 @@ kind                         = "bmux.sessions/sessions-events"
 # and shell CLIs can invoke sessions-plugin behavior via
 # `plugin:bmux.sessions:<cmd>`.
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "new-session"
 path          = ["new-session"]
@@ -71,6 +72,7 @@ value_name = "NAME"
 # syntax: retain legacy names and negotiate their major separately.
 
 [[commands]]
+access        = "observe"
 aliases       = [["session", "list"]]
 expose_in_cli = true
 name          = "list-sessions"
@@ -84,6 +86,7 @@ name    = "json"
 summary = "Print sessions as JSON"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "session-new"
 path          = ["session", "new"]
@@ -97,6 +100,7 @@ summary    = "Optional session name"
 value_name = "NAME"
 
 [[commands]]
+access        = "input"
 aliases       = [["session", "kill"]]
 expose_in_cli = true
 name          = "kill-session"
@@ -118,6 +122,7 @@ name    = "force-local"
 summary = "Bypass policy checks for local kill operations"
 
 [[commands]]
+access        = "input"
 aliases       = [["session", "kill-all"]]
 expose_in_cli = true
 name          = "kill-all-sessions"
@@ -157,6 +162,7 @@ name    = "global"
 summary = "Keep following across target session switches (requires --follow)"
 
 [[commands]]
+access        = "observe"
 aliases       = [["session", "detach"]]
 expose_in_cli = true
 name          = "detach"

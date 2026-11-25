@@ -385,6 +385,7 @@ mod tests {
                     expose_in_cli: true,
                     accepts_repeat: false,
                     forward_help: false,
+                    access: None,
                 },
                 PluginCommand {
                     name: "run".to_string(),
@@ -397,6 +398,7 @@ mod tests {
                     expose_in_cli: true,
                     accepts_repeat: false,
                     forward_help: false,
+                    access: None,
                 },
             ],
             event_subscriptions: Vec::new(),
@@ -445,6 +447,7 @@ mod tests {
                 expose_in_cli: true,
                 accepts_repeat: false,
                 forward_help: false,
+                access: None,
             }],
             event_subscriptions: Vec::new(),
             event_publications: Vec::new(),

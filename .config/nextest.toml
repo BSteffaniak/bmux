@@ -49,6 +49,12 @@ threads-required = "num-cpus"
 filter = 'binary(cluster_peer_auth_transport_integration)'
 threads-required = "num-cpus"
 
+# Remote-access gates each boot a host server plus several client terminals and
+# Iroh endpoints (some with a relay or UDP proxy); run them one at a time.
+[[profile.default.overrides]]
+filter = 'binary(remote_access)'
+threads-required = "num-cpus"
+
 # Every test sees a short, canonical, private TMPDIR, independent of the
 # host's temporary directory (symlinked on macOS, long under `nix develop`).
 # See scripts/nextest-test-tmpdir.sh.

@@ -57,6 +57,7 @@ interface agent-states {
 }
 
 @capability(READ)
+@access(observe)
 interface agents-state {
     query list-agents() -> agent-states.agent-snapshot;
 }

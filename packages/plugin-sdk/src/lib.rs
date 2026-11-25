@@ -91,6 +91,7 @@ mod plugin_support;
 mod process_runtime;
 pub mod prompt;
 mod ready;
+mod route_access;
 mod service;
 extern crate self as bmux_plugin_sdk;
 
@@ -178,6 +179,10 @@ pub use process_runtime::{
     encode_process_runtime_frame, split_process_runtime_frames,
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
+pub use route_access::{
+    ParseRouteAccessError, RemoteAccessAuthorizer, RemoteAccessAuthorizerHandle,
+    RemoteAccessDenied, RouteAccess, authorize_remote_access,
+};
 pub use service::{
     BoundedServiceEventSink, CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract,
     PluginService, ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind,

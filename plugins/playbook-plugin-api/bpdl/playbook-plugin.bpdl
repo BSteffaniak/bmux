@@ -42,6 +42,7 @@ interface playbook-types {
 }
 
 @capability(PLAYBOOK_READ)
+@access(observe)
 interface playbook-state {
     query lookup-preparation(request_id: string) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     query status(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
@@ -50,8 +51,9 @@ interface playbook-state {
 }
 
 @capability(PLAYBOOK_EXECUTE)
+@access(input)
 interface playbook-commands {
-    command prepare(input: playbook-types.preparation) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    @access(owner-local) command prepare(input: playbook-types.preparation) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command start(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command set-playback-speed(generation: u64, speed: string) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command pause-script(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;

@@ -5,16 +5,11 @@ use std::path::PathBuf;
 
 use super::{
     ConnectionContext, check_terminfo_available, current_cli_build_id, effective_enabled_plugins,
-    fetch_server_status,
-    hosted_output::{status_not_ready_lines, status_ready_lines},
-    plugin_host_metadata, read_server_runtime_metadata, resolve_pane_term, scan_available_plugins,
-    terminal_profile_name,
+    fetch_server_status, plugin_host_metadata, read_server_runtime_metadata, resolve_pane_term,
+    scan_available_plugins, terminal_profile_name,
 };
 
-pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
-    if hosted {
-        return run_hosted_doctor(as_json).await;
-    }
+pub(super) async fn run_doctor(as_json: bool) -> Result<u8> {
     let paths = ConfigPaths::default();
 
     let has_warnings = if as_json {
@@ -31,151 +26,6 @@ pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
     };
 
     Ok(u8::from(has_warnings))
-}
-
-async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
-    let paths = ConfigPaths::default();
-    let config = BmuxConfig::load().unwrap_or_default();
-    let control_plane_url = std::env::var("BMUX_CONTROL_PLANE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| config.connections.control_plane_url.clone())
-        .unwrap_or_else(|| "https://api.bmux.run".to_string());
-    let auth_path = paths.runtime_dir.join("auth-state.json");
-    let auth_token = std::fs::read_to_string(&auth_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .and_then(|json| {
-            json.get("access_token")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        });
-
-    let auth_ok = auth_token.is_some();
-    let control_plane_ok = if let Some(token) = auth_token.as_deref() {
-        let client = crate::reqwest_client();
-        let response = client
-            .get(format!("{control_plane_url}/v1/auth/whoami"))
-            .bearer_auth(token)
-            .send()
-            .await;
-        matches!(response, Ok(resp) if resp.status().is_success())
-    } else {
-        false
-    };
-
-    let host_state_path = paths.runtime_dir.join("host-state.json");
-    let host_runtime_ok = hosted_runtime_is_running(&host_state_path);
-    let share_lookup_ok = !config.connections.share_links.is_empty();
-
-    let lines = vec![
-        (
-            "auth",
-            auth_ok,
-            "bmux auth login",
-            format!("state: {}", auth_path.display()),
-        ),
-        (
-            "control-plane",
-            control_plane_ok,
-            "check network or BMUX_CONTROL_PLANE_URL",
-            control_plane_url.clone(),
-        ),
-        (
-            "host-runtime",
-            host_runtime_ok,
-            "bmux host --daemon",
-            format!("state: {}", host_state_path.display()),
-        ),
-        (
-            "share-lookup",
-            share_lookup_ok,
-            "bmux share <target> --name <name>",
-            format!("known links: {}", config.connections.share_links.len()),
-        ),
-    ];
-
-    let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
-
-    if as_json {
-        let checks: serde_json::Map<String, serde_json::Value> = lines
-            .iter()
-            .map(|(name, ok, hint, detail)| {
-                (
-                    (*name).to_string(),
-                    serde_json::json!({ "ok": ok, "detail": detail, "fix": if *ok { serde_json::Value::Null } else { serde_json::Value::String("bmux setup".to_string()) }, "advanced": if *ok { serde_json::Value::Null } else { serde_json::Value::String((*hint).to_string()) }}),
-                )
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"hosted": checks}))
-                .context("failed to encode hosted doctor json")?
-        );
-    } else {
-        let failed_checks = lines
-            .iter()
-            .filter_map(|(name, ok, _, _)| (!*ok).then_some(*name))
-            .collect::<Vec<_>>();
-        if has_failures {
-            let reason = format!("failed checks: {}", failed_checks.join(", "));
-            for line in status_not_ready_lines(Some(&reason), "bmux setup", None) {
-                println!("{line}");
-            }
-        } else {
-            for line in status_ready_lines(Some("bmux hosts")) {
-                println!("{line}");
-            }
-        }
-        for (name, ok, hint, detail) in &lines {
-            if *ok {
-                println!("{name}: ok ({detail})");
-            } else {
-                println!("{name}: fail ({detail}) | Advanced: {hint}");
-            }
-        }
-    }
-
-    Ok(u8::from(has_failures))
-}
-
-fn hosted_runtime_is_running(path: &PathBuf) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    let Some(pid) = json
-        .get("pid")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-    else {
-        return false;
-    };
-
-    hosted_process_is_running(pid)
-}
-
-#[cfg(unix)]
-fn hosted_process_is_running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(windows)]
-fn hosted_process_is_running(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}")])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
 }
 
 // ── text output ─────────────────────────────────────────────────────────

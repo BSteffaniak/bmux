@@ -196,7 +196,7 @@ mod tests {
         let local = StreamProvenance::Local;
         let remote = StreamProvenance::Admitted {
             subject_id: crate::ids::new_uuid(),
-            lease_id: crate::ids::new_uuid(),
+            connection_id: crate::ids::new_uuid(),
         };
         assert_eq!(check_read_identity(false, None, &local), Ok(None));
         assert_eq!(check_read_identity(false, Some(caller), &local), Ok(None));

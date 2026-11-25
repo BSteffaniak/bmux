@@ -7,6 +7,7 @@
 mod attach_provider;
 mod attach_session;
 mod connection_pool;
+mod transport_connector;
 
 pub use attach_provider::{
     AttachEndpointConnectFuture, AttachEndpointConnector, AttachProvider, AttachProviderBackend,
@@ -26,6 +27,11 @@ pub use attach_session::{
 pub use connection_pool::{
     ConnectionPoolAcquireError, ConnectionPoolConfigError, ConnectionPoolLimits,
     DedicatedEndpointConnection, EndpointConnectionLease, EndpointConnectionPool,
+};
+pub use transport_connector::{
+    TransportConnectError, TransportConnectFuture, TransportConnector,
+    TransportConnectorRegistration, TransportConnectorRegistry, TransportConnectorResolutionError,
+    TransportOrigin,
 };
 
 use bmux_attach_image_protocol::CompressionId;
@@ -166,6 +172,10 @@ pub enum ClientError {
 #[derive(Debug)]
 pub struct BmuxClient {
     checked_service_contracts: bool,
+    /// Set when a transport connector opened this client; `None` is the local
+    /// socket default.
+    transport_origin: Option<TransportOrigin>,
+    transport_failure: TransportFailure,
     stream: ClientStream,
     timeout: Duration,
     next_request_id: u64,
@@ -223,6 +233,26 @@ impl BmuxClient {
     #[must_use]
     pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
         self.negotiated_protocol.as_ref()
+    }
+
+    /// The transport connector and target that opened this client, if any.
+    #[must_use]
+    pub const fn transport_origin(&self) -> Option<&TransportOrigin> {
+        self.transport_origin.as_ref()
+    }
+
+    /// This connection's transport failure record, shared with the streaming
+    /// client made from this client.
+    #[must_use]
+    pub fn transport_failure(&self) -> TransportFailure {
+        self.transport_failure.clone()
+    }
+
+    /// Whether this client reached its server without a transport connector,
+    /// so the server shares this process's host and filesystem.
+    #[must_use]
+    pub const fn is_local_transport(&self) -> bool {
+        self.transport_origin.is_none()
     }
 
     /// Connect to a server endpoint and complete protocol handshake.
@@ -294,6 +324,8 @@ impl BmuxClient {
             principal_id,
             negotiated_protocol: None,
             checked_service_contracts: false,
+            transport_origin: None,
+            transport_failure: TransportFailure::default(),
         };
 
         let mut capabilities = default_supported_capabilities();
@@ -542,6 +574,14 @@ impl BmuxClient {
     ///
     /// Returns an error if transport/protocol validation fails.
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
+        let result = self.request_raw_unobserved(request).await;
+        if let Err(error) = &result {
+            self.transport_failure.observe(error);
+        }
+        result
+    }
+
+    async fn request_raw_unobserved(&mut self, request: Request) -> Result<Response> {
         validate_service_representation(self.checked_service_contracts, &request)?;
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
@@ -836,6 +876,38 @@ struct TimedOutRequest {
     elapsed_ms: u128,
 }
 
+/// The first transport failure a connection showed: its stream failed, or a
+/// request got no reply within the client's timeout.
+///
+/// One connection's handles share it (a client and the streaming client made
+/// from it), so a caller that handed the client to someone else can still tell
+/// a lost connection from an application error, even when that error was
+/// flattened into text on the way up (typed dispatch does this).
+#[derive(Clone, Debug, Default)]
+pub struct TransportFailure(Arc<StdMutex<Option<String>>>);
+
+impl TransportFailure {
+    /// The first failure recorded, if any.
+    #[must_use]
+    pub fn reason(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|reason| reason.clone())
+    }
+
+    fn record(&self, reason: String) {
+        store_stream_disconnect_reason(&self.0, reason);
+    }
+
+    /// Record `error` when it says the connection itself failed.
+    fn observe(&self, error: &ClientError) {
+        if matches!(
+            error,
+            ClientError::Timeout(_) | ClientError::Transport(IpcTransportError::Io(_))
+        ) {
+            self.record(error.to_string());
+        }
+    }
+}
+
 fn store_stream_disconnect_reason(reason_slot: &Arc<StdMutex<Option<String>>>, reason: String) {
     if let Ok(mut slot) = reason_slot.lock()
         && slot.is_none()
@@ -877,6 +949,7 @@ fn format_stream_disconnect_reason(error: &IpcTransportError) -> String {
 #[derive(Debug)]
 pub struct StreamingBmuxClient {
     checked_service_contracts: bool,
+    transport_origin: Option<TransportOrigin>,
     writer: StreamingClientWriter,
     timeout: Duration,
     next_request_id: u64,
@@ -886,6 +959,7 @@ pub struct StreamingBmuxClient {
     timed_out: TimedOutMap,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     disconnect_reason: Arc<StdMutex<Option<String>>>,
+    transport_failure: TransportFailure,
     /// Reads the connection; it holds the read half, so it is ended with the client.
     reader_task: tokio::task::JoinHandle<()>,
 }
@@ -957,6 +1031,8 @@ impl StreamingBmuxClient {
             principal_id,
             negotiated_protocol,
             checked_service_contracts,
+            transport_origin,
+            transport_failure,
         } = client;
 
         let (mut reader, mut writer) = match stream {
@@ -999,6 +1075,7 @@ impl StreamingBmuxClient {
         let reader_pending = Arc::clone(&pending);
         let reader_timed_out = Arc::clone(&timed_out);
         let reader_disconnect_reason = Arc::clone(&disconnect_reason);
+        let reader_failure = transport_failure.clone();
         let reader_task = tokio::spawn(async move {
             Self::reader_loop(
                 reader,
@@ -1006,12 +1083,14 @@ impl StreamingBmuxClient {
                 reader_timed_out,
                 event_tx,
                 reader_disconnect_reason,
+                reader_failure,
             )
             .await;
         });
 
         Ok(Self {
             checked_service_contracts,
+            transport_origin,
             writer,
             timeout,
             next_request_id,
@@ -1021,6 +1100,7 @@ impl StreamingBmuxClient {
             timed_out,
             event_rx,
             disconnect_reason,
+            transport_failure,
             reader_task,
         })
     }
@@ -1030,6 +1110,24 @@ impl StreamingBmuxClient {
         self.negotiated_protocol.as_ref()
     }
 
+    /// The transport connector and target that opened this client, if any.
+    #[must_use]
+    pub const fn transport_origin(&self) -> Option<&TransportOrigin> {
+        self.transport_origin.as_ref()
+    }
+
+    /// This connection's transport failure record.
+    #[must_use]
+    pub fn transport_failure(&self) -> TransportFailure {
+        self.transport_failure.clone()
+    }
+
+    /// Whether this client reached its server without a transport connector.
+    #[must_use]
+    pub const fn is_local_transport(&self) -> bool {
+        self.transport_origin.is_none()
+    }
+
     /// Background reader loop that demuxes incoming envelopes.
     async fn reader_loop(
         mut reader: StreamingClientReader,
@@ -1037,6 +1135,7 @@ impl StreamingBmuxClient {
         timed_out: TimedOutMap,
         event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
         disconnect_reason: Arc<StdMutex<Option<String>>>,
+        transport_failure: TransportFailure,
     ) {
         loop {
             let envelope = match reader.recv_envelope().await {
@@ -1044,6 +1143,7 @@ impl StreamingBmuxClient {
                 Err(error) => {
                     let reason = format_stream_disconnect_reason(&error);
                     store_stream_disconnect_reason(&disconnect_reason, reason.clone());
+                    transport_failure.record(reason.clone());
                     // Connection closed or error — wake all pending requests.
                     let pending_requests = std::mem::take(&mut *pending.lock().await);
                     for (_, tx) in pending_requests {
@@ -1143,11 +1243,13 @@ impl StreamingBmuxClient {
             Ok(Ok(())) => Ok(()),
             result => {
                 self.pending.lock().await.remove(&request_id);
-                Err(match result {
+                let error = match result {
                     Ok(Err(error)) => ClientError::Transport(error),
                     Err(_) => ClientError::Timeout(self.timeout),
                     Ok(Ok(())) => unreachable!(),
-                })
+                };
+                self.transport_failure.observe(&error);
+                Err(error)
             }
         }
     }
@@ -1190,11 +1292,13 @@ impl StreamingBmuxClient {
         let timeout = self.timeout;
         let pending = Arc::clone(&self.pending);
         let timed_out = Arc::clone(&self.timed_out);
+        let transport_failure = self.transport_failure.clone();
         let reply_task = tokio::spawn(async move {
             let recv_started = std::time::Instant::now();
             let response = tokio::time::timeout(timeout, rx)
                 .await
                 .map_err(|_| {
+                    transport_failure.record(format!("request timed out after {timeout:?}"));
                     let elapsed_ms = started_at.elapsed().as_millis();
                     warn!(
                         request_id,
@@ -1296,10 +1400,15 @@ impl StreamingBmuxClient {
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
         // Deliberately do NOT register in self.pending — the response (if
         // any) will be silently dropped by the reader task.
-        self.writer
+        let result = self
+            .writer
             .send_envelope(&envelope)
             .await
-            .map_err(ClientError::Transport)
+            .map_err(ClientError::Transport);
+        if let Err(error) = &result {
+            self.transport_failure.observe(error);
+        }
+        result
     }
 
     // ── Event push control ───────────────────────────────────────────────
@@ -1604,9 +1713,7 @@ fn request_detail(request: &Request) -> String {
 
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
-        Request::StreamAdmissionBackend => "stream_admission_backend",
         Request::CurrentStreamProvenance => "current_stream_provenance",
-        Request::AdmitStream { .. } => "admit_stream",
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
@@ -1751,7 +1858,6 @@ fn ipc_client_request_phase_payload(
 const fn response_kind_name(response: &Response) -> &'static str {
     match response {
         Response::Ok(payload) => match payload {
-            ResponsePayload::StreamAdmissionBackend { .. } => "stream_admission_backend",
             ResponsePayload::CurrentStreamProvenance { .. } => "current_stream_provenance",
             ResponsePayload::Pong => "pong",
             ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
@@ -1967,6 +2073,8 @@ mod tests {
             principal_id,
             negotiated_protocol: None,
             checked_service_contracts: false,
+            transport_origin: None,
+            transport_failure: crate::TransportFailure::default(),
         };
         let previous = client.set_request_timeout(Duration::from_secs(30));
         assert_eq!(previous, Duration::from_millis(500));
@@ -2002,6 +2110,8 @@ mod tests {
                         principal_id,
                         negotiated_protocol: None,
                         checked_service_contracts: false,
+                        transport_origin: None,
+                        transport_failure: crate::TransportFailure::default(),
                     })
                 },
             )
@@ -2043,6 +2153,8 @@ mod tests {
                     capabilities: vec![capability.to_string()],
                 }),
                 checked_service_contracts: false,
+                transport_origin: None,
+                transport_failure: crate::TransportFailure::default(),
             }
         };
         let mut initial = make_client(bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2);
@@ -2068,6 +2180,8 @@ mod tests {
             principal_id,
             negotiated_protocol: None,
             checked_service_contracts: false,
+            transport_origin: None,
+            transport_failure: crate::TransportFailure::default(),
         };
 
         let streaming =

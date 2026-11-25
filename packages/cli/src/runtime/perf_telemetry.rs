@@ -1,10 +1,5 @@
 use super::{BmuxConfig, Context, Instant, Result, Uuid, active_runtime_name};
 use bmux_performance_state::{PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE};
-#[cfg(feature = "bundled-plugin-connections")]
-use bmux_performance_state::{
-    PerformanceRecordingLevel as RuntimePerformanceRecordingLevel,
-    PerformanceRuntimeSettings as RuntimePerformanceRuntimeSettings,
-};
 use bmux_recording_plugin_api::{recording_commands, recording_types};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,17 +19,6 @@ impl PerfCaptureLevel {
             bmux_config::PerformanceRecordingLevel::Basic => Self::Basic,
             bmux_config::PerformanceRecordingLevel::Detailed => Self::Detailed,
             bmux_config::PerformanceRecordingLevel::Trace => Self::Trace,
-        }
-    }
-
-    #[cfg(feature = "bundled-plugin-connections")]
-    #[must_use]
-    pub(super) const fn from_runtime(level: RuntimePerformanceRecordingLevel) -> Self {
-        match level {
-            RuntimePerformanceRecordingLevel::Off => Self::Off,
-            RuntimePerformanceRecordingLevel::Basic => Self::Basic,
-            RuntimePerformanceRecordingLevel::Detailed => Self::Detailed,
-            RuntimePerformanceRecordingLevel::Trace => Self::Trace,
         }
     }
 
@@ -86,17 +70,6 @@ impl PerfCaptureSettings {
             window_ms: perf.window_ms.max(1),
             max_events_per_sec: perf.max_events_per_sec.max(1),
             max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
-        }
-    }
-
-    #[cfg(feature = "bundled-plugin-connections")]
-    #[must_use]
-    pub(super) fn from_runtime_settings(settings: &RuntimePerformanceRuntimeSettings) -> Self {
-        Self {
-            level: PerfCaptureLevel::from_runtime(settings.recording_level),
-            window_ms: settings.window_ms.max(1),
-            max_events_per_sec: settings.max_events_per_sec.max(1),
-            max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
         }
     }
 
@@ -237,37 +210,6 @@ impl PerfEventEmitter {
         }
 
         serde_json::Value::Object(object)
-    }
-
-    #[cfg(feature = "bundled-plugin-connections")]
-    pub(super) async fn emit_with_client(
-        &mut self,
-        client: &mut bmux_client::BmuxClient,
-        session_id: Option<Uuid>,
-        pane_id: Option<Uuid>,
-        event_name: &str,
-        payload: serde_json::Value,
-    ) -> Result<()> {
-        if !self.enabled() {
-            return Ok(());
-        }
-
-        let payload = self.normalized_payload(payload);
-        let encoded = serde_json::to_vec(&payload).context("failed encoding perf payload")?;
-        if !self.can_emit_payload(encoded.len()) {
-            return Ok(());
-        }
-
-        recording_commands::client::write_custom_event(
-            client,
-            session_id,
-            pane_id,
-            PERF_RECORDING_SOURCE.to_string(),
-            event_name.to_string(),
-            encoded,
-        )
-        .await?
-        .map_err(recording_plugin_error)
     }
 
     pub(super) async fn emit_with_streaming_client(

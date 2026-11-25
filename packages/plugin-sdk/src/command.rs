@@ -46,6 +46,11 @@ pub struct PluginCommand {
     /// print their own help. Otherwise the CLI answers help from this schema.
     #[serde(default)]
     pub forward_help: bool,
+    /// What a remote (admitted) caller needs to run this command on the
+    /// host through the CLI bridge (`run_plugin`). A command without a class
+    /// is never run for a remote caller; local callers are not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::RouteAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +120,7 @@ impl PluginCommand {
             expose_in_cli: default_expose_in_cli(),
             accepts_repeat: false,
             forward_help: false,
+            access: None,
         }
     }
 
@@ -164,6 +170,12 @@ impl PluginCommand {
     #[must_use]
     pub const fn forward_help(mut self, forward_help: bool) -> Self {
         self.forward_help = forward_help;
+        self
+    }
+
+    #[must_use]
+    pub const fn access(mut self, access: crate::RouteAccess) -> Self {
+        self.access = Some(access);
         self
     }
 

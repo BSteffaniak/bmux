@@ -2,7 +2,7 @@ use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationI
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 pub use bmux_plugin_runtime::PluginConcurrencyConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -31,6 +31,13 @@ pub struct PluginService {
     /// same-instance callback re-entry rejection for every operation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub reentrant_operations: BTreeSet<String>,
+    /// Interface-wide BPDL `@access` class. `None` means undeclared, which
+    /// admitted (remote) streams may never reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::RouteAccess>,
+    /// Per-operation BPDL `@access` overrides of [`Self::access`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_access: BTreeMap<String, crate::RouteAccess>,
 }
 
 /// BPDL-generated descriptor for an interface-level service endpoint.
@@ -47,6 +54,10 @@ pub struct ServiceInterfaceDescriptor {
     pub contract: &'static [u8],
     /// BPDL `@reentrant` query operations of this interface.
     pub reentrant_operations: &'static [&'static str],
+    /// Interface-wide BPDL `@access` class, if declared.
+    pub access: Option<crate::RouteAccess>,
+    /// Per-operation BPDL `@access` overrides.
+    pub operation_access: &'static [(&'static str, crate::RouteAccess)],
 }
 
 /// Type-level plugin contract exported by BPDL-generated API crates.
@@ -106,6 +117,12 @@ impl ServiceInterfaceDescriptor {
                 .iter()
                 .map(|operation| (*operation).to_string())
                 .collect(),
+            access: self.access,
+            operation_access: self
+                .operation_access
+                .iter()
+                .map(|(operation, access)| ((*operation).to_string(), *access))
+                .collect(),
         })
     }
 }
@@ -151,6 +168,16 @@ impl PluginService {
     #[must_use]
     pub fn is_reentrant_query(&self, operation: &str) -> bool {
         self.kind == ServiceKind::Query && self.reentrant_operations.contains(operation)
+    }
+
+    /// The declared access class of `operation`: its BPDL override, else the
+    /// interface class. `None` means undeclared.
+    #[must_use]
+    pub fn access_for(&self, operation: &str) -> Option<crate::RouteAccess> {
+        self.operation_access
+            .get(operation)
+            .copied()
+            .or(self.access)
     }
 }
 
@@ -874,7 +901,25 @@ mod tests {
             interface_id: "identity/v1".into(),
             concurrency: None,
             reentrant_operations: reentrant.iter().map(|op| (*op).to_string()).collect(),
+            access: None,
+            operation_access: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn access_classes_parse_from_generated_manifests() {
+        let parsed: super::PluginService = toml::from_str(
+            "capability = 'example.read'\nkind = 'query'\ninterface_id = 'state'\naccess = 'observe'\n[operation_access]\nkeys = 'owner-local'\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.access_for("get"), Some(crate::RouteAccess::Observe));
+        assert_eq!(
+            parsed.access_for("keys"),
+            Some(crate::RouteAccess::OwnerLocal)
+        );
+        let bare = declared(ServiceKind::Query, &[]);
+        assert_eq!(bare.access_for("get"), None);
+        assert!(!toml::to_string(&bare).unwrap().contains("access"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ capability FEEDBACK_WRITE = bmux.feedback.write;
 
 @capability(FEEDBACK_WRITE)
 @interface-version(1)
+@access(input)
 interface feedback-commands {
     // A fact about where the feedback was given, such as the focused pane's command.
     // Sensitive values are kept from the model.

@@ -4,47 +4,16 @@ use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
 };
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 
-// Explicit service/operation pairs only. Unmigrated routes require positive
-// Local provenance even when invoked directly via generated service clients.
-pub(crate) fn migrated_route(interface: &str, operation: &str) -> bool {
-    if interface == "pane-runtime-view-size-v1" {
-        return operation == "resize-alternate";
-    }
-    matches!(
-        (interface, operation),
-        (
-            "pane-runtime-execution-v4",
-            "reserve"
-                | "launch"
-                | "reconcile"
-                | "send-admitted"
-                | "input-receipt"
-                | "resolve"
-                | "retire"
-                | "new-program-session"
-                | "status"
-                | "screen"
-                | "send"
-                | "resize"
-                | "terminate"
-                | "wait"
-        ) | (
-            "pane-runtime-presentation-v1",
-            "capabilities" | "resize" | "capture-events" | "present"
-        ) | (
-            "pane-runtime-presentation-wait-v1",
-            "capabilities" | "wait-present"
-        ) | (
-            "pane-runtime-pointer-grid-v2",
-            "capabilities" | "screen" | "wait-present"
-        ) | (
-            "pane-runtime-spawn-commands-v1",
-            "new-session" | "split-shell"
-        ) | (
-            "pane-runtime-spawn-v1",
-            "home-directory" | "capture-source" | "observe-directory"
+/// Routes this plugin's BPDL declares `owner-local`: host readiness and
+/// managed lifecycle, and the per-client write and attach policies that only
+/// the host's permission owner sets.
+fn owner_local_route(interface: &str, operation: &str) -> bool {
+    interface == "pane-runtime-readiness-v1"
+        || matches!(
+            (interface, operation),
+            ("pane-runtime-commands", "set-client-write-permission")
+                | ("attach-runtime-commands", "set-client-attach-policy")
         )
-    )
 }
 
 /// Read-only queries in-process plugins make from background observers, which
@@ -65,16 +34,19 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
     let provenance = super::spawn::caller_provenance(ctx)
         .map_err(|error| ServiceResponse::error("authorization_denied", format!("{error:?}")))?;
     match provenance {
-        StreamProvenance::Local => Ok(()),
+        // The server admitted this remote subject's request by its route's
+        // access class; resource checks still use the subject. Owner-local
+        // routes stay closed even when another plugin calls them on a remote
+        // request's behalf.
         StreamProvenance::Admitted { .. }
-            if migrated_route(&ctx.request.service.interface_id, &ctx.request.operation) =>
+            if owner_local_route(&ctx.request.service.interface_id, &ctx.request.operation) =>
         {
-            Ok(())
+            Err(ServiceResponse::error(
+                "authorization_denied",
+                "owner-local route is not reachable remotely",
+            ))
         }
-        StreamProvenance::Admitted { .. } => Err(ServiceResponse::error(
-            "authorization_denied",
-            "remote route is not migrated to authoritative resource checks",
-        )),
+        StreamProvenance::Local | StreamProvenance::Admitted { .. } => Ok(()),
         StreamProvenance::HostInternal
             if ctx.caller_client_id.is_none()
                 && ctx.request.caller_plugin_id == "bmux.pane_runtime"
@@ -195,15 +167,6 @@ pub(crate) fn authorize(
 mod tests {
     use super::*;
 
-    #[test]
-    fn view_size_admits_only_the_guarded_operation() {
-        assert!(migrated_route(
-            "pane-runtime-view-size-v1",
-            "resize-alternate"
-        ));
-        assert!(!migrated_route("pane-runtime-view-size-v1", "resize"));
-        assert!(!migrated_route("pane-runtime-view-size-v1", "set-owner"));
-    }
     use bmux_plugin::StreamOrigin as StreamProvenance;
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
@@ -350,7 +313,7 @@ mod tests {
             assert!(authorize_route(&ctx).is_err());
             *origin.lock().unwrap() = StreamProvenance::Admitted {
                 subject_id: crate::ids::new_uuid(),
-                lease_id: crate::ids::new_uuid(),
+                connection_id: crate::ids::new_uuid(),
             };
             assert!(authorize_route(&ctx).is_err());
             *origin.lock().unwrap() = StreamProvenance::HostInternal;
@@ -447,7 +410,7 @@ mod tests {
         assert_eq!(output, b"local");
         *origin.lock().unwrap() = StreamProvenance::Admitted {
             subject_id: crate::ids::new_uuid(),
-            lease_id: crate::ids::new_uuid(),
+            connection_id: crate::ids::new_uuid(),
         };
         let remote = context("pane-runtime-execution-v4", "send", Vec::new());
         assert!(input_authority(&remote, &execution).is_err());
@@ -534,20 +497,19 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)] // Test router must return the SDK's fixed error type.
-    fn service_boundary_denies_legacy_remote_and_rechecks_migrated_mutations() {
+    fn service_boundary_denies_owner_local_remote_and_rechecks_mutations() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let origin = Arc::new(Mutex::new(StreamProvenance::Admitted {
             subject_id: crate::ids::new_uuid(),
-            lease_id: crate::ids::new_uuid(),
+            connection_id: crate::ids::new_uuid(),
         }));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = Arc::clone(&origin));
         for (interface, operation) in [
-            ("pane-runtime-commands", "send-input"),
             ("pane-runtime-commands", "set-client-write-permission"),
-            ("attach-runtime-commands", "attach-input"),
+            ("attach-runtime-commands", "set-client-attach-policy"),
             ("pane-runtime-readiness-v1", "fence-unhealthy"),
-            ("pane-runtime-execution-v4", "future-mutation"),
+            ("pane-runtime-readiness-v1", "runtime-readiness"),
         ] {
             let response = super::super::route(host, &context(interface, operation, Vec::new()));
             assert_eq!(response.error.unwrap().code, "authorization_denied");

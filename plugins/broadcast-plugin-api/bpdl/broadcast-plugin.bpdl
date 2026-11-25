@@ -6,6 +6,7 @@ capability BROADCAST_PRESENTATION = bmux.broadcast.presentation.v1;
 capability BROADCAST_DIAGNOSTICS = bmux.broadcast.diagnostics.v1;
 
 @capability(BROADCAST_PRESENTATION)
+@access(observe)
 interface broadcast-presentation-v1 {
     // Publication-global status only, not a selected-view/decorations selector.
     // Scoped consumers must not interpret this as ownership of their view.
@@ -14,6 +15,7 @@ interface broadcast-presentation-v1 {
 }
 
 @capability(BROADCAST_TURNKEY)
+@access(owner-local)
 interface broadcast-turnkey-v1 {
     // Public-safe labels only: printable ASCII, 1..64 bytes; never paths/titles.
     record source-descriptor { source_id: string, label: string, selected: bool }
@@ -31,6 +33,7 @@ interface broadcast-turnkey-v1 {
 }
 
 @capability(BROADCAST_CONTROL)
+@access(owner-local)
 interface broadcast-control-v1 {
     record status { local: string, remote: string, source_id: string?, error_code: string? }
     command prepare-local() -> bool;
@@ -58,6 +61,7 @@ interface broadcast-control-v1 {
 }
 
 @capability(BROADCAST_OUTPUT)
+@access(owner-local)
 interface broadcast-output-v1 {
     // source_id identifies one caller-owned committed view, never an active-client
     // alias. A selected ID remains pinned to its owner across lease loss/removal.
@@ -75,6 +79,7 @@ interface broadcast-output-v1 {
 // Process-local, bounded, allowlisted diagnostics. No credentials, fences, URLs,
 // frame payloads or peer-supplied text. Ages use a monotonic clock in milliseconds.
 @capability(BROADCAST_DIAGNOSTICS)
+@access(observe)
 interface broadcast-diagnostics-v1 {
     record failure { attempt_id: u64, operation: string, reason: string, age_ms: u64 }
     record event { process_instance: string, controller_instance: string, sequence: u64, attempt_id: u64, operation: string, kind: string, reason: string?, generation: string?, revision: u64?, http_status: u32?, refresh: u64, age_ms: u64 }

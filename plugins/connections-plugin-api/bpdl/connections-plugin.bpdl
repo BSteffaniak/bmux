@@ -1,32 +1,17 @@
-// Stable transport-neutral endpoint resolution and invocation contract.
+// Typed contract of the connections plugin: remote hosting administration
+// (owner-local), hosting status (observe), and typed service invocation on a
+// selected endpoint (local or a saved host).
 
 plugin bmux.connections version 1;
 
 capability CONNECTIONS_READ = bmux.connections.read;
 capability CONNECTIONS_INVOKE = bmux.connections.invoke;
-capability CONNECTIONS_PAIRING = bmux.connections.pairing;
+capability CONNECTIONS_HOSTING = bmux.connections.hosting;
 
 interface connection-types {
-    enum connection-transport {
-        local,
-        ssh,
-        tls,
-        iroh,
-    }
-
     enum service-invoke-kind {
         invoke-query,
         invoke-command,
-    }
-
-    record resolved-endpoint {
-        endpoint_id: string,
-        reference: string,
-        label: string,
-        transport: connection-transport,
-        address: string,
-        server_name: string?,
-        connect_timeout_ms: u64,
     }
 
     record invocation-options {
@@ -59,168 +44,118 @@ interface connection-types {
     }
 }
 
-// Device admission grants access to this runtime only, not cluster membership.
-interface pairing-types {
-    enum device-access {
-        denied,
-        full-local-runtime,
-    }
-    record admission-binding {
-        subject_id: uuid,
-        lease_id: uuid,
-    }
-    record listener-status {
-        endpoint_id: string,
-        enabled: bool,
-        endpoint_address: string?,
-        // Pinned device endpoint URIs, one per advertised direct address/relay.
-        endpoint_targets: list<string>,
-        // Optional ingress failed; local terminal operation remains available.
-        warning: string?,
-    }
-    record device {
-        device_id: string,
-        device_key: string,
-        access: device-access,
-        revision: u64,
-    }
-    variant stream-provenance {
-        local,
-        admitted { subject_id: uuid, lease_id: uuid },
-        invalid,
-    }
-    record device-access-check {
-        access: device-access,
-        revision: u64,
-    }
-    record invitation {
-        invitation_id: string,
-        endpoint_id: string,
-        device_key: string,
-        @secret secret: bytes,
-        expires_at: u64,
-        access: device-access,
-        // Sign these exact bytes with the device Iroh secret key.
-        @secret possession_message: bytes,
-    }
-    enum session-phase {
-        waiting-peer,
-        pending-approval,
-        pending-grant,
-        active,
-        rejected,
-        cancelled,
-        expired,
-    }
-    record pairing-session {
-        session_id: string,
-        // Display explicitly; never log this reusable pre-approval secret.
-        @secret invitation_link: string,
-        expires_at: u64,
-    }
-    record pairing-request {
-        session_id: string,
-        phase: session-phase,
-        peer_key: string?,
-        // Untrusted display label, authenticated as part of the transcript.
-        device_name: string?,
-        verification_phrase: string?,
-        device_id: string?,
-        expires_at: u64,
-    }
-    record admission-challenge {
-        @secret challenge: bytes,
-        @secret possession_message: bytes,
-    }
-}
-
-// The capability is discoverability, not owner authority. Handlers additionally
-// require host-trusted local owner provenance for administrative operations.
-@capability(CONNECTIONS_PAIRING)
-interface pairing-commands {
-    command set-enabled(enabled: bool) -> pairing-types.listener-status;
-    command start-listener() -> pairing-types.listener-status;
-    // Local owner authorizes this exact host and invitation-bound device key.
-    command pair-endpoint(target: string, invitation: pairing-types.invitation) -> string;
-    command stop-listener() -> pairing-types.listener-status;
-    command create-invitation(device_key: string, ttl_seconds: u64, access: pairing-types.device-access) -> pairing-types.invitation;
-    command redeem-invitation(invitation_id: string, @secret secret: bytes, @secret signature: bytes) -> pairing-types.device;
-    command grant-device(device_id: string, access: pairing-types.device-access) -> pairing-types.device;
-    command revoke-device(device_id: string) -> pairing-types.device;
-    command begin-admission(device_id: string) -> pairing-types.admission-challenge;
-    command finish-admission(@secret challenge: bytes, @secret signature: bytes) -> bytes;
-}
-
-@capability(CONNECTIONS_PAIRING)
-interface pairing-state {
-    query local-device-identity() -> string;
-    query listener-status() -> pairing-types.listener-status;
-    query current-provenance() -> pairing-types.stream-provenance;
-    query list-devices() -> list<pairing-types.device>;
-    query check-device-access(subject_id: uuid) -> pairing-types.device-access-check;
-}
-
-@capability(CONNECTIONS_READ)
-interface connections-state {
-    query resolve(target: string) -> result<connection-types.resolved-endpoint, connection-types.connection-error>;
-    query list-targets() -> list<connection-types.resolved-endpoint>;
-}
-
+// Invoking a service on another host uses this machine's device key, so it
+// is never reachable from a remote stream.
 @capability(CONNECTIONS_INVOKE)
+@access(owner-local)
 interface connections-commands {
     command invoke-service(invocation: connection-types.service-invocation) -> result<bytes, connection-types.connection-error>;
 }
 
-// Owner-only short operations. Handler must prove trusted local owner provenance.
-@capability(CONNECTIONS_PAIRING)
-interface pairing-session-commands {
-    command begin-session(ttl_seconds: u64, endpoint_targets: list<string>) -> pairing-types.pairing-session;
-    command approve-session(session_id: string, verification_phrase: string) -> pairing-types.device;
-    command reject-session(session_id: string) -> pairing-types.pairing-request;
-    command cancel-session(session_id: string) -> pairing-types.pairing-request;
-}
-@capability(CONNECTIONS_PAIRING)
-interface pairing-session-state {
-    query pending-request(session_id: string) -> pairing-types.pairing-request;
-}
-// Only this generated surface is exposed to an unadmitted Iroh peer.
-@capability(CONNECTIONS_PAIRING)
-interface pairing-peer-commands {
-    command submit-pairing(session_id: string, @secret nonce: bytes, @secret signature: bytes, device_name: string?) -> pairing-types.pairing-request;
-    command poll-pairing(session_id: string, @secret nonce: bytes) -> pairing-types.pairing-request;
-    command pairing-result(session_id: string, @secret nonce: bytes) -> pairing-types.device;
+interface hosting-types {
+    enum device-role {
+        full,
+        view-only,
+    }
+
+    enum device-state {
+        pending,
+        active,
+        revoked,
+    }
+
+    record device {
+        // Device public key (its Iroh endpoint id).
+        device_key: string,
+        principal: uuid,
+        // Untrusted display label.
+        name: string,
+        state: device-state,
+        role: device-role,
+        revision: u64,
+        approved_at: u64?,
+        last_seen: u64?,
+    }
+
+    record live-connection {
+        device_key: string,
+        name: string,
+        // `direct` or `relay`.
+        path: string,
+        rtt_ms: u64?,
+        connected_secs: u64,
+    }
+
+    record hosting-status {
+        enabled: bool,
+        // Where `enabled` comes from: `config`, `remote enable`, `remote disable` or `default`.
+        source: string,
+        endpoint_id: string,
+        bound_addrs: list<string>,
+        relay_mode: string,
+        relay: string?,
+        // Hosting failed to start; local terminals still work.
+        warning: string?,
+    }
+
+    record pairing-session {
+        session_id: string,
+        // Display explicitly to the owner; never log it.
+        @secret link: string,
+        expires_at: u64,
+    }
+
+    enum pairing-event-kind {
+        request,
+        withdrawn,
+        ended,
+        idle,
+    }
+
+    record pairing-event {
+        kind: pairing-event-kind,
+        request_id: string?,
+        device_name: string?,
+        device_key: string?,
+        phrase: string?,
+        // For `ended`: rejected, expired, cancelled, invalid, busy or failed.
+        reason: string?,
+    }
 }
 
-// Private host-selected provider. Every operation also requires HostInternal
-// provenance; ordinary local and admitted callers are rejected.
-@capability(CONNECTIONS_PAIRING)
-// v2: `probe` became `@reentrant`, which changes the contract identity.
-@interface-version(2)
-interface admission-provider-state {
-    // A listener start confirms its admission backend from inside its own
-    // pairing invocation, so the host's probe re-enters this instance on the
-    // same call chain. It reads only the immutable instance id and its sole
-    // outbound call is the `@reentrant` clients provenance query.
-    @reentrant query probe() -> uuid;
-    query validate(subject_id: uuid, lease_id: uuid) -> bool;
+@capability(CONNECTIONS_HOSTING)
+@access(owner-local)
+interface hosting-commands {
+    command set-enabled(enabled: bool) -> hosting-types.hosting-status;
+    command begin-pairing(role: hosting-types.device-role, name: string?, ttl_seconds: u64) -> hosting-types.pairing-session;
+    // Waits up to wait_ms for the next pairing event (pushed, not polled).
+    command next-pairing-event(session_id: string, wait_ms: u64) -> hosting-types.pairing-event;
+    command decide-pairing(session_id: string, request_id: string, approve: bool) -> hosting-types.device?;
+    command end-pairing(session_id: string) -> bool;
+    command revoke-device(device: string) -> hosting-types.device;
+    command set-device-role(device: string, role: hosting-types.device-role) -> hosting-types.device;
 }
-@capability(CONNECTIONS_PAIRING)
-interface admission-provider-commands {
-    command consume(@secret ticket: bytes) -> pairing-types.admission-binding;
+
+@capability(CONNECTIONS_HOSTING)
+@access(owner-local)
+interface hosting-admin-state {
+    query list-devices() -> list<hosting-types.device>;
+    query live-connections() -> list<hosting-types.live-connection>;
+}
+
+@capability(CONNECTIONS_READ)
+@access(observe)
+interface hosting-state {
+    query status() -> hosting-types.hosting-status;
 }
 
 /// What `bmux.connections` provides to and requires from the host and other plugins.
 world connections {
-    provide connections-state;
     provide connections-commands;
-    provide pairing-commands;
-    provide pairing-state;
-    provide admission-provider-state;
-    provide admission-provider-commands;
-    provide pairing-session-commands;
-    provide pairing-peer-commands;
-    provide pairing-session-state;
-    require capability bmux.clients.read;
+    provide hosting-commands;
+    provide hosting-admin-state;
+    provide hosting-state;
     require capability bmux.commands;
     require capability bmux.permissions.write;
+    require capability bmux.permissions.read;
 }

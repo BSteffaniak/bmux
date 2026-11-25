@@ -11,13 +11,15 @@ use std::time::Duration;
 
 use super::plugin_runtime::RuntimeCommandState;
 
-/// Run a selected `attach` or `connect` command against `state`.
+/// Run a selected `attach` against `state`, reaching the server through
+/// `connection_target` (the parsed global `--target`) when one is given.
 ///
 /// # Errors
 /// Returns parse-shape, connection, or attachment failures.
-pub(super) fn run_selected(
+pub(super) fn run_selected_with_target(
     state: &RuntimeCommandState,
     command: &bmux_cli_schema::Command,
+    connection_target: Option<&str>,
 ) -> Result<i32> {
     let run = async {
         match command {
@@ -37,6 +39,7 @@ pub(super) fn run_selected(
                 );
                 Box::pin(run_attach(
                     state,
+                    connection_target,
                     target.as_deref(),
                     follow.as_deref(),
                     *global,
@@ -61,16 +64,57 @@ pub(super) fn run_selected(
 
 /// Attach to `target` (or follow a client) on the selected runtime.
 ///
-/// Provider-owned targets open without a local server; every other target
-/// connects to the selected runtime's local server.
+/// Provider-owned targets open without a local server. Every other target
+/// attaches through `connection_target`'s transport connector when one is
+/// given (a connector-backed attachment resumes after a dropped connection),
+/// and otherwise to the selected runtime's local server.
 pub(super) async fn run_attach(
     state: &RuntimeCommandState,
+    connection_target: Option<&str>,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
 ) -> Result<u8> {
     let (config, paths) = (&state.config, &state.paths);
     let provider = super::attach::provider::resolve(target)?;
+    let connection_target = connection_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty() && *target != "local");
+    if let Some(connection_target) = connection_target
+        && provider.requires_fallback_client()
+    {
+        let mut client = crate::connection::connect_raw_with_context(
+            "bmux-cli-attach",
+            crate::connection::ConnectionContext::new(Some(connection_target)),
+        )
+        .await?;
+        // `connect <host>` without a session attaches the way bare
+        // `bmux --target <host>` does: the host's default session.
+        let default_session;
+        let target = if target.is_none() && follow.is_none() {
+            default_session = super::bootstrap::resolve_default_attach_target(&mut client)
+                .await?
+                .to_string();
+            Some(default_session.as_str())
+        } else {
+            target
+        };
+        return Box::pin(
+            super::attach::runtime::run_session_attach_with_client_options(
+                client,
+                target,
+                follow,
+                global,
+                super::attach::runtime::ClientAttachOptions {
+                    config: Some(config.clone()),
+                    command_state: Some(state.clone()),
+                    ..super::attach::runtime::ClientAttachOptions::default()
+                },
+            ),
+        )
+        .await
+        .map(|outcome| outcome.status_code);
+    }
     let fallback_client = if provider.requires_fallback_client() {
         Some(connect_local(config, paths, "bmux-cli-attach").await?)
     } else {

@@ -1,10 +1,14 @@
 //! Native tests need no symlink privilege; hardlinks and ACLs are checked by handle.
 use super::*;
-use crate::storage::PairingStore;
+use crate::storage::RecordStore as PairingStore;
 use std::sync::{Arc, Barrier};
 
 fn store(root: &Path) -> PairingStore {
-    PairingStore::client(root, "windows", c"pairing.json").unwrap()
+    PairingStore::new(
+        PrivateDirectory::open(&root.join("windows")).unwrap(),
+        "pairing.json",
+    )
+    .unwrap()
 }
 
 #[test]
@@ -20,7 +24,9 @@ fn publication_is_immutable_and_atomic_between_racers() {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    directory.publish(&[index; 1024]).unwrap()
+                    directory
+                        .publish_record(c"identity.json", &[index; 1024])
+                        .unwrap()
                 })
             })
             .collect();
@@ -32,7 +38,10 @@ fn publication_is_immutable_and_atomic_between_racers() {
     for winner in &results {
         assert_eq!(winner, &results[0]);
     }
-    assert_eq!(directory.read().unwrap(), Some(results[0].clone()));
+    assert_eq!(
+        directory.read_record(c"identity.json", 65_536).unwrap(),
+        Some(results[0].clone())
+    );
     assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
 }
 
@@ -115,13 +124,21 @@ fn hardlinked_and_directory_records_are_rejected_without_mutation() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("private");
     let directory = PrivateDirectory::open(&path).unwrap();
-    directory.publish(b"immutable identity").unwrap();
+    directory
+        .publish_record(c"identity.json", b"immutable identity")
+        .unwrap();
     let alias = root.path().join("outside");
     std::fs::hard_link(path.join("identity.json"), &alias).unwrap();
-    assert!(directory.read().is_err());
+    assert!(directory.read_record(c"identity.json", 65_536).is_err());
     assert_eq!(std::fs::read(&alias).unwrap(), b"immutable identity");
     std::fs::remove_file(alias).unwrap();
-    assert_eq!(directory.read().unwrap().unwrap(), b"immutable identity");
+    assert_eq!(
+        directory
+            .read_record(c"identity.json", 65_536)
+            .unwrap()
+            .unwrap(),
+        b"immutable identity"
+    );
     std::fs::create_dir(path.join("pairing.json")).unwrap();
     assert!(directory.read_record(c"pairing.json", 1024).is_err());
 }

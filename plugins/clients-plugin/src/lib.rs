@@ -584,9 +584,6 @@ impl ClientsPlugin {
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(&self.events(), ctx, ctx.caller_client_id, &req))
             },
-            "clients-identity/v1", "stream-admission-backend" => |_req: (), ctx| {
-                Ok::<_, ServiceResponse>(identity::stream_admission_backend(ctx))
-            },
             "clients-identity/v1", "current-stream-provenance" => |_req: (), ctx| {
                 Ok::<_, ServiceResponse>(identity::current_stream_provenance(ctx))
             },
@@ -1793,10 +1790,7 @@ pub fn authorize_kernel_request(encoded: &[u8]) -> bmux_plugin_sdk::Result<()> {
             details: error.to_string(),
         }
     })?;
-    if matches!(
-        request,
-        bmux_ipc::Request::CurrentStreamProvenance | bmux_ipc::Request::StreamAdmissionBackend
-    ) {
+    if matches!(request, bmux_ipc::Request::CurrentStreamProvenance) {
         Ok(())
     } else {
         Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
@@ -1811,8 +1805,6 @@ mod kernel_request_policy_tests {
     fn composition_policy_is_narrow_and_rejects_invalid_requests() {
         let provenance = bmux_ipc::encode(&bmux_ipc::Request::CurrentStreamProvenance).unwrap();
         assert!(super::authorize_kernel_request(&provenance).is_ok());
-        let backend = bmux_ipc::encode(&bmux_ipc::Request::StreamAdmissionBackend).unwrap();
-        assert!(super::authorize_kernel_request(&backend).is_ok());
         let unrelated = bmux_ipc::encode(&bmux_ipc::Request::Ping).unwrap();
         assert!(super::authorize_kernel_request(&unrelated).is_err());
         assert!(super::authorize_kernel_request(b"invalid IPC").is_err());

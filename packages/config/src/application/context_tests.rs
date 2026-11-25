@@ -191,7 +191,6 @@ fn explicit_errors_redact_composition_typed_values_and_validation_values() {
         "[composition]\nactive_profile = 'SECRET-CANARY'",
         "[composition]\nprofiles = 'SECRET-CANARY'",
         "[composition]\nactive_profile = 'a'\n[composition.profiles.a]\nextends = ['SECRET-CANARY']",
-        "[server.gateway]\nenabled = true\nlisten = 'SECRET-CANARY'",
         "[appearance]\npane_border_style = 'SECRET-CANARY'",
     ] {
         let error = resolve_application_configuration_with_context(

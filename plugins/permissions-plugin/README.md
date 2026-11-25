@@ -22,3 +22,16 @@ latency-sensitive permission checks.
 - **`permissions-commands`** -- `grant` / `revoke` roles
 - **`session-policy-state`** -- `check` / `list-hot-path-overrides` / `resolve-hot-path-decision`
 - **`session-policy-commands`** -- `grant-hot-path-override` / `revoke-hot-path-override`
+- **`remote-role-commands`** / **`remote-role-state`** (`owner-local`) -- set,
+  clear and read the role of a remote principal (a paired device): `full` or
+  `view-only`
+
+## Remote access
+
+At activation the plugin registers a `RemoteAccessAuthorizerHandle` in the
+host state registry. The server asks it for every request on an admitted
+(remote) stream: `full` allows `observe`, `input` and `manage` routes,
+`view-only` allows `observe`, and nothing allows `owner-local` routes. A
+principal without a role gets nothing. Roles are held in memory and persisted
+through plugin storage; the connections plugin sets them when the owner
+approves a device or runs `bmux remote role`.

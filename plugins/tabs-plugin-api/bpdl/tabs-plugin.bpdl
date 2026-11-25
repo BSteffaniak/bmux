@@ -15,6 +15,7 @@ capability TABS_READ = bmux.tabs.read;
 capability TABS_WRITE = bmux.tabs.write;
 
 @capability(TABS_WRITE)
+@access(input)
 interface tabs-placement-v1 {
     // Append a live tab to the destination arrangement before changing its
     // workspace attribute. Source references are retained, never destroyed.
@@ -23,6 +24,7 @@ interface tabs-placement-v1 {
 }
 
 @capability(TABS_READ)
+@access(observe)
 interface tabs-state {
     // A pane's current lifecycle status.
     variant pane-status {
@@ -94,6 +96,7 @@ interface tabs-state {
 }
 
 @capability(TABS_READ)
+@access(observe)
 interface tabs-catalog-v1 {
     // Complete discovery in workspace order, then each workspace's tab arrangement.
     // Reading this catalog never initializes or rewrites arrangement storage.
@@ -101,6 +104,7 @@ interface tabs-catalog-v1 {
 }
 
 @capability(TABS_WRITE)
+@access(input)
 interface tabs-commands {
     // Errors a focus command can produce.
     variant focus-error {
@@ -331,9 +335,9 @@ interface tabs-commands {
 
     // Tab-level commands.
     command new-tab(name: string?) -> result<tab-ack, tab-error>;
-    command rename-tab(name: string) -> result<tab-ack, tab-error>;
+    @access(manage) command rename-tab(name: string) -> result<tab-ack, tab-error>;
     // Rename a specific tab by id, independent of which tab is current.
-    command rename-tab-by-id(id: uuid, name: string)
+    @access(manage) command rename-tab-by-id(id: uuid, name: string)
         -> result<tab-ack, tab-error>;
     command kill-tab(target: string, force-local: bool) -> result<tab-ack, tab-error>;
     command kill-all-tabs(force-local: bool) -> result<tab-ack, tab-error>;
@@ -352,6 +356,7 @@ interface tabs-commands {
 // their owner: another owner's views are indistinguishable from absent ones.
 @capability(TABS_READ)
 @interface-version(1)
+@access(observe)
 interface tabs-personal-views {
     // One reference to a tab (a context id) inside a workspace arrangement.
     // `member-id` is stable identity independent of position and label.
@@ -425,6 +430,7 @@ interface tabs-personal-views {
 // the change and its outcome are durably committed together.
 @capability(TABS_WRITE)
 @interface-version(1)
+@access(input)
 interface tabs-personal-commands {
     record personal-ack {
         view-id: uuid,
@@ -439,7 +445,7 @@ interface tabs-personal-commands {
         -> result<personal-ack, tabs-personal-views.personal-view-error>;
     command create-view(mutation-id: uuid, view-id: uuid, name: string)
         -> result<personal-ack, tabs-personal-views.personal-view-error>;
-    command rename-view(mutation-id: uuid, view-id: uuid, expected-revision: u64, name: string)
+    @access(manage) command rename-view(mutation-id: uuid, view-id: uuid, expected-revision: u64, name: string)
         -> result<personal-ack, tabs-personal-views.personal-view-error>;
     // Forget a view. Tabs are never affected. The default view cannot be
     // deleted until another view is the default.
@@ -477,7 +483,7 @@ interface tabs-personal-commands {
         before: uuid?,
     ) -> result<personal-ack, tabs-personal-views.personal-view-error>;
     // Set or clear (`label` absent) a member's personal label.
-    command set-label(
+    @access(manage) command set-label(
         mutation-id: uuid,
         view-id: uuid,
         expected-revision: u64,
@@ -501,6 +507,7 @@ interface tabs-personal-commands {
 // attachment, on the `personal-view` state kind.
 @capability(TABS_WRITE)
 @interface-version(1)
+@access(observe)
 interface tabs-personal-attachment {
     record personal-binding {
         view-id: uuid,
@@ -545,6 +552,7 @@ interface tabs-personal-attachment {
 // view has not arranged yet is seeded from the canonical order first.
 @capability(TABS_WRITE)
 @interface-version(1)
+@access(input)
 interface tabs-personal-actions {
     // Add a live tab to the view at the end of its workspace's arrangement,
     // without selecting it.
@@ -574,6 +582,7 @@ interface tabs-personal-actions {
 // revision itself, retrying when another attachment edits the same view.
 @capability(TABS_WRITE)
 @interface-version(1)
+@access(manage)
 interface tabs-personal-labels {
     // Set the tab's personal label, or clear it (`label` absent or empty) so
     // the view shows the shared name again. The tab must be a member of the

@@ -3,6 +3,7 @@ plugin bmux.application_resurrection version 1;
 capability RESURRECTION_HOST = bmux.application_resurrection.host;
 
 @capability(RESURRECTION_HOST)
+@access(observe)
 interface resurrection-host-v1 {
     record host-status {
         protocol: string,
@@ -13,6 +14,7 @@ interface resurrection-host-v1 {
 }
 
 @capability(RESURRECTION_HOST)
+@access(owner-local)
 interface resurrection-launch-v1 {
     variant host-error {
         failed { message: string },
@@ -25,6 +27,7 @@ interface resurrection-launch-v1 {
 
 @capability(RESURRECTION_HOST)
 @major(2)
+@access(owner-local)
 interface resurrection-launch-v2 {
     record prepared-launch {
         endpoint: string,

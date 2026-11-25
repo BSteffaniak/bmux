@@ -183,6 +183,7 @@ fn extension_point_interface(point: &ExtensionPoint, name: &str) -> Interface {
         version: None,
         contract_major: None,
         capability: None,
+        access: None,
         docs: point.docs.clone(),
         stability: point.stability.clone(),
         items: std::iter::once(Item::Type(TypeDef {
@@ -316,6 +317,7 @@ fn commands_interface(package: &Package, name: &str) -> Interface {
         version: None,
         contract_major: None,
         capability: None,
+        access: None,
         docs: vec!["Plugin commands invocable from the command line and keymaps.".to_string()],
         stability: Stability::default(),
         items: package
@@ -336,6 +338,7 @@ fn commands_interface(package: &Package, name: &str) -> Interface {
                     ),
                     emits: None,
                     reentrant: false,
+                    access: None,
                     docs,
                     stability: command.stability.clone(),
                 })

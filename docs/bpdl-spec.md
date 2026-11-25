@@ -43,8 +43,9 @@ top_item   := annotation* ( interface | world | plugin_command
                           | contribution | extension_point )
 
 annotation := "@" ident ( "(" ( ident | integer ) ")" )?
-              // interface: @capability(NAME) @interface-version(N) @major(N)
-              // items:     @reentrant (query) @state (events) @default (case)
+              // interface: @capability(NAME) @access(CLASS) @interface-version(N) @major(N)
+              // items:     @reentrant (query) @access(CLASS) (query, command)
+              //            @state (events) @default (case)
               // anywhere:  @since(N) @unstable(feature) @deprecated(N)
 
 interface  := "interface" ident "{" ( annotation* interface_item )* "}"
@@ -413,6 +414,77 @@ them on generated types, fields and cases; WIT keeps them as WIT docs.
 Documentation and stability are metadata: neither enters contract
 identity.
 
+## Route access (`@access`)
+
+`@access(CLASS)` declares what a service route lets its caller do. The
+server checks it for every request on an admitted stream, a stream
+accepted from outside the host, such as a paired device's connection.
+Requests on local streams are never checked.
+
+`CLASS` is one of:
+
+| Class         | Meaning                                      |
+| ------------- | -------------------------------------------- |
+| `observe`     | Read state and receive output.               |
+| `input`       | Change what runs or what is shown.           |
+| `manage`      | Change durable configuration of the runtime. |
+| `owner-local` | Never reachable from an admitted stream.     |
+
+Put it on an interface to set the class of every operation, and on a
+`query` or `command` to override it for that operation:
+
+```bpdl
+@capability(READ) @access(observe)
+interface state {
+    query get() -> u32;                    // observe
+    @access(owner-local) query keys() -> list<string>;
+    @reentrant @access(observe) query current() -> u32;
+}
+
+@capability(WRITE)
+interface edit {
+    @access(input) command set(n: u32) -> unit;
+    command reset() -> unit;               // undeclared
+}
+```
+
+- An operation's class is its own `@access`, else its interface's.
+- At most one `@access` per interface or operation; a second one, an
+  unknown class or a missing argument is a parse error.
+- `@access` is accepted only on interfaces and directly before `query` or
+  `command`. On any other item (`events`, `record`, ...) it is a parse
+  error, and on an interface without queries or commands it is a
+  validation error.
+- An omitted annotation is not an error. The operation is undeclared:
+  codegen emits `ACCESS = None` (or no override entry) and admitted
+  streams can never reach it. `provide opaque` services carry no class
+  either. Declare a class on every route a remote device should reach.
+
+The permissions plugin decides which classes a remote principal may use,
+by the device's role:
+
+| Role        | `observe` | `input` | `manage` | `owner-local` |
+| ----------- | --------- | ------- | -------- | ------------- |
+| `full`      | yes       | yes     | yes      | no            |
+| `view-only` | yes       | no      | no       | no            |
+
+`owner-local` is refused before the permissions plugin is asked, so no
+role or authorizer can grant it. A request on an admitted stream is also
+refused when no remote access authorizer is registered
+(`bmux_plugin_sdk::authorize_remote_access`).
+
+Codegen emits `ACCESS: Option<RouteAccess>` and
+`OPERATION_ACCESS: &[(&str, RouteAccess)]` in each service interface
+module and carries both in `SERVICE_DESCRIPTOR`
+(`ServiceInterfaceDescriptor::access` and `operation_access`). Generated
+manifests list them as `access` and `operation_access` on each service,
+omitted when absent, so the host knows each route's class without running
+plugin code.
+
+`@access` is authorization metadata: it does not enter contract identity.
+Adding, changing or removing a class keeps the interface's
+`SERVICE_CONTRACT` unchanged.
+
 ## Plugin declarations
 
 ### `world`
@@ -467,8 +539,8 @@ before the IR hashes byte-for-byte as before, so all pinned repository
 identities (`packages/plugin-schema/tests/fixtures/contract-identities.txt`)
 are unchanged. New constructs (flags, resources, tuples, streams, futures,
 handles) use type and item tags no earlier schema could produce, which is
-why they extend v2 instead of requiring v3. `@major`, documentation and
-stability gates are not identity-bearing. Ambiguous or unresolved imported
+why they extend v2 instead of requiring v3. `@major`, `@access`,
+documentation and stability gates are not identity-bearing. Ambiguous or unresolved imported
 names produce empty evidence, never a guess.
 
 Contract evolution is exact identity plus multi-version adapters: a wire
@@ -523,7 +595,7 @@ settings with:
 
 | Key                     | Generated from                                                                 |
 | ----------------------- | ------------------------------------------------------------------------------ |
-| `services`              | `provide` entries (capability, kind, `@reentrant` operations)                  |
+| `services`              | `provide` entries (capability, kind, `@reentrant` operations, `@access`)       |
 | `contracts`             | each provided service: wire id, major (`@interface-version`, `@major`, else 1) |
 | `provided_capabilities` | provided services and `provide capability`                                     |
 | `required_capabilities` | `require` entries                                                              |
@@ -678,10 +750,12 @@ Only the single-schema form is supported; imports require `schema!`.
   unique within an interface.
 - An interface declares at most one `events` item.
 - `@reentrant` may only annotate a non-streaming `query`.
+- `@access` may only annotate an interface, a `query` or a `command`; an
+  interface carrying it must declare at least one query or command.
 - `map<K, _>` keys must be one of `string`, `uuid`, or an integer
   primitive (`u8`…`u64`, `i8`…`i64`).
 - `record`/`variant` types must be acyclic in their required fields.
-  Cycles through `T?`, `list<T>`, or `map<_, T>` _value_ position are
+  Cycles through `T?`, `list<T>`, or `map<_, T>` *value* position are
   allowed because the generated Rust compiles; direct `T` fields
   (including via `result<T, _>` or `result<_, T>`) form cycle edges
   and are rejected.

@@ -579,7 +579,6 @@ fn resolve_origin_paths(
                     "identity_file" | "known_hosts_file" | "ca_file"
                 ]
                 | ["kiosk", "files", "sshd_include_path" | "wrapper_dir"]
-                | ["server", "gateway", "cert_file" | "key_file"]
         );
         if !is_path {
             return;

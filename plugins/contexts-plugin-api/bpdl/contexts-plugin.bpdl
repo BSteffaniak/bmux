@@ -21,6 +21,7 @@ capability CONTEXTS_CLIENT_SELECTION_V1 = bmux.contexts.client_selection.v1;
 
 // Fresh-shell options are explicit; older creation contracts retain their meaning.
 @capability(CONTEXTS_WRITE)
+@access(input)
 interface contexts-spawn-v1 {
     record initial-shell-options {
         cwd: string?,
@@ -35,11 +36,13 @@ interface contexts-spawn-v1 {
 // Caller-local transient visit history, newest first. Unsupported providers
 // reject this interface rather than silently substituting shared MRU order.
 @capability(CONTEXTS_READ)
+@access(observe)
 interface contexts-visits-v1 {
     query list-visits() -> result<list<uuid>, string>;
 }
 
 @capability(CONTEXTS_READ)
+@access(observe)
 interface contexts-state {
     // Snapshot of a single context's public state.
     record context-summary {
@@ -67,6 +70,7 @@ interface contexts-state {
 }
 
 @capability(CONTEXTS_WRITE)
+@access(input)
 interface contexts-commands {
     // Errors a `create-context` command can produce.
     //
@@ -129,9 +133,9 @@ interface contexts-commands {
         -> result<context-ack, select-context-error>;
     command close-context(selector: contexts-state.context-selector, force: bool)
         -> result<context-ack, close-context-error>;
-    command rename-context(selector: contexts-state.context-selector, name: string)
+    @access(manage) command rename-context(selector: contexts-state.context-selector, name: string)
         -> result<context-ack, rename-context-error>;
-    command set-context-attributes(
+    @access(manage) command set-context-attributes(
         selector: contexts-state.context-selector,
         attributes: map<string, string>,
     ) -> result<context-ack, set-context-attributes-error>;
@@ -144,6 +148,7 @@ interface contexts-commands {
 // Gated by its own capability, not `bmux.contexts.write`: holding write access
 // to contexts does not let a plugin move another client's attachment.
 @capability(CONTEXTS_CLIENT_SELECTION_V1)
+@access(manage)
 interface contexts-client-selection-v1 {
     // Select a context that has an execution for `client-id`. Emits
     // `selected` and `session-active-context-changed` naming the client as
@@ -158,6 +163,7 @@ interface contexts-client-selection-v1 {
 }
 
 @capability(CONTEXTS_WRITE)
+@access(input)
 interface contexts-activation-v1 {
     // Exact activation never allocates or replaces a missing execution.
     command activate(context-id: uuid)

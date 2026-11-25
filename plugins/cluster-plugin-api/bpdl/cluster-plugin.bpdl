@@ -690,6 +690,7 @@ interface cluster-types {
 
 @capability(CLUSTER_READ)
 @interface-version(1)
+@access(observe)
 interface cluster-query {
     query identity() -> cluster-types.cluster-identity;
     query list_clusters() -> cluster-types.cluster-list-result;
@@ -701,41 +702,44 @@ interface cluster-query {
 
 @capability(CLUSTER_WRITE)
 @interface-version(1)
+@access(manage)
 interface cluster-command {
-    command init(endpoint: string?) -> cluster-types.cluster-identity;
-    command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
-    command enrollment_revoke(enrollment_id: string) -> cluster-types.enrollment-revocation-result;
-    command credential_rotate_prepare() -> cluster-types.credential-rotation-request;
+    @access(owner-local) command init(endpoint: string?) -> cluster-types.cluster-identity;
+    @access(owner-local) command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
+    @access(owner-local) command enrollment_revoke(enrollment_id: string) -> cluster-types.enrollment-revocation-result;
+    @access(owner-local) command credential_rotate_prepare() -> cluster-types.credential-rotation-request;
     command credential_rotate_accept(request: cluster-types.credential-rotation-request) -> cluster-types.member-credential-result;
-    command credential_rotate_commit(member: cluster-types.cluster-member) -> cluster-types.member-credential-result;
-    command member_revoke(node_id: string) -> cluster-types.member-credential-result;
+    @access(owner-local) command credential_rotate_commit(member: cluster-types.cluster-member) -> cluster-types.member-credential-result;
+    @access(owner-local) command member_revoke(node_id: string) -> cluster-types.member-credential-result;
     // Internal recovery primitive: converge Raft voters to current signed membership.
-    command consensus_reconcile() -> cluster-types.cluster-member-list;
+    @access(owner-local) command consensus_reconcile() -> cluster-types.cluster-member-list;
     // Reconcile a prospective signed membership snapshot before publishing it.
     command consensus_reconcile_members(members: list<cluster-types.cluster-member>, authorization: cluster-types.consensus-voter-change-authorization) -> cluster-types.cluster-member-list;
     // Safely remove one current voter before publishing leave/revocation state.
     command consensus_remove_voter(authorization: cluster-types.consensus-voter-change-authorization) -> cluster-types.cluster-member-list;
-    command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
+    @access(owner-local) command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
     command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?, protocol: cluster-types.cluster-protocol-offer, possession_signature: bytes) -> cluster-types.cluster-join-result;
-    command leave_prepare() -> cluster-types.cluster-leave-request;
-    command leave(leave_id: string) -> cluster-types.cluster-leave-result;
+    @access(owner-local) command leave_prepare() -> cluster-types.cluster-leave-request;
+    @access(owner-local) command leave(leave_id: string) -> cluster-types.cluster-leave-result;
     command accept_leave(leave_id: string, cluster_id: string, node_id: string, signature: bytes) -> cluster-types.cluster-leave-result;
-    command up(cluster: string, hosts: list<string>) -> cluster-types.cluster-up-result;
-    command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
-    command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
-    command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
+    @access(owner-local) command up(cluster: string, hosts: list<string>) -> cluster-types.cluster-up-result;
+    @access(input) command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
+    @access(input) command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
+    @access(input) command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
 }
 
 // Proof-bearing refresh is separate from generic membership metadata updates.
 // Verification time is assigned by the authoritative runtime, not this contract.
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(owner-local)
 interface cluster-protocol-refresh {
     command submit(command_id: cluster-types.command-id, replacement: cluster-types.cluster-member, expected_serial: string, expected_revision: u64, node_signature: bytes) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(owner-local)
 interface cluster-principal-bootstrap {
     command submit(proof: cluster-principal-bootstrap-types.bootstrap-proof, expected_control_revision: u64) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
@@ -743,12 +747,14 @@ interface cluster-principal-bootstrap {
 // Reports carry node proofs; the authority assigns credential verification time.
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(owner-local)
 interface cluster-capability-publication {
     command submit(reports: list<cluster-capability-types.capability-report>) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_WRITE)
 @interface-version(1)
+@access(manage)
 interface cluster-control-command {
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
@@ -758,10 +764,11 @@ interface cluster-control-command {
 // bytes (including all fields) must not exceed 1,048,576 bytes.
 @capability(CLUSTER_WRITE)
 @interface-version(1)
+@access(manage)
 interface cluster-bounded-control-command {
     // Protocol 1 guarantees the canonical 1 MiB admission limit and a
     // non-forwarding mutate-local operation. Unknown protocols are rejected.
-    command forwarding-protocol() -> u16;
+    @access(observe) command forwarding-protocol() -> u16;
     // At most one forwarded hop. A missing local operation is an explicit
     // compatibility error, never permission to fall back to mutate or v1.
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
@@ -771,6 +778,7 @@ interface cluster-bounded-control-command {
 
 @capability(CLUSTER_WRITE)
 @interface-version(2)
+@access(manage)
 interface cluster-control-command {
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
     command activate-feature(command_id: cluster-types.command-id, principal_id: string, issued_at_unix_ms: u64, expected_control_revision: u64, read_schema_floor: u16, write_schema_floor: u16, feature: string) -> result<cluster-types.control-response, cluster-types.control-service-error>;
@@ -778,6 +786,7 @@ interface cluster-control-command {
 
 @capability(CLUSTER_READ)
 @interface-version(1)
+@access(observe)
 interface cluster-control-state {
     query read_linearizable() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
     query read_stale() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
@@ -785,6 +794,7 @@ interface cluster-control-state {
 
 @capability(CLUSTER_READ)
 @interface-version(2)
+@access(observe)
 interface cluster-control-state {
     query read_linearizable() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
     query read_stale() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
@@ -793,6 +803,7 @@ interface cluster-control-state {
 
 @capability(CLUSTER_WRITE)
 @interface-version(1)
+@access(input)
 interface cluster-attach-command {
     command action(request: cluster-types.attach-action-request) -> result<cluster-types.control-response, cluster-types.control-service-error>;
     command input(workspace_id: cluster-types.workspace-id, command_id: cluster-types.command-id, execution_id: cluster-types.execution-id, generation: u64, principal_id: string, data: bytes) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
@@ -802,6 +813,7 @@ interface cluster-attach-command {
 @capability(CLUSTER_READ)
 // v2: `snapshot` and `output` gave way to `routes` (observe leases; frames are pushed).
 @interface-version(2)
+@access(observe)
 interface cluster-attach-state {
     query layout(workspace_id: cluster-types.workspace-id, tab_id: cluster-types.logical-tab-id?, columns: u16, rows: u16) -> result<cluster-types.attach-layout, cluster-types.control-service-error>;
     // Where to follow each execution's screen: its worker's endpoint and an observe lease.
@@ -811,6 +823,7 @@ interface cluster-attach-state {
 @capability(CLUSTER_WRITE)
 // v2: leases gained the `observe` class and executions lost their output cursors.
 @interface-version(2)
+@access(input)
 interface cluster-worker-command {
     command launch(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-launch-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
     command adopt(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-adoption-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
@@ -825,6 +838,7 @@ interface cluster-worker-command {
 @capability(CLUSTER_READ)
 // v2: `output` and `snapshot` are gone; workers push frames (`cluster-worker-stream`).
 @interface-version(2)
+@access(observe)
 interface cluster-worker-state {
     query get(execution_id: cluster-types.execution-id) -> result<cluster-types.worker-query-result, cluster-types.worker-service-error>;
     query inventory() -> cluster-types.worker-execution-list;
@@ -835,6 +849,7 @@ interface cluster-worker-state {
 // the revision applied now; `enabled: false` stops.
 @capability(CLUSTER_READ)
 @interface-version(1)
+@access(observe)
 interface cluster-control-watch {
     query watch(enabled: bool) -> result<u64, cluster-types.control-service-error>;
 }
@@ -844,6 +859,7 @@ interface cluster-control-watch {
 // the previous one; an empty set stops.
 @capability(CLUSTER_READ)
 @interface-version(1)
+@access(observe)
 interface cluster-worker-stream {
     query observe(authorities: list<cluster-types.worker-authority>, max_history_lines: u32) -> result<list<cluster-types.observed-execution>, cluster-types.worker-service-error>;
 }
@@ -939,6 +955,7 @@ interface cluster-consensus-transfer-types {
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(manage)
 interface cluster-consensus-transfer {
     command begin(request: cluster-consensus-transfer-types.transfer-request) -> result<u64, cluster-consensus-transfer-types.transfer-error>;
     command chunk(request: cluster-consensus-transfer-types.chunk-request) -> result<cluster-consensus-transfer-types.chunk-outcome, cluster-consensus-transfer-types.transfer-error>;
@@ -1001,6 +1018,7 @@ interface cluster-consensus-rpc-types {
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(manage)
 interface cluster-consensus-rpc {
     command vote(request: cluster-consensus-vote-types.vote-request) -> result<cluster-consensus-vote-types.vote-response, cluster-consensus-rpc-types.rpc-error>;
     // Durable means the log transaction committed, not application or quorum commit.
@@ -1027,6 +1045,7 @@ interface cluster-consensus-rpc-v2-types {
 
 @capability(CLUSTER_AUTH)
 @interface-version(2)
+@access(manage)
 interface cluster-consensus-rpc {
     // Request fields retain their modeled representation, but signatures use
     // the V2 append domain. No fallback to V1 or interpretation of bare errors
@@ -1077,6 +1096,7 @@ interface cluster-consensus-snapshot-types {
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(manage)
 interface cluster-consensus-snapshot {
     // Requires explicit negotiation of snapshot v1, transfer v1 AND owned RPC
     // v1. No fallback to finish or legacy install-snapshot is permitted.
@@ -1108,6 +1128,7 @@ interface cluster-consensus-vote-types {
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(manage)
 interface cluster-peer-auth {
     command challenge(claimant_node_id: string) -> cluster-types.peer-auth-challenge;
     command prove(challenge: cluster-types.peer-auth-challenge) -> cluster-types.peer-auth-proof;
@@ -1118,12 +1139,14 @@ interface cluster-peer-auth {
 // bound to the read operation, receiver, and exact query payload.
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+@access(observe)
 interface cluster-peer-read {
     command read_linearizable(request: cluster-types.raft-rpc-request) -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_READ)
 @interface-version(1)
+@access(observe)
 interface cluster-connection-events {
     query list() -> cluster-types.cluster-connection-event-list;
 }

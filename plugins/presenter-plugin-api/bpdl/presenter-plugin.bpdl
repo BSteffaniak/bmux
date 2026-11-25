@@ -6,6 +6,7 @@ capability PRESENTER_MANAGE_TRUSTED = bmux.presenter.manage.v2;
 
 @capability(PRESENTER_VIEW)
 @major(2)
+@access(observe)
 interface presenter-view-v2 {
     enum interaction-mode { receive-only, submit-only, shared, independent }
     record cursor { run_id: string, deck_revision: u64, revision: u64 }
@@ -35,18 +36,19 @@ interface presenter-view-v2 {
     // No wait holds an unbounded service invocation; callers poll at bounded cadence.
     command poll(host_id: string, participant_id: string, cursor: cursor?) -> result<poll, error>;
     command snapshot(host_id: string, participant_id: string) -> result<snapshot, error>;
-    command submit(host_id: string, participant_id: string, action_id: u64, expected: cursor, action: action) -> result<acknowledgment, error>;
+    @access(input) command submit(host_id: string, participant_id: string, action_id: u64, expected: cursor, action: action) -> result<acknowledgment, error>;
     command asset(host_id: string, participant_id: string, id: string, offset: u64, length: u32) -> result<asset-chunk, error>;
     command leave(host_id: string, participant_id: string) -> unit;
 }
 
 @capability(PRESENTER_MANAGE)
+@access(manage)
 interface presenter-host-v1 {
     record host-info { id: string, run_id: string, source: string }
     // Paths resolve only in the managing owner's server process. This is privileged
     // management, not a viewer operation or an arbitrary remote document fetch.
-    command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool) -> result<host-info, string>;
-    command list() -> list<host-info>;
+    @access(owner-local) command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool) -> result<host-info, string>;
+    @access(observe) command list() -> list<host-info>;
     command reload(host_id: string) -> result<unit, string>;
     command stop(host_id: string) -> result<unit, string>;
 }
@@ -54,6 +56,7 @@ interface presenter-host-v1 {
 // Explicit approval is a new versioned contract. V1 creation stays untrusted.
 @capability(PRESENTER_MANAGE_TRUSTED)
 @major(2)
+@access(owner-local)
 interface presenter-host-v2 {
     command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool, allow_playbooks: bool) -> result<presenter-host-v1.host-info, string>;
 }

@@ -18,6 +18,8 @@ static SERVICES: [ServiceInterfaceDescriptor; 1] = [ServiceInterfaceDescriptor {
     interface_id: InterfaceId::from_static("generated/v3"),
     contract: &CONTRACT,
     reentrant_operations: &[],
+    access: None,
+    operation_access: &[],
 }];
 const MANIFEST: &str = r#"
 id = "example.body"

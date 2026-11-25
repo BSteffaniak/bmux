@@ -21,26 +21,13 @@ pub fn current_stream_provenance(
             bmux_ipc::StreamProvenance::Local => StreamProvenance::Local,
             bmux_ipc::StreamProvenance::Admitted {
                 subject_id,
-                lease_id,
+                connection_id,
             } => StreamProvenance::Admitted {
                 subject_id,
-                lease_id,
+                connection_id,
             },
             bmux_ipc::StreamProvenance::Invalid => StreamProvenance::Invalid,
         }),
-        _ => Err(IdentityError::UnsupportedContext),
-    }
-}
-
-/// Query live backend instance through the authenticated host bridge.
-pub fn stream_admission_backend(
-    caller: &impl bmux_plugin::ServiceCaller,
-) -> Result<Option<Uuid>, IdentityError> {
-    match caller
-        .execute_kernel_request(bmux_ipc::Request::StreamAdmissionBackend)
-        .map_err(|_| IdentityError::UnsupportedContext)?
-    {
-        bmux_ipc::ResponsePayload::StreamAdmissionBackend { authority_id } => Ok(authority_id),
         _ => Err(IdentityError::UnsupportedContext),
     }
 }
@@ -61,13 +48,6 @@ impl CallerIdentity {
 }
 
 impl ClientsIdentityService for CallerIdentity {
-    fn stream_admission_backend<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Uuid>, IdentityError>> + Send + 'a>,
-    > {
-        Box::pin(async { Err(IdentityError::UnsupportedContext) })
-    }
     fn current_stream_provenance<'a>(
         &'a self,
     ) -> std::pin::Pin<
@@ -336,17 +316,17 @@ mod tests {
     #[test]
     fn provenance_facade_preserves_all_origins_and_denies_missing_bridge() {
         let subject_id = Uuid::from_u128(1);
-        let lease_id = Uuid::from_u128(2);
+        let connection_id = Uuid::from_u128(2);
         for (wire, expected) in [
             (bmux_ipc::StreamProvenance::Local, StreamProvenance::Local),
             (
                 bmux_ipc::StreamProvenance::Admitted {
                     subject_id,
-                    lease_id,
+                    connection_id,
                 },
                 StreamProvenance::Admitted {
                     subject_id,
-                    lease_id,
+                    connection_id,
                 },
             ),
             (

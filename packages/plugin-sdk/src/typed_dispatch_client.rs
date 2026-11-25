@@ -152,6 +152,9 @@ pub trait TypedServiceEndpoint {
             // Endpoint descriptors address one caller-side operation; the
             // provider's reentrant set travels in its generated declaration.
             reentrant_operations: &[],
+            // Access classes likewise travel in the provider's declaration.
+            access: None,
+            operation_access: &[],
         }
     }
 }

@@ -18,7 +18,6 @@ path = "src/main.rs"
 bmux_bench                  = { workspace = true }
 bmux_bench_cli              = { workspace = true, optional = true }
 bmux_connections_admin      = { workspace = true, optional = true }
-bmux_connections_plugin_api = { workspace = true }
 bmux_frontend_runtime       = { workspace = true }
 bmux_plugin_runtime         = { workspace = true }
 # Internal bmux packages
@@ -53,7 +52,6 @@ bmux_recording_bootstrap = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
-bmux_remote_ssh = { workspace = true }
 bmux_scene_protocol = { workspace = true }
 bmux_server = { workspace = true }
 bmux_session_models = { workspace = true, features = ["serde"] }
@@ -135,19 +133,12 @@ clap = { workspace = true, features = [
     "usage",
 ] }
 futures-util = { workspace = true }
-git_sshripped_ssh_agent = { workspace = true }
-iroh = { workspace = true, optional = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [
     "tui",
     "persistence-json",
 ] }
-rcgen = { workspace = true }
 regex = { workspace = true }
-reqwest = { workspace = true }
-rustls = { workspace = true }
-rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -164,7 +155,6 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
-tokio-rustls = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["attributes", "std"] }
@@ -273,7 +263,6 @@ fail-on-warnings = [
     "bmux_playbook?/fail-on-warnings",
     "bmux_recording_plugin?/fail-on-warnings",
     "bmux_recording_bootstrap/fail-on-warnings",
-    "bmux_remote_ssh/fail-on-warnings",
     "bmux_connections_admin?/fail-on-warnings",
     "bmux_recording_plugin_api/fail-on-warnings",
     "bmux_recording_protocol/fail-on-warnings",
@@ -344,13 +333,11 @@ bundled-plugin-cli = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]
 bundled-plugin-cluster = [
-    "remote-iroh",
     "dep:bmux_cluster_plugin",
     "dep:bmux_cluster_plugin_client",
 ]
 bundled-plugin-command-palette = ["dep:bmux_command_palette_plugin"]
 bundled-plugin-connections = [
-    "remote-iroh",
     "dep:bmux_connections_plugin",
     "dep:bmux_connections_admin",
 ]
@@ -385,7 +372,6 @@ bundled-plugin-theme = ["dep:bmux_theme_plugin"]
 bundled-plugin-windows    = ["dep:bmux_tabs_plugin", "bundled-plugin-workspaces"]
 bundled-plugin-workspaces = ["dep:bmux_workspaces_plugin"]
 bundled-visual-adapters   = ["dep:bmux_visual_adapters_plugin_renderer"]
-remote-iroh               = ["dep:iroh"]
 
 # Optional features
 bundled-fonts = ["bmux_recording_plugin?/bundled-fonts"]
@@ -440,8 +426,12 @@ image-sixel = [
 [dev-dependencies]
 bmux_cluster_plugin_api    = { workspace = true }
 bmux_plugin_schema         = { workspace = true }
+# Remote-access acceptance tests drive real terminals and run a loopback relay.
+bmux_pty                   = { workspace = true, features = ["native"] }
 bmux_workspaces_plugin_api = { workspace = true }
 gif                        = { workspace = true }
+iroh                       = { workspace = true }
+iroh-relay                 = { workspace = true, features = ["server"] }
 serde_json                 = { workspace = true }
 serial_test                = { workspace = true }
 tempfile                   = { workspace = true }

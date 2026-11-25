@@ -90,6 +90,7 @@ forward_to_streaming_clients = false
 kind                         = "bmux.tabs/personal-view"
 
 [[commands]]
+access        = "observe"
 expose_in_cli = true
 name          = "explain-spawn-directory"
 path          = ["explain-spawn-directory"]
@@ -120,6 +121,7 @@ name       = "cwd"
 value_name = "ABSOLUTE_DIRECTORY"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "new"]]
 expose_in_cli = true
 name          = "new-tab"
@@ -159,6 +161,7 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
+access        = "manage"
 aliases       = [["tab", "rename"]]
 execution     = "caller_process"
 expose_in_cli = true
@@ -174,6 +177,7 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
+access        = "manage"
 execution     = "caller_process"
 expose_in_cli = true
 name          = "rename-tab-by-id"
@@ -194,6 +198,7 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
+access        = "observe"
 aliases       = [["tab", "list"]]
 expose_in_cli = true
 name          = "list-tabs"
@@ -214,6 +219,7 @@ name  = "json"
 short = "j"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "kill"]]
 expose_in_cli = true
 name          = "kill-tab"
@@ -240,6 +246,7 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "kill-all"]]
 expose_in_cli = true
 name          = "kill-all-tabs"
@@ -259,6 +266,7 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "switch"]]
 expose_in_cli = true
 name          = "switch-tab"
@@ -280,6 +288,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "move"]]
 expose_in_cli = true
 name          = "move-tab"
@@ -309,6 +318,7 @@ value_name = "PLACEMENT"
 values     = ["before", "after"]
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 aliases        = [["tab", "next"]]
 expose_in_cli  = true
@@ -317,6 +327,7 @@ path           = ["next-tab"]
 summary        = "Switch to the next workspace tab"
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 aliases        = [["tab", "prev"]]
 expose_in_cli  = true
@@ -325,6 +336,7 @@ path           = ["prev-tab"]
 summary        = "Switch to the previous workspace tab"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "last"]]
 expose_in_cli = true
 name          = "last-tab"
@@ -332,6 +344,7 @@ path          = ["last-tab"]
 summary       = "Switch to the previously active workspace tab"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "goto"]]
 expose_in_cli = true
 name          = "goto-tab"
@@ -346,6 +359,7 @@ required   = true
 value_name = "INDEX"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "close-current"]]
 expose_in_cli = true
 name          = "close-current-tab"
@@ -353,6 +367,7 @@ path          = ["close-current-tab"]
 summary       = "Close the current workspace tab"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "remove-from-view"]]
 expose_in_cli = true
 name          = "remove-from-view"
@@ -360,6 +375,7 @@ path          = ["remove-from-view"]
 summary       = "Remove the current tab from this attachment's tab view (it keeps running)"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "undo-remove"]]
 expose_in_cli = true
 name          = "undo-remove-from-view"
@@ -367,6 +383,7 @@ path          = ["undo-remove-from-view"]
 summary       = "Put the tab this attachment last removed from its view back, if it still exists"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "open"]]
 expose_in_cli = true
 name          = "open-tab"
@@ -381,6 +398,7 @@ required   = true
 value_name = "TAB_ID"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "add-to-view"]]
 expose_in_cli = true
 name          = "add-tab-to-view"
@@ -395,6 +413,7 @@ required   = true
 value_name = "TAB_ID"
 
 [[commands]]
+access        = "observe"
 aliases       = [["tab", "view", "list"]]
 expose_in_cli = true
 name          = "list-views"
@@ -402,6 +421,7 @@ path          = ["list-views"]
 summary       = "List your tab views (the default and this attachment's are marked)"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "view", "create"]]
 expose_in_cli = true
 name          = "create-view"
@@ -422,6 +442,7 @@ name    = "copy"
 summary = "Start from a copy of this attachment's view (its tabs, order and labels) instead of empty"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "view", "switch"]]
 expose_in_cli = true
 name          = "switch-view"
@@ -437,6 +458,7 @@ summary    = "View name or id"
 value_name = "VIEW"
 
 [[commands]]
+access        = "manage"
 aliases       = [["tab", "view", "rename"]]
 expose_in_cli = true
 name          = "rename-view"
@@ -458,6 +480,7 @@ summary    = "View name or id (default: this attachment's view)"
 value_name = "VIEW"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "view", "delete"]]
 expose_in_cli = true
 name          = "delete-view"
@@ -472,6 +495,7 @@ summary    = "View name or id (default: this attachment's view)"
 value_name = "VIEW"
 
 [[commands]]
+access        = "input"
 aliases       = [["tab", "view", "set-default"]]
 expose_in_cli = true
 name          = "set-default-view"
@@ -486,6 +510,7 @@ summary    = "View name or id (default: this attachment's view)"
 value_name = "VIEW"
 
 [[commands]]
+access        = "manage"
 aliases       = [["tab", "label"]]
 expose_in_cli = true
 name          = "set-tab-label"
@@ -507,6 +532,7 @@ summary    = "Tab id (default: the current tab)"
 value_name = "TAB_ID"
 
 [[commands]]
+access        = "manage"
 aliases       = [["tab", "clear-label"]]
 expose_in_cli = true
 name          = "clear-tab-label"
@@ -521,6 +547,7 @@ summary    = "Tab id (default: the current tab)"
 value_name = "TAB_ID"
 
 [[commands]]
+access        = "manage"
 aliases       = [["tab", "reset-order"]]
 expose_in_cli = true
 name          = "reset-order"
@@ -536,6 +563,7 @@ summary       = "Reset the persisted tab order and rebuild deterministically fro
 # domain-specific variants.
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 expose_in_cli  = true
 name           = "focus-pane-in-direction"
@@ -558,6 +586,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "split-pane"
 path          = ["split-pane"]
@@ -591,6 +620,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 expose_in_cli  = true
 name           = "resize-pane"
@@ -612,6 +642,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "zoom-pane"
 path          = ["zoom-pane"]
@@ -625,6 +656,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "observe"
 expose_in_cli = true
 name          = "list-floating-panes"
 path          = ["list-floating-panes"]
@@ -638,6 +670,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "create-floating-pane"
 path          = ["create-floating-pane"]
@@ -692,6 +725,7 @@ name       = "h"
 value_name = "HEIGHT"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "focus-floating-pane"
 path          = ["focus-floating-pane"]
@@ -705,6 +739,7 @@ required   = true
 value_name = "PANE_ID"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "raise-floating-pane"
 path          = ["raise-floating-pane"]
@@ -718,6 +753,7 @@ required   = true
 value_name = "PANE_ID"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "lower-floating-pane"
 path          = ["lower-floating-pane"]
@@ -731,30 +767,35 @@ required   = true
 value_name = "PANE_ID"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "focus-next-floating-pane"
 path          = ["focus-next-floating-pane"]
 summary       = "Focus the next visible floating pane"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "raise-active-floating-pane"
 path          = ["raise-active-floating-pane"]
 summary       = "Raise the active floating pane"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "lower-active-floating-pane"
 path          = ["lower-active-floating-pane"]
 summary       = "Lower the active floating pane"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "close-active-floating-pane"
 path          = ["close-active-floating-pane"]
 summary       = "Close the active floating pane"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "move-floating-pane"
 path          = ["move-floating-pane"]
@@ -782,6 +823,7 @@ required   = true
 value_name = "Y"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "resize-floating-pane"
 path          = ["resize-floating-pane"]
@@ -809,6 +851,7 @@ required   = true
 value_name = "HEIGHT"
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 expose_in_cli  = true
 name           = "move-active-floating-pane"
@@ -830,6 +873,7 @@ name       = "cells"
 value_name = "CELLS"
 
 [[commands]]
+access        = "input"
 accepts_repeat = true
 expose_in_cli  = true
 name           = "resize-active-floating-pane"
@@ -850,6 +894,7 @@ name       = "cells"
 value_name = "CELLS"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "set-floating-pane-z"
 path          = ["set-floating-pane-z"]
@@ -870,6 +915,7 @@ required   = true
 value_name = "Z"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "set-floating-pane-layer"
 path          = ["set-floating-pane-layer"]
@@ -890,6 +936,7 @@ required   = true
 value_name = "LAYER"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "close-floating-pane"
 path          = ["close-floating-pane"]
@@ -903,6 +950,7 @@ required   = true
 value_name = "PANE_ID"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "close-active-pane"
 path          = ["close-active-pane"]
@@ -916,6 +964,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "restart-pane"
 path          = ["restart-pane"]

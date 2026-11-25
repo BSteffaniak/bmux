@@ -102,9 +102,10 @@ headless agent interaction, and explicit recovery.
 - [Shared Rust/WASM browser rendering](docs/browser-rendering.md) (local read-only view)
 - [Operations](docs/operations.md) and [testing](TESTING.md)
 
-Remote gateways and login startup are opt-in operations. Review their network
-exposure and supervision behavior before enabling them. Do not copy gateway
-examples into an internet-facing deployment without appropriate access controls.
+Remote access and login startup are opt-in operations. Review their network
+exposure and supervision behavior before enabling them. Remote access is off
+until `bmux remote enable`, and only devices you approve while pairing can
+connect; see [Remote access and pairing](docs/remote-pairing.md).
 
 ## Development
 

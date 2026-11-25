@@ -176,6 +176,15 @@
               fi
             done
             export PATH="${rustToolchain}/bin:$PATH"
+            # Cargo runs `cargo <tool>` from $CARGO_HOME/bin BEFORE PATH unless PATH names
+            # that directory. Name it last, so this shell's cargo-deny, nextest and machete
+            # win over older `cargo install`ed copies (an old cargo-deny cannot parse the
+            # current advisory database).
+            cargo_home_bin="''${CARGO_HOME:-$HOME/.cargo}/bin"
+            case ":$PATH:" in
+              *":$cargo_home_bin:"*) ;;
+              *) export PATH="$PATH:$cargo_home_bin" ;;
+            esac
             export RUSTC="${rustToolchain}/bin/rustc"
             export RUSTDOC="${rustToolchain}/bin/rustdoc"
             export BMUX_NIX_TOOLCHAIN="${rustToolchain}"

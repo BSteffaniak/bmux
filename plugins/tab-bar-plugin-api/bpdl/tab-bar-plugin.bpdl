@@ -23,6 +23,7 @@ capability NOTIFY = bmux.tab_bar.notify;
 
 @capability(INPUT)
 @interface-version(2)
+@access(input)
 interface presentation-actions {
     command move-selection(action: string, tabs: list<uuid>, workspace: uuid) -> unit;
     command list-destinations() -> list<workspaces.workspace-summary>;
@@ -66,6 +67,7 @@ interface status-items-list {
 }
 
 @capability(STATUS_WRITE)
+@access(input)
 interface status-items {
     variant status-item-error {
         invalid-argument { reason: string },
@@ -90,6 +92,7 @@ interface status-items {
 }
 
 @capability(STATUS_READ)
+@access(observe)
 interface status-items-state {
     // List contributed items, optionally only those of one owner plugin.
     query list-status-items(owner: string?) -> list<status-items-list.status-item>;
@@ -120,6 +123,7 @@ interface notifications-list {
 }
 
 @capability(NOTIFY)
+@access(input)
 interface notifications {
     variant notification-error {
         invalid-argument { reason: string },

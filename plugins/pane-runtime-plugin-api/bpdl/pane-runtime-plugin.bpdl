@@ -35,11 +35,12 @@ capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
 capability PANE_RUNTIME_OUTPUT_FILTERS_V1 = bmux.pane_runtime.output_filters.v1;
 
 @capability(PANE_RUNTIME_ENVIRONMENT_V1)
+@access(input)
 interface pane-runtime-environment-v1 {
     // Absent encoding is legacy unix-bytes; new callers identify the native format.
     // Cross-platform representations are rejected, never lossily reinterpreted.
     record environment-entry { key: bytes, value: bytes, encoding: string? }
-    command capabilities() -> u32;
+    @access(observe) command capabilities() -> u32;
     command reserve(launch_mutation_id: uuid, options: pane-runtime-execution-v4.terminal-program-options,
         environment: list<environment-entry>) -> result<pane-runtime-execution-v4.terminal-launch-reservation, pane-runtime-execution-v4.terminal-recovery-error>;
 }
@@ -50,6 +51,7 @@ interface pane-runtime-environment-v1 {
 // services reject nonempty pointer recovery state; their meaning is unchanged.
 // Read operations use command dispatch, like the existing presentation services.
 @capability(PANE_RUNTIME_POINTER_GRID_V1)
+@access(observe)
 interface pane-runtime-pointer-grid-v2 {
     record grid-capabilities { format_versions: list<u32> }
     command capabilities() -> grid-capabilities;
@@ -73,6 +75,7 @@ interface pane-runtime-pointer-grid-v2 {
 
 // Projection may lead persistence. These receipts are never durable v4 receipts.
 @capability(PANE_RUNTIME_LIVE_PRESENTATION_V1)
+@access(observe)
 interface pane-runtime-live-presentation-v1 {
     record live-capabilities {
         schema_version: u32,
@@ -112,6 +115,7 @@ interface pane-runtime-live-presentation-v1 {
 // Volatile HUMAN delivery is explicitly distinct from durable v4 mutations.
 
 @capability(PANE_RUNTIME_HUMAN_INPUT_V1)
+@access(input)
 interface pane-runtime-human-input-v1 {
     record human-input-capabilities {
         protocol_version: u32,
@@ -138,7 +142,7 @@ interface pane-runtime-human-input-v1 {
         sequence { reason: string },
         uncertain { reason: string },
     }
-    command capabilities() -> human-input-capabilities;
+    @access(observe) command capabilities() -> human-input-capabilities;
     command open(execution: pane-runtime-execution-v4.terminal-execution-ref) -> result<human-input-stream, human-input-error>;
     command push(stream: human-input-stream, sequence: u64, data: bytes) -> result<human-input-ack, human-input-error>;
     command close(stream: human-input-stream) -> result<unit, human-input-error>;
@@ -147,6 +151,7 @@ interface pane-runtime-human-input-v1 {
 // Exact execution controls. A replacement never inherits the old token.
 // Cohesive execution contract. Earlier execution identities are unsupported.
 @capability(PANE_RUNTIME_EXECUTION_V4)
+@access(input)
 interface pane-runtime-execution-v4 {
     record terminal-program-options {
         program: string,
@@ -203,12 +208,12 @@ interface pane-runtime-execution-v4 {
     // Detached holders are not individually killed, but late terminal I/O may fail.
     command new-program-session(name: string?, options: terminal-program-options)
         -> result<terminal-execution-ref, terminal-execution-error>;
-    command status(execution: terminal-execution-ref) -> result<terminal-execution-status, terminal-execution-error>;
-    command screen(execution: terminal-execution-ref) -> result<terminal-execution-screen, terminal-execution-error>;
+    @access(observe) command status(execution: terminal-execution-ref) -> result<terminal-execution-status, terminal-execution-error>;
+    @access(observe) command screen(execution: terminal-execution-ref) -> result<terminal-execution-screen, terminal-execution-error>;
     command send(execution: terminal-execution-ref, data: bytes) -> result<unit, terminal-execution-error>;
     command resize(execution: terminal-execution-ref, cols: u16, rows: u16) -> result<unit, terminal-execution-error>;
     command terminate(execution: terminal-execution-ref, grace_ms: u32) -> result<terminal-execution-status, terminal-execution-error>;
-    command wait(execution: terminal-execution-ref, timeout_ms: u32) -> result<terminal-execution-status, terminal-execution-error>;
+    @access(observe) command wait(execution: terminal-execution-ref, timeout_ms: u32) -> result<terminal-execution-status, terminal-execution-error>;
     record terminal-capture-cursor {
         execution: terminal-execution-ref,
         spool_generation: uuid,
@@ -307,9 +312,9 @@ interface pane-runtime-execution-v4 {
     command reconcile(execution: terminal-execution-ref) -> result<terminal-reconciliation, terminal-recovery-error>;
     command send-admitted(execution: terminal-execution-ref, input_mutation_id: uuid, data: bytes)
         -> result<terminal-input-receipt, terminal-recovery-error>;
-    command input-receipt(execution: terminal-execution-ref, input_mutation_id: uuid)
+    @access(observe) command input-receipt(execution: terminal-execution-ref, input_mutation_id: uuid)
         -> result<terminal-input-receipt, terminal-recovery-error>;
-    command resolve(execution: terminal-execution-ref, resolution_mutation_id: uuid,
+    @access(observe) command resolve(execution: terminal-execution-ref, resolution_mutation_id: uuid,
         expected_revision: u64, action: terminal-resolution-action, input_mutation_id: uuid?, grace_ms: u32)
         -> result<terminal-resolution-receipt, terminal-recovery-error>;
     command capture-resume(cursor: terminal-capture-cursor, max_bytes: u32)
@@ -325,6 +330,7 @@ interface pane-runtime-execution-v4 {
 // at most 1000ms, and encoded responses are at most 4MiB. Cancellation never
 // advances server state; retrying the same token observes the latest state.
 @capability(PANE_RUNTIME_PRESENTATION_WAIT_V1)
+@access(observe)
 interface pane-runtime-presentation-wait-v1 {
     record wait-capabilities {
         schema_version: u32,
@@ -348,6 +354,7 @@ interface pane-runtime-presentation-wait-v1 {
 }
 
 @capability(PANE_RUNTIME_PRESENTATION_V1)
+@access(observe)
 interface pane-runtime-presentation-v1 {
     record presentation-capabilities {
         schema_version: u32,
@@ -374,7 +381,7 @@ interface pane-runtime-presentation-v1 {
         data: bytes,
         eof: bool,
     }
-    command resize(execution: pane-runtime-execution-v4.terminal-execution-ref,
+    @access(input) command resize(execution: pane-runtime-execution-v4.terminal-execution-ref,
         format: terminal-capture-format, cols: u16, rows: u16)
         -> result<unit, pane-runtime-execution-v4.terminal-execution-error>;
     command capture-events(execution: pane-runtime-execution-v4.terminal-execution-ref,
@@ -388,6 +395,7 @@ interface pane-runtime-presentation-v1 {
 // native last-writer policy, conditional on the exact observed source revision.
 // Normal-screen reflow is local and MUST NOT invoke this service.
 @capability(PANE_RUNTIME_VIEW_SIZE_V1)
+@access(input)
 interface pane-runtime-view-size-v1 {
     // Revision is GridSnapshot.revision from execution's encoded_grid, not a
     // presentation revision. It is checked with mode under the geometry lock,
@@ -407,6 +415,7 @@ interface pane-runtime-view-size-v1 {
 }
 
 @capability(PANE_RUNTIME_SPAWN_V1)
+@access(observe)
 interface pane-runtime-spawn-v1 {
     // An execution-host identity, not a client-side filesystem path.
     // The execution token changes on restart even when pane_id is retained.
@@ -467,6 +476,7 @@ interface pane-runtime-spawn-v1 {
 }
 
 @capability(PANE_RUNTIME_SPAWN_V1)
+@access(input)
 interface pane-runtime-spawn-commands-v1 {
     command new-session(
         name: string?,
@@ -485,6 +495,7 @@ interface pane-runtime-spawn-commands-v1 {
 
 // Reconciliation is owned by the execution plugin, not the generic host.
 @capability(PANE_RUNTIME_WRITE)
+@access(owner-local)
 interface pane-runtime-readiness-v1 {
     // Captured at activation, not inferred from files under a running process.
     record runtime-readiness {
@@ -533,6 +544,7 @@ interface pane-runtime-readiness-v1 {
 }
 
 @capability(PANE_RUNTIME_READ)
+@access(observe)
 interface pane-runtime-state {
 
     record pane-summary {
@@ -712,6 +724,7 @@ interface pane-runtime-state {
 }
 
 @capability(PANE_RUNTIME_WRITE)
+@access(input)
 interface pane-runtime-commands {
     // Shared acknowledgement carrying the target pane + session id
     // after a mutating command completes. All mutation commands return
@@ -800,7 +813,7 @@ interface pane-runtime-commands {
 
     // Install a new global padding default live, keeping configured rules.
     // Callers persist the matching configuration themselves.
-    command set-global-pane-padding(
+    @access(manage) command set-global-pane-padding(
         padding: pane-runtime-state.pane-padding-spec,
     ) -> result<unit, pane-command-error>;
 
@@ -984,7 +997,7 @@ interface pane-runtime-commands {
     // Update the cached write decision for an already-attached client.
     // The permissions plugin calls this when a role changes so pane input
     // stays hot-path local without becoming stale.
-    command set-client-write-permission(
+    @access(owner-local) command set-client-write-permission(
         session_id: uuid,
         client_id: uuid,
         allowed: bool,
@@ -1016,6 +1029,7 @@ interface pane-runtime-commands {
 }
 
 @capability(ATTACH_RUNTIME_WRITE)
+@access(input)
 interface attach-runtime-commands {
     // Response from `attach-session` / `attach-context`. Carries the
     // attach grant issued by the AttachTokenManager; client re-presents
@@ -1094,20 +1108,23 @@ interface attach-runtime-commands {
     // Grant is caller/session-bound; after grant this live connection cannot
     // escalate through mutation commands, even after detach. Retired disconnected
     // transport UUIDs alone may be reclaimed; they must never be reused.
-    command observer-grant(selector: session-selector) -> result<attach-grant, attach-command-error>;
-    command observer-open(session_id: uuid, @secret attach_token: uuid) -> result<attach-ready, attach-command-error>;
+    @access(observe) command observer-grant(selector: session-selector) -> result<attach-grant, attach-command-error>;
+    @access(observe) command observer-open(session_id: uuid, @secret attach_token: uuid) -> result<attach-ready, attach-command-error>;
 
-    command attach-session(
+    // Attaching is viewing: a caller without `input` access attaches too.
+    // Whether the attachment may write is the session policy's answer
+    // (`pane.direct_input`), and input itself stays behind `input` routes.
+    @access(observe) command attach-session(
         selector: session-selector,
         can_write: bool,
     ) -> result<attach-grant, attach-command-error>;
 
-    command attach-context(
+    @access(observe) command attach-context(
         selector: context-selector,
         can_write: bool,
     ) -> result<attach-grant, attach-command-error>;
 
-    command attach-open(
+    @access(observe) command attach-open(
         session_id: uuid,
         @secret attach_token: uuid,
     ) -> result<attach-ready, attach-command-error>;
@@ -1147,18 +1164,20 @@ interface attach-runtime-commands {
         data: list<u8>,
     ) -> result<attach-input-accepted, attach-command-error>;
 
-    command attach-output(
+    @access(observe) command attach-output(
         session_id: uuid,
         max_bytes: u32,
     ) -> result<attach-output, attach-command-error>;
 
-    command observe-viewport(
+    @access(observe) command observe-viewport(
         session_id: uuid,
         cols: u16,
         rows: u16,
     ) -> result<attach-viewport-set, attach-command-error>;
 
-    command attach-set-viewport(
+    // Resizes the session for a caller the session policy lets resize
+    // (`pane.resize`); any other attached caller observes the shared geometry.
+    @access(observe) command attach-set-viewport(
         session_id: uuid,
         cols: u16,
         rows: u16,
@@ -1183,17 +1202,18 @@ interface attach-runtime-commands {
         cell_pixel_h: u16,
     ) -> result<attach-retarget-ready, attach-command-error>;
 
-    command set-client-attach-policy(
+    @access(owner-local) command set-client-attach-policy(
         allow_detach: bool,
     ) -> result<u8, attach-command-error>;
 
-    command detach() -> result<u8, attach-command-error>;
+    @access(observe) command detach() -> result<u8, attach-command-error>;
 }
 
 @capability(ATTACH_RUNTIME_READ)
 // v2: frames replaced grid deltas; frame pushes carry clipboard writes and replay markers;
 // observers follow panes with `observe-pane-frames`.
 @interface-version(2)
+@access(observe)
 interface attach-runtime-state {
     record pane-chunk {
         pane_id: uuid,
@@ -1690,6 +1710,7 @@ interface pane-runtime-focus {
 // first set and their rules in order; the first rule matching a sequence
 // decides it.
 @capability(PANE_RUNTIME_OUTPUT_FILTERS_V1)
+@access(input)
 interface pane-runtime-output-filters-v1 {
     variant output-match {
         // CSI sequences by final byte and intermediates (a private marker

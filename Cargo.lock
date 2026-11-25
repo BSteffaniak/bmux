@@ -533,7 +533,7 @@ dependencies = [
  "bcrypt-pbkdf",
  "bech32",
  "cbc",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305",
  "cipher 0.4.4",
  "cookie-factory",
  "ctr 0.9.2",
@@ -568,7 +568,7 @@ checksum = "01d4375964d1501e5f1b32aef2ead573913893ff238448d4e9fdf1522d828656"
 dependencies = [
  "base64 0.22.1",
  "bech32",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305",
  "cookie-factory",
  "hkdf 0.12.4",
  "hpke",
@@ -4719,7 +4719,6 @@ dependencies = [
  "bmux_config",
  "bmux_connections_admin",
  "bmux_connections_plugin",
- "bmux_connections_plugin_api",
  "bmux_context_state",
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
@@ -4755,12 +4754,12 @@ dependencies = [
  "bmux_presentation_scene",
  "bmux_presenter_plugin",
  "bmux_prompted_actions_plugin",
+ "bmux_pty",
  "bmux_recording_bootstrap",
  "bmux_recording_plugin",
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
- "bmux_remote_ssh",
  "bmux_scene_protocol",
  "bmux_server",
  "bmux_session_models",
@@ -4790,17 +4789,12 @@ dependencies = [
  "clap",
  "futures-util",
  "gif",
- "git_sshripped_ssh_agent",
  "iroh",
+ "iroh-relay",
  "libc",
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
- "rcgen",
  "regex",
- "reqwest 0.13.5",
- "rustls 0.23.46",
- "rustls-native-certs",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "serial_test",
@@ -4810,7 +4804,6 @@ dependencies = [
  "tempfile",
  "time 0.3.55",
  "tokio",
- "tokio-rustls 0.26.6",
  "toml 1.2.2+spec-1.1.0",
  "toml_edit 0.25.20+spec-1.1.0",
  "tracing",
@@ -5097,43 +5090,26 @@ name = "bmux_connections_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
- "bmux_attach_layout_protocol",
  "bmux_client",
- "bmux_clients_plugin_api",
  "bmux_config",
  "bmux_connections_admin",
  "bmux_connections_plugin_api",
  "bmux_ipc",
- "bmux_keyboard",
- "bmux_pane_runtime_plugin",
- "bmux_pane_runtime_plugin_api",
- "bmux_permissions_plugin",
  "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
- "bmux_remote_ssh",
- "bmux_server",
- "bmux_sessions_plugin",
- "bmux_terminal_grid",
  "clap",
- "git_sshripped_recipient",
- "git_sshripped_ssh_agent",
- "git_sshripped_ssh_identity",
+ "getrandom 0.4.3",
  "iroh",
  "libc",
  "qrcode",
- "reqwest 0.13.5",
- "rustls 0.23.46",
- "rustls-native-certs",
- "rustls-pemfile",
+ "redb",
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "switchy",
  "tempfile",
  "tokio",
- "tokio-rustls 0.26.6",
  "toml 1.2.2+spec-1.1.0",
  "tracing",
  "url 2.5.9",
@@ -5770,7 +5746,6 @@ name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_clients_plugin_api",
- "bmux_connections_plugin_api",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
@@ -5782,6 +5757,7 @@ dependencies = [
  "bmux_sessions_plugin_api",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
@@ -7274,7 +7250,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
 ]
@@ -7288,20 +7263,8 @@ dependencies = [
  "aead 0.5.2",
  "chacha20 0.9.1",
  "cipher 0.4.4",
- "poly1305 0.8.0",
+ "poly1305",
  "zeroize",
-]
-
-[[package]]
-name = "chacha20poly1305"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
-dependencies = [
- "aead 0.6.1",
- "chacha20 0.10.2",
- "cipher 0.5.2",
- "poly1305 0.9.1",
 ]
 
 [[package]]
@@ -8520,12 +8483,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "doctest-file"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
-
-[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9612,86 +9569,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git_sshripped_recipient"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73e37def9cebdf71fad1dfcd1a57e6045a564768b109d7b52a5e8f5e78a65474"
-dependencies = [
- "age",
- "anyhow",
- "base64 0.23.1",
- "git_sshripped_recipient_models",
- "profiling",
- "reqwest 0.13.5",
- "serde_json",
- "sha2 0.11.1",
- "toml 1.2.2+spec-1.1.0",
-]
-
-[[package]]
-name = "git_sshripped_recipient_models"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e0fc040a8597647d9f12c6bb38bd5d1f97682e8ccfba1b3a99a97e5f707b5b1"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "git_sshripped_ssh_agent"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e742e090a1c46757702d0271ec466b70f99c432fce21fbb09143544b46b0509e"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "chacha20poly1305 0.11.0",
- "git_sshripped_ssh_agent_models",
- "hkdf 0.13.0",
- "profiling",
- "rand 0.10.4",
- "sha2 0.11.1",
- "ssh-agent-client-rs",
- "ssh-key",
-]
-
-[[package]]
-name = "git_sshripped_ssh_agent_models"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d509c9efe954923c43219983f242441b27b403f5287fddcf3ef230023f17009"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "git_sshripped_ssh_identity"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "914a50f93a040cf5523308e71cbc20f9a140589681076f1cfb4a49303068b1e2"
-dependencies = [
- "age",
- "anyhow",
- "dirs",
- "git_sshripped_ssh_identity_models",
- "hex",
- "profiling",
- "rpassword",
- "ssh-agent-client-rs",
- "ssh-key",
- "wait-timeout",
-]
-
-[[package]]
-name = "git_sshripped_ssh_identity_models"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34620f056d78e4faa75c4a08384d4844366831d865f4bcd30472dbee5a3777fa"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "gix-actor"
 version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10256,7 +10133,7 @@ checksum = "4917627a14198c3603282c5158b815ad5534795451d3c074b53cf3cee0960b11"
 dependencies = [
  "aead 0.5.2",
  "aes-gcm",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305",
  "digest 0.10.7",
  "generic-array",
  "hkdf 0.12.4",
@@ -11366,19 +11243,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71dd52191aae121e8611f1e8dc3e324dd0dd1dee1e6dd91d10ee07a3cfb4d9d8"
 
 [[package]]
-name = "interprocess"
-version = "2.4.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f243523bf126ddfc5cddf87a8193a941bfca29476ce3c842e24c916cf5a22ec"
-dependencies = [
- "doctest-file",
- "libc",
- "recvmsg",
- "widestring",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "intl-memoizer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11565,12 +11429,20 @@ version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e136dab0f56d67ae1e8e4de75f84e271b6b2ccf0cdbed1be79936783247c1590"
 dependencies = [
+ "http-body-util",
+ "hyper 1.12.0",
+ "hyper-util",
  "iroh-metrics-derive",
  "itoa",
  "n0-error",
  "portable-atomic",
+ "reqwest 0.13.5",
+ "rustls 0.23.46",
+ "rustls-platform-verifier",
  "ryu",
  "serde",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -11595,6 +11467,8 @@ dependencies = [
  "blake3",
  "bytes 1.12.2",
  "cfg_aliases",
+ "clap",
+ "dashmap 6.2.1",
  "data-encoding",
  "derive_more 2.1.1",
  "getrandom 0.4.3",
@@ -11615,17 +11489,28 @@ dependencies = [
  "pin-project",
  "postcard",
  "rand 0.10.4",
+ "rcgen",
+ "reloadable-state",
  "reqwest 0.13.5",
  "rustls 0.23.46",
+ "rustls-cert-file-reader",
+ "rustls-cert-reloadable-resolver",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
+ "serde_json",
+ "sha1 0.11.0",
+ "simdutf8",
  "strum 0.28.0",
+ "time 0.3.55",
  "tokio",
  "tokio-rustls 0.26.6",
+ "tokio-rustls-acme",
  "tokio-util",
  "tokio-websockets",
+ "toml 1.2.2+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "url 2.5.9",
  "webpki-roots 1.0.12",
  "ws_stream_wasm",
@@ -13281,6 +13166,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "slab",
  "sorted-index-buffer",
  "thiserror 2.0.21",
@@ -14781,17 +14667,7 @@ checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
 dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
- "universal-hash 0.5.1",
-]
-
-[[package]]
-name = "poly1305"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
-dependencies = [
- "cpufeatures 0.3.1",
- "universal-hash 0.6.1",
+ "universal-hash",
 ]
 
 [[package]]
@@ -14812,7 +14688,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "opaque-debug",
- "universal-hash 0.5.1",
+ "universal-hash",
 ]
 
 [[package]]
@@ -15553,12 +15429,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "recvmsg"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
-
-[[package]]
 name = "redb"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15726,6 +15596,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38540a682c6e9bca04a8bca9e5ec5a6ba168dfbb04c9998fe517a9befb92eb68"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "reloadable-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dc20ac1418988b60072d783c9f68e28a173fb63493c127952f6face3b40c6e0"
+
+[[package]]
+name = "reloadable-state"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3853ef78d45b50f8b989896304a85239539d39b7f866a000e8846b9b72d74ce8"
+dependencies = [
+ "arc-swap",
+ "reloadable-core",
+ "tokio",
 ]
 
 [[package]]
@@ -16447,6 +16334,40 @@ dependencies = [
  "rustls-webpki 0.103.17",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-cert-file-reader"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb47c2a50fdfdaf95b0ac8b12620fc327da1fd4adbb30d0c56d866b005873ff"
+dependencies = [
+ "rustls-cert-read",
+ "rustls-pki-types",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "rustls-cert-read"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd46e8c5ae4de3345c4786a83f99ec7aff287209b9e26fa883c473aeb28f19d5"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "rustls-cert-reloadable-resolver"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1baa8a3a1f05eaa9fc55aed4342867f70e5c170ea3bfed1b38c51a4857c0c8"
+dependencies = [
+ "futures-util",
+ "reloadable-state",
+ "rustls 0.23.46",
+ "rustls-cert-read",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -17465,20 +17386,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssh-agent-client-rs"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d22c5f4ab58452cce2806ef98abec5012c078aeb07936ea13d8a39928b3af2b"
-dependencies = [
- "bytes 1.12.2",
- "interprocess",
- "signature 2.2.0",
- "ssh-encoding",
- "ssh-key",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "ssh-cipher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17506,7 +17413,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b86f5297f0f04d08cabaa0f6bff7cb6aec4d9c3b49d87990d63da9d9156a8c3"
 dependencies = [
  "ed25519-dalek 2.2.0",
- "num-bigint-dig",
  "p256",
  "p384",
  "p521",
@@ -19316,6 +19222,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls-acme"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14303ebe76ff697adc251341c800c56e7a6a15c53dcd6e45986dbc291e2ae9a4"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "futures 0.3.34",
+ "log 0.4.35",
+ "num-bigint",
+ "pem",
+ "proc-macro2",
+ "rcgen",
+ "reqwest 0.13.5",
+ "ring",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time 0.3.55",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "webpki-roots 1.0.12",
+ "x509-parser",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -20400,16 +20333,6 @@ checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
 dependencies = [
  "crypto-common 0.1.7",
  "subtle",
-]
-
-[[package]]
-name = "universal-hash"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
-dependencies = [
- "crypto-common 0.2.2",
- "ctutils",
 ]
 
 [[package]]

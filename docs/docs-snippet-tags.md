@@ -12,7 +12,7 @@ you want CI to validate examples against current APIs.
 ## Examples
 
 ```bmux-cli
-bmux remote doctor prod --fix
+bmux remote role laptop view-only
 bmux logs level --json
 ```
 

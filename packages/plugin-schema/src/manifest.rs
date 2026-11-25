@@ -11,7 +11,7 @@
 //!
 //! | Generated key            | Source                                               |
 //! |--------------------------|------------------------------------------------------|
-//! | `services`               | `provide <iface>` (capability, kind, `@reentrant` ops) and `provide opaque` |
+//! | `services`               | `provide <iface>` (capability, kind, `@reentrant` ops, `@access` classes) and `provide opaque` |
 //! | `contracts`              | every provided service: wire id, major = `@interface-version` or 1 |
 //! | `provided_capabilities`  | provided services' capabilities and `provide capability` |
 //! | `required_capabilities`  | `require <iface>` capabilities and `require capability` |
@@ -50,6 +50,10 @@ pub struct ServiceEntry {
     pub interface_id: String,
     pub kind: ServiceKind,
     pub reentrant_operations: BTreeSet<String>,
+    /// Interface-wide `@access` class.
+    pub access: Option<crate::ast::Access>,
+    /// Per-operation `@access` overrides.
+    pub operation_access: BTreeMap<String, crate::ast::Access>,
 }
 
 /// One generated `[[contracts]]` entry.
@@ -214,6 +218,17 @@ pub fn world_declarations(set: &PackageSet, package: &Package) -> Result<WorldDe
                             .reentrant_operations()
                             .map(str::to_string)
                             .collect(),
+                        access: iface.access,
+                        operation_access: iface
+                            .items
+                            .iter()
+                            .filter_map(|item| match item {
+                                crate::ir::Item::Function(function) => function
+                                    .access
+                                    .map(|access| (function.name.clone(), access)),
+                                _ => None,
+                            })
+                            .collect(),
                     },
                     iface.major(),
                 )?;
@@ -231,6 +246,8 @@ pub fn world_declarations(set: &PackageSet, package: &Package) -> Result<WorldDe
                         .map_or_else(|| name.clone(), |version| format!("{name}/v{version}")),
                     kind: *kind,
                     reentrant_operations: BTreeSet::new(),
+                    access: None,
+                    operation_access: BTreeMap::new(),
                 },
                 version.unwrap_or(1),
             )?,
@@ -349,6 +366,48 @@ fn claim_command_paths(table: &mut toml::Table, package: &Package) -> Result<(),
     Ok(())
 }
 
+/// One generated `[[services]]` table.
+fn service_table(service: &ServiceEntry) -> toml::Value {
+    let mut entry = BTreeMap::new();
+    entry.insert("capability", service.capability.clone().into());
+    entry.insert("interface_id", service.interface_id.clone().into());
+    entry.insert("kind", service.kind.as_str().into());
+    if !service.reentrant_operations.is_empty() {
+        entry.insert(
+            "reentrant_operations",
+            toml::Value::Array(
+                service
+                    .reentrant_operations
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(access) = service.access {
+        entry.insert("access", access.as_str().into());
+    }
+    if !service.operation_access.is_empty() {
+        entry.insert(
+            "operation_access",
+            toml::Value::Table(
+                service
+                    .operation_access
+                    .iter()
+                    .map(|(operation, access)| (operation.clone(), access.as_str().into()))
+                    .collect(),
+            ),
+        );
+    }
+    toml::Value::Table(
+        entry
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
 /// Merge handwritten `settings` TOML with the declarations generated from
 /// the package's world, returning the complete manifest TOML.
 ///
@@ -397,35 +456,7 @@ pub fn generate(set: &PackageSet, package: &Package, settings: &str) -> Result<S
     insert("required_capabilities", &declarations.required_capabilities);
     insert("optional_capabilities", &declarations.optional_capabilities);
     if !declarations.services.is_empty() {
-        let services = declarations
-            .services
-            .iter()
-            .map(|service| {
-                let mut entry = BTreeMap::new();
-                entry.insert("capability", service.capability.clone().into());
-                entry.insert("interface_id", service.interface_id.clone().into());
-                entry.insert("kind", service.kind.as_str().into());
-                if !service.reentrant_operations.is_empty() {
-                    entry.insert(
-                        "reentrant_operations",
-                        toml::Value::Array(
-                            service
-                                .reentrant_operations
-                                .iter()
-                                .cloned()
-                                .map(toml::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                toml::Value::Table(
-                    entry
-                        .into_iter()
-                        .map(|(key, value)| (key.to_string(), value))
-                        .collect(),
-                )
-            })
-            .collect();
+        let services = declarations.services.iter().map(service_table).collect();
         table.insert("services".into(), toml::Value::Array(services));
     }
     if !declarations.contracts.is_empty() {
@@ -477,6 +508,29 @@ mod tests {
             require capability acme.storage;
             require optional capability acme.spawn;
         }";
+
+    #[test]
+    fn services_carry_access_classes() {
+        let source = "plugin acme.files version 1;
+            capability READ = acme.files.read;
+            @capability(READ) @access(observe) interface state {
+                query get() -> u32;
+                @access(owner-local) query keys() -> u32;
+            }
+            @capability(READ) interface bare { query get() -> u32; }
+            world files { provide state; provide bare; }";
+        let manifest = generate(&PackageSet::new(), &package(source), "id = 'acme.files'\n")
+            .expect("manifest");
+        let value: toml::Table = toml::from_str(&manifest).expect("valid TOML");
+        let services = value["services"].as_array().expect("services");
+        assert_eq!(services[0]["access"].as_str(), Some("observe"));
+        assert_eq!(
+            services[0]["operation_access"]["keys"].as_str(),
+            Some("owner-local")
+        );
+        assert!(services[1].get("access").is_none());
+        assert!(services[1].get("operation_access").is_none());
+    }
 
     #[test]
     fn generates_every_contract_key_from_the_world() {

@@ -740,10 +740,10 @@ fn validate_plugin_owns_path(
 #[cfg(test)]
 mod tests {
     use super::{PluginCommandRegistry, selected_subcommand_path, validate_argument_metadata};
-    use bmux_plugin_sdk::{PluginCommand, PluginCommandArgument, PluginCommandArgumentKind};
     use bmux_cli_schema::Cli;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::{PluginCommand, PluginCommandArgument, PluginCommandArgumentKind};
     use clap::{Command, CommandFactory};
     use std::path::Path;
 
@@ -1141,9 +1141,8 @@ minimum = "1.0"
         });
         validate_argument_metadata(&command).expect("one trailing positional may forward help");
         for help in ["--help", "-h"] {
-            let arguments =
-                PluginCommandRegistry::validate_arguments(&command, &[help.to_owned()])
-                    .expect("help is an argument, not a request to the CLI");
+            let arguments = PluginCommandRegistry::validate_arguments(&command, &[help.to_owned()])
+                .expect("help is an argument, not a request to the CLI");
             assert_eq!(arguments, vec![help.to_owned()]);
         }
         let mut flagged = command.clone();

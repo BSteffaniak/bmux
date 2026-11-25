@@ -108,7 +108,7 @@ pub(super) fn parse_runtime_cli(
         && matches!(
             cli.command,
             Some(
-                bmux_cli_schema::Command::Doctor { hosted: false, .. }
+                bmux_cli_schema::Command::Doctor { .. }
                     | bmux_cli_schema::Command::Config {
                         command: bmux_cli_schema::ConfigCommand::Path { .. }
                             | bmux_cli_schema::ConfigCommand::Get { .. }

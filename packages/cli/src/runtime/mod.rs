@@ -1,10 +1,8 @@
-#[cfg(feature = "bundled-plugin-connections")]
-use crate::connection::connect;
 use crate::connection::{
     ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect_raw,
-    connect_raw_with_context, connect_with_context, current_cli_build_id,
-    expand_bmux_target_if_needed, map_client_connect_error, read_server_runtime_metadata,
-    remove_server_runtime_metadata_file, write_server_runtime_metadata,
+    connect_raw_with_context, connect_with_context, current_cli_build_id, map_client_connect_error,
+    read_server_runtime_metadata, remove_server_runtime_metadata_file,
+    write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use anyhow::{Context, Result};
@@ -26,7 +24,6 @@ mod device_seal_broker;
 mod diagnostics_layer;
 mod dispatch;
 mod doctor_cli;
-mod hosted_output;
 #[cfg(feature = "bundled-plugin-connections")]
 mod kiosk_cli;
 mod logs_cli;
@@ -42,7 +39,6 @@ pub use plugin_runtime::RuntimeCommandState;
 #[cfg(feature = "docs-test")]
 pub use plugin_runtime::bundled_cli_command_for_docs;
 mod prompt;
-mod remote_cli;
 mod sandbox_cli;
 mod server_autostart;
 mod server_commands;
@@ -97,14 +93,6 @@ pub use prompt::{
     PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
     PromptValidation, PromptValue, PromptWidth,
 };
-#[cfg(feature = "bundled-plugin-connections")]
-use remote_cli::{
-    SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel, reconnect_backoff_ms,
-};
-use remote_cli::{
-    plugin_command_proxies_to_target, run_target_proxy, run_target_proxy_from_current_argv,
-    should_proxy_to_target, target_is_ssh,
-};
 use sandbox_cli::{
     BundleIncludeOptions, BundleSandboxOptions, InspectTargetOptions, RerunSandboxOptions,
     RunSandboxOptions, TriageBundleOptions, TriageSandboxOptions, run_sandbox_bundle,
@@ -113,8 +101,7 @@ use sandbox_cli::{
     run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
 };
 use server_commands::{
-    run_server_bridge, run_server_gateway, run_server_status, run_server_stop,
-    run_server_whoami_principal, server_event_name,
+    run_server_status, run_server_stop, run_server_whoami_principal, server_event_name,
 };
 use server_runtime::{
     cleanup_stale_pid_file, fetch_server_status, read_server_pid_file, remove_server_pid_file,
@@ -232,7 +219,7 @@ const fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -
     match command {
         None | Some(Command::Attach { .. }) => LogProcessScope::Client,
         Some(Command::Server {
-            command: ServerCommand::Start { .. } | ServerCommand::Gateway { .. },
+            command: ServerCommand::Start { .. },
         }) => LogProcessScope::Server,
         Some(_) => LogProcessScope::Command,
     }
@@ -333,9 +320,6 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
             );
             maybe_print_slot_startup_banner(command_enters_raw_mode(cli.command.as_ref()));
             let connection_context = ConnectionContext::new(cli.target.as_deref());
-            if should_proxy_to_target(&cli).await? {
-                return run_target_proxy_from_current_argv(&cli).await;
-            }
 
             if let Some(command) = &cli.command {
                 startup_future_marker("runtime.before_run_command", 0);
@@ -365,12 +349,6 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
                 init_logging(false, Some(log_level), enters_raw_mode, logging_scope);
             tracing::info!(plugin_id, command_name, "runtime.cli.plugin_start");
             maybe_print_slot_startup_banner(enters_raw_mode);
-            if plugin_command_proxies_to_target(&plugin_id, &command_name)
-                && target_is_ssh(target.as_deref()).await?
-            {
-                let wants_tty = plugin_id == "bmux.sessions" && command_name == "session-attach";
-                return run_target_proxy(target.as_deref(), true, wants_tty).await;
-            }
             plugin_runtime::run_plugin_command_with_target(
                 command_state.as_ref(),
                 &plugin_id,

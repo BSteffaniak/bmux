@@ -19,9 +19,8 @@ use super::{
     run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list,
     run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run,
     run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
-    run_server_bridge, run_server_gateway, run_server_start, run_server_status, run_server_stop,
-    run_server_whoami_principal, run_session_attach, run_terminal_doctor,
-    run_terminal_install_terminfo,
+    run_server_start, run_server_status, run_server_stop, run_server_whoami_principal,
+    run_session_attach, run_terminal_doctor, run_terminal_install_terminfo,
     server_autostart::{
         run_server_autostart_install, run_server_autostart_print, run_server_autostart_status,
         run_server_autostart_uninstall,
@@ -225,8 +224,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
                 ServerAutostartCommand::Status { .. } => BuiltInHandlerId::ServerAutostartStatus,
                 ServerAutostartCommand::Print { .. } => BuiltInHandlerId::ServerAutostartPrint,
             },
-            ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
-            ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
         },
         Command::Logs { command } => match command {
             LogsCommand::Path { .. } => BuiltInHandlerId::LogsPath,
@@ -440,38 +437,6 @@ pub(super) async fn dispatch_built_in_command(
             },
         ) => run_server_autostart_print(executable.as_deref(), connection_context),
         (
-            BuiltInHandlerId::ServerGateway,
-            Command::Server {
-                command:
-                    ServerCommand::Gateway {
-                        listen,
-                        host,
-                        host_mode,
-                        host_relay,
-                        quick,
-                        cert_file,
-                        key_file,
-                    },
-            },
-        ) => {
-            run_server_gateway(
-                listen,
-                *host,
-                *host_mode,
-                host_relay,
-                *quick,
-                cert_file.as_deref(),
-                key_file.as_deref(),
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::ServerBridge,
-            Command::Server {
-                command: ServerCommand::Bridge { stdio, preflight },
-            },
-        ) => run_server_bridge(*stdio, *preflight).await,
-        (
             BuiltInHandlerId::LogsPath,
             Command::Logs {
                 command: LogsCommand::Path { json },
@@ -593,9 +558,7 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_config_profiles_evaluate(*json),
-        (BuiltInHandlerId::Doctor, Command::Doctor { json, hosted }) => {
-            run_doctor(*json, *hosted).await
-        }
+        (BuiltInHandlerId::Doctor, Command::Doctor { json }) => run_doctor(*json).await,
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {

@@ -25,7 +25,7 @@
 use crate::{
     Error, Span,
     ast::{
-        CapabilityDecl, Contribution, DeliveryMode, Docs, EnumCase, EnumDef, EventsDecl,
+        Access, CapabilityDecl, Contribution, DeliveryMode, Docs, EnumCase, EnumDef, EventsDecl,
         ExtensionOperation, ExtensionPoint, ExtensionPointRef, Field, FlagDef, FlagsDef, Import,
         Interface, InterfaceItem, InterfaceRef, Literal, Operation, PluginCommand, PluginHeader,
         Primitive, RecordDef, ResourceDef, ResourceMethod, ResourceMethodKind, Schema,
@@ -73,6 +73,38 @@ fn parse_error(span: Span, message: impl Into<String>) -> Error {
 }
 
 impl Annotation {
+    /// `@access(observe|input|manage|owner-local)`.
+    fn access_arg(&self) -> Result<Access, Error> {
+        match &self.arg {
+            Some(AnnotationArg::Name(value)) => Access::parse(value).ok_or_else(|| {
+                parse_error(
+                    self.span,
+                    format!(
+                        "unknown access class `{value}` in `@access(...)`; expected `observe`, `input`, `manage`, or `owner-local`"
+                    ),
+                )
+            }),
+            _ => Err(parse_error(
+                self.span,
+                "expected access class in `@access(observe|input|manage|owner-local)`",
+            )),
+        }
+    }
+
+    /// The single `@access` among `annotations`, if any.
+    fn single_access(annotations: &[Self]) -> Result<Option<Access>, Error> {
+        let mut access = None;
+        for annotation in annotations.iter().filter(|a| a.name == "access") {
+            if access.replace(annotation.access_arg()?).is_some() {
+                return Err(parse_error(
+                    annotation.span,
+                    "duplicate `@access` annotation",
+                ));
+            }
+        }
+        Ok(access)
+    }
+
     fn int_arg(&self) -> Result<u32, Error> {
         match &self.arg {
             Some(AnnotationArg::Int(value)) => u32::try_from(*value).map_err(|_| {
@@ -268,7 +300,8 @@ impl Parser<'_> {
         let mut capability = None;
         let mut interface_version = None;
         let mut major = None;
-        for annotation in &annotations {
+        let access = Annotation::single_access(&annotations)?;
+        for annotation in annotations.iter().filter(|a| a.name != "access") {
             match annotation.name.as_str() {
                 "capability" => {
                     let value = match &annotation.arg {
@@ -331,7 +364,7 @@ impl Parser<'_> {
                     return Err(parse_error(
                         annotation.span,
                         format!(
-                            "unknown interface annotation `@{other}`; expected `@capability(NAME)`, `@interface-version(N)`, `@major(N)`, `@since(N)`, `@unstable(feature)`, or `@deprecated(N)`"
+                            "unknown interface annotation `@{other}`; expected `@capability(NAME)`, `@access(CLASS)`, `@interface-version(N)`, `@major(N)`, `@since(N)`, `@unstable(feature)`, or `@deprecated(N)`"
                         ),
                     ));
                 }
@@ -359,6 +392,7 @@ impl Parser<'_> {
             interface_version,
             major,
             capability,
+            access,
             items,
             span,
         })
@@ -376,6 +410,7 @@ impl Parser<'_> {
             parse_error(Span::new(0, 0), "unexpected end of input inside interface")
         })?;
         let reentrant = annotations.iter().filter(|a| a.name == "reentrant").count();
+        let access = Annotation::single_access(&annotations)?;
         let state = annotations.iter().any(|a| a.name == "state");
         if reentrant > 1 {
             return Err(parse_error(
@@ -430,8 +465,9 @@ impl Parser<'_> {
                 ))
             }
             TokenKind::Query => {
-                item_annotations(&["reentrant"], "a query")?;
+                item_annotations(&["reentrant", "access"], "a query")?;
                 let mut operation = self.parse_operation(OpKind::Query, docs, stability)?;
+                operation.access = access;
                 if reentrant == 1 {
                     if operation.emits.is_some() {
                         return Err(parse_error(
@@ -447,12 +483,10 @@ impl Parser<'_> {
                 Ok(InterfaceItem::Query(operation))
             }
             TokenKind::Command => {
-                item_annotations(&[], "a command")?;
-                Ok(InterfaceItem::Command(self.parse_operation(
-                    OpKind::Command,
-                    docs,
-                    stability,
-                )?))
+                item_annotations(&["access"], "a command")?;
+                let mut operation = self.parse_operation(OpKind::Command, docs, stability)?;
+                operation.access = access;
+                Ok(InterfaceItem::Command(operation))
             }
             TokenKind::Events => {
                 for annotation in &annotations {
@@ -726,6 +760,7 @@ impl Parser<'_> {
             returns,
             emits,
             reentrant: false,
+            access: None,
             span,
         })
     }
@@ -1757,6 +1792,65 @@ mod tests {
             "plugin p version 1; interface i { @reentrant @reentrant query get() -> u32; }",
         );
         assert!(doubled.contains("directly precede"), "got: {doubled}");
+    }
+
+    #[test]
+    fn parses_interface_access_and_operation_overrides() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             @access(observe) @capability(READ)\n\
+             interface i {\n\
+               query get() -> u32;\n\
+               @access(owner-local) query secret() -> u32;\n\
+               @reentrant @access(input) query poke() -> u32;\n\
+             }\n\
+             @capability(WRITE) interface c { @access(manage) command set(n: u32) -> unit; }",
+        );
+        let iface = &schema.interfaces[0];
+        assert_eq!(iface.access, Some(Access::Observe));
+        let access = |index: usize| match &iface.items[index] {
+            InterfaceItem::Query(op) => op.access,
+            other => panic!("expected query, got {other:?}"),
+        };
+        assert_eq!(access(0), None);
+        assert_eq!(access(1), Some(Access::OwnerLocal));
+        assert_eq!(access(2), Some(Access::Input));
+        assert_eq!(schema.interfaces[1].access, None);
+        let InterfaceItem::Command(set) = &schema.interfaces[1].items[0] else {
+            panic!("expected command");
+        };
+        assert_eq!(set.access, Some(Access::Manage));
+    }
+
+    #[test]
+    fn rejects_bad_access_annotations() {
+        let unknown =
+            parse_error("plugin p version 1; @access(admin) interface i { query get() -> u32; }");
+        assert!(
+            unknown.contains("unknown access class `admin`"),
+            "got: {unknown}"
+        );
+        let missing =
+            parse_error("plugin p version 1; @access interface i { query get() -> u32; }");
+        assert!(missing.contains("expected access class"), "got: {missing}");
+        let doubled = parse_error(
+            "plugin p version 1; interface i { @access(input) @access(observe) query get() -> u32; }",
+        );
+        assert!(doubled.contains("duplicate `@access`"), "got: {doubled}");
+        let doubled_iface = parse_error(
+            "plugin p version 1; @access(input) @access(observe) interface i { query get() -> u32; }",
+        );
+        assert!(
+            doubled_iface.contains("duplicate `@access`"),
+            "got: {doubled_iface}"
+        );
+        let on_events = parse_error(
+            "plugin p version 1; interface i { record e { n: u32 } @access(observe) events e; }",
+        );
+        assert!(on_events.contains("@access"), "got: {on_events}");
+        let on_record =
+            parse_error("plugin p version 1; interface i { @access(observe) record e { n: u32 } }");
+        assert!(on_record.contains("@access"), "got: {on_record}");
     }
 
     #[test]

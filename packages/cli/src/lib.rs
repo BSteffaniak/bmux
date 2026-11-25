@@ -13,7 +13,6 @@ pub mod runtime_owner;
 #[cfg(feature = "docs-test")]
 pub use runtime::bundled_cli_command_for_docs;
 pub(crate) mod sandbox_meta;
-mod ssh_access;
 
 pub mod application_execution;
 pub mod attach;
@@ -22,11 +21,6 @@ pub mod input;
 /// Playbook system for headless scripted bmux execution.
 #[cfg(feature = "bundled-plugin-playbook")]
 pub mod playbook;
-
-pub(crate) fn reqwest_client() -> reqwest::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::new()
-}
 
 /// Run with the actual selected primary runtime owner. The caller must keep its
 /// driver alive and join it outside asynchronous execution after this returns.

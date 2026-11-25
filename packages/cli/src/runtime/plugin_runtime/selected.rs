@@ -782,20 +782,6 @@ impl ProductionPlugin {
             Backend::Scoped(execution) => execution.collect_typed_services(context),
         }
     }
-    pub(in crate::runtime) fn collect_activation_contributions(
-        &self,
-    ) -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
-        match &self.backend {
-            Backend::Process(plugin) => plugin.collect_activation_contributions(),
-            Backend::Scoped(execution) => match Self::observe_sync(
-                execution,
-                execution.begin(NativeOperation::Registrations)?,
-            )? {
-                NativeOutcome::Registrations(registrations) => Ok(registrations.contributions),
-                _ => Err(failure("unexpected registration outcome")),
-            },
-        }
-    }
     pub(in crate::runtime) fn cancel_background_tasks(&self) -> bmux_plugin_sdk::Result<()> {
         match &self.backend {
             // Process plugins own no host activation tasks.

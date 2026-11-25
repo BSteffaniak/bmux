@@ -7,6 +7,7 @@ provided_features = ["bmux.workspaces"]
 version           = "0.0.1-alpha.0"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "activate-tab"
 path          = ["workspace", "activate-tab"]
@@ -24,6 +25,7 @@ forward_to_streaming_clients = true
 kind                         = "bmux.workspaces/workspaces-events"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "new-workspace"
 path          = ["workspace", "new"]
@@ -37,12 +39,14 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
+access        = "observe"
 expose_in_cli = true
 name          = "list-workspaces"
 path          = ["workspace", "list"]
 summary       = "List workspaces"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "switch-workspace"
 path          = ["workspace", "switch"]
@@ -55,6 +59,7 @@ required   = true
 value_name = "TARGET"
 
 [[commands]]
+access        = "manage"
 expose_in_cli = true
 name          = "rename-workspace"
 path          = ["workspace", "rename"]
@@ -73,6 +78,7 @@ required   = true
 value_name = "NAME"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "kill-workspace"
 path          = ["workspace", "kill"]
@@ -85,6 +91,7 @@ required   = true
 value_name = "TARGET"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "move-tab-to-workspace"
 path          = ["workspace", "move-tab"]
@@ -103,18 +110,21 @@ required   = true
 value_name = "TARGET"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "next-workspace"
 path          = ["workspace", "next"]
 summary       = "Select the next workspace"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "prev-workspace"
 path          = ["workspace", "previous"]
 summary       = "Select the previous workspace"
 
 [[commands]]
+access        = "input"
 expose_in_cli = true
 name          = "last-workspace"
 path          = ["workspace", "last"]

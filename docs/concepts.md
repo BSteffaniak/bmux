@@ -156,14 +156,14 @@ carry domain logic through plugin/service interfaces.
 
 ## Command Surfaces
 
-- **Task-first commands**: `bmux connect`, `bmux setup`, `bmux host`
+- **Task-first commands**: `bmux connect`, `bmux attach`, `bmux new-session`
 - **Grouped commands**: `bmux session ...`, `bmux server ...`, `bmux remote ...`
 - **Automation commands**: `bmux playbook ...`
 
 ## Quick Validation Examples
 
 ```bmux-cli
-bmux setup --check
+bmux doctor
 bmux server status --json
 bmux list-sessions --json
 ```

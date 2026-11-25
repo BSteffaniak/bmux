@@ -20,6 +20,7 @@ mod prompt_search;
 pub mod prompt_ui;
 pub mod provider;
 mod published_presentations;
+mod reconnect;
 pub mod render;
 mod replay_log;
 pub mod runtime;

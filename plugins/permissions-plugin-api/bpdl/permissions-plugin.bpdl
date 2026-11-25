@@ -7,6 +7,7 @@ capability PERMISSIONS_WRITE = bmux.permissions.write;
 capability SESSIONS_POLICY = bmux.sessions.policy;
 
 @capability(PERMISSIONS_READ)
+@access(observe)
 interface permissions-state {
     record permission-entry {
         client-id: string,
@@ -17,6 +18,7 @@ interface permissions-state {
 }
 
 @capability(PERMISSIONS_WRITE)
+@access(owner-local)
 interface permissions-commands {
     record command-ack {
         ok: bool,
@@ -24,14 +26,38 @@ interface permissions-commands {
 
     command grant(session: string, client-id: string, role: string) -> command-ack;
     command revoke(session: string, client-id: string) -> command-ack;
-
-    // Stable admitted subject, never a transient client ID. Absent session-id
-    // explicitly grants runtime-wide resource scope; device admission is separate.
-    command grant-resource(subject-id: uuid, session-id: uuid?, role: string) -> command-ack;
-    command revoke-resource(subject-id: uuid, session-id: uuid?) -> command-ack;
 }
 
+// Roles of remote principals (paired devices), checked for every request on
+// an admitted stream: `full` allows observe, input and manage; `view-only`
+// allows observe. Nothing allows owner-local routes remotely.
+interface remote-role-types {
+    enum remote-role {
+        full,
+        view-only,
+    }
+
+    record remote-role-ack {
+        ok: bool,
+    }
+}
+
+@capability(PERMISSIONS_WRITE)
+@access(owner-local)
+interface remote-role-commands {
+    command set-remote-role(principal-id: uuid, role: remote-role-types.remote-role) -> remote-role-types.remote-role-ack;
+    command clear-remote-role(principal-id: uuid) -> remote-role-types.remote-role-ack;
+}
+
+@capability(PERMISSIONS_READ)
+@access(owner-local)
+interface remote-role-state {
+    query remote-role(principal-id: uuid) -> remote-role-types.remote-role?;
+}
+
+// Providers serving an admitted caller ask this on that caller's stream.
 @capability(SESSIONS_POLICY)
+@access(observe)
 interface session-policy-state {
     record session-policy-check-response {
         allowed: bool,
@@ -81,6 +107,7 @@ interface session-policy-state {
 }
 
 @capability(SESSIONS_POLICY)
+@access(owner-local)
 interface session-policy-commands {
     record command-ack {
         ok: bool,
@@ -111,11 +138,12 @@ world permissions {
     provide permissions-commands;
     provide session-policy-state;
     provide session-policy-commands;
+    provide remote-role-commands;
+    provide remote-role-state;
     require capability bmux.clients.read;
     require capability bmux.commands;
     require capability bmux.contexts.read;
     require capability bmux.pane_runtime.write;
     require capability bmux.sessions.read;
     require capability bmux.storage;
-    require optional capability bmux.connections.pairing;
 }

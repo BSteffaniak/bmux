@@ -14,7 +14,7 @@ Command-line interface for bmux terminal multiplexer.
 - Client follow controls (follow/unfollow)
 - Alias-compatible command forms (top-level and grouped)
 - Runtime/terminal diagnostics (`keymap doctor`, `terminal doctor`)
-- First-class SSH targets (`connect`, `remote`, and global `--target`)
+- Remote access to paired hosts (`connect`, `remote`, and global `--target`)
 
 Default launch behavior:
 
@@ -26,9 +26,9 @@ The native autostart service runs `bmux server start` in the foreground so
 launchd, systemd, or Task Scheduler owns supervision and restart behavior; it
 deliberately does not use `--daemon`. `install` starts the service immediately
 unless `--no-start` is passed. Rerun `install` after moving or upgrading a
-non-stable executable path. If `[server.gateway]` is enabled, the gateway starts
-normally with the managed server—there is no separate gateway setting for
-autostart.
+non-stable executable path. If remote access is enabled (`bmux remote enable`),
+it starts normally with the managed server; there is no separate remote access
+setting for autostart.
 
 On Linux, autostart targets the user manager's `default.target` and therefore
 starts at login. bmux does not enable lingering; users who explicitly need
@@ -114,36 +114,60 @@ Shutdown behavior:
 - `bmux server restore --yes` replaces the current in-memory server state with the persisted snapshot.
 - `--force-local` kill bypass is allowed only when your profile principal matches the server owner principal (`bmux server whoami-principal`).
 
-## Remote Target Commands
+## Remote Access Commands
+
+Remote access is provided by the `bmux.connections` plugin. A host pairs each
+device once; the device then attaches over Iroh (QUIC) without running a server
+of its own. See [docs/remote-pairing.md](../../docs/remote-pairing.md).
 
 ```bash
-# connect directly to a target/session
-bmux connect prod app
+# host: enable remote access once, then pair a device
+bmux remote enable
+bmux remote pair                         # prints a one-time link, then approves
+bmux remote pair --role view-only --name laptop
 
-# when session is omitted:
-# - 0 sessions: error with next-step command
-# - 1 session: auto-select
-# - many sessions: interactive picker
-bmux connect prod
+# connecting device: paste the link, compare the phrase with the host
+bmux connect --pair
+bmux connect --pair --name desk --device-name work-mac
 
-# remote target utilities
+# connecting device: attach to the saved host
+bmux connect desk
+bmux connect desk app
+bmux attach --target desk app
+
+# target any normal command at a saved host
+bmux --target desk list-sessions
+
+# connecting device: saved hosts
+bmux remote hosts
+bmux remote rename desk desktop
+bmux remote forget desktop
+
+# host: devices and live connections
 bmux remote list
-bmux remote list --json
-bmux remote test prod
-bmux remote doctor prod --fix
-bmux remote init prod --ssh bmux@prod.example.com --set-default
-bmux remote install-server prod
-bmux remote upgrade prod
-bmux connect prod --reconnect-forever
-bmux remote complete targets
-bmux remote complete sessions prod
+bmux remote status
+bmux remote role laptop view-only
+bmux remote revoke laptop
+bmux remote disable
+```
 
-# streamlined aliases
-bmux setup
-bmux host
+Target precedence for command routing:
+
+1. `--target`
+2. `BMUX_TARGET`
+3. `[connections].default_target`
+4. local target
+
+A target is `local` or the name of a saved host (`bmux remote hosts`). Bare
+`bmux` with no subcommand attaches locally unless `--target` is given. Targets
+in `[connections.targets]` with an `ssh`, `tls` or `iroh` transport are no
+longer dialed; remove them and pair the host instead.
+
+## Runtime and Sandbox Commands
+
+```bash
 # optional runtime instance selection (parallel local runtimes)
 bmux --runtime dev server start --daemon
-bmux --runtime dev host
 
 # sandboxed runs (isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
@@ -172,119 +196,7 @@ bmux sandbox cleanup --dry-run --json
 bmux sandbox clean --dry-run --json
 bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600
-# opt-in control-plane mode (hard-fails if control-plane operations fail)
-bmux setup --mode control-plane
-bmux host --mode control-plane
-bmux join bmux://my-host
-bmux hosts
-bmux auth login
-bmux share --name my-host
-bmux unshare my-host
-
-# run an internet-accessible TLS gateway
-bmux server gateway --listen 0.0.0.0:7443 --quick
-
-# Or add this to bmux.toml to start it with the local server:
-# [server.gateway]
-# enabled = true
-# listen = "0.0.0.0:7443"
-# quick = true
-
-# or force reverse-SSH hosting helper instead of iroh
-bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
-
-# iroh hosted mode is default when --host is enabled
-bmux server gateway --listen 127.0.0.1:7443 --host
-# prints iroh://<endpoint_id>?relay=<url>
-bmux connect iroh://<endpoint_id>?relay=<url> app
-
-# target any normal command remotely
-bmux --target prod list-sessions
-bmux --target prod attach app
 ```
-
-Shell completion snippets:
-
-```bash
-# Bash: target completion for `bmux connect <TAB>`
-_bmux_complete_targets() {
-  COMPREPLY=( $(compgen -W "$(bmux remote complete targets 2>/dev/null)" -- "${COMP_WORDS[COMP_CWORD]}") )
-}
-complete -F _bmux_complete_targets bmux
-
-# Bash: session completion helper
-_bmux_complete_sessions() {
-  local target="$1"
-  bmux remote complete sessions "$target" 2>/dev/null
-}
-
-# Zsh helper examples
-_bmux_targets() { bmux remote complete targets 2>/dev/null }
-_bmux_sessions() { bmux remote complete sessions "$1" 2>/dev/null }
-
-# Fish helper examples
-function __bmux_targets
-  bmux remote complete targets 2>/dev/null
-end
-```
-
-A TLS gateway can be declared in `bmux.toml` and started automatically with the
-local server:
-
-```toml
-[server.gateway]
-enabled = true
-listen = "0.0.0.0:7443"
-quick = true
-```
-
-For production TLS material, omit `quick` and configure both `cert_file` and
-`key_file` instead. Gateway changes require a server restart. Binding `0.0.0.0`
-exposes the listener to reachable networks, so use appropriate firewall and
-access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server
-gateway --host ...` commands.
-
-Target precedence for command routing:
-
-1. `--target`
-2. `BMUX_TARGET`
-3. `[connections].default_target`
-4. local target
-
-Example target config:
-
-```toml
-[connections]
-default_target = "local"
-
-[connections.targets.prod]
-transport = "ssh"
-host = "prod.example.com"
-user = "bmux"
-port = 22
-identity_file = "~/.ssh/id_ed25519"
-known_hosts_file = "~/.ssh/known_hosts"
-strict_host_key_checking = true
-jump = "ops@bastion.example.com"
-remote_bmux_path = "bmux"
-connect_timeout_ms = 8000
-default_session = "main"
-
-[connections.targets.tls-prod]
-transport = "tls"
-host = "gateway.example.com"
-port = 7443
-server_name = "gateway.example.com"
-ca_file = "~/.config/bmux/gateway-ca.pem"
-```
-
-TLS targets support standard command routing via `--target` (for commands that
-use normal client connections), plus `bmux connect` and remote utility commands.
-
-Hosted URLs are accepted directly by connect (for example: `bmux connect
-https://abc123.example.net app`).
-
-For long-lived unstable links, `bmux connect` supports `--reconnect-forever`.
 
 ## Logging Commands
 

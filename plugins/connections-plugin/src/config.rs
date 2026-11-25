@@ -15,7 +15,10 @@ pub struct RemoteSettings {
     pub startup_wait_ms: u64,
     /// None permits an explicit owner CLI opt-in; Some(false) is a hard prohibition.
     pub allow_full_runtime_ingress: Option<bool>,
+    /// The only address this process's endpoint binds (host and connecting side).
     pub bind_addr: Option<std::net::SocketAddr>,
+    /// Extra addresses the host advertises in pairing links (for example a port forward).
+    pub external_addrs: Vec<std::net::SocketAddr>,
     pub auto_start: bool,
 }
 
@@ -26,6 +29,7 @@ impl Default for RemoteSettings {
             startup_wait_ms: 5_000,
             allow_full_runtime_ingress: None,
             bind_addr: None,
+            external_addrs: Vec::new(),
             auto_start: false,
         }
     }
@@ -97,6 +101,14 @@ impl RemoteSettings {
         {
             bail!("auto_start requires explicit ingress permission and a fixed bind_addr");
         }
+        if remote.external_addrs.len() > 8
+            || remote
+                .external_addrs
+                .iter()
+                .any(|addr| addr.port() == 0 || addr.ip().is_unspecified())
+        {
+            bail!("remote.external_addrs takes at most 8 concrete ip:port addresses");
+        }
         if !(1..=60_000).contains(&remote.startup_wait_ms) {
             bail!("remote.startup_wait_ms must be in 1..=60000");
         }
@@ -110,7 +122,7 @@ impl RemoteSettings {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid custom relay URL"))?;
                 if text.len() > 2048
-                    || url.scheme() != "https"
+                    || !relay_scheme_allowed(&url)
                     || url.host_str().is_none()
                     || !url.username().is_empty()
                     || url.password().is_some()
@@ -119,13 +131,28 @@ impl RemoteSettings {
                     || url.path() != "/"
                     || !unique.insert(url.to_string())
                 {
-                    bail!("custom relay URLs must be unique HTTPS origins without credentials");
+                    bail!(
+                        "custom relay URLs must be unique HTTPS origins without credentials (plain HTTP only for loopback IP literals)"
+                    );
                 }
                 text.parse::<iroh::RelayUrl>()
                     .map_err(|_| anyhow::anyhow!("invalid Iroh relay URL"))?;
             }
         }
         Ok(remote)
+    }
+}
+
+/// HTTPS everywhere; plain HTTP only for a loopback IP literal (a local test relay).
+fn relay_scheme_allowed(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -146,6 +173,12 @@ mod tests {
             assert!(load(&format!("[remote.relay]\nmode = '{mode}'")).is_ok());
         }
         assert!(load("[remote.relay]\nmode = 'custom'\nurls = ['https://relay.example']").is_ok());
+        assert_eq!(
+            load("[remote]\nexternal_addrs = ['192.0.2.1:4433']")
+                .unwrap()
+                .external_addrs,
+            ["192.0.2.1:4433".parse::<std::net::SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -182,6 +215,42 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_relays_only_on_loopback_ip_literals() {
+        for url in [
+            "http://127.0.0.1:3340",
+            "http://127.8.9.10",
+            "http://[::1]:3340",
+            "https://relay.example",
+            "https://127.0.0.1:3340",
+        ] {
+            assert!(
+                load(&format!(
+                    "[remote.relay]\nmode = 'custom'\nurls = ['{url}']"
+                ))
+                .is_ok(),
+                "rejected {url}"
+            );
+        }
+        for url in [
+            "http://localhost:3340",
+            "http://relay.example",
+            "http://10.0.0.1:3340",
+            "http://192.168.1.2",
+            "http://[::2]:3340",
+            "http://0.0.0.0:3340",
+            "ftp://127.0.0.1",
+        ] {
+            assert!(
+                load(&format!(
+                    "[remote.relay]\nmode = 'custom'\nurls = ['{url}']"
+                ))
+                .is_err(),
+                "accepted {url}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_settings_fail_closed() {
         for text in [
             "[remote]\nauto_start = true",
@@ -190,6 +259,8 @@ mod tests {
             "[remote]\nstartup_wait_ms = 60001",
             "[remote]\nstartup_wait_ms = -1",
             "[remote]\nunknown = true",
+            "[remote]\nexternal_addrs = ['0.0.0.0:1']",
+            "[remote]\nexternal_addrs = ['192.0.2.1:0']",
             "[remote.relay]\nmode = 'bogus'",
             "[remote.relay]\nmode = 'custom'\nurls = []",
             "[remote.relay]\nmode = 'disabled'\nurls = ['https://relay.example']",

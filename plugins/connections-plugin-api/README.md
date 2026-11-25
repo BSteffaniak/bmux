@@ -1,11 +1,12 @@
 # bmux_connections_plugin_api
 
-Stable, transport-neutral typed contract for resolving configured bmux
-connection targets and invoking typed services on a selected endpoint.
+Typed contract of the bmux connections plugin, generated from
+`bpdl/connections-plugin.bpdl`:
 
-The API exposes canonical opaque endpoint identities, endpoint descriptions,
-invocation deadline/retry options, structured cancellation/timeout/retry errors,
-and opaque typed-service request/response bytes. It deliberately contains no
-cluster, workspace, placement, or gateway-selection policy. Runtime target
-resolution, SSH/TLS/Iroh connection establishment, trust checks, and IO belong
-in `bmux_connections_plugin`.
+- `hosting-commands` and `hosting-admin-state` (`owner-local`): enable or
+  disable remote hosting, pairing sessions, and paired-device administration.
+- `hosting-state` (`observe`): whether hosting is enabled, and where.
+- `connections-commands` (`owner-local`): invoke a typed service on a selected
+  endpoint (`local` or a saved host).
+
+Runtime state, transport and pairing belong in `bmux_connections_plugin`.

@@ -388,6 +388,15 @@ impl ErasedIpcStreamWriter {
         })
     }
 
+    /// Write a pre-encoded frame (length-prefixed bytes) directly to the transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails.
+    pub async fn write_raw_frame(&mut self, frame: &[u8]) -> Result<(), IpcTransportError> {
+        write_frame(&mut self.inner, frame).await
+    }
+
     /// Enable frame-level compression for all subsequent `send_envelope` calls.
     pub fn enable_frame_compression(
         &mut self,
@@ -576,6 +585,12 @@ impl LocalIpcStream {
             #[cfg(windows)]
             StreamInner::WindowsClient(stream) => read_frame_with_timing(stream).await,
         }
+    }
+}
+
+impl From<LocalIpcStream> for ErasedIpcStream {
+    fn from(stream: LocalIpcStream) -> Self {
+        Self::new(Box::new(stream))
     }
 }
 

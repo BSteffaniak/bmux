@@ -1,154 +1,146 @@
-# Remote pairing and daemonless clients
+# Remote access and pairing (experimental)
 
-Remote hosting is opt-in. Only the host needs a running bmux server; a
-connecting
-client does not start or require a local server. This workflow uses a
-self-contained invitation over Iroh, not a short-code rendezvous service.
+> **Experimental.** Remote access is being rebuilt (see
+> `docs/development/remote-access-architecture.md`). Formats and commands may
+> change; pairings made with earlier versions do not carry over.
 
-## First connection
+Pair a device once, then `bmux connect desktop` gives the same attach as
+running `bmux` on the desktop. Only the host runs a bmux server. The connecting
+device needs no server, account or port forwarding: the two machines talk over
+[Iroh](https://iroh.computer) (QUIC), directly when they can and through a
+relay otherwise.
 
-On the host, start the server if necessary and explicitly enable remote access:
+## Pair a device
+
+On the host, enable hosting once (it stays enabled across restarts):
 
 ```sh
-bmux server start --daemon
 bmux remote enable
-bmux remote pair
 ```
 
-The last command prints a short-lived pairing link and waits. Treat that link as
-sensitive: share it privately with the intended device, not in a public issue,
-recording, or log. No files need to be exchanged.
-
-On the other computer:
+Then open a pairing session:
 
 ```sh
-bmux connect --pair
+bmux remote pair                     # full access
+bmux remote pair --role view-only    # watch only
+bmux remote pair --name laptop       # name the device yourself
 ```
 
-Paste the link at the hidden prompt. Choose a saved host alias and a device
-name.
-Compare the displayed verification phrase on both machines before approving on
-the host. Link possession alone does not authorize terminal access. The client
-saves the host's identity and its own device credentials, then attaches.
+`remote pair` prints `Pairing link: bmux-pair:…` and a QR code, then waits.
+The link carries the host key, address hints and a 256-bit secret. It works
+once and expires after 10 minutes. Treat it as a secret: share it privately,
+never in an issue, recording or log.
 
-On later connections:
+On the other device:
 
 ```sh
-bmux connect desktop
-bmux connect desktop work
+bmux connect --pair                          # saves the host under its name
+bmux connect --pair --name desk              # choose the saved name
+bmux connect --pair --device-name work-mac   # what the host owner sees
 ```
 
-Use the same terminal name to resume that terminal. The host must remain running
-and reachable. This is currently single-terminal access, not remote layout/tab
-synchronization. Do not interpret a failed or uncertain input delivery as a safe
-reason to replay that input.
+Paste the link at `Pairing link (input hidden): `. The device proves it holds
+the link's secret, and both sides show the same phrase:
 
-## Hosting policy and startup
+- the device prints `Verify on the host: xxxx-xxxx-xxxx-xxxx`;
+- the host prints `Compare this phrase on the other device: xxxx-xxxx-xxxx-xxxx`
+  and asks to approve.
 
-Remote hosting is off by default. Omitting `allow_full_runtime_ingress` allows a
-trusted local owner to opt in with `bmux remote enable`; that preference
-persists
-across server restarts. `bmux remote disable` persists an off preference.
+Approve only when the phrases match. The device then prints
+`Paired. Saved host: <name>` and attaches.
 
-An explicit `allow_full_runtime_ingress = false` is a **hard prohibition**:
-CLI enablement and previously saved opt-ins cannot override it. Change the
-configuration and restart the host before enabling again. This differs from
-omitting the field, which leaves the owner opt-in available.
+The phrase is derived from the host key, the device key, the link secret, the
+requested role and the protocol version, so a copied link used from another
+device shows a different phrase. The host refuses a session after five wrong
+proofs and holds at most four waiting requests.
 
-To host automatically from configuration:
+## Connect
+
+```sh
+bmux connect desk            # attach to the host's sessions
+bmux connect desk work       # attach to session `work`
+bmux --target desk list-sessions
+```
+
+Every attach feature works, because it is the normal attach running over a
+stream of the QUIC connection. One endpoint and one connection per host are
+shared by every client in a process.
+
+## Roles and devices (on the host)
+
+| Role | Can |
+| --- | --- |
+| `full` | observe, type, and change the runtime (acts as the host user) |
+| `view-only` | observe only |
+
+Owner-local operations (pairing, enabling or disabling hosting, revoking,
+changing roles, plugin and configuration management, stopping the server) are
+never reachable from a paired device, whatever its role.
+
+```sh
+bmux remote list                      # paired devices
+bmux remote role laptop view-only     # takes effect on the next request
+bmux remote revoke laptop             # closes its connections now
+bmux remote status                    # hosting, host key, devices, live connections
+bmux remote disable                   # stops hosting and closes every remote connection
+```
+
+A revoked device is refused at the QUIC handshake when it reconnects.
+
+## Saved hosts (on the connecting device)
+
+```sh
+bmux remote hosts
+bmux remote rename desk desktop
+bmux remote forget desktop
+```
+
+These never need a server. `forget` only removes the host from this device; the
+host still lists the device until its owner runs `bmux remote revoke`.
+
+If a saved host answers with a different host key, the connection stops with
+an error: the host's key was reset, or something else answers at its address.
+Forget it and pair again if the reset was intended.
+
+## Settings
+
+In `bmux.toml`, under the connections plugin:
 
 ```toml
 [plugins.settings."bmux.connections".remote]
-allow_full_runtime_ingress = true
-auto_start = true
-bind_addr = "0.0.0.0:7443"
-```
+# Hosting is off until `bmux remote enable`. `false` forbids it outright.
+# allow_full_runtime_ingress = false
+# Bind only this address (host listener and the connecting endpoint).
+# bind_addr = "0.0.0.0:7842"
+# Extra addresses to advertise in pairing links, for example a port forward.
+# external_addrs = ["203.0.113.7:7842"]
+# Start hosting with the server (needs allow_full_runtime_ingress = true and
+# a fixed bind_addr).
+# auto_start = false
 
-Auto-start from configuration requires an explicit, nonzero UDP bind port.
-A saved CLI disable still suppresses configured auto-start until the owner
-explicitly enables it again. Enabling hosting never enrolls a device by itself.
-
-## Managing trust
-
-Client-side saved-host commands require no local server:
-
-```sh
-bmux remote-list                 # saved paired hosts; `remote list` lists configured targets
-bmux remote status desktop
-bmux remote rename desktop workstation
-bmux remote forget workstation
-```
-
-Forgetting a host removes local trust information; it does not revoke the device
-on the host. Host-side management remains a trusted local-owner operation:
-
-```sh
-bmux remote revoke mac
-bmux remote disable
-```
-
-Pairing grants terminal resource access as the host user, not cluster membership
-or cluster administration. Only approve devices you trust with that access.
-Revocation must reject current authority and future admission; saved client keys
-are not authority to bypass it.
-
-## Networking and infrastructure
-
-The default Iroh preset uses external public connectivity infrastructure.
-Connections may use an encrypted relay path and upgrade to direct connectivity;
-restrictive networks can require relaying. Relays cannot decrypt terminal
-contents, but can observe traffic metadata, interrupt service, or be
-unavailable.
-No port forwarding or separate bmux pairing-mailbox deployment is needed for
-this invitation format. Public relay availability is not an unconditional
-connectivity guarantee.
-
-Host relay settings belong to the connections plugin:
-
-```toml
 [plugins.settings."bmux.connections".remote.relay]
-mode = "default"
+mode = "default"          # the public Iroh relays
+# mode = "custom"         # your own relays (HTTPS; plain HTTP only on 127.0.0.0/8 or ::1)
+# urls = ["https://relay.example.com"]
+# mode = "disabled"       # direct connections only
 ```
 
-For a managed relay, use `mode = "custom"` and `urls =
-["https://relay.example/"]`.
-`mode = "disabled"` is useful for direct-only/offline setups and deterministic
-local testing. A pasted invitation does not override the client's local relay
-policy.
+## Where things live
 
-## Local socket upgrade compatibility
+- Host key: `<state dir>/connections/host.key` (one per machine and user; only
+  one runtime hosts at a time).
+- Device key: `<state dir>/connections/devices/<profile>.key`.
+- Paired devices (host): `<state dir>/connections/trust.redb`.
+- Saved hosts (device): `<state dir>/connections/known-hosts/<profile>.json`.
 
-Local IPC now requires a same-user peer and a private, owned runtime directory
-(`0700` on Unix); sockets are created with mode `0600`. Existing directories
-are not silently chmodded or chowned, and live sockets are not unlinked to
-repair an unsafe configuration. Custom `BMUX_RUNTIME_DIR` locations remain
-supported when they meet these requirements.
+All of these are owner-only. Keys and link secrets never appear in listings,
+logs or errors.
 
-With `XDG_RUNTIME_DIR`, the default location is unchanged. Without it, the Unix
-fallback changes from the shared temporary `bmux` directory to `bmux-UID`.
-Because runtime identity is scoped to the runtime path, this fallback change
-also selects a different identity/grant namespace. To retain the old namespace,
-stop the old runtime, verify that the old directory belongs to your user and
-has private permissions, and explicitly select it with
-`BMUX_RUNTIME_DIR=/tmp/bmux` (adjust for a nonstandard temporary directory).
-Do not reuse a directory owned by another user or remove another user's files.
-Otherwise, use the new default and pair clients to its new identity.
+## Testing
 
-## Validation boundaries
-
-Run the isolated Unix PTY acceptance fixture against an explicit newly built
-binary:
+The end-to-end acceptance tests drive real host and client processes over
+loopback:
 
 ```sh
-nix develop --command cargo build -p bmux_cli --bin bmux
-# In the Nix development shell:
-python3 scripts/smoke-remote-pairing.py --binary "$CARGO_TARGET_DIR/debug/bmux"
+cargo nextest run -p bmux_cli --test remote_access
 ```
-
-The fixture owns all host/client state and processes; it does not manage a
-user's
-running server. It checks direct-loopback behavior, not public relay
-reachability
-or native macOS behavior. Release acceptance additionally needs native platform
-CI and a two-computer, two-network trial, including a proven relay-only path,
-network interruption, host restart, and revocation.

@@ -406,8 +406,7 @@ impl Plugin for ClusterPlugin {
             .typed_services(|plugin, context, registry| {
                 plugin.register_typed_services(&context, registry);
                 Ok(())
-            })
-            .registrations(|_, a0| Self::register_contributions(a0));
+            });
     }
 }
 
@@ -777,24 +776,6 @@ impl ClusterPlugin {
             "cluster-pane-move" => run_cluster_pane_move(context).map_err(PluginCommandError::from),
             "cluster-pane-retry" => run_cluster_pane_retry(context).map_err(PluginCommandError::from)
         })
-    }
-
-    fn register_contributions(
-        registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
-    ) -> bmux_plugin_sdk::Result<()> {
-        registrar
-            .register(bmux_plugin_sdk::PluginContribution::Extension {
-                id: "cluster.stream-admitted-routes".into(),
-                extension_point: bmux_plugin::stream_admission::STREAM_ADMITTED_ROUTES_EXTENSION
-                    .into(),
-                payload: bmux_plugin_sdk::encode_service_message(&admission::routes())?,
-            })
-            .map_err(
-                |details| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
-                    plugin_id: "bmux.cluster".into(),
-                    details,
-                },
-            )
     }
 
     /// Serve one wire invocation. The worker's pane-runtime calls made while
@@ -3075,7 +3056,7 @@ mod tests {
         use bmux_plugin::StreamOrigin;
         let _origin = provenance_router(StreamOrigin::Admitted {
             subject_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
         });
         for (interface, operation) in [
             ("cluster-command/v1", "init"),
@@ -3113,7 +3094,7 @@ mod tests {
             } else {
                 StreamOrigin::Admitted {
                     subject_id: Uuid::nil(),
-                    lease_id: Uuid::nil(),
+                    connection_id: Uuid::nil(),
                 }
             }
         });
@@ -3149,7 +3130,7 @@ mod tests {
         use bmux_plugin::StreamOrigin;
         let _origin = provenance_router(StreamOrigin::Admitted {
             subject_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
         });
         let fixture = ServiceTestConfigDir::create();
         let config_dir = fixture.dir.to_str().unwrap();
@@ -3198,22 +3179,44 @@ mod tests {
     }
 
     #[test]
-    fn admitted_route_contributions_are_exact_proof_protocols() {
-        let routes = admission::routes();
-        assert_eq!(routes.len(), 15);
+    fn remote_protocols_are_exact_proof_protocols_with_remote_classes() {
+        let operations = admission::remote_protocol_operations();
+        assert_eq!(operations.len(), 15);
         let declarations = plugin_definition().declarations().unwrap().services;
-        for route in routes {
-            assert_eq!(route.kind, ServiceKind::Command);
+        for (capability, interface, operation) in operations {
+            let service = declarations
+                .iter()
+                .find(|service| {
+                    service.capability.as_str() == capability
+                        && service.kind == ServiceKind::Command
+                        && service.interface_id == interface
+                })
+                .unwrap_or_else(|| panic!("{interface} is provided"));
+            // Reachable by an admitted stream: declared, and never owner-local.
+            let access = service.access_for(operation);
             assert!(
-                declarations
-                    .iter()
-                    .any(|service| service.capability.as_str() == route.capability
-                        && service.kind == route.kind
-                        && service.interface_id == route.interface_id)
+                access.is_some_and(|access| access != bmux_plugin_sdk::RouteAccess::OwnerLocal),
+                "{interface}.{operation}: {access:?}"
             );
             assert!(
-                !["prove", "init", "join", "leave", "mutate", "member_revoke"]
-                    .contains(&route.operation.as_str())
+                !["prove", "init", "join", "leave", "mutate", "member_revoke"].contains(&operation)
+            );
+        }
+        // Local administration stays owner-local.
+        let command = declarations
+            .iter()
+            .find(|service| service.interface_id == "cluster-command/v1")
+            .unwrap();
+        for operation in [
+            "init",
+            "join",
+            "leave",
+            "member_revoke",
+            "enrollment_token_create",
+        ] {
+            assert_eq!(
+                command.access_for(operation),
+                Some(bmux_plugin_sdk::RouteAccess::OwnerLocal)
             );
         }
     }

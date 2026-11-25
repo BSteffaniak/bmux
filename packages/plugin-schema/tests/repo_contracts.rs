@@ -207,3 +207,30 @@ fn every_repo_contract_lowers_to_valid_wit() {
             .unwrap_or_else(|error| panic!("{id} lowered to invalid WIT: {error:?}\n{source}"));
     }
 }
+
+/// Every routed operation must say what a remote principal needs to use it:
+/// admitted (remote) streams can never reach a route without a class, so a
+/// missing `@access` silently makes a service local-only.
+#[test]
+fn every_repo_service_operation_declares_an_access_class() {
+    use bmux_plugin_schema::ast::InterfaceItem;
+    let repo = repo_schemas();
+    let mut missing = Vec::new();
+    for relative in repo.sources.keys() {
+        let (schema, _) = resolved(&repo, relative);
+        for interface in &schema.interfaces {
+            for item in &interface.items {
+                if let InterfaceItem::Query(op) | InterfaceItem::Command(op) = item
+                    && op.access.or(interface.access).is_none()
+                {
+                    missing.push(format!("{relative} {}.{}", interface.name, op.name));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "operations without an `@access` class:\n{}",
+        missing.join("\n")
+    );
+}

@@ -72,7 +72,7 @@ fn current_stream_provenance_contract_has_no_caller_selected_identity() {
     assert_eq!(clients_identity::INTERFACE_ID, "clients-identity/v1");
     let admitted = StreamProvenance::Admitted {
         subject_id: uuid::Uuid::from_u128(1),
-        lease_id: uuid::Uuid::from_u128(2),
+        connection_id: uuid::Uuid::from_u128(2),
     };
     for value in [StreamProvenance::Local, admitted, StreamProvenance::Invalid] {
         let bytes = serde_json::to_vec(&value).unwrap();

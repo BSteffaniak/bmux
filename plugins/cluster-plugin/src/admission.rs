@@ -47,18 +47,35 @@ const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-pub fn routes() -> Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> {
+/// Whether an admitted (remote) caller may use this exact cluster protocol
+/// operation. The server already checked the route's BPDL access class; the
+/// cluster also keeps remote peers to the protocols that carry their own
+/// signatures and proofs, never its local administration.
+pub fn remote_protocol(
+    capability: &str,
+    kind: ServiceKind,
+    interface: &str,
+    operation: &str,
+) -> bool {
+    kind == ServiceKind::Command
+        && REMOTE_PROTOCOLS
+            .iter()
+            .any(|(protocol_capability, protocol, operations)| {
+                *protocol_capability == capability
+                    && *protocol == interface
+                    && operations.contains(&operation)
+            })
+}
+
+/// Every remote protocol operation, for tests.
+#[cfg(test)]
+pub fn remote_protocol_operations() -> Vec<(&'static str, &'static str, &'static str)> {
     REMOTE_PROTOCOLS
         .iter()
         .flat_map(|(capability, interface, operations)| {
-            operations.iter().map(move |operation| {
-                bmux_plugin::stream_admission::StreamAdmittedRoute {
-                    capability: (*capability).into(),
-                    kind: ServiceKind::Command,
-                    interface_id: (*interface).into(),
-                    operation: (*operation).into(),
-                }
-            })
+            operations
+                .iter()
+                .map(move |operation| (*capability, *interface, *operation))
         })
         .collect()
 }
@@ -88,17 +105,17 @@ pub fn authorize(context: &NativeServiceContext) -> Result<(), ServiceResponse> 
         StreamOrigin::Local | StreamOrigin::HostInternal => Ok(()),
         StreamOrigin::Admitted { .. } => {
             let service = &context.request.service;
-            if !routes().iter().any(|route| {
-                route.capability == service.capability.as_str()
-                    && route.kind == service.kind
-                    && route.interface_id == service.interface_id
-                    && route.operation == context.request.operation
-            }) {
+            if !remote_protocol(
+                service.capability.as_str(),
+                service.kind,
+                &service.interface_id,
+                &context.request.operation,
+            ) {
                 return Err(denied("protocol_not_admitted"));
             }
-            // The host registry lookup revalidates the retained lease against
-            // the admission authority, including revocation. Do not substitute
-            // a caller-chosen subject or an owner-only pairing query.
+            // The host's provenance lookup is live: a revoked binding reads as
+            // Invalid. Do not substitute a caller-chosen subject or an
+            // owner-only pairing query.
             if context.cancellation.is_cancelled() {
                 return Err(denied("cancelled"));
             }
@@ -106,6 +123,6 @@ pub fn authorize(context: &NativeServiceContext) -> Result<(), ServiceResponse> 
             // verify request-bound signatures, credentials and transitions.
             Ok(())
         }
-        StreamOrigin::Invalid => Err(denied("invalid_lease")),
+        StreamOrigin::Invalid => Err(denied("invalid_origin")),
     }
 }

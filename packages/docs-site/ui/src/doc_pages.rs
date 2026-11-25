@@ -185,6 +185,13 @@ pub static DOC_PAGES: &[DocPage] = &[
         nav_label: "Private Input",
     },
     docs_markdown_page! {
+        source: "docs/pane-execution.md",
+        route: "/docs/pane-execution",
+        title: "Pane Processes",
+        section: USAGE,
+        nav_label: "Pane Processes",
+    },
+    docs_markdown_page! {
         source: "docs/pane-padding.md",
         route: "/docs/pane-padding",
         title: "Pane Padding",

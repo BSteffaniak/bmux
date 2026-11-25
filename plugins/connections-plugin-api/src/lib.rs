@@ -1,8 +1,7 @@
 //! Typed public API of the bmux connections plugin.
 //!
-//! Consumers use this contract to resolve configured endpoints and invoke a
-//! typed service on one selected endpoint. Endpoint selection policy remains
-//! in the consuming plugin.
+//! Remote hosting administration and status, and typed service invocation
+//! on a selected endpoint (`local` or a saved host).
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]

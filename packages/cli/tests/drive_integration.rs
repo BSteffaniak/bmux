@@ -8,7 +8,8 @@ use std::process::{Command, Output};
 
 /// The program under test: a prompt that echoes one line, then leaves the
 /// alternate screen on when it exits (a bug lint must report).
-const PROGRAM: &str = r#"printf '\033[?1049hready> '; read line; printf 'got %s\n' "$line"; read rest"#;
+const PROGRAM: &str =
+    r#"printf '\033[?1049hready> '; read line; printf 'got %s\n' "$line"; read rest"#;
 
 struct Home {
     root: PathBuf,
@@ -91,7 +92,9 @@ fn screen_text(report: &serde_json::Value) -> String {
 fn drive_acts_observes_lints_and_replays() {
     let home = Home::new();
 
-    let start = home.json(&["start", "--name", "prompt", "--size", "60x10", "--", "sh", "-c", PROGRAM]);
+    let start = home.json(&[
+        "start", "--name", "prompt", "--size", "60x10", "--", "sh", "-c", PROGRAM,
+    ]);
     assert_eq!(start["ok"], true, "{start:#}");
     assert!(screen_text(&start).contains("ready>"), "{start:#}");
     assert_eq!(start["screen"]["alternate_screen"], true);
@@ -105,7 +108,11 @@ fn drive_acts_observes_lints_and_replays() {
         "{typed:#}"
     );
 
-    assert!(home.drive(&["expect", "--text", "got hello world"]).status.success());
+    assert!(
+        home.drive(&["expect", "--text", "got hello world"])
+            .status
+            .success()
+    );
     let failed = home.drive(&["expect", "--text", "not on screen"]);
     assert_eq!(failed.status.code(), Some(1));
 
@@ -119,12 +126,23 @@ fn drive_acts_observes_lints_and_replays() {
     assert!(new.contains(&"left-on:alternate screen"), "{ended:#}");
 
     let stopped = home.json(&["stop"]);
-    let script = stopped["script"].as_str().expect("stop reports the script").to_owned();
+    let script = stopped["script"]
+        .as_str()
+        .expect("stop reports the script")
+        .to_owned();
     assert!(script.contains("type 'hello world' --enter"), "{script}");
-    assert!(script.contains("expect --text 'got hello world'"), "{script}");
-    assert!(!script.contains("not on screen"), "failed checks are not recorded: {script}");
     assert!(
-        home.drive(&["list"]).stdout.starts_with(b"no drive sessions"),
+        script.contains("expect --text 'got hello world'"),
+        "{script}"
+    );
+    assert!(
+        !script.contains("not on screen"),
+        "failed checks are not recorded: {script}"
+    );
+    assert!(
+        home.drive(&["list"])
+            .stdout
+            .starts_with(b"no drive sessions"),
         "stop removes the session"
     );
 
@@ -138,5 +156,8 @@ fn drive_acts_observes_lints_and_replays() {
     ]);
     let report = String::from_utf8_lossy(&replay.stdout);
     assert!(replay.status.success(), "{report}");
-    assert!(report.contains("PASS at 60x10") && report.contains("PASS at 30x6"), "{report}");
+    assert!(
+        report.contains("PASS at 60x10") && report.contains("PASS at 30x6"),
+        "{report}"
+    );
 }

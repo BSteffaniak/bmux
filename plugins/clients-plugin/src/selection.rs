@@ -329,7 +329,7 @@ mod tests {
                 Some(StreamOrigin::HostInternal),
                 Some(StreamOrigin::Admitted {
                     subject_id: Uuid::from_u128(3),
-                    lease_id: Uuid::from_u128(4),
+                    connection_id: Uuid::from_u128(4),
                 }),
             ] {
                 check(0, origin, false, 0);

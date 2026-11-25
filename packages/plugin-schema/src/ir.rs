@@ -76,6 +76,9 @@ pub struct Interface {
     pub contract_major: Option<u32>,
     /// Capability constant name guarding the service operations.
     pub capability: Option<String>,
+    /// Interface-wide `@access` class. Authorization metadata, not identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::ast::Access>,
     pub docs: Vec<String>,
     pub stability: Stability,
     /// Declaration order is preserved: it can affect wire encoding.
@@ -130,6 +133,18 @@ impl Interface {
             }),
             Item::Events(_) => Some(ServiceKind::Event),
             Item::Type(_) => None,
+        })
+    }
+
+    /// Effective access class of every operation: its override, else the
+    /// interface class. Operations with neither are omitted.
+    pub fn operation_access(&self) -> impl Iterator<Item = (&str, crate::ast::Access)> {
+        self.items.iter().filter_map(|item| match item {
+            Item::Function(function) => function
+                .access
+                .or(self.access)
+                .map(|access| (function.name.as_str(), access)),
+            _ => None,
         })
     }
 
@@ -242,6 +257,9 @@ pub struct Function {
     /// Request-scoped event frames before the single terminal result.
     pub emits: Option<Type>,
     pub reentrant: bool,
+    /// `@access` override of the interface class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::ast::Access>,
     pub docs: Vec<String>,
     pub stability: Stability,
 }
@@ -697,6 +715,7 @@ impl Lowering<'_> {
             version: iface.interface_version,
             contract_major: iface.major,
             capability: iface.capability.clone(),
+            access: iface.access,
             docs: iface.docs.clone(),
             stability: stability(&iface.stability),
             items: iface.items.iter().map(|item| self.item(item)).collect(),
@@ -808,6 +827,7 @@ impl Lowering<'_> {
             result: self.ty(&op.returns),
             emits: op.emits.as_ref().map(|ty| self.ty(ty)),
             reentrant: op.reentrant,
+            access: op.access,
             docs: op.docs.clone(),
             stability: stability(&op.stability),
         }

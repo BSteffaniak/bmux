@@ -24,6 +24,7 @@ interface snapshot-participant-types-v1 {
 }
 
 @capability(SNAPSHOT_PARTICIPANT_READ_V1)
+@access(owner-local)
 interface snapshot-participant-state-v1 {
     query participants() -> result<list<string>, snapshot-participant-types-v1.participant-error>;
     query restore-dependencies(participant_id: string) -> result<list<string>, snapshot-participant-types-v1.participant-error>;
@@ -32,6 +33,7 @@ interface snapshot-participant-state-v1 {
 }
 
 @capability(SNAPSHOT_PARTICIPANT_WRITE_V1)
+@access(owner-local)
 interface snapshot-participant-commands-v1 {
     command quiesce(participant_id: string) -> result<unit, snapshot-participant-types-v1.participant-error>;
     command restore(snapshot: snapshot-participant-types-v1.participant-snapshot) -> result<unit, snapshot-participant-types-v1.participant-error>;
@@ -70,12 +72,16 @@ interface snapshot-types {
 }
 
 @capability(SNAPSHOT_READ)
+@access(observe)
 interface snapshot-state {
     query status() -> result<snapshot-types.snapshot-status-payload, snapshot-types.snapshot-error>;
     query restore-dry-run() -> result<snapshot-types.snapshot-dry-run-result, snapshot-types.snapshot-error>;
 }
 
+// Saving and restoring the server's persisted state administers the server
+// itself, like stopping it: never reachable from a remote principal.
 @capability(SNAPSHOT_WRITE)
+@access(owner-local)
 interface snapshot-commands {
     command save-now() -> result<snapshot-types.snapshot-save-result, snapshot-types.snapshot-error>;
     command restore-apply() -> result<snapshot-types.snapshot-apply-summary, snapshot-types.snapshot-error>;

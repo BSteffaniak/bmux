@@ -711,4 +711,118 @@ mod tests {
         server.request_shutdown();
         task.await.expect("server join").expect("server run");
     }
+
+    /// A connector that reaches an isolated server over its local socket, the
+    /// way a remote connector hands the attach path a ready client.
+    #[derive(Debug)]
+    struct LoopbackConnector {
+        paths: bmux_config::ConfigPaths,
+        connects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl bmux_client::TransportConnector for LoopbackConnector {
+        fn supports(&self, target: &str) -> bool {
+            target == "loopback"
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a str,
+            client_name: &'static str,
+        ) -> bmux_client::TransportConnectFuture<'a> {
+            self.connects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(BmuxClient::connect_with_paths_and_timeout(
+                &self.paths,
+                client_name,
+                std::time::Duration::from_secs(5),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connector_clients_open_the_normal_attach_backend_and_reconnect_through_the_connector()
+    {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = bmux_config::ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        let server = Arc::new(bmux_server::BmuxServer::from_config_paths(&paths));
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(bmux_client::TransportConnectorRegistry::new());
+        let _registration = registry.register(Arc::new(LoopbackConnector {
+            paths: paths.clone(),
+            connects: Arc::clone(&connects),
+        }));
+        let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match registry.connect("loopback", "connector-attach-test").await {
+                    Ok(client) => break client,
+                    Err(error) => {
+                        assert!(
+                            !task.is_finished(),
+                            "server stopped before readiness: {error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("connector did not reach the server");
+        assert!(!client.is_local_transport());
+        assert_eq!(
+            client
+                .transport_origin()
+                .map(bmux_client::TransportOrigin::target),
+            Some("loopback")
+        );
+
+        // The connector's client takes the same provider path as a local one.
+        let session = resolve(Some("main"))
+            .unwrap()
+            .open(
+                None,
+                bmux_client::AttachProviderOpenContext {
+                    fallback_client: Some(client),
+                    endpoint_connector: None,
+                },
+            )
+            .await
+            .expect("open default provider");
+        let AttachProviderBackend::Legacy(mut client) = session.backend else {
+            panic!("connector clients use the normal attach backend");
+        };
+        client
+            .ping()
+            .await
+            .expect("connector client serves requests");
+        let origin = client.transport_origin().cloned().expect("origin kept");
+        let streaming = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
+        assert!(!streaming.is_local_transport());
+
+        // Plugin kernel calls and reconnects open fresh clients through the
+        // connector, never through a local default.
+        let before = connects.load(std::sync::atomic::Ordering::SeqCst);
+        let factory = super::super::runtime::connector_kernel_client_factory(&origin);
+        let mut kernel_client = factory().await.expect("kernel client");
+        kernel_client
+            .ping()
+            .await
+            .expect("kernel client serves requests");
+        assert!(!kernel_client.is_local_transport());
+        assert_eq!(
+            connects.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+
+        drop((streaming, kernel_client));
+        server.request_shutdown();
+        task.await.expect("server join").expect("server run");
+    }
 }

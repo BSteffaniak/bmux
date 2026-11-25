@@ -323,6 +323,18 @@ fn session_write_allowed(
     session_id: SessionId,
     client_id: ClientId,
 ) -> Result<bool, AttachCommandError> {
+    session_action_allowed(host, ctx, session_id, client_id, "pane.direct_input")
+}
+
+/// The session policy's answer for `action` by this caller, or `true` when no
+/// permissions plugin is enabled (single-user behavior).
+fn session_action_allowed(
+    host: &crate::runtime::PaneRuntimeHost,
+    ctx: &NativeServiceContext,
+    session_id: SessionId,
+    client_id: ClientId,
+    action: &str,
+) -> Result<bool, AttachCommandError> {
     if !ctx
         .enabled_plugins
         .iter()
@@ -345,7 +357,7 @@ fn session_write_allowed(
             None,
             client_id.0,
             principal_id,
-            "pane.direct_input".to_string(),
+            action.to_string(),
             None,
             None,
             None,
@@ -1004,6 +1016,20 @@ pub fn attach_set_viewport(
 ) -> Result<AttachViewportSet, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
     let session_id = SessionId(req.session_id);
+    // Sizing the session's panes is input; an attached caller the session
+    // policy does not let resize (a view-only device) observes the shared
+    // geometry instead, exactly as `observe-viewport` does.
+    if !session_action_allowed(host, ctx, session_id, client_id, "pane.resize")? {
+        return observe_viewport(
+            host,
+            &ObserveViewportArgs {
+                session_id: req.session_id,
+                cols: req.cols,
+                rows: req.rows,
+            },
+            ctx,
+        );
+    }
     let runtime = host
         .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;

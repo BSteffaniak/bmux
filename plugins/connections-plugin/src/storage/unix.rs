@@ -1,5 +1,5 @@
 #[cfg(test)]
-use super::{PairingStore, runtime_directory};
+use super::RecordStore;
 use anyhow::{Context, Result, bail};
 use std::ffi::{CStr, CString};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -29,7 +29,7 @@ impl PrivateDirectory {
         Ok(Self { handle })
     }
 
-    pub(super) fn lock(&self, name: &CStr) -> Result<File> {
+    pub(crate) fn lock(&self, name: &CStr) -> Result<File> {
         // Open a fresh description per transaction to serialize threads as well
         // as processes. Publish once with O_EXCL, then open existing names without
         // O_CREAT: concurrent O_CREAT and flock can race with ENOENT on macOS.
@@ -57,7 +57,34 @@ impl PrivateDirectory {
         }
     }
 
-    pub(super) fn remove_record(&self, name: &CStr) -> Result<()> {
+    /// Take an exclusive lock without waiting; `None` when another holder has it.
+    pub(crate) fn try_lock(&self, name: &CStr) -> Result<Option<File>> {
+        let lock = match self.open_file(
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
+        ) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.open_file(name, libc::O_RDWR | libc::O_NONBLOCK)?
+            }
+            Err(error) => return Err(error).context("create private lock"),
+        };
+        check_private(&lock, false)?;
+        loop {
+            // SAFETY: lock owns a live descriptor, released on every return path.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(lock));
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(error).context("lock private record"),
+            }
+        }
+    }
+
+    pub(crate) fn remove_record(&self, name: &CStr) -> Result<()> {
         // SAFETY: checked directory and static single-component name.
         if unsafe { libc::unlinkat(self.handle.as_raw_fd(), name.as_ptr(), 0) } != 0 {
             return Err(std::io::Error::last_os_error()).context("remove pairing record");
@@ -66,11 +93,7 @@ impl PrivateDirectory {
         Ok(())
     }
 
-    pub(crate) fn read(&self) -> Result<Option<Vec<u8>>> {
-        self.read_record(c"identity.json", 16_384)
-    }
-
-    pub(super) fn read_record(&self, name: &CStr, limit: u64) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_record(&self, name: &CStr, limit: u64) -> Result<Option<Vec<u8>>> {
         let mut file = match self.open_file(name, libc::O_RDONLY | libc::O_NONBLOCK) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -87,10 +110,11 @@ impl PrivateDirectory {
         Ok(Some(bytes))
     }
 
-    pub(crate) fn publish(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let temporary = CString::new(format!(".identity-{}", uuid::Uuid::new_v4()))?;
+    /// Atomically create `name` unless it exists; returns the winning bytes.
+    pub(crate) fn publish_record(&self, name: &CStr, bytes: &[u8]) -> Result<Vec<u8>> {
+        let temporary = CString::new(format!(".publish-{}", uuid::Uuid::new_v4()))?;
         let mut file = self.open_file(&temporary, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
-        let result = self.publish_from(&temporary, &mut file, bytes);
+        let result = self.publish_from(name, &temporary, &mut file, bytes);
         // SAFETY: directory fd and the NUL-terminated name remain valid for this call.
         // Only remove a temporary entry we successfully created, never the destination.
         let cleanup = unsafe { libc::unlinkat(self.handle.as_raw_fd(), temporary.as_ptr(), 0) };
@@ -103,7 +127,13 @@ impl PrivateDirectory {
         Ok(winner)
     }
 
-    fn publish_from(&self, temporary: &CStr, file: &mut File, bytes: &[u8]) -> Result<Vec<u8>> {
+    fn publish_from(
+        &self,
+        name: &CStr,
+        temporary: &CStr,
+        file: &mut File,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>> {
         file.write_all(bytes)?;
         file.sync_all()?;
         // SAFETY: both names are valid C strings; the directory fd is live. linkat
@@ -113,20 +143,21 @@ impl PrivateDirectory {
                 self.handle.as_raw_fd(),
                 temporary.as_ptr(),
                 self.handle.as_raw_fd(),
-                c"identity.json".as_ptr(),
+                name.as_ptr(),
                 0,
             )
         };
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(error).context("publish persistent endpoint identity");
+                return Err(error).context("publish private record");
             }
         }
-        self.read()?.context("published identity disappeared")
+        self.read_record(name, 65_536)?
+            .context("published record disappeared")
     }
 
-    pub(super) fn replace_record(&self, name: &CStr, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn replace_record(&self, name: &CStr, bytes: &[u8]) -> Result<()> {
         let temporary = CString::new(format!(".pairing-{}", uuid::Uuid::new_v4()))?;
         let mut file = self.open_file(&temporary, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| -> Result<()> {
@@ -195,17 +226,8 @@ fn check_private(file: &File, directory: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
 
-    fn roots(root: &Path) -> (PathBuf, PathBuf) {
-        let state = root.join("state");
-        let runtime = root.join("runtime");
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::create_dir_all(&runtime).unwrap();
-        (state, runtime)
-    }
-
-    fn increment(store: &PairingStore) {
+    fn increment(store: &RecordStore) {
         store
             .transaction(|bytes| {
                 let value = bytes
@@ -217,13 +239,20 @@ mod tests {
             .unwrap();
     }
 
+    fn store(root: &Path) -> RecordStore {
+        RecordStore::new(
+            PrivateDirectory::open(&root.join("private")).unwrap(),
+            "count.json",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn transaction_subprocess() {
         let Some(root) = std::env::var_os("BMUX_PAIRING_TEST_ROOT") else {
             return;
         };
-        let (state, runtime) = roots(Path::new(&root));
-        let store = PairingStore::open(&state, &runtime).unwrap();
+        let store = store(Path::new(&root));
         for _ in 0..12 {
             increment(&store);
         }
@@ -232,7 +261,7 @@ mod tests {
     #[test]
     fn transactions_serialize_across_processes_and_threads() {
         let root = tempfile::tempdir().unwrap();
-        let (state, runtime) = roots(root.path());
+        let store = store(root.path());
         let mut children: Vec<_> = (0..4)
             .map(|_| {
                 std::process::Command::new(std::env::current_exe().unwrap())
@@ -243,7 +272,6 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let store = PairingStore::open(&state, &runtime).unwrap();
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 let store = &store;
@@ -257,19 +285,16 @@ mod tests {
         for child in &mut children {
             assert!(child.wait().unwrap().success());
         }
-        store
-            .transaction(|bytes| {
-                assert_eq!(serde_json::from_slice::<u64>(bytes.as_ref().unwrap())?, 96);
-                Ok(())
-            })
-            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<u64>(&store.read().unwrap().unwrap()).unwrap(),
+            96
+        );
     }
 
     #[test]
     fn errors_and_oversize_leave_state_unchanged() {
         let root = tempfile::tempdir().unwrap();
-        let (state, runtime) = roots(root.path());
-        let store = PairingStore::open(&state, &runtime).unwrap();
+        let store = store(root.path());
         increment(&store);
         assert!(
             store
@@ -287,21 +312,29 @@ mod tests {
                 })
                 .is_err()
         );
-        store
-            .transaction(|bytes| {
-                assert_eq!(bytes.as_deref(), Some(b"1".as_slice()));
-                Ok(())
-            })
-            .unwrap();
-        let path = runtime_directory(&state, &runtime)
-            .unwrap()
-            .join("pairing.json");
+        assert_eq!(store.read().unwrap().as_deref(), Some(b"1".as_slice()));
+        let path = root.path().join("private/count.json");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(store.transaction(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn publish_keeps_the_first_winner_and_try_lock_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = PrivateDirectory::open(&root.path().join("private")).unwrap();
+        assert_eq!(directory.publish_record(c"key", b"one").unwrap(), b"one");
+        assert_eq!(directory.publish_record(c"key", b"two").unwrap(), b"one");
+        let held = directory
+            .try_lock(c"host.lock")
+            .unwrap()
+            .expect("first lock");
+        assert!(directory.try_lock(c"host.lock").unwrap().is_none());
+        drop(held);
+        assert!(directory.try_lock(c"host.lock").unwrap().is_some());
     }
 
     #[test]
@@ -313,24 +346,19 @@ mod tests {
             .unwrap();
         check_private(&file, false).unwrap();
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
-        drop(file);
-        let reopened = directory.open_file(c"created", libc::O_RDONLY).unwrap();
-        check_private(&reopened, false).unwrap();
-        assert_eq!(reopened.metadata().unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]
     fn symlink_records_and_directories_are_rejected() {
         let root = tempfile::tempdir().unwrap();
-        let (state, runtime) = roots(root.path());
-        let path = runtime_directory(&state, &runtime).unwrap();
         let target = root.path().join("target");
         std::fs::create_dir(&target).unwrap();
+        let path = root.path().join("private");
         symlink(&target, &path).unwrap();
-        assert!(PairingStore::open(&state, &runtime).is_err());
+        assert!(PrivateDirectory::open(&path).is_err());
         std::fs::remove_file(&path).unwrap();
-        let store = PairingStore::open(&state, &runtime).unwrap();
-        symlink(&target, path.join("pairing.json")).unwrap();
+        let store = store(root.path());
+        symlink(&target, path.join("count.json")).unwrap();
         assert!(store.transaction(|_| Ok(())).is_err());
     }
 }

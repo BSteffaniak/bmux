@@ -4521,7 +4521,7 @@ mod one_way_input_contract_tests {
     }
 
     #[tokio::test]
-    async fn checked_native_input_observes_authoritative_denial() {
+    async fn checked_native_input_is_one_way_and_never_waits_for_a_reply() {
         use bmux_ipc::{Envelope, EnvelopeKind, Response, ResponsePayload};
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let server = tokio::spawn(async move {
@@ -4598,22 +4598,16 @@ mod one_way_input_contract_tests {
         client.require_service_contracts().unwrap();
         let mut client = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
         let session = Uuid::new_v4();
-        assert!(
-            client
-                .send_one_way_attach_input(session, b"i".to_vec())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("observer")
-        );
-        assert!(
-            client
-                .send_one_way_pane_direct_input(session, Uuid::new_v4(), b"i".to_vec())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("observer")
-        );
+        // Both writes complete on delivery; the server's denials arrive as
+        // unclaimed responses the reader drops.
+        client
+            .send_one_way_attach_input(session, b"i".to_vec())
+            .await
+            .unwrap();
+        client
+            .send_one_way_pane_direct_input(session, Uuid::new_v4(), b"i".to_vec())
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 
@@ -4665,15 +4659,9 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         session_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
-        if bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self) {
-            // Native checked connections must observe authoritative rejections,
-            // not treat successful transport delivery as permission to write.
-            return match AttachCommands::client::attach_input(self, session_id, data).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => typed_server_error("attach-input", error),
-                Err(error) => typed_dispatch_error("attach-input", error),
-            };
-        }
+        // Input is one-way on every connection, local or connector-backed:
+        // a write never waits for a reply. The server enforces write access
+        // and reports a rejected writer through attach events.
         let typed_payload =
             bmux_plugin_sdk::encode_service_message(&AttachCommands::client::AttachInputRequest {
                 session_id,
@@ -4698,15 +4686,6 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
-        if bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(self) {
-            return match PaneCommands::client::pane_direct_input(self, session_id, pane_id, data)
-                .await
-            {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => typed_server_error("pane-direct-input", error),
-                Err(error) => typed_dispatch_error("pane-direct-input", error),
-            };
-        }
         let typed_payload = bmux_plugin_sdk::encode_service_message(
             &PaneCommands::client::PaneDirectInputRequest {
                 session_id,

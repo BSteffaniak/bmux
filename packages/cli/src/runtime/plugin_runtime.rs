@@ -230,8 +230,10 @@ fn install_static_bundled_client_adapters(enabled: &[String], paths: &ConfigPath
 fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     #[cfg(feature = "bundled-plugin-connections")]
     if plugin_id == "bmux.connections" {
-        crate::runtime::attach::provider::register_plugin_provider(
-            bmux_connections_plugin::client_attach_provider(paths),
+        // Saved hosts become `--target` names; the connector owns their syntax.
+        crate::connection::register_plugin_transport_connector(
+            plugin_id,
+            bmux_connections_plugin::client_transport_connector(paths),
         );
     }
     #[cfg(feature = "bundled-plugin-pane-runtime")]
@@ -3310,11 +3312,9 @@ fn connections_definition(
     state: &RuntimeCommandState,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
     let clipboard_state = state.clone();
-    let attach_state = state.clone();
-    bmux_connections_plugin::standalone_definition(bmux_connections_plugin::hosted::HostedClient {
-        admin: Some(super::remote_cli::admin_ports(
-            state.connection_target.clone(),
-        )),
+    // `connect <host> [session]` forwards to the core `attach` command with
+    // `--target <host>` (see `attach_selected`); the plugin needs no attach port.
+    bmux_connections_plugin::standalone_definition(bmux_connections_plugin::ClientHost {
         paths: state.paths.clone(),
         config: state.config.clone(),
         runtime_name: super::active_runtime_name(),
@@ -3324,16 +3324,8 @@ fn connections_definition(
                 anyhow::anyhow!(super::attach::runtime::format_clipboard_service_error(&e))
             })
         }),
-        attach: Arc::new(move |target, session, follow, global, forever| {
-            let _selected = SelectedCommandStateGuard::enter(&attach_state);
-            block_on_command(super::remote_cli::attach_endpoint(
-                &attach_state,
-                &target,
-                session.as_deref(),
-                follow.as_deref(),
-                global,
-                forever,
-            ))
+        kiosk_attach: Arc::new(|grant| {
+            block_on_command(super::kiosk_cli::attach_authorized(grant))
         }),
     })
 }
@@ -5003,6 +4995,8 @@ allow_hyphen_values=true
                 interface_id: "provider-command/v1".to_string(),
                 concurrency: None,
                 reentrant_operations: std::collections::BTreeSet::new(),
+                access: None,
+                operation_access: std::collections::BTreeMap::new(),
             }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -5140,6 +5134,8 @@ allow_hyphen_values=true
                     interface_id: "provider-query/v1".to_string(),
                     concurrency: None,
                     reentrant_operations: std::collections::BTreeSet::new(),
+                    access: None,
+                    operation_access: std::collections::BTreeMap::new(),
                 },
                 bmux_plugin_sdk::PluginService {
                     capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
@@ -5148,6 +5144,8 @@ allow_hyphen_values=true
                     interface_id: "provider-command/v1".to_string(),
                     concurrency: None,
                     reentrant_operations: std::collections::BTreeSet::new(),
+                    access: None,
+                    operation_access: std::collections::BTreeMap::new(),
                 },
             ],
             commands: Vec::new(),

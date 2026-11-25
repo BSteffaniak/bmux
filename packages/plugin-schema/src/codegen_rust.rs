@@ -652,9 +652,45 @@ fn emit_interface_service_descriptor(iface: &Interface, out: &mut String) {
         out,
         "    pub const REENTRANT_OPERATIONS: &[&str] = &[{reentrant}];\n"
     );
+    let access = iface.access.map_or_else(
+        || "::core::option::Option::None".to_string(),
+        |access| {
+            format!(
+                "::core::option::Option::Some(::bmux_plugin_sdk::RouteAccess::{})",
+                access.rust_variant()
+            )
+        },
+    );
+    let operation_access = iface
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            InterfaceItem::Query(op) | InterfaceItem::Command(op) => op.access.map(|access| {
+                format!(
+                    "({:?}, ::bmux_plugin_sdk::RouteAccess::{})",
+                    op.name,
+                    access.rust_variant()
+                )
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(
+        "    /// BPDL `@access` class of this interface; `None` when undeclared, which\n    /// admitted (remote) streams can never reach.\n",
+    );
     let _ = writeln!(
         out,
-        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: SERVICE_CONTRACT,\n        reentrant_operations: REENTRANT_OPERATIONS,\n    }};\n"
+        "    pub const ACCESS: ::core::option::Option<::bmux_plugin_sdk::RouteAccess> = {access};\n"
+    );
+    out.push_str("    /// Per-operation BPDL `@access` overrides of [`ACCESS`].\n");
+    let _ = writeln!(
+        out,
+        "    pub const OPERATION_ACCESS: &[(&str, ::bmux_plugin_sdk::RouteAccess)] = &[{operation_access}];\n"
+    );
+    let _ = writeln!(
+        out,
+        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: SERVICE_CONTRACT,\n        reentrant_operations: REENTRANT_OPERATIONS,\n        access: ACCESS,\n        operation_access: OPERATION_ACCESS,\n    }};\n"
     );
     out.push_str(
         "    /// Convert this BPDL interface descriptor into a plugin service declaration.\n",
@@ -1511,6 +1547,28 @@ fn pascal_case(s: &str) -> String {
 mod tests {
     use super::{ImportInfo, ImportMap, emit, emit_with_imports};
     use crate::compile;
+
+    #[test]
+    fn access_classes_travel_in_the_generated_service_descriptor() {
+        let source = "plugin example version 1; capability READ = example.read; capability WRITE = example.write;\n\
+            @capability(READ) @access(observe) interface state { query get() -> u32; @access(owner-local) query secret() -> u32; }\n\
+            @capability(WRITE) interface edit { @access(input) command set(n: u32) -> unit; command other() -> unit; }";
+        let rust = emit(&compile(source).unwrap());
+        assert!(rust.contains(
+            "pub const ACCESS: ::core::option::Option<::bmux_plugin_sdk::RouteAccess> = ::core::option::Option::Some(::bmux_plugin_sdk::RouteAccess::Observe);"
+        ));
+        assert!(rust.contains(
+            "pub const OPERATION_ACCESS: &[(&str, ::bmux_plugin_sdk::RouteAccess)] = &[(\"secret\", ::bmux_plugin_sdk::RouteAccess::OwnerLocal)];"
+        ));
+        assert!(rust.contains(
+            "pub const ACCESS: ::core::option::Option<::bmux_plugin_sdk::RouteAccess> = ::core::option::Option::None;"
+        ));
+        assert!(rust.contains(
+            "pub const OPERATION_ACCESS: &[(&str, ::bmux_plugin_sdk::RouteAccess)] = &[(\"set\", ::bmux_plugin_sdk::RouteAccess::Input)];"
+        ));
+        assert!(rust.contains("access: ACCESS,"));
+        assert!(rust.contains("operation_access: OPERATION_ACCESS,"));
+    }
 
     #[test]
     fn secret_fields_redact_records_and_requests_without_changing_contract() {

@@ -20,7 +20,6 @@ use uuid::Uuid;
 const BOOTSTRAP_RECORDING_START_ENV: &str = "BMUX_BOOTSTRAP_RECORDING_START";
 
 use super::plugin_kernel::RuntimeLoggingHandle;
-use super::server_commands::prepare_configured_gateway;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
     activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file, connect_with_context,
@@ -74,7 +73,8 @@ pub(super) async fn run_default_server_attach(
         }
         client
     } else {
-        crate::connection::apply_stale_build_policy(ConnectionPolicyScope::Normal)?;
+        // The local stale-build policy is about this machine's server; a
+        // remote host runs its own build.
         selected.connect("bmux-cli-default-attach").await?
     };
     let target = resolve_default_attach_target(&mut client).await?;
@@ -462,11 +462,6 @@ async fn run_server_start_inner(
     }
 
     let config = BmuxConfig::load()?;
-    let configured_gateway = if foreground_internal || !daemon {
-        prepare_configured_gateway(&config.server.gateway).await?
-    } else {
-        None
-    };
     let base_rolling_settings = bmux_server::rolling_recording_settings_from_config(&config);
     let effective_rolling_settings =
         bmux_server::apply_rolling_start_options(&base_rolling_settings, &rolling_options);
@@ -667,112 +662,6 @@ async fn run_server_start_inner(
     Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
     super::dispatch::startup_future_marker("plugins.after_activate", 0);
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
-    {
-        use bmux_plugin::stream_admission::{
-            STREAM_ADMISSION_PROVIDER_EXTENSION, STREAM_ADMITTED_ROUTES_EXTENSION,
-            StreamAdmissionProviderDeclaration, StreamAdmittedRoute,
-        };
-        let mut selected = None;
-        for plugin in loaded_plugins.iter() {
-            for contribution in plugin.collect_activation_contributions()? {
-                if let bmux_plugin_sdk::PluginContribution::Extension {
-                    extension_point,
-                    payload,
-                    ..
-                } = &contribution
-                    && extension_point == STREAM_ADMITTED_ROUTES_EXTENSION
-                {
-                    let routes: Vec<StreamAdmittedRoute> =
-                        bmux_plugin_sdk::decode_service_message(payload)?;
-                    for route in routes {
-                        anyhow::ensure!(
-                            !route.operation.is_empty()
-                                && route.operation != "*"
-                                && plugin.declaration.services.iter().any(|service| service
-                                    .capability
-                                    .as_str()
-                                    == route.capability
-                                    && service.interface_id == route.interface_id
-                                    && service.kind == route.kind),
-                            "invalid admitted route declaration: provider={} capability={} kind={:?} interface={} operation={}",
-                            plugin.declaration.id.as_str(),
-                            route.capability,
-                            route.kind,
-                            route.interface_id,
-                            route.operation
-                        );
-                        server.approve_admitted_route(bmux_server::ServiceRoute {
-                            capability: route.capability,
-                            interface_id: route.interface_id,
-                            operation: route.operation,
-                            kind: match route.kind {
-                                bmux_plugin_sdk::ServiceKind::Query => {
-                                    bmux_ipc::InvokeServiceKind::Query
-                                }
-                                bmux_plugin_sdk::ServiceKind::Command => {
-                                    bmux_ipc::InvokeServiceKind::Command
-                                }
-                                bmux_plugin_sdk::ServiceKind::Event => {
-                                    anyhow::bail!("event cannot be an admitted request route")
-                                }
-                            },
-                        })?;
-                    }
-                }
-                if let bmux_plugin_sdk::PluginContribution::Extension {
-                    extension_point,
-                    payload,
-                    ..
-                } = contribution
-                    && extension_point == STREAM_ADMISSION_PROVIDER_EXTENSION
-                {
-                    anyhow::ensure!(
-                        selected.is_none(),
-                        "multiple stream admission providers declared"
-                    );
-                    let declaration: StreamAdmissionProviderDeclaration =
-                        bmux_plugin_sdk::decode_service_message(&payload)?;
-                    let route = |operation: &bmux_plugin::stream_admission::StreamAdmissionProviderOperation, kind| {
-                        anyhow::ensure!(plugin.declaration.services.iter().any(|service|
-                            service.capability.as_str() == operation.capability
-                            && service.interface_id == operation.interface_id
-                            && service.kind == kind), "admission route not owned by declaring provider");
-                        Ok::<_, anyhow::Error>(bmux_server::ServiceRoute {
-                            capability: operation.capability.clone(),
-                            kind: match kind {
-                                bmux_plugin_sdk::ServiceKind::Query => bmux_ipc::InvokeServiceKind::Query,
-                                bmux_plugin_sdk::ServiceKind::Command => bmux_ipc::InvokeServiceKind::Command,
-                                bmux_plugin_sdk::ServiceKind::Event => anyhow::bail!("event cannot be an admission operation"),
-                            },
-                            interface_id: operation.interface_id.clone(), operation: operation.operation.clone(),
-                        })
-                    };
-                    let routes = bmux_server::StreamAdmissionProviderRoutes {
-                        probe: route(&declaration.probe, bmux_plugin_sdk::ServiceKind::Query)?,
-                        consume: route(
-                            &declaration.consume,
-                            bmux_plugin_sdk::ServiceKind::Command,
-                        )?,
-                        validate: route(
-                            &declaration.validate,
-                            bmux_plugin_sdk::ServiceKind::Query,
-                        )?,
-                    };
-                    selected = Some((routes, declaration));
-                }
-            }
-        }
-        if let Some((routes, declaration)) = selected {
-            let deadline = std::time::Duration::from_millis(declaration.deadline_ms);
-            let capacity = declaration.max_in_flight;
-            server.install_stream_admission_provider(
-                routes,
-                std::sync::Arc::new(declaration),
-                deadline,
-                capacity,
-            )?;
-        }
-    }
     // Spawn a plugin-bus → streaming-client forwarder task for every
     // `event_publications` entry that opted into
     // `forward_to_streaming_clients`. These live for the server's
@@ -929,13 +818,6 @@ async fn run_server_start_inner(
         )
         .map_err(anyhow::Error::msg)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;
-    let gateway_loop = async move {
-        match configured_gateway {
-            Some(gateway) => gateway.run().await,
-            None => std::future::pending::<Result<()>>().await,
-        }
-    };
-    let mut gateway_loop = Box::pin(gateway_loop);
     let ownership = startup_ownership
         .as_ref()
         .context("foreground startup has no lifetime claim")?;
@@ -1023,7 +905,6 @@ async fn run_server_start_inner(
             result = single_terminal => result,
             () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
             result = &mut server_loop => result,
-            result = &mut gateway_loop => result,
         }
     } else {
         let (plugin_bridge_shutdown_tx, plugin_bridge_shutdown_rx) =
@@ -1048,17 +929,12 @@ async fn run_server_start_inner(
                 result?;
                 Ok(())
             }
-            result = &mut gateway_loop => {
-                let _ = plugin_bridge_shutdown_tx.send(true);
-                result
-            }
         }
     };
-    // Cancellation must release gateway listeners before plugin teardown, which
-    // can take time. A pinned reference would keep the underlying future alive.
+    // Cancellation must release the server's listeners before plugin teardown,
+    // which can take time. A pinned reference would keep the future alive.
     drop(managed_idle_context);
     drop(server_loop);
-    drop(gateway_loop);
     #[cfg(feature = "bundled-plugin-snapshot")]
     {
         *snapshot_runtime

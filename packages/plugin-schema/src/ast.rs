@@ -101,8 +101,66 @@ pub struct Interface {
     /// Capability constant required to invoke this service interface.
     /// Present only for query-only or command-only interfaces.
     pub capability: Option<String>,
+    /// `@access(class)`: the route access class of every operation that does
+    /// not override it. Authorization metadata only; never wire identity.
+    pub access: Option<Access>,
     pub items: Vec<InterfaceItem>,
     pub span: Span,
+}
+
+/// Route access class from `@access(observe|input|manage|owner-local)`.
+///
+/// Streams admitted from outside the host may reach a route only when its
+/// class is declared, is not `owner-local`, and the host's authorizer allows
+/// the class for the stream's principal. Local streams are not checked.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    /// Read state and receive output.
+    Observe,
+    /// Change what runs or what is shown.
+    Input,
+    /// Change durable configuration of the runtime.
+    Manage,
+    /// Never reachable from an admitted stream.
+    OwnerLocal,
+}
+
+impl Access {
+    /// Every class.
+    pub const ALL: [Self; 4] = [Self::Observe, Self::Input, Self::Manage, Self::OwnerLocal];
+
+    /// BPDL spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Input => "input",
+            Self::Manage => "manage",
+            Self::OwnerLocal => "owner-local",
+        }
+    }
+
+    /// Parse a BPDL spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|access| access.as_str() == value)
+    }
+
+    /// Variant name of the matching `bmux_plugin_sdk::RouteAccess`.
+    #[must_use]
+    pub const fn rust_variant(self) -> &'static str {
+        match self {
+            Self::Observe => "Observe",
+            Self::Input => "Input",
+            Self::Manage => "Manage",
+            Self::OwnerLocal => "OwnerLocal",
+        }
+    }
 }
 
 /// Items allowed inside an `interface { ... }` block.
@@ -241,6 +299,8 @@ pub struct Operation {
     /// non-streaming `query` operations. It changes concurrency semantics, so
     /// it is part of the canonical contract identity when set.
     pub reentrant: bool,
+    /// `@access(class)` override of the interface's access class.
+    pub access: Option<Access>,
     pub span: Span,
 }
 

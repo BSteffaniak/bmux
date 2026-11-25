@@ -7,6 +7,15 @@ different things. A plugin can supply the first two and still call back into the
 built-in handler. An empty manifest match below is not proof that the operation
 belongs in core.
 
+The remote access commands in this baseline (`share`, `unshare`, hosted
+`setup`, `host`, `hosts`, `join`, `auth`, `access`, the old `remote`
+subcommands, `server gateway` and `server bridge`) were later removed rather than
+migrated; see
+[remote-access-architecture.md](remote-access-architecture.md). The current
+remote surface (`connect`, `remote`, `kiosk`) is declared in
+`plugins/connections-plugin/plugin.toml`. The rows below still describe the
+baseline.
+
 ## Where to find the implemented ownership map
 
 [`command-dispositions.json`](../../scripts/cli-ownership/command-dispositions.json) records the disposition of each audited command or namespace: 70 migrated, 190 retained in plugins, 78 retained in core, 29 composed namespaces, and 15 non-CLI entries (hidden commands, including the sidebar and tab-bar show/hide/toggle namespaces). Use that catalog for current ownership; the family decisions below describe the starting inventory. [`scripts/cli-ownership`](../../scripts/cli-ownership/README.md) contains the frozen reference cases and four-profile comparison. An intentional help or availability change is not a byte-identical match to the historical command.
@@ -23,9 +32,6 @@ them runs under `cargo test`:
   plugin administration and repair with `bundled-plugin-cli`.
 - `python3 packages/cli/tests/recording_snapshot_roundtrip.py --binary /path/to/bmux`:
   Unix PTY attach, recording and snapshot save/restore round trip.
-- `python3 plugins/connections-plugin/src/hosted/acceptance.py /path/to/bmux`:
-  hosted share/join/setup flows against a local fixture control plane (needs
-  `zbarimg` or macOS Vision for QR decoding).
 
 ## Migration decisions
 
@@ -53,13 +59,11 @@ Test the plugin actually performs the side effect rather than forwarding back to
 its old path. Keep a neutral fallback only where baseline operation requires
 one.
 
-For sharing specifically: use an isolated configuration and local control-plane
-fixture; exercise `share --qr`, copy failure, unnamed/default target,
-role/TTL/one-time, `unshare`, and `share revoke`. Decode the rendered QR and
-compare the URL, including the `bmux://` fallback. Require `qrcode` absent from
-the locked bare and local-splits graphs and present with connections. Repeat the
-graph check for each claimed dependency saving; moving code alone is not
-evidence.
+For remote access, the end-to-end acceptance tests drive real host and client
+processes (`cargo nextest run -p bmux_cli --test remote_access`). Require
+`qrcode` absent from the locked bare and local-splits graphs and present with
+connections. Repeat the graph check for each claimed dependency saving; moving
+code alone is not evidence.
 
 ## Built-in execution table
 

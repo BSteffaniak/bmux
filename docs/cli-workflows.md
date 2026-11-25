@@ -1,7 +1,7 @@
 # CLI workflows
 
-For account-free remote terminal pairing without a client-side server, see
-[Remote pairing and daemonless clients](remote-pairing.md).
+For reaching this machine's sessions from another device, see
+[Remote access and pairing](remote-pairing.md).
 
 The current CLI is server-backed by default. Running `bmux` with no subcommand
 starts or reuses a server, creates a session when needed, and attaches.
@@ -48,26 +48,28 @@ bmux follow <client-uuid>                     # your attached terminal follows
 bmux follow <client-uuid> --client <your-id>  # with several attachments, name one
 bmux unfollow
 
-# Remote targets over SSH
-bmux connect prod app
-bmux connect prod                # picker when multiple sessions
+# Remote access: pair a device once (host side)
+bmux remote enable
+bmux remote pair                 # prints a one-time link and waits to approve
+bmux remote pair --role view-only --name laptop
 bmux remote list
-bmux remote test prod
-bmux remote doctor prod --fix
-bmux remote init prod --ssh bmux@prod.example.com --set-default
-bmux remote install-server prod
-bmux remote upgrade prod
-bmux --target prod list-sessions
-bmux connect prod --reconnect-forever
-bmux remote complete targets
-bmux remote complete sessions prod
+bmux remote status
+bmux remote role laptop view-only
+bmux remote revoke laptop
+bmux remote disable
 
-# Streamlined hosted workflow (p2p default, no bmux control-plane required)
-bmux setup
-bmux host
+# Remote access: the connecting device (needs no server)
+bmux connect --pair              # paste the link, compare the phrase
+bmux connect desk                # attach to the saved host
+bmux connect desk app            # attach to session `app`
+bmux attach --target desk app
+bmux --target desk list-sessions
+bmux remote hosts
+bmux remote rename desk desktop
+bmux remote forget desktop
+
 # Optional runtime instance selection (for parallel local runtimes)
 bmux --runtime dev server start --daemon
-bmux --runtime dev host
 
 # Native per-user login autostart (launchd, systemd user service, or Task Scheduler)
 bmux server autostart install
@@ -109,35 +111,6 @@ bmux sandbox cleanup --dry-run --json
 bmux sandbox clean --dry-run --json
 bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600
-# Optional control-plane mode for account/share links
-bmux setup --mode control-plane
-bmux host --mode control-plane
-bmux share --name my-host
-bmux join bmux://my-host
-
-# Bash/Zsh/Fish completion can call:
-# bmux remote complete targets
-# bmux remote complete sessions <target>
-
-# Internet-accessible TLS gateway
-bmux server gateway --listen 0.0.0.0:7443 --quick
-bmux connect tls-prod app
-
-# Or start the TLS gateway automatically with the local server by adding:
-# [server.gateway]
-# enabled = true
-# listen = "0.0.0.0:7443"
-# quick = true
-# Restart the bmux server after changing gateway settings.
-
-# Reverse-SSH hosted helper (prints public URL in ssh output)
-bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
-bmux connect https://your-public-url app
-
-# Iroh hosted mode (default for --host)
-bmux server gateway --listen 127.0.0.1:7443 --host
-# prints: iroh://<endpoint_id>?relay=<url>
-bmux connect iroh://<endpoint_id>?relay=<url> app
 
 # Logging
 bmux logs path
@@ -151,30 +124,10 @@ bmux logs watch --profile incident-db
 bmux logs profiles list
 ```
 
-A TLS gateway can also start automatically with the local server:
-
-```toml
-[server.gateway]
-enabled = true
-listen = "0.0.0.0:7443"
-quick = true
-```
-
-For a production certificate, disable quick mode by omitting `quick` and provide
-both PEM files:
-
-```toml
-[server.gateway]
-enabled = true
-listen = "0.0.0.0:7443"
-cert_file = "/etc/bmux/gateway-cert.pem"
-key_file = "/etc/bmux/gateway-key.pem"
-```
-
-Restart the bmux server after changing gateway settings. Listening on `0.0.0.0`
-exposes the gateway to reachable networks; apply appropriate firewall and access
-controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway
---host ...` command flows.
+Remote access is off until `bmux remote enable`, and only paired devices can
+connect. Its listener, relay and auto-start settings live under
+`[plugins.settings."bmux.connections".remote]`; see
+[Remote access and pairing](remote-pairing.md#settings).
 
 `bmux logs watch` uses a ratatui interface and supports Vim-style navigation
 (`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
@@ -196,9 +149,8 @@ Environment overrides:
 
 A native autostart service runs foreground `bmux server start` so the operating
 system owns supervision; it does not use `--daemon`. Installation is explicit
-and starts immediately unless `--no-start` is passed. Existing
-`[server.gateway]` configuration is loaded normally, so an enabled gateway also
-starts at login.
+and starts immediately unless `--no-start` is passed. If remote access is
+enabled (`bmux remote enable`), it also starts with the server at login.
 
 Imperative installation refuses symlinked, read-only, conflicting, or externally
 managed declarations. Nix/Home Manager users should define
@@ -210,57 +162,14 @@ automatically.
 Runtime selection vs sandbox isolation:
 
 - Use `--runtime <name>` to run multiple local bmux runtime instances side-by-side while still using your normal config/data/state roots.
-- Use `bmux sandbox dev --inherit-config` for local build testing with a private snapshot of your normal settings and fresh BMUX config/runtime/data/state/log directories. It uses the invoked binary (or explicit `--bmux-bin`), disables gateway startup, and preserves your shell environment and working directory. Detaching retains the server; use the printed `sandbox attach` or `sandbox stop` command. A changed binary requires stopping the old sandbox before testing the rebuild. This is not an OS security sandbox: configured external paths, plugin artifacts, and external services remain shared. Do not use config snapshots as shareable diagnostics; they can contain secrets.
+- Use `bmux sandbox dev --inherit-config` for local build testing with a private snapshot of your normal settings and fresh BMUX config/runtime/data/state/log directories. It uses the invoked binary (or explicit `--bmux-bin`) and preserves your shell environment and working directory. Detaching retains the server; use the printed `sandbox attach` or `sandbox stop` command. A changed binary requires stopping the old sandbox before testing the rebuild. This is not an OS security sandbox: configured external paths, plugin artifacts, and external services remain shared. Do not use config snapshots as shareable diagnostics; they can contain secrets.
 - Use `bmux sandbox ...` when you want a throwaway isolated environment (config/runtime/data/state/logs/home/tmp) for safe local build testing and failure triage.
 - `BMUX_LOG_DIR`: explicit log directory
 - `BMUX_STATE_DIR`: explicit state directory
 - `BMUX_TARGET`: default command target (same behavior as `--target`)
 
-Connection targets can be configured in `bmux.toml`:
-
-```toml
-[connections]
-hosted_mode = "p2p" # or "control_plane" (hard-fail on control-plane errors)
-default_target = "local"
-
-[connections.targets.prod]
-transport = "ssh"
-host = "prod.example.com"
-user = "bmux"
-port = 22
-identity_file = "~/.ssh/id_ed25519"
-known_hosts_file = "~/.ssh/known_hosts"
-strict_host_key_checking = true
-jump = "ops@bastion.example.com"
-remote_bmux_path = "bmux"
-connect_timeout_ms = 8000
-default_session = "main"
-
-[connections.targets.tls-prod]
-transport = "tls"
-host = "gateway.example.com"
-port = 7443
-server_name = "gateway.example.com"
-ca_file = "~/.config/bmux/gateway-ca.pem"
-```
-
-Example shell wiring for target/session completion:
-
-```bash
-# Bash helper functions
-_bmux_targets() {
-  bmux remote complete targets 2>/dev/null
-}
-
-_bmux_sessions() {
-  local target="$1"
-  bmux remote complete sessions "$target" 2>/dev/null
-}
-
-# Usage examples:
-# _bmux_targets
-# _bmux_sessions prod
-```
+`--target` and `BMUX_TARGET` name a saved host (see `bmux remote hosts`) or
+`local`. Saved hosts come from pairing, not from `bmux.toml`.
 
 Plugin command ownership policy is optional and declarative:
 
@@ -310,4 +219,4 @@ are documented in [Window presentation plugins](tab-presentations.md).
   cargo build -p bmux_example_hello_plugin
   ```
 
-See the [root README](../README.md) for installation and [TESTING.md](../TESTING.md) for validation. Examples using remote hosts, gateways, service installation, or plugin installation change runtime state; review them before running.
+See the [root README](../README.md) for installation and [TESTING.md](../TESTING.md) for validation. Examples using remote access, service installation, or plugin installation change runtime state; review them before running.

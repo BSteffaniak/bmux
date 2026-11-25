@@ -10,21 +10,44 @@ bmux attach dev
 bmux list-sessions --json
 ```
 
-## Remote Target Workflow
+## Remote Access: Pair a Device
+
+On the host, enable remote access once and open a pairing session:
 
 ```bmux-cli
-bmux remote list --json
-bmux remote test prod
-bmux connect prod app
+bmux remote enable
+bmux remote pair
+bmux remote pair --role view-only --name laptop
 ```
 
-## Hosted Flow
+On the other device, paste the printed link when prompted, check that both
+sides show the same phrase, and let the host approve:
 
 ```bmux-cli
-bmux setup --mode p2p
-bmux host --status
-bmux hosts
+bmux connect --pair
+bmux connect --pair --name desk --device-name work-mac
 ```
+
+## Remote Access: Connect and Manage
+
+```bmux-cli
+# On the connecting device
+bmux connect desk
+bmux connect desk work
+bmux remote hosts
+bmux remote rename desk desktop
+bmux remote forget desktop
+
+# On the host
+bmux remote status
+bmux remote list
+bmux remote role laptop view-only
+bmux remote revoke laptop
+bmux remote disable
+```
+
+See [Remote Access and Pairing](/docs/remote-pairing) for the full flow and
+settings.
 
 ## Kiosk Access Flow
 

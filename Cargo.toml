@@ -456,6 +456,7 @@ futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 gif = { version = "0.14.2" }
 iroh = { version = "1.5.0", default-features = true }
+iroh-relay = { version = "1.5.0", default-features = false }
 js-sys = { version = "0.3.107" }
 libc = { version = "0.2" }
 libloading = { version = "0.9.1", default-features = false, features = ["std"] }

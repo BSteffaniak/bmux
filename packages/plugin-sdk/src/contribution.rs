@@ -170,6 +170,7 @@ mod tests {
             expose_in_cli: false,
             accepts_repeat: false,
             forward_help: false,
+            access: None,
         };
         let contribution = PluginContribution::command(command);
         assert_eq!(contribution.id(), "command:hello");
