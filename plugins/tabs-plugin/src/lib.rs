@@ -1854,7 +1854,7 @@ impl TabsPlugin {
                 let shared = shared.clone();
                 // Serialize effects and await blocking work even during shutdown:
                 // cancellation cannot make an in-flight service call disappear.
-                worker.spawn_blocking(move || {
+                let ran = worker.run_blocking(move || {
                     if let Err(error) = recover_tab_placements(
                         &tab_states(&shared.runtime_state),
                         shared.caller.as_ref(),
@@ -1866,7 +1866,9 @@ impl TabsPlugin {
                     // Tab create/rename/close, selection and workspace changes
                     // can change attachments' projections.
                     shared.attachments.schedule();
-                }).await.map_err(|error| error.to_string())?;
+                }).await?;
+                // Teardown refused the step: a normal stop, as on cancellation.
+                if ran.is_none() { return Ok(()); }
             }
         }).map_err(PluginCommandError::failed)?;
         Ok(())
@@ -3246,14 +3248,10 @@ async fn publish_on_worker(
 ) -> std::result::Result<bool, String> {
     let shared = shared.clone();
     let board = Arc::clone(board);
-    match worker
-        .spawn_blocking(move || publish_tab_status(&shared, &board))
-        .await
-    {
-        Ok(()) => Ok(true),
-        Err(error) if error.is_closed() => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
+    Ok(worker
+        .run_blocking(move || publish_tab_status(&shared, &board))
+        .await?
+        .is_some())
 }
 
 /// Follow pane signals and publish each tab's status once a second when it
@@ -3402,10 +3400,14 @@ fn spawn_attachment_refresher(
                         () = shared.attachments.woken() => {}
                     }
                     let shared = shared.clone();
-                    worker
-                        .spawn_blocking(move || refresh_attachments(&shared))
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    // Teardown refused the step: a normal stop, as on cancellation.
+                    if worker
+                        .run_blocking(move || refresh_attachments(&shared))
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
                 }
             },
         )

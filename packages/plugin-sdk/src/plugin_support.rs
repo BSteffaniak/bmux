@@ -237,4 +237,57 @@ impl HostAsyncHandle {
         let _scope = self.background.enter();
         crate::rt::spawn_blocking(f)
     }
+
+    /// Run one step of a background task's blocking work and wait for it.
+    ///
+    /// `Ok(None)` when teardown already began and the scope refused the job:
+    /// that is a normal stop, and the task should return `Ok(())` exactly as
+    /// it does on cancellation (its cancellation and its next step can race).
+    ///
+    /// # Errors
+    /// The job panicked, or no host runtime is reachable.
+    pub async fn run_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Option<T>, String> {
+        match self.spawn_blocking(f).await {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.is_closed() => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A background task whose next blocking step races its cancellation
+    /// stops cleanly: the refused step is a normal stop, never a failure that
+    /// would fail teardown.
+    #[tokio::test]
+    async fn a_blocking_step_refused_at_teardown_is_a_clean_stop() {
+        let tasks = bmux_plugin_runtime::background::BackgroundTasks::new();
+        let handle = HostAsyncHandle::new(tasks.clone());
+        assert_eq!(handle.run_blocking(|| 7).await, Ok(Some(7)));
+        let (go, gate) = tokio::sync::oneshot::channel::<()>();
+        let (step, stepped) = tokio::sync::oneshot::channel();
+        let worker = handle.clone();
+        handle
+            .spawn_background("observer", move |_cancellation| async move {
+                let _ = gate.await;
+                // Teardown began before this step: the scope refuses it.
+                let outcome = worker.run_blocking(|| ()).await?;
+                let _ = step.send(outcome.is_none());
+                Ok(())
+            })
+            .unwrap();
+        tasks.cancel().unwrap();
+        go.send(()).unwrap();
+        tasks
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("a refused step must not fail teardown");
+        assert_eq!(stepped.await, Ok(true));
+    }
 }

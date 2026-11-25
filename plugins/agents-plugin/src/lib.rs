@@ -408,14 +408,12 @@ impl Observer {
                         () = cancellation.cancelled() => return Ok(()),
                         _ = tick.tick() => {
                             let observer = Arc::clone(&jobs_observer);
-                            let changed = match worker
-                                .spawn_blocking(move || observer.list_jobs())
-                                .await
-                            {
-                                Ok(changed) => changed,
-                                // Teardown closed the scope first: this is a normal stop.
-                                Err(error) if error.is_closed() => return Ok(()),
-                                Err(error) => return Err(error.to_string()),
+                            // `None`: teardown closed the scope first, a normal stop.
+                            let Some(changed) = worker
+                                .run_blocking(move || observer.list_jobs())
+                                .await?
+                            else {
+                                return Ok(());
                             };
                             if changed {
                                 wake_on_jobs.notify_one();
@@ -436,11 +434,13 @@ impl Observer {
                         () = tokio::time::sleep(SAFETY_PASS) => {}
                     }
                     let pass_observer = Arc::clone(&observer);
-                    match worker.spawn_blocking(move || pass_observer.pass()).await {
-                        Ok(()) => {}
-                        // Teardown closed the scope during the pass: this is a normal stop.
-                        Err(error) if error.is_closed() => return Ok(()),
-                        Err(error) => return Err(error.to_string()),
+                    // `None`: teardown closed the scope during the pass, a normal stop.
+                    if worker
+                        .run_blocking(move || pass_observer.pass())
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(());
                     }
                     tokio::time::sleep(MIN_PASS_INTERVAL).await;
                 }

@@ -1342,8 +1342,8 @@ fn spawn_follow_observer(
                     };
                     let events = events.clone();
                     let caller = Arc::clone(&caller);
-                    worker
-                        .spawn_blocking(move || {
+                    let followed = worker
+                        .run_blocking(move || {
                             follow_leader(
                                 &events,
                                 caller.as_ref(),
@@ -1352,8 +1352,11 @@ fn spawn_follow_observer(
                                 SessionId(session_id),
                             );
                         })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await?;
+                    // Teardown refused the step: a normal stop, as on cancellation.
+                    if followed.is_none() {
+                        return Ok(());
+                    }
                 }
             },
         )

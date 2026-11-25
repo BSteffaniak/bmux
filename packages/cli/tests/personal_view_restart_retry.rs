@@ -114,13 +114,13 @@ impl Daemon {
         }
     }
 
-    /// Graceful stop: the daemon saves and exits. The stop command's own
-    /// status is not this test's subject (a plugin's late background cleanup
-    /// can fail it after the save); the daemon exiting is.
+    /// Graceful stop: the daemon saves and exits, and the stop succeeds. A
+    /// plugin background task that fails its teardown (for example a
+    /// blocking step refused because teardown began) leaves an error receipt,
+    /// which fails the stop command.
     fn stop(&mut self) -> Result<()> {
-        if let Err(error) = self.run(&["server", "stop"]) {
-            eprintln!("graceful stop reported: {error:#}");
-        }
+        self.run(&["server", "stop"])
+            .context("graceful stop failed")?;
         let mut child = self.child.take().context("daemon not running")?;
         let until = Instant::now() + STARTUP;
         while child.try_wait()?.is_none() {
