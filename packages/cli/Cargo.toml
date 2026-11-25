@@ -15,11 +15,11 @@ name = "bmux"
 path = "src/main.rs"
 
 [dependencies]
-bmux_bench                  = { workspace = true }
-bmux_bench_cli              = { workspace = true, optional = true }
-bmux_connections_admin      = { workspace = true, optional = true }
-bmux_frontend_runtime       = { workspace = true }
-bmux_plugin_runtime         = { workspace = true }
+bmux_bench             = { workspace = true }
+bmux_bench_cli         = { workspace = true, optional = true }
+bmux_connections_admin = { workspace = true, optional = true }
+bmux_frontend_runtime  = { workspace = true }
+bmux_plugin_runtime    = { workspace = true }
 # Internal bmux packages
 bmux_appearance = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }
@@ -46,8 +46,8 @@ bmux_performance_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_playbook = { workspace = true, features = ["runtime"], optional = true }
 bmux_plugin = { workspace = true, features = ["tui"] }
-bmux_presentation_scene = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_presentation_scene = { workspace = true }
 bmux_recording_bootstrap = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol = { workspace = true }
@@ -82,6 +82,7 @@ bmux_web_renderer = { workspace = true }
 sshenv_vault = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
+bmux_agents_plugin = { workspace = true, optional = true }
 bmux_application_resurrection_plugin = { workspace = true, optional = true }
 bmux_broadcast_plugin = { workspace = true, optional = true }
 bmux_broadcast_plugin_api = { workspace = true }
@@ -112,7 +113,6 @@ bmux_prompted_actions_plugin = { workspace = true, optional = true }
 bmux_recording_plugin = { workspace = true, optional = true }
 bmux_sessions_plugin = { workspace = true, optional = true }
 bmux_sidebar_plugin = { workspace = true, optional = true }
-bmux_agents_plugin = { workspace = true, optional = true }
 bmux_snapshot_plugin = { workspace = true, optional = true }
 bmux_tab_bar_plugin = { workspace = true, optional = true }
 bmux_tabs_plugin = { workspace = true, optional = true }
@@ -349,6 +349,7 @@ bundled-plugin-decoration = [
 ]
 bundled-plugin-feedback = ["dep:bmux_feedback_plugin"]
 # The feedback plugin hosts Bcode in the bmux server when no installed Bcode is named.
+bundled-plugin-agents = ["dep:bmux_agents_plugin"]
 bundled-plugin-feedback-embedded-bcode = [
     "bmux_feedback_plugin?/embedded-bcode",
     "bundled-plugin-feedback",
@@ -363,7 +364,6 @@ bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-recording = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions = ["dep:bmux_sessions_plugin"]
 bundled-plugin-sidebar = ["dep:bmux_sidebar_plugin"]
-bundled-plugin-agents = ["dep:bmux_agents_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
 bundled-plugin-tab-bar = ["dep:bmux_tab_bar_plugin"]
 bundled-plugin-theme = ["dep:bmux_theme_plugin"]
@@ -424,8 +424,9 @@ image-sixel = [
 ]
 
 [dev-dependencies]
-bmux_cluster_plugin_api    = { workspace = true }
-bmux_plugin_schema         = { workspace = true }
+bmux_cluster_plugin_api     = { workspace = true }
+bmux_connections_plugin_api = { workspace = true }
+bmux_plugin_schema          = { workspace = true }
 # Remote-access acceptance tests drive real terminals and run a loopback relay.
 bmux_pty                   = { workspace = true, features = ["native"] }
 bmux_workspaces_plugin_api = { workspace = true }

@@ -258,6 +258,21 @@ about pairing, devices or Iroh.
 - **Cluster.** Node-to-node RPC and cluster attach use the connection manager. Cross-host
   cluster attach works once admitted principals get event push. The cluster client's
   hard-coded 80×24 layouts take the real viewport.
+  - Members are saved hosts. A member's advertised endpoint is the alias every node saved
+    it under, and each node also pairs with itself under its own name, since the leader
+    reaches every worker, itself included, by endpoint. The connections plugin lists the
+    saved hosts through its `owner-local` `saved-hosts-state` service; `local` is never a
+    member.
+  - Health checks (`cluster status`/`doctor`, `pane new`, `up`) make one read-only
+    `hosting-state.status` call to the saved host: `observe`, single attempt, never
+    retried or replaced by a local call.
+  - Remote cluster routes stay an explicit list in the cluster plugin's admission:
+    the signed consensus and membership protocols, plus worker launch, input and resize
+    (signed leases), execution lookup, and the observe-leased worker stream.
+  - Paired-transport round trips can outlast the 150 ms consensus heartbeat, so the
+    engine keeps a probe's conflict hint even after a heartbeat replaced the probe.
+  - A worker verifies leases with a linearizable membership read, so workers are
+    enrolled as voters; an observer-edge worker cannot run panes yet.
 - **Mobile.** The mobile FFI target model (`docs/mobile-ffi-contract.md`) replaces
   `ssh`/`tls`/`iroh` with "paired host" and reuses the client crate and connector.
 

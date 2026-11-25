@@ -553,6 +553,7 @@ mod tests {
                 bmux_client::AttachProviderOpenContext {
                     fallback_client: None,
                     endpoint_connector: Some(Arc::new(UnreachableConnector)),
+                    viewport: None,
                 },
             )
             .await
@@ -698,6 +699,7 @@ mod tests {
                 bmux_client::AttachProviderOpenContext {
                     fallback_client: Some(client),
                     endpoint_connector: None,
+                    viewport: None,
                 },
             )
             .await
@@ -791,6 +793,7 @@ mod tests {
                 bmux_client::AttachProviderOpenContext {
                     fallback_client: Some(client),
                     endpoint_connector: None,
+                    viewport: None,
                 },
             )
             .await

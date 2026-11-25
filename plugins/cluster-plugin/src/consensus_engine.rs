@@ -1469,7 +1469,13 @@ impl Engine {
                 state.probing = false;
             }
             AppendReplyOutcome::Conflict { next } => {
-                if was_inflight {
+                // While probing, a heartbeat retransmits the probe and clears the
+                // in-flight one, so when a round trip outlasts the heartbeat
+                // interval (a paired, relayed or distant peer) every reply would
+                // arrive for a superseded probe and the hint would never be used.
+                // A hint is only a retry position, bounded below by the match and
+                // above by the log, so a late one is safe to apply.
+                if was_inflight || state.probing {
                     let floor = state
                         .matched
                         .map_or(LogIndex(0), |matched| LogIndex(matched.index.0 + 1));

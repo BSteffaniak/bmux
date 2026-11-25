@@ -1,7 +1,9 @@
 use bmux_cluster_plugin_api::cluster_types::AuthenticatedPeer;
 use bmux_connections_plugin_api::{
     connection_types::{InvocationOptions, ServiceInvocation, ServiceInvokeKind},
-    connections_commands,
+    connections_commands, hosting_state,
+    saved_host_types::SavedHost,
+    saved_hosts_state,
 };
 use bmux_plugin::{ServiceCaller, ServiceCallerDispatchClient};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError};
@@ -93,6 +95,73 @@ where
             })
         }
     }
+}
+
+/// One bounded attempt per probe: a refusal cannot succeed when repeated, and
+/// a health check must never mask an unreachable member with retries.
+const PROBE_OPTIONS: InvocationOptions = InvocationOptions {
+    timeout_ms: 15_000,
+    max_attempts: 1,
+    retry_backoff_ms: 0,
+};
+
+/// The hosts this machine has paired with, from the connections plugin's
+/// typed `saved-hosts-state` service.
+pub fn saved_hosts<C: ServiceCaller + Sync + ?Sized>(caller: &C) -> Result<Vec<SavedHost>, String> {
+    let mut client = ServiceCallerDispatchClient::new(caller);
+    bmux_plugin::block_on_typed_dispatch(saved_hosts_state::client::list_saved_hosts(&mut client))
+        .map_err(|error| format!("listing saved hosts failed: {error}"))
+}
+
+/// A read-only health check of cluster member `target`: a saved host, reached
+/// over the paired transport, that answers its `observe`-class hosting status.
+/// `Doctor` also requires that the member reports hosting enabled without a
+/// warning, under the host key this machine pinned when pairing.
+///
+/// Never runs against the local runtime: `local` is not a member endpoint.
+pub fn probe_saved_host<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+    probe: crate::HealthProbe,
+    target: &str,
+) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() || target == "local" {
+        return Err(
+            "the local runtime is not a cluster member endpoint; name a saved host".to_string(),
+        );
+    }
+    let saved = saved_hosts(caller)?
+        .into_iter()
+        .find(|host| host.alias == target)
+        .ok_or_else(|| not_a_saved_host(target))?;
+    let mut remote = EndpointDispatchClient::new(caller, target).with_options(PROBE_OPTIONS);
+    let status = bmux_plugin::block_on_typed_dispatch(hosting_state::client::status(&mut remote))
+        .map_err(|error| format!("member did not answer: {error}"))?;
+    if matches!(probe, crate::HealthProbe::Doctor) {
+        if status.endpoint_id != saved.host_key {
+            return Err(format!(
+                "member answered as {} but '{target}' is pinned to {}",
+                status.endpoint_id, saved.host_key
+            ));
+        }
+        if !status.enabled {
+            return Err(format!(
+                "member has remote hosting disabled ({})",
+                status.source
+            ));
+        }
+        if let Some(warning) = status.warning {
+            return Err(format!("member hosting warning: {warning}"));
+        }
+    }
+    Ok(())
+}
+
+/// Why `target` cannot be a cluster member.
+pub fn not_a_saved_host(target: &str) -> String {
+    format!(
+        "'{target}' is not a saved host; pair with it first (`bmux connect --pair --name {target}`)"
+    )
 }
 
 #[derive(Debug)]

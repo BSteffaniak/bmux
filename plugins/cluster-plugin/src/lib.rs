@@ -820,14 +820,12 @@ impl ClusterPlugin {
 fn route_cluster_services(context: &NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "cluster-query/v1", "list_clusters" => |(): (), ctx| {
-            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+            let clusters = load_cluster_definitions(&ctx.connection.config_dir, ctx.settings.clone())
                 .map_err(|error| ServiceResponse::error("list_clusters_failed", error))?;
-            Ok(ClusterQueryListClustersResponse {
-                clusters: inventory.clusters,
-            })
+            Ok(ClusterQueryListClustersResponse { clusters })
         },
         "cluster-query/v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
-            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+            let inventory = load_cluster_inventory_for_context(ctx, &ctx.connection.config_dir, ctx.settings.clone())
                 .map_err(|error| ServiceResponse::error("status_failed", error))?;
             let probe = if req.doctor.unwrap_or(false) {
                 HealthProbe::Doctor
@@ -839,7 +837,7 @@ fn route_cluster_services(context: &NativeServiceContext) -> ServiceResponse {
             Ok(ClusterQueryStatusResponse { statuses })
         },
         "cluster-command/v1", "up" => |req: ClusterCommandUpRequest, ctx| {
-            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+            let inventory = load_cluster_inventory_for_context(ctx, &ctx.connection.config_dir, ctx.settings.clone())
                 .map_err(|error| ServiceResponse::error("up_failed", error))?;
             let result = execute_cluster_up(
                 ctx,
@@ -1466,7 +1464,18 @@ mod tests {
     }
 
     impl ClusterRuntimeOps for FakeRuntime {
-        fn remote_probe_status(&self, _: HealthProbe, target: &str) -> Result<i32, String> {
+        fn saved_hosts(&self) -> Result<BTreeSet<String>, String> {
+            Ok(self
+                .inner
+                .lock()
+                .expect("runtime lock poisoned")
+                .health
+                .keys()
+                .cloned()
+                .collect())
+        }
+
+        fn probe_member(&self, _: HealthProbe, target: &str) -> Result<(), String> {
             let healthy = {
                 let mut guard = self.inner.lock().expect("runtime lock poisoned");
                 if let Some(sequence) = guard.health_sequences.get_mut(target)
@@ -1478,7 +1487,11 @@ mod tests {
                     guard.health.get(target).copied().unwrap_or(false)
                 }
             };
-            Ok(i32::from(!healthy))
+            if healthy {
+                Ok(())
+            } else {
+                Err("member did not answer".to_string())
+            }
         }
 
         fn session_list(&self) -> Result<SessionListResponse, String> {
@@ -1751,7 +1764,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&dir).expect("service test config dir should be created");
-            let config = "[connections.targets.db-a]\ntransport='ssh'\nhost='db-a.example.com'\n[connections.targets.db-b]\ntransport='ssh'\nhost='db-b.example.com'\n";
+            let config = "";
             fs::write(dir.join("bmux.toml"), config)
                 .expect("service test config should be written");
             Self { dir }
@@ -3181,14 +3194,15 @@ mod tests {
     #[test]
     fn remote_protocols_are_exact_proof_protocols_with_remote_classes() {
         let operations = admission::remote_protocol_operations();
-        assert_eq!(operations.len(), 15);
+        assert_eq!(operations.len(), 20);
         let declarations = plugin_definition().declarations().unwrap().services;
-        for (capability, interface, operation) in operations {
+        for (kind, capability, interface, operation) in operations {
+            assert!(admission::remote_protocol(capability, kind, interface, operation));
             let service = declarations
                 .iter()
                 .find(|service| {
                     service.capability.as_str() == capability
-                        && service.kind == ServiceKind::Command
+                        && service.kind == kind
                         && service.interface_id == interface
                 })
                 .unwrap_or_else(|| panic!("{interface} is provided"));
@@ -3251,26 +3265,18 @@ mod tests {
     }
 
     #[test]
-    fn invoke_service_status_returns_degraded_when_probe_runtime_is_unavailable() {
+    fn invoke_service_status_fails_when_saved_hosts_are_unavailable() {
+        // Members are saved hosts; without the connections service there are
+        // none to probe, and nothing falls back to the local runtime.
         let harness = ServiceTestHarness::new();
-        let response = harness.invoke(
+        harness.expect_error_code(
             "cluster-query/v1",
             "status",
             &ClusterQueryStatusRequest {
                 selector: Some("prod".to_string()),
                 doctor: Some(false),
             },
-        );
-        assert!(response.error.is_none(), "status should succeed");
-        let decoded: ClusterQueryStatusResponse =
-            bmux_plugin_sdk::decode_service_message(&response.payload)
-                .expect("status response should decode");
-        assert_eq!(decoded.statuses.len(), 2);
-        assert!(
-            decoded
-                .statuses
-                .iter()
-                .all(|status| matches!(status.state, ClusterHostState::Degraded))
+            "status_failed",
         );
     }
 
@@ -3674,7 +3680,7 @@ mod tests {
                 "prod".to_string(),
                 vec!["db-a".to_string(), "db-b".to_string()],
             )]),
-            known_targets: BTreeSet::from(["db-a".to_string(), "db-b".to_string()]),
+            saved_hosts: BTreeSet::from(["db-a".to_string(), "db-b".to_string()]),
         };
         let result = execute_cluster_up(
             &runtime,
@@ -3738,7 +3744,7 @@ mod tests {
                     "db-ok".to_string(),
                 ],
             )]),
-            known_targets: BTreeSet::from([
+            saved_hosts: BTreeSet::from([
                 "db-precheck-fail".to_string(),
                 "db-launch-fail".to_string(),
                 "db-ok".to_string(),
@@ -3767,7 +3773,7 @@ mod tests {
             precheck_failed
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("probe exited with status"))
+                .is_some_and(|reason| reason.contains("member did not answer"))
         );
         assert!(precheck_failed.pane_id.is_none());
 
@@ -3817,7 +3823,7 @@ mod tests {
                     "db-ok".to_string(),
                 ],
             )]),
-            known_targets: BTreeSet::from([
+            saved_hosts: BTreeSet::from([
                 "db-precheck-fail".to_string(),
                 "db-launch-fail".to_string(),
                 "db-ok".to_string(),
@@ -3856,7 +3862,7 @@ mod tests {
                 "prod".to_string(),
                 vec!["db-launch-fail".to_string(), "db-ok".to_string()],
             )]),
-            known_targets: BTreeSet::from(["db-launch-fail".to_string(), "db-ok".to_string()]),
+            saved_hosts: BTreeSet::from(["db-launch-fail".to_string(), "db-ok".to_string()]),
         };
 
         let error = execute_cluster_up(
@@ -3899,7 +3905,7 @@ mod tests {
                     "db-after".to_string(),
                 ],
             )]),
-            known_targets: BTreeSet::from([
+            saved_hosts: BTreeSet::from([
                 "db-ok".to_string(),
                 "db-launch-fail".to_string(),
                 "db-after".to_string(),
@@ -3939,7 +3945,7 @@ mod tests {
 
         let inventory = ClusterInventory {
             clusters: BTreeMap::from([("prod".to_string(), vec!["db-a".to_string()])]),
-            known_targets: BTreeSet::from(["db-a".to_string()]),
+            saved_hosts: BTreeSet::from(["db-a".to_string()]),
         };
 
         let result = execute_cluster_up(
@@ -4148,7 +4154,7 @@ mod tests {
 
         let inventory = ClusterInventory {
             clusters: BTreeMap::from([("prod".to_string(), vec!["db-a".to_string()])]),
-            known_targets: BTreeSet::from(["db-a".to_string()]),
+            saved_hosts: BTreeSet::from(["db-a".to_string()]),
         };
 
         let up = execute_cluster_up(
@@ -4245,7 +4251,7 @@ mod tests {
                     "db-after".to_string(),
                 ],
             )]),
-            known_targets: BTreeSet::from([
+            saved_hosts: BTreeSet::from([
                 "db-ok".to_string(),
                 "db-fail".to_string(),
                 "db-after".to_string(),

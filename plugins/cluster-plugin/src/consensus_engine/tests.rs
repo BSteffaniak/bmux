@@ -702,3 +702,131 @@ fn leader_without_quorum_pushes_back_instead_of_growing_its_log() {
     assert_eq!(uncommitted, limit);
     assert!(backpressure >= 10);
 }
+
+/// Every message the leader sent to `to` in `effects`.
+fn sends_to(effects: &[Effect], to: NodeId) -> Vec<Message> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send { to: peer, message } if *peer == to => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Cluster {
+    fn heartbeat(&mut self, id: u64) -> Vec<Effect> {
+        let generation = self.timers[&(node(id), TimerKind::Heartbeat)];
+        self.input(
+            id,
+            Input::Timer {
+                kind: TimerKind::Heartbeat,
+                generation,
+            },
+        )
+    }
+
+    /// Delivers `message` from the leader to `to` and returns `to`'s reply once durable.
+    fn exchange(&mut self, to: u64, message: Message) -> Message {
+        self.messages.clear();
+        self.input(
+            to,
+            Input::Message {
+                from: node(1),
+                message,
+            },
+        );
+        while let Some(max) = self
+            .held
+            .remove(&node(to))
+            .and_then(|held| held.into_iter().max())
+        {
+            let effects = self
+                .engines
+                .get_mut(&node(to))
+                .unwrap()
+                .handle(Input::Persisted { id: max });
+            self.route(node(to), effects);
+        }
+        let reply = self
+            .messages
+            .iter()
+            .find(|(from, peer, _)| *from == node(to) && *peer == node(1))
+            .map(|(_, _, message)| message.clone())
+            .expect("the follower replies");
+        self.messages.clear();
+        reply
+    }
+}
+
+#[test]
+fn a_conflict_reply_that_arrives_after_its_probe_was_replaced_still_moves_the_probe() {
+    // A follower behind a link whose round trip outlasts the heartbeat interval: while
+    // the leader probes it, each heartbeat replaces the probe before its reply arrives.
+    // The late conflict hint must still be used, or the leader keeps the replaced probe's
+    // position and the follower never catches up.
+    // A learner that missed the leader's first probes, as a node joining over such a
+    // link does.
+    let mut cluster = Cluster::new(&[1, 3], &[2]);
+    cluster.down.insert(node(2));
+    cluster.elect(1);
+    for token in 0..3 {
+        cluster.input(
+            1,
+            Input::Propose {
+                token,
+                payload: b"x".to_vec(),
+            },
+        );
+    }
+    cluster.settle();
+    cluster.down.clear();
+    cluster.messages.clear();
+    // It joined with an empty log, as a node enrolled into a running cluster does.
+    let (empty, _) = Engine::recover(
+        node(2),
+        Config::default(),
+        Recovered {
+            hard_state: HardState {
+                term: Term(0),
+                voted_for: None,
+            },
+            snapshot: None,
+            entries: Vec::new(),
+            commit: None,
+            applied: None,
+        },
+    )
+    .unwrap();
+    cluster.engines.insert(node(2), empty);
+
+    let replaced = sends_to(&cluster.heartbeat(1), node(2)).remove(0);
+    // The next heartbeat replaces the probe before its reply arrives.
+    assert_ne!(sends_to(&cluster.heartbeat(1), node(2)), Vec::new());
+    cluster.messages.clear();
+    let late = cluster.exchange(2, replaced);
+    assert!(
+        matches!(
+            late,
+            Message::AppendReply {
+                outcome: AppendReplyOutcome::Conflict { .. },
+                ..
+            }
+        ),
+        "{late:?}"
+    );
+    let effects = cluster.input(
+        1,
+        Input::Message {
+            from: node(2),
+            message: late,
+        },
+    );
+    assert_ne!(
+        sends_to(&effects, node(2)),
+        Vec::new(),
+        "the late hint was dropped"
+    );
+    cluster.settle();
+    assert_eq!(cluster.engine(2).last_log(), cluster.engine(1).last_log());
+}

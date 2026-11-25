@@ -10,12 +10,12 @@ Current scope:
 
 - Durable federation identity foundation: activation creates or validates a local Ed25519 node key; `NodeId` is the canonical public-key identity, and `cluster init` creates an idempotent persistent `ClusterId` through the generated `cluster-command/v1:init` service. Corrupt, future-version, or mismatched identity records fail closed without key rotation.
 - Generated membership lifecycle commands: `cluster enrollment-token create`, `cluster join`, `cluster leave`, and `cluster members`. Enrollment tokens are issuer-signed, expire within the reviewed ten-minute maximum, are request-idempotent, and are single-use across node identities; same-node redemption is retry-safe. The candidate signs token-, endpoint-, identity-, and protocol-bound possession claims before redemption. Join rejects incompatible wire epochs, peer revisions, durable schema ranges, and mandatory feature sets before membership mutation, then persists an issuer-signed, expiring public membership credential while private keys remain local. Join routes generated redemption through the explicit `bmux.connections` endpoint and validates the issuer/member snapshot before local adoption. Leave uses a signed prepare/accept/commit transaction and preserves the local node key.
-- Generated peer authentication: `cluster-peer-auth/v1` issues verifier-signed 30-second challenges bound to cluster, verifier credential, claimant audience, and nonce; the claimant verifies the verifier's active credential and signs the full challenge; the verifier checks the claimant's active credential and consumes the nonce durably. Join and remote leave orchestration require this challenge/prove/authenticate flow through `bmux.connections`, so the same plugin-owned authentication is transport-neutral. Replays, forged proofs, wrong audience, expiry, stale credentials, inactive members, and challenge tampering fail closed. Isolated two-server process tests prove the real join and leave path over SSH and quick-TLS.
+- Generated peer authentication: `cluster-peer-auth/v1` issues verifier-signed 30-second challenges bound to cluster, verifier credential, claimant audience, and nonce; the claimant verifies the verifier's active credential and signs the full challenge; the verifier checks the claimant's active credential and consumes the nonce durably. Join and remote leave orchestration require this challenge/prove/authenticate flow through `bmux.connections`, so the same plugin-owned authentication is transport-neutral. Replays, forged proofs, wrong audience, expiry, stale credentials, inactive members, and challenge tampering fail closed. Isolated two-server process tests prove the real join and leave path over paired Iroh devices.
 - Durable node capability metadata separates the exclusive consensus role (`voter` or `observer-edge`) from independent `worker` and `ingress` grants. Initializers default to voter+worker+ingress; enrollment defaults to observer-edge+worker. Explicit grants are signed into enrollment tokens and validated before adoption. Legacy member records are migrated deterministically.
 - Read-only cluster inventory and health checks (`cluster hosts/status/doctor`)
 - Inventory sourced from `[plugins.settings."bmux.cluster"].clusters`
-- Target resolution validated against `[connections.targets]`
-- Readiness probes delegated to core remote commands (`remote test` / `remote doctor`)
+- Members are saved hosts: hosts this machine paired with (`bmux connect --pair --name <host>`), listed through the connections plugin's typed `saved-hosts-state` service. `local` is never a member.
+- Readiness probes are read-only, single-attempt `hosting-state.status` calls on the saved host over the paired transport (`observe` class, so a view-only pairing suffices); `doctor` also checks the pinned host key and that hosting is enabled. A refusal is reported, never retried or replaced by a local fallback.
 - `cluster up` creates/reuses `cluster-<name>` session and launches host-bound panes
 - Partial-start semantics: unhealthy hosts are reported as degraded while healthy hosts still launch
 - `cluster up` supports launch failure policy controls (`--retries`, `--on-failure=continue|abort|prompt`)
@@ -143,11 +143,10 @@ Example:
 
 ```toml
 [plugins.settings."bmux.cluster"]
-# Stable connections target advertised for authenticated consensus RPC.
-# This may be a self-contained tls://, https://, iroh://, or ssh:// URI, or a
-# named [connections.targets] alias provisioned identically on every cluster
-# member. Local targets are forbidden. Aliases are part of cluster provisioning:
-# the same alias must resolve to the same remote identity on every node.
+# Stable endpoint advertised for authenticated consensus RPC: the saved-host
+# alias every other member paired with this node under. Local targets are
+# forbidden. Aliases are part of cluster provisioning: the same alias must name
+# the same paired host on every node.
 consensus_endpoint = "prod-a"
 
 [plugins.settings."bmux.cluster".clusters.prod]
@@ -199,7 +198,7 @@ gateway_mode = "auto"
   - `status` returns host states from probe execution (`ready` or `degraded`).
   - Errors use `list_clusters_failed` / `status_failed`.
 - `cluster-command/v1`
-  - `init` creates or returns the durable cluster identity; `--endpoint` advertises the stable connections target required by voter consensus startup. Advertised endpoints are either self-contained `tls://`, `https://`, `iroh://`, or `ssh://` references, or named `[connections.targets]` aliases provisioned identically across the cluster. Blank/local/malformed references, duplicate active-member endpoints, and implicit active-voter endpoint rewrites are rejected. Every authenticated connection verifies that the resolved endpoint presents the expected member `NodeId`. The same endpoint may be configured as `plugins.settings."bmux.cluster".consensus_endpoint` for restart-safe activation.
+  - `init` creates or returns the durable cluster identity; `--endpoint` advertises the stable connections target required by voter consensus startup. Advertised endpoints are saved-host aliases (hosts paired with `bmux connect --pair`) provisioned identically across the cluster. Blank/local/malformed references, duplicate active-member endpoints, and implicit active-voter endpoint rewrites are rejected. Every authenticated connection verifies that the resolved endpoint presents the expected member `NodeId`. The same endpoint may be configured as `plugins.settings."bmux.cluster".consensus_endpoint` for restart-safe activation.
   - `enrollment_token_create`, `redeem_enrollment`, and `join` implement signed, expiring, retry-safe enrollment as generated typed phases; redemption verifies node-key possession and compatibility before consuming the token, then returns an issuer-signed public membership credential.
   - `leave_prepare`, `accept_leave`, and `leave` implement signed, retryable leave coordination without nested service dispatch.
   - `up` returns session id plus per-host launch status payload.

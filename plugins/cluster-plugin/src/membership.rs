@@ -2655,7 +2655,7 @@ pub enum ClusterHostRef {
 #[derive(Debug, Clone)]
 pub struct ClusterInventory {
     pub clusters: BTreeMap<String, Vec<String>>,
-    pub known_targets: BTreeSet<String>,
+    pub saved_hosts: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2696,7 +2696,7 @@ pub fn collect_statuses_for_selector(
                 caller,
                 selector,
                 hosts,
-                &inventory.known_targets,
+                &inventory.saved_hosts,
                 probe,
                 &mut statuses,
             );
@@ -2712,7 +2712,7 @@ pub fn collect_statuses_for_selector(
                     caller,
                     cluster_name,
                     &selected,
-                    &inventory.known_targets,
+                    &inventory.saved_hosts,
                     probe,
                     &mut statuses,
                 );
@@ -2730,7 +2730,7 @@ pub fn collect_statuses_for_selector(
             caller,
             cluster_name,
             hosts,
-            &inventory.known_targets,
+            &inventory.saved_hosts,
             probe,
             &mut statuses,
         );
@@ -2742,17 +2742,17 @@ pub fn collect_cluster_statuses(
     caller: &impl ClusterRuntimeOps,
     cluster_name: &str,
     hosts: &[String],
-    known_targets: &BTreeSet<String>,
+    saved_hosts: &BTreeSet<String>,
     probe: HealthProbe,
     statuses: &mut Vec<ClusterHostStatus>,
 ) {
     for host in hosts {
-        if !known_targets.contains(host) {
+        if !saved_hosts.contains(host) {
             statuses.push(ClusterHostStatus {
                 cluster: cluster_name.to_string(),
                 target: host.clone(),
                 state: ClusterHostState::Degraded,
-                reason: Some("target is missing from [connections.targets]".to_string()),
+                reason: Some(crate::endpoint::not_a_saved_host(host)),
             });
             continue;
         }
@@ -2779,31 +2779,46 @@ pub fn run_health_probe(
     target: &str,
     probe: HealthProbe,
 ) -> Result<(), String> {
-    let status = caller
-        .remote_probe_status(probe, target)
-        .map_err(|error| format!("probe failed to run: {error}"))?;
-    if status == EXIT_OK {
-        Ok(())
-    } else {
-        Err(format!("probe exited with status {status}"))
-    }
+    caller.probe_member(probe, target)
 }
 
 pub fn load_cluster_inventory(context: &NativeCommandContext) -> Result<ClusterInventory, String> {
-    load_cluster_inventory_for_context(&context.connection.config_dir, context.settings.clone())
+    load_cluster_inventory_for_context(
+        context,
+        &context.connection.config_dir,
+        context.settings.clone(),
+    )
 }
 
+/// The configured clusters, with the saved hosts (paired with this machine)
+/// that can be their members.
 pub fn load_cluster_inventory_for_context(
+    caller: &impl ClusterRuntimeOps,
     config_dir: &str,
     settings: Option<toml::Value>,
 ) -> Result<ClusterInventory, String> {
-    let config_path = PathBuf::from(config_dir).join("bmux.toml");
-    let config = BmuxConfig::load_from_path(&config_path)
-        .map_err(|error| format!("failed loading config {}: {error}", config_path.display()))?;
+    Ok(ClusterInventory {
+        clusters: load_cluster_definitions(config_dir, settings)?,
+        saved_hosts: caller.saved_hosts()?,
+    })
+}
 
-    let settings_value = settings
-        .or_else(|| config.plugins.settings.get("bmux.cluster").cloned())
-        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+/// Cluster name -> member endpoint names from `[plugins.settings."bmux.cluster"]`.
+pub fn load_cluster_definitions(
+    config_dir: &str,
+    settings: Option<toml::Value>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let config_path = PathBuf::from(config_dir).join("bmux.toml");
+    let settings_value = match settings {
+        Some(settings) => settings,
+        None => BmuxConfig::load_from_path(&config_path)
+            .map_err(|error| format!("failed loading config {}: {error}", config_path.display()))?
+            .plugins
+            .settings
+            .get("bmux.cluster")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new())),
+    };
     let settings: ClusterSettings = settings_value
         .try_into()
         .map_err(|error| format!("invalid bmux.cluster settings: {error}"))?;
@@ -2821,16 +2836,9 @@ pub fn load_cluster_inventory_for_context(
                 targets.push(target.trim().to_string());
             }
         }
-        let unique = dedupe_preserve_order(targets);
-        clusters.insert(name, unique);
+        clusters.insert(name, dedupe_preserve_order(targets));
     }
-
-    let known_targets = config.connections.targets.keys().cloned().collect();
-
-    Ok(ClusterInventory {
-        clusters,
-        known_targets,
-    })
+    Ok(clusters)
 }
 
 pub fn target_from_host_ref(host: &ClusterHostRef) -> Option<String> {

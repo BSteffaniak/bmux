@@ -5,6 +5,7 @@
 //! uses: the layout from the ingress, observe leases from `routes`, frames the worker pushes to
 //! the observing connection, input and resizes through the ingress, and control revisions the
 //! ingress pushes. Nothing here polls the provider: every change arrives from `next_event`.
+use crate::harness::{Host, RemoteSettings, Role, pair_only, reserve_udp_port};
 use crate::support::{ServerEnv, assert_success, combined_output};
 use bmux_client::{
     AttachEndpointConnectFuture, AttachEndpointConnector, AttachInputPayload,
@@ -23,7 +24,7 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The worker's advertised member endpoint: a configured alias for the server's local socket.
+/// The worker's advertised member endpoint: the saved host this node paired with itself under.
 const WORKER_ALIAS: &str = "frames-worker";
 const WORKSPACE_NAME: &str = "frames";
 const PRINCIPAL: &str = "principal:frame-replication-test";
@@ -32,45 +33,28 @@ const PUSH_DEADLINE: Duration = Duration::from_secs(10);
 /// How long the leader's reconciler may take to launch an execution.
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(30);
 
-fn server_config() -> String {
-    format!(
-        "[general]\nserver_timeout = 30000\n\n[connections.targets.{WORKER_ALIAS}]\ntransport = \"local\"\n"
-    )
-}
-
-/// Dials endpoint targets as the CLI's attach connector does for local-transport targets:
-/// `local` and configured aliases whose transport is local reach this server's socket; anything
-/// else is not an explicit connection target. The configuration is read on each connect.
+/// Dials the attach's endpoint targets. The node is its own worker, so its saved-host alias
+/// names this same server: the attach side reaches it over the local socket, while the
+/// server's own cluster calls go through the paired transport. Anything else is refused.
 #[derive(Debug)]
 struct ServerConfigConnector {
     socket: PathBuf,
-    config: PathBuf,
 }
 
 impl ServerConfigConnector {
     fn new(server: &ServerEnv) -> Self {
         Self {
             socket: server.runtime_dir.join("server.sock"),
-            config: server.config_dir.join("bmux.toml"),
         }
     }
 
-    fn resolves_locally(&self, target: &str) -> Result<(), String> {
-        if target == "local" {
+    fn resolves_locally(target: &str) -> Result<(), String> {
+        if target == "local" || target == WORKER_ALIAS {
             return Ok(());
         }
-        let text = std::fs::read_to_string(&self.config).map_err(|error| error.to_string())?;
-        let config: bmux_config::BmuxConfig =
-            toml::from_str(&text).map_err(|error| error.to_string())?;
-        match config.connections.targets.get(target) {
-            Some(named) if named.transport == bmux_config::ConnectionTransport::Local => Ok(()),
-            Some(_) => Err(format!(
-                "attach endpoint target '{target}' is not a local-transport target"
-            )),
-            None => Err(format!(
-                "attach endpoint target '{target}' is not a configured alias or direct endpoint"
-            )),
-        }
+        Err(format!(
+            "attach endpoint target '{target}' is not this node's saved host"
+        ))
     }
 }
 
@@ -81,7 +65,7 @@ impl AttachEndpointConnector for ServerConfigConnector {
         client_name: &'static str,
     ) -> AttachEndpointConnectFuture<'a> {
         Box::pin(async move {
-            self.resolves_locally(target)?;
+            Self::resolves_locally(target)?;
             BmuxClient::connect(
                 &bmux_ipc::IpcEndpoint::UnixSocket(self.socket.clone()),
                 Duration::from_secs(30),
@@ -387,6 +371,7 @@ impl Attached {
         let context = AttachProviderOpenContext {
             fallback_client: Some(local_connection(server).await),
             endpoint_connector: Some(std::sync::Arc::new(ServerConfigConnector::new(server))),
+            viewport: None,
         };
         let opened = tokio::time::timeout(PUSH_DEADLINE, provider.open(resolved, None, context))
             .await
@@ -559,11 +544,15 @@ fn cluster_attach_replicates_a_worker_pane_through_pushed_frames() {
         .enable_all()
         .build()
         .expect("test runtime");
-    let mut server = ServerEnv::new("cluster-frames");
-    server.write_config(&server_config());
-    server.start();
-    // A single-node cluster: this node is its voter, ingress and worker, advertised under an
-    // alias of its own local socket.
+    let mut host = Host::start(
+        "cluster-frames",
+        RemoteSettings::loopback_host(reserve_udp_port()),
+    );
+    // A single-node cluster: this node is its voter, ingress and worker. It reaches itself as
+    // a member like any other, as a saved host over the paired transport, so it pairs with
+    // itself and advertises that alias.
+    pair_only(&host, &host, WORKER_ALIAS, "frames-node", Role::Full);
+    let server = &host.env;
     let init = server.run(&["cluster", "init", "--endpoint", WORKER_ALIAS]);
     assert_success(&init, "initialize single-node cluster");
     assert!(
@@ -571,6 +560,6 @@ fn cluster_attach_replicates_a_worker_pane_through_pushed_frames() {
         "unexpected init output: {}",
         combined_output(&init)
     );
-    runtime.block_on(replicate(&server));
-    server.finish();
+    runtime.block_on(replicate(server));
+    host.env.finish();
 }

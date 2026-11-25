@@ -45,6 +45,27 @@ const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
         "cluster-consensus-snapshot/v1",
         &["install"],
     ),
+    // Worker lifecycle and input from the ingress: each carries a WorkerAuthority
+    // lease the ingress signed, which the worker verifies.
+    (
+        "bmux.server_clusters.write",
+        "cluster-worker-command/v2",
+        &["launch", "input", "resize"],
+    ),
+];
+
+/// Remote queries a cluster member serves to other members over the paired transport.
+const REMOTE_QUERIES: &[(&str, &str, &[&str])] = &[
+    // The leader's reconciler asks a worker for an execution before launching it again
+    // (launch is idempotent per execution id; this only reads its state).
+    ("bmux.server_clusters.read", "cluster-worker-state/v2", &["get"]),
+    // An attaching client follows an execution's screen from its worker; every authority
+    // is an observe lease the ingress signed, verified by the worker.
+    (
+        "bmux.server_clusters.read",
+        "cluster-worker-stream/v1",
+        &["observe"],
+    ),
 ];
 
 /// Whether an admitted (remote) caller may use this exact cluster protocol
@@ -57,27 +78,37 @@ pub fn remote_protocol(
     interface: &str,
     operation: &str,
 ) -> bool {
-    kind == ServiceKind::Command
-        && REMOTE_PROTOCOLS
-            .iter()
-            .any(|(protocol_capability, protocol, operations)| {
-                *protocol_capability == capability
-                    && *protocol == interface
-                    && operations.contains(&operation)
-            })
+    let table = match kind {
+        ServiceKind::Command => REMOTE_PROTOCOLS,
+        ServiceKind::Query => REMOTE_QUERIES,
+        ServiceKind::Event => return false,
+    };
+    table
+        .iter()
+        .any(|(protocol_capability, protocol, operations)| {
+            *protocol_capability == capability
+                && *protocol == interface
+                && operations.contains(&operation)
+        })
 }
 
 /// Every remote protocol operation, for tests.
 #[cfg(test)]
-pub fn remote_protocol_operations() -> Vec<(&'static str, &'static str, &'static str)> {
-    REMOTE_PROTOCOLS
-        .iter()
-        .flat_map(|(capability, interface, operations)| {
+pub fn remote_protocol_operations()
+-> Vec<(ServiceKind, &'static str, &'static str, &'static str)> {
+    [
+        (ServiceKind::Command, REMOTE_PROTOCOLS),
+        (ServiceKind::Query, REMOTE_QUERIES),
+    ]
+    .into_iter()
+    .flat_map(|(kind, table)| {
+        table.iter().flat_map(move |(capability, interface, operations)| {
             operations
                 .iter()
-                .map(move |operation| (*capability, *interface, *operation))
+                .map(move |operation| (kind, *capability, *interface, *operation))
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn denied(reason: &'static str) -> ServiceResponse {

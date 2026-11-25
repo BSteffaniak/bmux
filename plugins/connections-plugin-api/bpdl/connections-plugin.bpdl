@@ -52,6 +52,26 @@ interface connections-commands {
     command invoke-service(invocation: connection-types.service-invocation) -> result<bytes, connection-types.connection-error>;
 }
 
+interface saved-host-types {
+    record saved-host {
+        // The name this machine saved the host under (`bmux connect --pair --name`).
+        alias: string,
+        // The host's pinned public key (its Iroh endpoint id).
+        host_key: string,
+        // `direct` or `relay`, from the last connection.
+        last_path: string?,
+    }
+}
+
+// The hosts this machine has paired with (its client known hosts), so other
+// plugins can name them as endpoints for `invoke-service`. Owner-local: a
+// remote principal never learns where this machine connects.
+@capability(CONNECTIONS_INVOKE)
+@access(owner-local)
+interface saved-hosts-state {
+    query list-saved-hosts() -> list<saved-host-types.saved-host>;
+}
+
 interface hosting-types {
     enum device-role {
         full,
@@ -152,6 +172,7 @@ interface hosting-state {
 /// What `bmux.connections` provides to and requires from the host and other plugins.
 world connections {
     provide connections-commands;
+    provide saved-hosts-state;
     provide hosting-commands;
     provide hosting-admin-state;
     provide hosting-state;

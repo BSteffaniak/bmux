@@ -9,10 +9,10 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_state as api_pane_runtime_state,
 };
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
-use bmux_plugin_sdk::{PluginCliCommandRequest, StorageGetRequest, StorageSetRequest};
+use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
 use bmux_sessions_plugin_api::sessions_state as api_sessions_state;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -133,7 +133,11 @@ pub trait ClusterRuntimeOps {
             Err("cluster storage scope unavailable".into())
         }
     }
-    fn remote_probe_status(&self, probe: HealthProbe, target: &str) -> Result<i32, String>;
+    /// Aliases of the hosts this machine has paired with: the only cluster member
+    /// endpoints.
+    fn saved_hosts(&self) -> Result<BTreeSet<String>, String>;
+    /// A read-only check of one saved host over the paired transport.
+    fn probe_member(&self, probe: HealthProbe, target: &str) -> Result<(), String>;
     fn session_list(&self) -> Result<SessionListResponse, String>;
     fn session_create(
         &self,
@@ -163,21 +167,15 @@ impl<T: HostRuntimeApi + Sync> ClusterRuntimeOps for T {
             &std::path::Path::new(&connection.data_dir).join("plugin-storage"),
         ))
     }
-    fn remote_probe_status(&self, probe: HealthProbe, target: &str) -> Result<i32, String> {
-        // Dispatch on the current caller port. Connections owns target resolution
-        // and authorization; a denial must never trigger a local fallback.
-        let operation = match probe {
-            HealthProbe::Test => "remote-test",
-            HealthProbe::Doctor => "remote-doctor",
-        };
-        let request = PluginCliCommandRequest::new(
-            "bmux.connections".into(),
-            operation.into(),
-            vec![target.into()],
-        );
-        HostRuntimeApi::plugin_command_run(self, &request)
-            .map(|response| response.exit_code)
-            .map_err(|error| error.to_string())
+    fn saved_hosts(&self) -> Result<BTreeSet<String>, String> {
+        crate::endpoint::saved_hosts(self)
+            .map(|hosts| hosts.into_iter().map(|host| host.alias).collect())
+    }
+
+    fn probe_member(&self, probe: HealthProbe, target: &str) -> Result<(), String> {
+        // Connections owns target resolution and authorization; a denial
+        // must never trigger a local fallback or a retry.
+        crate::endpoint::probe_saved_host(self, probe, target)
     }
 
     fn session_list(&self) -> Result<SessionListResponse, String> {
@@ -1106,11 +1104,84 @@ pub fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
 #[cfg(test)]
 mod probe_authority_tests {
     use super::*;
-    use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use bmux_connections_plugin_api::{
+        connection_types::{ConnectionError, ServiceInvokeKind},
+        connections_commands, hosting_state, hosting_types::HostingStatus,
+        saved_host_types::SavedHost, saved_hosts_state,
+    };
+    use bmux_plugin_sdk::{Result as PluginResult, ServiceKind};
+    use std::sync::Mutex;
 
+    const PINNED: &str = "pinned-host-key";
+
+    /// How the saved host answers its hosting status.
+    enum Answer {
+        Status { endpoint_id: &'static str },
+        Refused,
+    }
+
+    /// A port that knows one saved host, `fixture`, and records every call.
     struct ProbePort {
-        calls: AtomicUsize,
+        answers: Mutex<Vec<Answer>>,
+        invocations: Mutex<Vec<String>>,
+        listings: Mutex<usize>,
+    }
+
+    impl ProbePort {
+        fn new(answers: Vec<Answer>) -> Self {
+            Self {
+                answers: Mutex::new(answers),
+                invocations: Mutex::new(Vec::new()),
+                listings: Mutex::new(0),
+            }
+        }
+
+        fn invoke(&self, payload: &[u8]) -> PluginResult<Vec<u8>> {
+            let request: connections_commands::client::InvokeServiceRequest =
+                bmux_plugin_sdk::decode_service_message(
+                    bmux_plugin_sdk::service_contract::decode_for(
+                        connections_commands::INTERFACE_ID.as_str(),
+                        connections_commands::SERVICE_CONTRACT,
+                        payload,
+                    )?,
+                )?;
+            let invocation = request.invocation;
+            // A health probe is one read-only, observe-class call: never a retry,
+            // never a command.
+            assert_eq!(invocation.kind, ServiceInvokeKind::InvokeQuery);
+            assert_eq!(
+                invocation.interface_id,
+                hosting_state::INTERFACE_ID.as_str()
+            );
+            assert_eq!(invocation.operation, "status");
+            let options = invocation.options.expect("probe options");
+            assert_eq!(options.max_attempts, 1);
+            self.invocations
+                .lock()
+                .unwrap()
+                .push(invocation.target.clone());
+            let answer = self.answers.lock().unwrap().remove(0);
+            let result = match answer {
+                Answer::Status { endpoint_id } => Ok(bmux_plugin_sdk::encode_service_message(
+                    &HostingStatus {
+                        enabled: true,
+                        source: "remote enable".into(),
+                        endpoint_id: endpoint_id.into(),
+                        bound_addrs: Vec::new(),
+                        relay_mode: "disabled".into(),
+                        relay: None,
+                        warning: None,
+                    },
+                )?),
+                Answer::Refused => Err(ConnectionError::ServiceFailed {
+                    target: invocation.target,
+                    reason: "remote principal may not use this route".into(),
+                }),
+            };
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &bmux_plugin_sdk::encode_service_message(&result)?,
+            ))
+        }
     }
 
     impl ServiceCaller for ProbePort {
@@ -1122,63 +1193,154 @@ mod probe_authority_tests {
             operation: &str,
             payload: Vec<u8>,
         ) -> PluginResult<Vec<u8>> {
-            assert_eq!(capability, bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY);
-            assert_eq!(kind, ServiceKind::Command);
-            assert_eq!(interface, bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1);
-            assert_eq!(
-                operation,
-                bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1
-            );
-            let request: PluginCliCommandRequest =
-                bmux_plugin_sdk::decode_service_message(&payload)?;
-            let index = self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.plugin_id, "bmux.connections");
-            assert_eq!(
-                request.command_name,
-                if index == 0 {
-                    "remote-test"
-                } else {
-                    "remote-doctor"
-                }
-            );
-            assert_eq!(request.arguments, ["fixture target"]);
-            if index == 1 {
-                return Err(PluginError::UnsupportedHostOperation {
-                    operation: "denied",
-                });
+            assert_eq!(capability, "bmux.connections.invoke");
+            if interface == saved_hosts_state::INTERFACE_ID.as_str() {
+                assert_eq!(kind, ServiceKind::Query);
+                assert_eq!(operation, "list-saved-hosts");
+                *self.listings.lock().unwrap() += 1;
+                let hosts = vec![SavedHost {
+                    alias: "fixture".into(),
+                    host_key: PINNED.into(),
+                    last_path: Some("direct".into()),
+                }];
+                return Ok(bmux_plugin_sdk::service_contract::encode_response(
+                    &bmux_plugin_sdk::encode_service_message(&hosts)?,
+                ));
             }
-            bmux_plugin_sdk::encode_service_message(
-                &bmux_plugin_sdk::PluginCliCommandResponse::new(17),
-            )
+            assert_eq!(kind, ServiceKind::Command);
+            assert_eq!(interface, connections_commands::INTERFACE_ID.as_str());
+            assert_eq!(operation, "invoke-service");
+            self.invoke(&payload)
         }
 
         fn execute_kernel_request(
             &self,
             _: bmux_ipc::Request,
         ) -> PluginResult<bmux_ipc::ResponsePayload> {
-            panic!("denied probes must not fall back to kernel access")
+            panic!("member probes must never fall back to the local kernel")
         }
     }
 
-    #[test]
-    fn probes_preserve_wire_status_and_do_not_retry_a_denied_caller() {
-        let port = ProbePort {
-            calls: AtomicUsize::new(0),
-        };
-        let inventory = ClusterInventory {
-            clusters: BTreeMap::from([("fleet".into(), vec!["fixture target".into()])]),
-            known_targets: BTreeSet::from(["fixture target".into()]),
-        };
-        for (probe, reason) in [
-            (HealthProbe::Test, "probe exited with status 17"),
-            (HealthProbe::Doctor, "probe failed to run:"),
-        ] {
-            let statuses =
-                collect_statuses_for_selector(&port, &inventory, Some("fleet"), probe).unwrap();
-            assert_eq!(statuses.len(), 1);
-            assert_eq!(statuses[0].state, ClusterHostState::Degraded);
-            assert!(statuses[0].reason.as_deref().unwrap().starts_with(reason));
+    /// Probes through the production `HostRuntimeApi` path's own functions.
+    struct Probing<'a>(&'a ProbePort);
+
+    impl ClusterRuntimeOps for Probing<'_> {
+        fn saved_hosts(&self) -> Result<BTreeSet<String>, String> {
+            crate::endpoint::saved_hosts(self.0)
+                .map(|hosts| hosts.into_iter().map(|host| host.alias).collect())
         }
-        assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+        fn probe_member(&self, probe: HealthProbe, target: &str) -> Result<(), String> {
+            crate::endpoint::probe_saved_host(self.0, probe, target)
+        }
+        fn session_list(&self) -> Result<SessionListResponse, String> {
+            unreachable!()
+        }
+        fn session_create(&self, _: &SessionCreateRequest) -> Result<SessionCreateResponse, String> {
+            unreachable!()
+        }
+        fn session_select(&self, _: &SessionSelectRequest) -> Result<SessionSelectResponse, String> {
+            unreachable!()
+        }
+        fn pane_list(&self, _: &PaneListRequest) -> Result<PaneListResponse, String> {
+            unreachable!()
+        }
+        fn pane_launch(&self, _: &PaneLaunchRequest) -> Result<PaneLaunchResponse, String> {
+            unreachable!()
+        }
+        fn pane_close(&self, _: &PaneCloseRequest) -> Result<PaneCloseResponse, String> {
+            unreachable!()
+        }
+        fn storage_get(
+            &self,
+            _: &StorageGetRequest,
+        ) -> Result<bmux_plugin_sdk::StorageGetResponse, String> {
+            unreachable!()
+        }
+        fn storage_set(&self, _: &StorageSetRequest) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    fn statuses(port: &ProbePort, probe: HealthProbe) -> Vec<ClusterHostStatus> {
+        let probing = Probing(port);
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "fleet".into(),
+                vec!["fixture".into(), "unpaired".into(), "local".into()],
+            )]),
+            saved_hosts: probing.saved_hosts().unwrap(),
+        };
+        collect_statuses_for_selector(&probing, &inventory, Some("fleet"), probe).unwrap()
+    }
+
+    #[test]
+    fn only_saved_hosts_are_probed_and_only_over_the_paired_transport() {
+        let port = ProbePort::new(vec![Answer::Status {
+            endpoint_id: PINNED,
+        }]);
+        let statuses = statuses(&port, HealthProbe::Test);
+        let state = |target: &str| {
+            statuses
+                .iter()
+                .find(|status| status.target == target)
+                .unwrap()
+        };
+        assert_eq!(state("fixture").state, ClusterHostState::Ready);
+        for unsaved in ["unpaired", "local"] {
+            assert_eq!(state(unsaved).state, ClusterHostState::Degraded);
+            assert!(
+                state(unsaved)
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("is not a saved host"),
+                "{:?}",
+                state(unsaved).reason
+            );
+        }
+        assert_eq!(*port.invocations.lock().unwrap(), ["fixture"]);
+        // `local` is refused even when named directly.
+        let direct = crate::endpoint::probe_saved_host(&port, HealthProbe::Test, "local");
+        assert!(direct.unwrap_err().contains("not a cluster member endpoint"));
+        assert_eq!(port.invocations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_probe_is_degraded_once_and_doctor_checks_the_pinned_key() {
+        let port = ProbePort::new(vec![
+            Answer::Refused,
+            Answer::Status {
+                endpoint_id: "someone-else",
+            },
+            Answer::Status {
+                endpoint_id: PINNED,
+            },
+        ]);
+        let refused = statuses(&port, HealthProbe::Test);
+        assert_eq!(refused[0].state, ClusterHostState::Degraded);
+        assert!(
+            refused[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("remote principal may not use this route"),
+            "{:?}",
+            refused[0].reason
+        );
+        // One call per probe: the refusal was not retried.
+        assert_eq!(port.invocations.lock().unwrap().len(), 1);
+
+        let mismatched = statuses(&port, HealthProbe::Doctor);
+        assert_eq!(mismatched[0].state, ClusterHostState::Degraded);
+        assert!(
+            mismatched[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("is pinned to pinned-host-key")
+        );
+        let healthy = statuses(&port, HealthProbe::Doctor);
+        assert_eq!(healthy[0].state, ClusterHostState::Ready);
+        assert_eq!(port.invocations.lock().unwrap().len(), 3);
     }
 }

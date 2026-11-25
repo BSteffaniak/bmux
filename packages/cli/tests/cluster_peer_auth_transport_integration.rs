@@ -1,17 +1,36 @@
 #[allow(dead_code)] // The shared process fixture also serves other test binaries.
 mod support;
 
+// The remote-access fixture: hosts with remote hosting on, and the pairing ceremony. Cluster
+// nodes reach each other as saved hosts over the paired (Iroh) transport.
+#[cfg(all(
+    unix,
+    feature = "bundled-plugin-cluster",
+    feature = "bundled-plugin-connections"
+))]
+#[allow(dead_code)]
+#[path = "remote_access/harness.rs"]
+mod harness;
+
 // Pane replication through the cluster attach provider runs on this same process harness.
-#[cfg(feature = "bundled-plugin-cluster")]
+#[cfg(all(
+    unix,
+    feature = "bundled-plugin-cluster",
+    feature = "bundled-plugin-connections"
+))]
 mod cluster_frame_replication;
+
+// Cluster membership over the paired transport: join and leave with mutual peer
+// authentication, and three voters surviving a restart.
+#[cfg(all(
+    unix,
+    feature = "bundled-plugin-cluster",
+    feature = "bundled-plugin-connections"
+))]
+mod cluster_paired_membership;
 
 use serial_test::serial;
 use support::{ServerEnv, assert_success};
-
-// Cluster membership over paired transport (join/leave with mutual peer
-// authentication, three voters surviving a restart) is rewritten on the
-// connections plugin's saved hosts in remote-access phase 3 (lane F); see
-// docs/development/remote-access-architecture.md and remote_access gate 9.
 
 #[test]
 #[serial]

@@ -31,7 +31,7 @@ where
         match reconcile_once(caller.as_ref(), &identity, &nodes).await {
             Ok(_) => delay = RECONCILE_INTERVAL,
             Err(error) => {
-                tracing::debug!(%error, retry_ms = delay.as_millis(), "cluster pending-workflow reconciliation deferred");
+                tracing::warn!(%error, retry_ms = delay.as_millis(), "cluster pending-workflow reconciliation deferred");
                 delay = delay.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
             }
         }

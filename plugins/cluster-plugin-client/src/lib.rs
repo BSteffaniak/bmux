@@ -76,8 +76,10 @@ impl AttachProvider for ClusterAttachProvider {
         target.scheme() == Some("cluster")
     }
 
+    /// The selected server (local, or a saved host chosen with `--target`) is the
+    /// cluster ingress: a cluster id names no endpoint to dial.
     fn requires_fallback_client(&self) -> bool {
-        false
+        true
     }
 
     fn resolve(
@@ -146,12 +148,16 @@ impl AttachProvider for ClusterAttachProvider {
                     })?
             };
             let principal_id = format!("principal:{}", client.principal_id());
+            let viewport = initial_viewport(context.viewport);
             let session = ClusterAttachSession::open(
                 client,
                 connector,
-                target.cluster.clone(),
-                target.workspace.clone(),
+                ClusterAttachTarget {
+                    cluster: target.cluster.clone(),
+                    workspace: target.workspace.clone(),
+                },
                 principal_id,
+                viewport,
                 resume,
             )
             .await
@@ -164,6 +170,15 @@ impl AttachProvider for ClusterAttachProvider {
                 target: Some(target.workspace.clone()),
             })
         })
+    }
+}
+
+/// The size used before the renderer reports one: the viewer's terminal when the host
+/// knows it, otherwise the conventional 80x24. A zero dimension is never laid out.
+fn initial_viewport(viewport: Option<(u16, u16)>) -> (u16, u16) {
+    match viewport {
+        Some((columns, rows)) if columns > 0 && rows > 0 => (columns, rows),
+        _ => (80, 24),
     }
 }
 
@@ -682,11 +697,12 @@ impl ClusterAttachSession {
     async fn open(
         client: BmuxClient,
         connector: Arc<dyn AttachEndpointConnector>,
-        cluster: String,
-        workspace: String,
+        target: ClusterAttachTarget,
         principal_id: String,
+        viewport: (u16, u16),
         resume: Option<AttachResumeState>,
     ) -> Result<Self, AttachSessionError> {
+        let ClusterAttachTarget { cluster, workspace } = target;
         // The ingress pushes each control revision it applies to this connection, so the layout
         // is read when it changes.
         let mut client =
@@ -719,8 +735,8 @@ impl ClusterAttachSession {
             &mut client,
             record.workspace_id.clone(),
             None,
-            80,
-            24,
+            viewport.0,
+            viewport.1,
         )
         .await
         .map_err(provider_error)?
@@ -746,7 +762,7 @@ impl ClusterAttachSession {
             pending_events: std::collections::VecDeque::new(),
             unzoomed_scene: None,
             zoomed_pane: None,
-            viewport: (80, 24),
+            viewport,
             check_layout: false,
             reobserve_at: None,
             detached: false,
@@ -2359,6 +2375,13 @@ pub fn attach_provider() -> Arc<dyn bmux_client::AttachProvider> {
 mod tests {
     use super::*;
     #[test]
+    fn the_first_layout_uses_the_viewers_terminal_size() {
+        assert_eq!(initial_viewport(Some((132, 41))), (132, 41));
+        assert_eq!(initial_viewport(Some((0, 41))), (80, 24));
+        assert_eq!(initial_viewport(None), (80, 24));
+    }
+
+    #[test]
     fn action_command_ids_are_stable_and_separated() {
         assert_eq!(
             command_id_from_text("action-1"),
@@ -3434,7 +3457,7 @@ mod tests {
     #[test]
     fn cluster_provider_claims_and_validates_cluster_uris() {
         let provider = ClusterAttachProvider;
-        assert!(!provider.requires_fallback_client());
+        assert!(provider.requires_fallback_client());
         assert!(provider.supports(&AttachTarget::parse("cluster://prod/workspace")));
         assert!(!provider.supports(&AttachTarget::parse("local://workspace")));
         let resolved = provider

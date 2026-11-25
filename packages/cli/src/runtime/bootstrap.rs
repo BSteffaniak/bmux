@@ -1257,6 +1257,7 @@ pub(super) async fn run_session_attach(
                 bmux_client::AttachProviderOpenContext {
                     fallback_client: None,
                     endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                    viewport: bmux_terminal::terminal::size().ok(),
                 },
             )
             .await?;

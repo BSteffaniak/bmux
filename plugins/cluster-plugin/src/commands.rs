@@ -575,13 +575,13 @@ pub fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> 
             .get(cluster_name)
             .ok_or_else(|| format!("unknown cluster '{cluster_name}'"))?;
         println!("cluster {cluster_name}");
-        print_cluster_targets(hosts, &inventory.known_targets);
+        print_cluster_targets(hosts, &inventory.saved_hosts);
         return Ok(EXIT_OK);
     }
 
     for (cluster_name, hosts) in &inventory.clusters {
         println!("cluster {cluster_name}");
-        print_cluster_targets(hosts, &inventory.known_targets);
+        print_cluster_targets(hosts, &inventory.saved_hosts);
     }
 
     Ok(EXIT_OK)
@@ -777,16 +777,16 @@ pub fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, Stri
     Ok(EXIT_OK)
 }
 
-pub fn print_cluster_targets(targets: &[String], known_targets: &BTreeSet<String>) {
+pub fn print_cluster_targets(targets: &[String], saved_hosts: &BTreeSet<String>) {
     if targets.is_empty() {
         println!("  (no hosts)");
         return;
     }
     for target in targets {
-        let state = if known_targets.contains(target) {
-            "configured"
+        let state = if saved_hosts.contains(target) {
+            "saved_host"
         } else {
-            "missing_target"
+            "not_a_saved_host"
         };
         println!("  - {target} [{state}]");
     }

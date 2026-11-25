@@ -1894,7 +1894,10 @@ mod tests {
         }
 
         impl crate::ClusterRuntimeOps for MemoryStorage {
-            fn remote_probe_status(&self, _: crate::HealthProbe, _: &str) -> Result<i32, String> {
+            fn saved_hosts(&self) -> Result<std::collections::BTreeSet<String>, String> {
+                Err("unused".to_string())
+            }
+            fn probe_member(&self, _: crate::HealthProbe, _: &str) -> Result<(), String> {
                 Err("unused".to_string())
             }
             fn session_list(&self) -> Result<crate::SessionListResponse, String> {

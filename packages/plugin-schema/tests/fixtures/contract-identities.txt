@@ -54,6 +54,8 @@ plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-peer-read/v1 21fb6f7
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-connection-events/v1 fa72a1a5768dc2dec6488316fd6fe3d4e8a581f3da119600a1194f67b5b4fc14
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl connection-types 98049b39ed4886521356a1b6471324fc20f859d4d39b880aa5a1a5c22a37d515
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl connections-commands 7bc1e808ff79b865982f1e099b7ec1d95618b0815030813dda6015f1164386cc
+plugins/connections-plugin-api/bpdl/connections-plugin.bpdl saved-host-types a28825acee35e34f0f2635a46174bec810f33febf1a3b721a91b38c71d26bb98
+plugins/connections-plugin-api/bpdl/connections-plugin.bpdl saved-hosts-state 3f4deb290f0addf2e6c97f1663ee0dd9ea33b7d75aa9cbf74ec73f5042754fe2
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl hosting-types 619f3e5cbc12511eeb3444e5a6087bd3908009cf155fd8932bd3098129976df3
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl hosting-commands 95658b39a8f57c2b1139f8c0e58544a30cf941a3d2ec01689bd314923b899331
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl hosting-admin-state e8fd71a29c42e8b9f78bc7a42c843c175cd891e3cd62ea7c74c7aaf75fe200f4

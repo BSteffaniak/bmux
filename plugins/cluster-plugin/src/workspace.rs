@@ -45,7 +45,7 @@ pub fn execute_cluster_up(
     }
 
     let mut statuses =
-        build_cluster_launch_statuses(caller, &selected_hosts, &inventory.known_targets);
+        build_cluster_launch_statuses(caller, &selected_hosts, &inventory.saved_hosts);
 
     let session_name = format!("cluster-{}", args.cluster);
     let session_selector = ensure_cluster_session(caller, &session_name)?;
@@ -77,15 +77,15 @@ pub fn execute_cluster_up(
 pub fn build_cluster_launch_statuses(
     caller: &impl ClusterRuntimeOps,
     selected_hosts: &[String],
-    known_targets: &BTreeSet<String>,
+    saved_hosts: &BTreeSet<String>,
 ) -> Vec<ClusterLaunchStatus> {
     let mut statuses = Vec::new();
     for target in selected_hosts {
-        if !known_targets.contains(target) {
+        if !saved_hosts.contains(target) {
             statuses.push(ClusterLaunchStatus {
                 target: target.clone(),
                 state: ClusterHostState::Degraded,
-                reason: Some("target is missing from [connections.targets]".to_string()),
+                reason: Some(crate::endpoint::not_a_saved_host(target)),
                 pane_id: None,
             });
             continue;

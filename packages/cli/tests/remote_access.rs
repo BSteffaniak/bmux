@@ -21,6 +21,9 @@ mod probe;
 mod relay;
 #[path = "remote_access/udp_proxy.rs"]
 mod udp_proxy;
+#[cfg(feature = "bundled-plugin-cluster")]
+#[path = "remote_access/cluster.rs"]
+mod cluster;
 
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
@@ -655,8 +658,25 @@ fn gate8_owner_local_routes_are_refused_for_a_full_remote_principal() {
 // Gate 9: cluster over the paired transport.
 // ---------------------------------------------------------------------------------------
 
+/// Pairs every node's own profile with every node, itself included, saving each under that
+/// node's name: a member reaches every member, itself too, by its advertised endpoint.
+/// Pairing never grants cluster membership; enrollment does.
+#[cfg(feature = "bundled-plugin-cluster")]
+fn pair_mesh(nodes: &[(&Host, &str)]) {
+    for (host, host_name) in nodes {
+        for (connecting, connecting_name) in nodes {
+            let device = if host_name == connecting_name {
+                format!("{connecting_name}-self")
+            } else {
+                (*connecting_name).to_owned()
+            };
+            pair_only(host, *connecting, host_name, &device, Role::Full);
+        }
+    }
+}
+
 #[test]
-#[ignore = "remote-access: needs lane F (cluster RPC and cluster attach on the connection manager; cluster CLI naming paired hosts as endpoints)"]
+#[cfg(feature = "bundled-plugin-cluster")]
 fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
     let node_a = Host::start(
         "cluster-a",
@@ -666,11 +686,9 @@ fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
         "cluster-b",
         RemoteSettings::loopback_host(reserve_udp_port()),
     );
-    // Each node's own profile pairs with the other (pairing never grants membership;
-    // enrollment does).
-    pair_only(&node_a, &node_b, "node-a", "node-b", Role::Full);
-    pair_only(&node_b, &node_a, "node-b", "node-a", Role::Full);
+    pair_mesh(&[(&node_a, "node-a"), (&node_b, "node-b")]);
 
+    // Each node advertises the saved-host name the other paired with it under.
     node_a.ok(&["cluster", "init", "--endpoint", "node-a"], "init cluster");
     let token_output = node_a.ok(
         &[
@@ -678,7 +696,12 @@ fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
             "enrollment-token",
             "create",
             "--endpoint",
-            "node-b",
+            "node-a",
+            // A worker verifies each lease against linearizable membership, which takes
+            // a consensus voter.
+            "--role",
+            "voter",
+            "--worker",
         ],
         "create enrollment token",
     );
@@ -709,20 +732,32 @@ fn gate9_cluster_nodes_over_paired_transport_attach_across_hosts() {
         );
     }
 
-    // A pane placed on the worker (node B), attached from node A.
-    node_a.ok(
-        &[
-            "cluster", "pane", "new", "--host", "node-b", "--name", "worker",
-        ],
-        "place a pane on the worker",
-    );
-    let mut attach = node_a.terminal("cluster-attach", &["cluster", "up", "--host", "node-b"]);
-    attach.wait_attached();
-    let typed = marker("worker-pane");
-    attach.type_marker(&typed);
-    attach.wait_text(&typed, STEP);
-    let hostname = node_b.ok(&["cluster", "hosts"], "list cluster hosts");
-    assert!(hostname.contains("node-b"), "{hostname}");
+    // A pane placed on the worker (node B) through the ingress (node A).
+    let word = marker("worker");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let cluster_id = runtime.block_on(async {
+        let mut worker = cluster::owner(&node_b).await;
+        let (worker_node, _) = cluster::identity(&mut worker).await;
+        let mut ingress = cluster::owner(&node_a).await;
+        let (_, cluster_id) = cluster::identity(&mut ingress).await;
+        let mut nodes = cluster::Nodes(vec![ingress, worker]);
+        cluster::place_pane(&mut nodes, "gate9", &worker_node, &word.to_ascii_lowercase())
+            .await;
+        cluster_id.expect("initialized node has a cluster id")
+    });
+
+    // Node A's owner attaches to the cluster workspace: frames come from node B over the
+    // paired transport, and typed input reaches node B's pane.
+    let target = format!("cluster://{cluster_id}/gate9");
+    let mut attach = node_a.terminal("cluster-attach", &["attach", &target]);
+    attach.wait_text(&format!("ready:{}", word.to_ascii_lowercase()), STEP);
+    let typed = marker("typed");
+    attach.send(format!("{}\r", typed.to_ascii_lowercase()).as_bytes());
+    attach.wait_text(&format!("SEEN:{typed}"), STEP);
 }
 
 // ---------------------------------------------------------------------------------------

@@ -5,7 +5,7 @@ use crate::roles::PermissionsGrants;
 use crate::trust::{Device, DeviceState, Role};
 use bmux_connections_plugin_api::hosting_types::{self as api, DeviceRole, PairingEventKind};
 use bmux_connections_plugin_api::{
-    connections_commands, hosting_admin_state, hosting_commands, hosting_state,
+    connections_commands, hosting_admin_state, hosting_commands, hosting_state, saved_hosts_state,
 };
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::prelude::*;
@@ -228,6 +228,13 @@ pub fn invoke(owner: Option<&Host>, context: &NativeServiceContext) -> ServiceRe
                 .set_role(&request.device, role(request.role), &PermissionsGrants { caller: &caller })
                 .map(device)
                 .map_err(failed("role"))
+        },
+        saved_hosts_state::client::ListSavedHostsEndpoint => |(): (), ctx| {
+            require_local_or_internal(ctx)?;
+            let paths = crate::cli::paths_from(&ctx.connection);
+            crate::connector::SavedHostConnector::new(paths)
+                .saved_hosts()
+                .map_err(failed("known_hosts"))
         },
         connections_commands::client::InvokeServiceEndpoint => |request, ctx| {
             require_local_or_internal(ctx)?;

@@ -95,6 +95,9 @@ pub struct AttachProviderOpenContext {
     pub fallback_client: Option<BmuxClient>,
     /// Generic endpoint dialer for providers that own candidate selection.
     pub endpoint_connector: Option<Arc<dyn AttachEndpointConnector>>,
+    /// The viewer's terminal size (columns, rows) when it is known, so a provider
+    /// lays out its first snapshot at the real size instead of a placeholder.
+    pub viewport: Option<(u16, u16)>,
 }
 
 impl fmt::Debug for AttachProviderOpenContext {
@@ -103,6 +106,7 @@ impl fmt::Debug for AttachProviderOpenContext {
             .debug_struct("AttachProviderOpenContext")
             .field("has_fallback_client", &self.fallback_client.is_some())
             .field("has_endpoint_connector", &self.endpoint_connector.is_some())
+            .field("viewport", &self.viewport)
             .finish()
     }
 }

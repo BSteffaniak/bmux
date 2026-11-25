@@ -7,6 +7,7 @@ use crate::identity::DeviceKey;
 use crate::known_hosts::{KnownHost, KnownHosts, host_key_changed};
 use crate::transport::manager::{ClientTransport, ConnectionManager, HostRoute, Refused, refused};
 use anyhow::{Context, Result};
+use bmux_connections_plugin_api::saved_host_types::SavedHost;
 use bmux_client::{BmuxClient, ClientError, TransportConnectFuture, TransportConnector};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,6 +39,22 @@ impl SavedHostConnector {
             return Ok(None);
         }
         KnownHosts::open(&self.paths.state_dir, CLIENT_PROFILE)?.get(alias)
+    }
+
+    /// Every saved host, without creating client state when there is none.
+    pub fn saved_hosts(&self) -> Result<Vec<SavedHost>> {
+        if !self.known_hosts_file().is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(KnownHosts::open(&self.paths.state_dir, CLIENT_PROFILE)?
+            .list()?
+            .into_iter()
+            .map(|(alias, host)| SavedHost {
+                alias,
+                host_key: host.host_key,
+                last_path: host.last_path,
+            })
+            .collect())
     }
 
     /// Open a client for saved host `alias`.

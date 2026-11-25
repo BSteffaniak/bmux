@@ -1,6 +1,6 @@
 use bmux_connections_plugin_api::{
     connection_types::{ConnectionError, InvocationOptions, ServiceInvocation, ServiceInvokeKind},
-    connections_commands, hosting_admin_state, hosting_commands, hosting_state,
+    connections_commands, hosting_admin_state, hosting_commands, hosting_state, saved_hosts_state,
     hosting_types::{Device, DeviceRole, DeviceState, PairingSession},
 };
 
@@ -40,6 +40,7 @@ fn hosting_interfaces_are_distinct_and_devices_round_trip() {
         hosting_commands::INTERFACE_ID.to_string(),
         hosting_admin_state::INTERFACE_ID.to_string(),
         hosting_state::INTERFACE_ID.to_string(),
+        saved_hosts_state::INTERFACE_ID.to_string(),
     ];
     for (index, id) in ids.iter().enumerate() {
         assert!(!ids[index + 1..].contains(id));
@@ -76,5 +77,6 @@ fn administration_is_owner_local_and_status_is_observe() {
     assert_eq!(hosting_commands::ACCESS, Some(RouteAccess::OwnerLocal));
     assert_eq!(hosting_admin_state::ACCESS, Some(RouteAccess::OwnerLocal));
     assert_eq!(connections_commands::ACCESS, Some(RouteAccess::OwnerLocal));
+    assert_eq!(saved_hosts_state::ACCESS, Some(RouteAccess::OwnerLocal));
     assert_eq!(hosting_state::ACCESS, Some(RouteAccess::Observe));
 }

@@ -4542,6 +4542,7 @@ async fn run_session_attach_once_tracked(
             bmux_client::AttachProviderOpenContext {
                 fallback_client: Some(client),
                 endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                viewport: terminal::size().ok(),
             },
         )
         .await?;
@@ -4582,6 +4583,7 @@ pub async fn run_session_attach_with_client_headless(
             bmux_client::AttachProviderOpenContext {
                 fallback_client: Some(client),
                 endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                viewport: terminal::size().ok(),
             },
         )
         .await?;
@@ -4624,6 +4626,7 @@ pub async fn run_session_attach_with_client_observer(
             bmux_client::AttachProviderOpenContext {
                 fallback_client: Some(client),
                 endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                viewport: terminal::size().ok(),
             },
         )
         .await?;

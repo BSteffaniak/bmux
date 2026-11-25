@@ -171,12 +171,18 @@ impl Host {
     /// Starts the server and enables hosting (`bmux remote enable --yes`).
     #[must_use]
     pub fn start(label: &str, settings: RemoteSettings) -> Self {
+        Self::start_with(label, settings, "")
+    }
+
+    /// [`Host::start`] with `extra` appended to the server's configuration.
+    #[must_use]
+    pub fn start_with(label: &str, settings: RemoteSettings, extra: &str) -> Self {
         let mut env = ServerEnv::new(label);
         env.isolate_shell_config();
         private_dir(&env.root().join("home").join(".config"));
         let shell = write_quiet_shell(env.root());
         env.write_config(&format!(
-            "[general]\ndefault_shell = {}\nserver_timeout = 30000\n[behavior]\nrestore_last_layout = false\npane_shell_integration = false\n[multi_client]\ndefault_follow_mode = false\n\n{}",
+            "[general]\ndefault_shell = {}\nserver_timeout = 30000\n[behavior]\nrestore_last_layout = false\npane_shell_integration = false\n[multi_client]\ndefault_follow_mode = false\n\n{}\n{extra}",
             serde_json::to_string(&shell.to_string_lossy()).expect("quote shell path"),
             settings.toml(),
         ));

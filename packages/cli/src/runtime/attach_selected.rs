@@ -128,6 +128,7 @@ pub(super) async fn run_attach(
                 endpoint_connector: Some(std::sync::Arc::new(
                     crate::connection::CliAttachEndpointConnector,
                 )),
+                viewport: bmux_terminal::terminal::size().ok(),
             },
         )
         .await?;
