@@ -18,6 +18,7 @@ const HEIGHT: u16 = 40;
 struct Calls {
     replays: Vec<(u64, bool)>,
     shrinks: Vec<u64>,
+    verifies: Vec<u64>,
     paused: bool,
     parallel: u64,
     controls: Vec<Arc<ReplayControl>>,
@@ -54,6 +55,14 @@ impl Controller for Fake {
         Some(RunId {
             worker: 0,
             run: u64::try_from(calls.replays.len()).unwrap(),
+        })
+    }
+    fn verify(&self, seed: u64, _: u64) -> Option<RunId> {
+        let mut calls = self.0.lock().unwrap();
+        calls.verifies.push(seed);
+        Some(RunId {
+            worker: 0,
+            run: 1000 + u64::try_from(calls.verifies.len()).unwrap(),
         })
     }
     fn shrink(&self, seed: u64, _: u64) -> Option<RunId> {
@@ -315,6 +324,121 @@ fn a_failure_is_toasted_reproduced_and_then_shrunk() {
 }
 
 #[test]
+fn a_failure_that_does_not_reproduce_is_verified_and_shows_where_it_diverges() {
+    let (mut app, fake) = app();
+    start(&mut app, id(1, 1), 42);
+    finish(&mut app, id(1, 1), 42, false);
+    app.tick(Instant::now());
+    let job = app.store.failures[0].confirming.unwrap();
+    app.event(
+        SimEvent::RunStarted {
+            id: job,
+            seed: 42,
+            props: vec![],
+            steps: None,
+            worker: 0,
+            kind: RunKind::Replay,
+            epoch_offset: 3,
+        },
+        Instant::now(),
+    );
+    app.event(
+        SimEvent::RunFinished {
+            id: job,
+            seed: 42,
+            success: true,
+            report: String::new(),
+            steps: 1,
+            real_time: Duration::ZERO,
+            sim_time: Duration::ZERO,
+        },
+        Instant::now(),
+    );
+    assert_eq!(app.store.failures[0].reproduced, Some(false));
+    // Not reproduced: a verify job looks for where a replay parts from the run, not a shrink.
+    app.tick(Instant::now());
+    assert_eq!(fake.0.lock().unwrap().verifies, [42]);
+    assert_eq!(fake.0.lock().unwrap().shrinks, [] as [u64; 0]);
+    let verifying = app.store.failures[0].verifying.unwrap();
+    key(&mut app, KeyCode::Char('f'));
+    let text = draw(&mut app);
+    assert!(text.contains("verifying"), "{text}");
+    app.event(
+        SimEvent::Verified {
+            id: verifying,
+            verification: Verification::Diverged(
+                "the first difference: observation 12, terminal output".into(),
+            ),
+        },
+        Instant::now(),
+    );
+    assert_eq!(app.store.failures[0].verifying, None);
+    assert!(app.toasts.iter().any(|t| t.title.contains("diverges")));
+    let text = draw(&mut app);
+    assert!(text.contains("diverges from the seed"), "{text}");
+    assert!(text.contains("observation 12, terminal output"), "{text}");
+}
+
+/// The median time to draw a frame of `app` (and commit its hit regions), after warming up.
+fn frame_time(app: &mut App) -> Duration {
+    for _ in 0..3 {
+        draw(app);
+    }
+    let mut times: Vec<Duration> = (0..20)
+        .map(|_| {
+            let start = Instant::now();
+            draw(app);
+            start.elapsed()
+        })
+        .collect();
+    times.sort();
+    times[times.len() / 2]
+}
+
+/// The dashboard's performance budget: with 64 workers running and a 50 000-decision run open, a
+/// frame draws within 8 ms in a release build (`cargo test --release -p bmux_simvar_tui budget`,
+/// as CI runs it). A debug build only checks that such frames draw.
+#[test]
+fn a_frame_of_a_large_fleet_and_run_draws_within_the_budget() {
+    const BUDGET: Duration = Duration::from_millis(8);
+    let (mut app, _) = app();
+    for worker in 1..=64 {
+        start(&mut app, id(worker, 1), worker);
+    }
+    let mut index = RunIndex::default();
+    for n in 0..50_000_u64 {
+        let thread = usize::try_from(n % 8).unwrap();
+        index.record(n, thread, || format!("thread-{thread}"));
+    }
+    for decision in (0..50_000).step_by(250) {
+        index.event(TimelineEvent {
+            decision,
+            kind: "open".into(),
+            label: "pane opened".into(),
+            tone: Tone::Info,
+            entity: None,
+        });
+    }
+    app.event(
+        SimEvent::Telemetry {
+            id: id(1, 1),
+            payload: Arc::new(index),
+        },
+        Instant::now(),
+    );
+    let fleet = frame_time(&mut app);
+    app.act(Action::OpenRun(id(1, 1)));
+    app.tick(Instant::now());
+    let run = frame_time(&mut app);
+    assert!(draw(&mut app).contains("thread-7"));
+    eprintln!("median frame: Fleet {fleet:?}, Run {run:?} (budget {BUDGET:?})");
+    if !cfg!(debug_assertions) {
+        assert!(fleet <= BUDGET, "a Fleet frame took {fleet:?}");
+        assert!(run <= BUDGET, "a Run frame took {run:?}");
+    }
+}
+
+#[test]
 fn opening_a_finished_run_replays_it_and_the_transport_steps_it() {
     let (mut app, fake) = app();
     start(&mut app, id(1, 1), 99);
@@ -484,6 +608,45 @@ fn the_wheel_scrolls_the_list_under_the_pointer() {
         Instant::now(),
     );
     assert_eq!(app.scroll.get("workers"), Some(&WHEEL));
+}
+
+#[test]
+fn a_dragged_divider_stays_where_it_was_left_in_the_next_session() {
+    let dir = std::env::temp_dir().join(format!(
+        "simvar-tui-layout-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let session = || {
+        App::new(
+            Options {
+                title: "pane-runtime".into(),
+                views: vec![],
+                controller: None,
+                interest: Arc::new(Interest::default()),
+                findings: Some(Findings::new(&dir)),
+                open: None,
+            },
+            Instant::now(),
+        )
+    };
+    let mut app = session();
+    start(&mut app, id(1, 1), 3);
+    draw(&mut app);
+    let handle = region(&app, "split.col.fleet");
+    let at = |x| bmux_tui::geometry::Point::new(x, handle.y + 3);
+    for (kind, x) in [
+        (MouseEventKind::Down(MouseButton::Left), handle.x),
+        (MouseEventKind::Drag(MouseButton::Left), WIDTH / 4),
+        (MouseEventKind::Up(MouseButton::Left), WIDTH / 4),
+    ] {
+        app.input(&Event::Mouse(MouseEvent::new(kind, at(x))), Instant::now());
+    }
+    assert_eq!(app.splits.get("col.fleet"), Some(&25));
+    // The next session starts with the divider there.
+    assert_eq!(session().splits.get("col.fleet"), Some(&25));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

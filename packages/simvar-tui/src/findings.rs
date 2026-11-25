@@ -3,6 +3,7 @@
 //! Each failure group is saved as a JSON file under a findings directory (by default `target/sim-findings/<simulation>/`), so restarting the
 //! dashboard keeps them, and a later build can re-check them.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -77,6 +78,8 @@ impl Finding {
             reproduced: (self.build == build).then_some(self.reproduced).flatten(),
             confirming: None,
             shrink: None,
+            verifying: None,
+            verification: None,
             saved: true,
             stale: self.build != build,
         }
@@ -131,6 +134,35 @@ impl Findings {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
+    }
+
+    fn layout_path(&self) -> PathBuf {
+        self.dir.join("layout.splits")
+    }
+
+    /// The dashboard's divider positions saved last (none when unsaved or unreadable).
+    #[must_use]
+    pub fn load_layout(&self) -> BTreeMap<String, u16> {
+        std::fs::read(self.layout_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Save the dashboard's divider positions, for the next session.
+    ///
+    /// # Errors
+    ///
+    /// * If the directory or file cannot be written
+    pub fn save_layout(&self, splits: &BTreeMap<String, u16>) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.layout_path();
+        let staging = path.with_extension("splits.tmp");
+        std::fs::write(
+            &staging,
+            serde_json::to_vec_pretty(splits).map_err(io::Error::other)?,
+        )?;
+        std::fs::rename(staging, path)
     }
 
     fn path(&self, signature: &str) -> PathBuf {

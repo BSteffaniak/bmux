@@ -374,11 +374,17 @@ Built on 2026-11-21:
 - **Differences from the plan:**
   - The timeline's "dashed segment showing what a thread waits on" is the
     thread's state in its lane label and in the Threads page.
-  - The nondeterminism diff shows `↺✗` (a replay that passed), not an aligned
-    trace diff.
+  - The nondeterminism diff: when a failure's confirming replay passes (`↺✗`), a
+    verify job (simvar's `control().verify`) runs the seed recording everything it
+    observes and replays it in a fresh process; the failure's page shows the first
+    observation where they part, with the text around it, rather than an aligned
+    view of two whole traces.
   - Predicates for breakpoints are event kinds (`break crash`), not arbitrary
     state predicates.
   - Dividers are dragged through the dashboard's own drag handles (the fleet's
-    columns, the run overview's rows), not `panel_group`, and are not saved
-    between sessions.
-  - The 8 ms performance budget is not yet a test.
+    columns, the run overview's rows), not `panel_group`. Where they are left is
+    saved with the findings (`layout.splits`) and restored next session.
+  - The 8 ms performance budget is a test
+    (`a_frame_of_a_large_fleet_and_run_draws_within_the_budget`), asserted in release
+    builds: CI runs `cargo test --release -p bmux_simvar_tui budget`. Frames measured
+    0.1 ms (Fleet) and 0.7 ms (Run) on an M-series Mac.

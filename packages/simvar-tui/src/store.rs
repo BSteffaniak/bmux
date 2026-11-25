@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use simvar_observer::{RunId, RunKind, SchedulerView, SimEvent};
+use simvar_observer::{RunId, RunKind, SchedulerView, SimEvent, Verification};
 
 use crate::telemetry::{Invariants, Pulse, RunIndex, Shape};
 
@@ -264,6 +264,10 @@ pub struct FailureGroup {
     pub confirming: Option<RunId>,
     /// Shrinking, once started.
     pub shrink: Option<ShrinkStatus>,
+    /// The verify job looking for where a replay parts from the failed run, while it runs.
+    pub verifying: Option<RunId>,
+    /// What the verify job found, once it finished.
+    pub verification: Option<Verification>,
     /// Loaded from saved findings rather than seen in this session.
     pub saved: bool,
     /// Saved by another build: its seed may not replay the same run on this one, so a replay
@@ -339,6 +343,8 @@ pub enum Notice {
     Confirmed(usize, bool),
     /// Shrinking finished (group).
     Shrunk(usize),
+    /// A verify job finished (group).
+    Verified(usize),
     /// Every run is done.
     Finished,
 }
@@ -502,6 +508,14 @@ impl Store {
                 now,
                 &mut notices,
             ),
+            SimEvent::Verified { id, verification } => {
+                if let Some(index) = self.failures.iter().position(|g| g.verifying == Some(id)) {
+                    let group = &mut self.failures[index];
+                    group.verifying = None;
+                    group.verification = Some(verification);
+                    notices.push(Notice::Verified(index));
+                }
+            }
             SimEvent::Shrink {
                 id,
                 attempts,
@@ -678,6 +692,8 @@ impl Store {
                     reproduced: None,
                     confirming: None,
                     shrink: None,
+                    verifying: None,
+                    verification: None,
                     saved: false,
                     stale: false,
                 });
@@ -722,6 +738,14 @@ impl Store {
     pub fn confirming(&mut self, group: usize, job: RunId) {
         if let Some(group) = self.failures.get_mut(group) {
             group.confirming = Some(job);
+        }
+    }
+
+    /// Note that a verify job (`job`) started for failure group `group`.
+    pub fn verifying(&mut self, group: usize, job: RunId) {
+        if let Some(group) = self.failures.get_mut(group) {
+            group.verifying = Some(job);
+            group.verification = None;
         }
     }
 

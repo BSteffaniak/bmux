@@ -877,6 +877,10 @@ impl Controller for FleetController {
             .ok()
     }
 
+    fn verify(&self, seed: u64, epoch_offset: u64) -> Option<RunId> {
+        simvar::control().verify(seed, epoch_offset).ok()
+    }
+
     fn shrink(&self, seed: u64, epoch_offset: u64) -> Option<RunId> {
         simvar::control().shrink(seed, epoch_offset).ok()
     }

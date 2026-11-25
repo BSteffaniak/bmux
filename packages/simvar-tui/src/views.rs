@@ -768,7 +768,48 @@ fn invariants_exercised(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
     }
 }
 
-/// A failure group's status glyphs: reproduction and shrinking.
+/// What a verify job found for a failure that did not reproduce, followed by a blank line;
+/// nothing when none ran.
+fn verification_lines(theme: &Theme, group: &crate::store::FailureGroup) -> Vec<Line> {
+    use simvar_observer::Verification;
+    let (heading, body, style) = match &group.verification {
+        None if group.verifying.is_some() => (
+            "verifying: running the seed, then replaying it in a fresh process…",
+            "",
+            theme.replay(),
+        ),
+        None => return Vec::new(),
+        Some(Verification::Diverged(text)) => (
+            "a replay in a fresh process diverges from the seed's run:",
+            text.as_str(),
+            theme.warn(),
+        ),
+        Some(Verification::Same) => (
+            "the seed's run and its replay agree: the fleet's run differed (state from earlier \
+             runs in its process?)",
+            "",
+            theme.warn(),
+        ),
+        Some(Verification::Failed(text)) => (
+            "the seed failed again when verified:",
+            text.as_str(),
+            theme.info(),
+        ),
+        Some(Verification::Error(text)) => ("could not verify:", text.as_str(), theme.bad()),
+    };
+    std::iter::once(one(span(
+        format!(" {heading}"),
+        style.add_modifier(Modifier::BOLD),
+    )))
+    .chain(
+        body.lines()
+            .map(|line| one(span(format!("   {line}"), style))),
+    )
+    .chain(std::iter::once(Line::raw("")))
+    .collect()
+}
+
+/// A failure group's status glyphs: reproduction, verification and shrinking.
 fn failure_status(theme: &Theme, group: &crate::store::FailureGroup, tick: u64) -> Vec<Span> {
     use crate::store::Verdict;
     let mut out = Vec::new();
@@ -784,6 +825,12 @@ fn failure_status(theme: &Theme, group: &crate::store::FailureGroup, tick: u64) 
     };
     if !text.is_empty() {
         out.push(span(text, style));
+    }
+    if group.verifying.is_some() {
+        out.push(span(
+            format!(" {} verifying", spinner(tick)),
+            theme.replay(),
+        ));
     }
     if let Some(shrink) = &group.shrink {
         if shrink.done && shrink.best == 0 {
@@ -1042,15 +1089,20 @@ fn failure_card(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
             inset(row(parts[1], 1), 0),
         );
     }
-    // What failed, then the few facts of the harness's report that matter.
-    let report: Vec<Line> = failure_lines(&group.report)
+    // Where a replay parts from the run (when it did not reproduce), what failed, then the few
+    // facts of the harness's report that matter.
+    let report: Vec<Line> = verification_lines(theme, group)
         .into_iter()
-        .map(|line| one(span(format!(" {line}"), theme.bad())))
-        .chain(std::iter::once(Line::raw("")))
-        .chain(std::iter::once(one(span(
-            format!(" {}", run_facts(&group.report)),
-            theme.muted(),
-        ))))
+        .chain(
+            failure_lines(&group.report)
+                .into_iter()
+                .map(|line| one(span(format!(" {line}"), theme.bad())))
+                .chain(std::iter::once(Line::raw("")))
+                .chain(std::iter::once(one(span(
+                    format!(" {}", run_facts(&group.report)),
+                    theme.muted(),
+                )))),
+        )
         .collect();
     ui.hit_as("list.report", parts[2], HitRole::Scroll);
     let offset = usize::from(app.scroll.get("report").copied().unwrap_or(0))

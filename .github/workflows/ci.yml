@@ -435,6 +435,11 @@ jobs:
         shell: bash
         run: cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings
 
+      # A frame for 64 workers and a 50 000-decision run draws within 8 ms (release only).
+      - name: Simulation dashboard frame budget
+        shell: bash
+        run: cargo test --release -p bmux_simvar_tui budget
+
       # Everything each simulation links: local crates scanned by their manifests' rules,
       # external crates on simulation/determinism.toml's audit list.
       - name: Determinism check of what the simulations link

@@ -322,6 +322,9 @@ mod tests {
         fn shrink(&self, _: u64, _: u64) -> Option<RunId> {
             None
         }
+        fn verify(&self, _: u64, _: u64) -> Option<RunId> {
+            None
+        }
     }
 
     #[test]

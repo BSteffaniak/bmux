@@ -11,7 +11,7 @@ use bmux_tui::geometry::Point;
 use bmux_tui::hit::HitMap;
 use bmux_tui::interaction::InteractionRouter;
 use bmux_tui::paint::PaintCx;
-use simvar_observer::{Breakpoint, RunId, RunKind, SimEvent};
+use simvar_observer::{Breakpoint, RunId, RunKind, SimEvent, Verification};
 
 use crate::findings::{Finding, Findings, build_identity};
 use crate::store::{Notice, RunRecord, Store};
@@ -252,6 +252,8 @@ struct Jobs {
     confirm: VecDeque<usize>,
     shrink: VecDeque<usize>,
     shrinking: Option<usize>,
+    /// Failures that did not reproduce, to find where a replay parts from their run.
+    verify: VecDeque<usize>,
 }
 
 /// The dashboard's state; see the [module documentation](self).
@@ -301,6 +303,11 @@ impl App {
                 store.add_saved(finding.group(&build, now));
             }
         }
+        let splits = options
+            .findings
+            .as_ref()
+            .map(Findings::load_layout)
+            .unwrap_or_default();
         let mut app = Self {
             store,
             views: options.views,
@@ -320,7 +327,7 @@ impl App {
             palette: None,
             help: false,
             scroll: BTreeMap::new(),
-            splits: BTreeMap::new(),
+            splits,
             dragging: None,
             selected_failure: 0,
             selected_worker: 0,
@@ -403,7 +410,8 @@ impl App {
             Notice::Confirmed(group, reproduced) => {
                 let failure = &self.store.failures[group];
                 let signature = failure.signature.clone();
-                let (tone, title) = match (reproduced, failure.stale) {
+                let stale = failure.stale;
+                let (tone, title) = match (reproduced, stale) {
                     (true, false) => (Tone::Info, "Failure reproduced"),
                     (true, true) => (Tone::Info, "Still fails on this build"),
                     (false, false) => (Tone::Warn, "Did not reproduce: nondeterministic"),
@@ -418,8 +426,30 @@ impl App {
                 );
                 if reproduced {
                     self.jobs.shrink.push_back(group);
+                } else if !stale {
+                    self.jobs.verify.push_back(group);
                 }
                 self.save(group);
+            }
+            Notice::Verified(group) => {
+                let failure = &self.store.failures[group];
+                let (tone, title) = match &failure.verification {
+                    Some(Verification::Diverged(_)) => {
+                        (Tone::Warn, "Found where a replay diverges")
+                    }
+                    Some(Verification::Same) => {
+                        (Tone::Warn, "Replays agree; the fleet run differed")
+                    }
+                    Some(Verification::Failed(_)) => (Tone::Info, "Failed again when verified"),
+                    Some(Verification::Error(_)) | None => (Tone::Bad, "Could not verify"),
+                };
+                self.toast(
+                    tone,
+                    title,
+                    failure.signature.clone(),
+                    Some(Action::OpenFailure(group)),
+                    now,
+                );
             }
             Notice::Shrunk(group) => {
                 if self.jobs.shrinking == Some(group) {
@@ -551,6 +581,14 @@ impl App {
             self.store.confirming(group, job);
             self.dirty = true;
         }
+        if !self.store.failures.iter().any(|g| g.verifying.is_some())
+            && let Some(group) = self.jobs.verify.pop_front()
+            && let Some(failure) = self.store.failures.get(group)
+            && let Some(job) = controller.verify(failure.seed, failure.epoch_offset)
+        {
+            self.store.verifying(group, job);
+            self.dirty = true;
+        }
         if self.jobs.shrinking.is_none()
             && let Some(group) = self.jobs.shrink.pop_front()
             && let Some(failure) = self.store.failures.get(group)
@@ -667,7 +705,15 @@ impl App {
                         self.dragging = target.clone().filter(|id| draggable(id));
                     }
                     MouseEventKind::Drag(_) => target.clone_from(&self.dragging),
-                    MouseEventKind::Up(_) if self.dragging.take().is_some() => return,
+                    MouseEventKind::Up(_) if let Some(dragged) = self.dragging.take() => {
+                        // A divider stays where it was left, in later sessions too.
+                        if dragged.starts_with("split.")
+                            && let Some(findings) = &self.findings
+                        {
+                            let _ = findings.save_layout(&self.splits);
+                        }
+                        return;
+                    }
                     _ => {}
                 }
                 match mouse.kind {

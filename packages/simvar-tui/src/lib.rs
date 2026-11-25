@@ -44,6 +44,7 @@ use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 use bmux_tui::text::Line;
 pub use simvar_observer::{
     Breakpoint, ReplayControl, ReplayMode, RunId, RunKind, SchedulerView, SimEvent, SimObserver,
+    Verification,
 };
 
 pub use app::App;
@@ -126,6 +127,9 @@ pub trait Controller: Send {
     ) -> Option<RunId>;
     /// Shrink the failing run of `seed` and `epoch_offset`. `None` when it cannot start.
     fn shrink(&self, seed: u64, epoch_offset: u64) -> Option<RunId>;
+    /// Run `seed` and `epoch_offset` and replay it in a fresh process, reporting where the two
+    /// part (a `SimEvent::Verified`). `None` when it cannot start.
+    fn verify(&self, seed: u64, epoch_offset: u64) -> Option<RunId>;
 }
 
 /// Collects simvar's events for a [`Dashboard`]; register it with simvar's `add_observer`.
