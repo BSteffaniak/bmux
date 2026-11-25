@@ -7,6 +7,18 @@ forbid = [
     # This process's executable goes through the pane runtime's platform layer.
     "bmux_plugin::retain_executable",
     "bmux_plugin::executable_sha256",
+    # Entry points of audited crates no seed controls (see each crate's audit below).
+    "futures::select",
+    "futures_util::select",
+    "ctrlc",
+    "dispatch2",
+    "nix",
+    "rustix",
+    "scoped_thread_local",
+    "log_enabled",
+    "log::max_level",
+    "tracing::enabled",
+    "level_enabled",
 ]
 
 # Every crate the simulations link from a registry or git repository, as with `cargo vet`: a
@@ -137,18 +149,6 @@ verdict = "pure"
 reason = "CRC-32."
 
 [[audit]]
-name = "crossbeam-channel"
-version = "=0.5.17"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
-
-[[audit]]
-name = "crossbeam-utils"
-version = "=0.8.23"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
-
-[[audit]]
 name = "crypto-common"
 version = "^0.2"
 verdict = "pure"
@@ -156,9 +156,9 @@ reason = "Cryptography traits."
 
 [[audit]]
 name = "ctrlc"
-version = "=3.5.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^3"
+verdict = "restricted"
+reason = "simvar's Ctrl-C handler, installed once per process before any run: its thread waits for SIGINT and never enters a run. Forbidden in scanned crates (`ctrlc`)."
 
 [[audit]]
 name = "deranged"
@@ -174,9 +174,9 @@ reason = "Hash function traits."
 
 [[audit]]
 name = "dispatch2"
-version = "=0.3.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "restricted"
+reason = "macOS's Grand Central Dispatch, reached only through ctrlc's handler (a semaphore). Forbidden in scanned crates (`dispatch2`)."
 
 [[audit]]
 name = "either"
@@ -258,15 +258,15 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "futures-channel"
-version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "pure"
+reason = "Channels (oneshot, mpsc) whose wakes follow sends and receives: no clocks, threads or randomness."
 
 [[audit]]
 name = "futures-core"
-version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "pure"
+reason = "Future, Stream and task traits, and AtomicWaker: no clocks, threads, randomness or I/O."
 
 [[audit]]
 name = "futures-executor"
@@ -294,9 +294,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "futures-util"
-version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.3"
+verdict = "restricted"
+reason = "Combinators, deterministic in themselves, except `select!` (not `select_biased!`), which picks its first branch with an unseeded generator: forbidden (`futures::select`, `futures_util::select`); switchy_async's `select!` draws from the run's seed."
 
 [[audit]]
 name = "genawaiter"
@@ -606,9 +606,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "log"
-version = "=0.4.35"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.4"
+verdict = "restricted"
+reason = "Logging facade: records go to the process's logger and nothing comes back into a run, except the level (`log_enabled!`, `log::max_level`), process-wide state a run's logic must not branch on: forbidden in scanned crates."
 
 [[audit]]
 name = "matchers"
@@ -672,9 +672,9 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 
 [[audit]]
 name = "nix"
-version = "=0.32.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.32"
+verdict = "restricted"
+reason = "System calls, reached only through ctrlc's handler (signals, a pipe). Forbidden in scanned crates (`nix`); native backends name it in their native-only files."
 
 [[audit]]
 name = "nu-ansi-term"
@@ -906,9 +906,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "rustix"
-version = "=1.1.6"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^1"
+verdict = "restricted"
+reason = "System calls, from switchy_fs's native backend and tempfile; in simulations only error-number conversion runs. Forbidden in scanned crates (`rustix`)."
 
 [[audit]]
 name = "rustls"
@@ -936,9 +936,9 @@ reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simu
 
 [[audit]]
 name = "scoped-tls"
-version = "=1.0.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean itself, but its macro puts a thread-local into the calling crate."
+version = "^1"
+verdict = "restricted"
+reason = "`scoped_thread_local!` declares thread-local state in the calling crate, which the scan's thread_local rule cannot see through the macro; the simulators use it for their own state. Forbidden in scanned crates (`scoped_thread_local`)."
 
 [[audit]]
 name = "scopeguard"
@@ -1229,12 +1229,6 @@ verdict = "controlled"
 reason = "The switchy simulators and the simvar harness: they provide the controlled versions."
 
 [[audit]]
-name = "symlink"
-version = "=0.1.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
-
-[[audit]]
 name = "sync_wrapper"
 version = "=1.0.2"
 verdict = "pure"
@@ -1385,16 +1379,10 @@ verdict = "pure"
 reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
-name = "tracing-appender"
-version = "=0.2.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
-
-[[audit]]
 name = "tracing-core"
-version = "=0.1.36"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+version = "^0.1"
+verdict = "restricted"
+reason = "tracing's core: events go to the process's subscriber and nothing comes back into a run, except whether a level is enabled (`tracing::enabled!`, `level_enabled!`), process-wide state a run's logic must not branch on: forbidden in scanned crates."
 
 [[audit]]
 name = "tracing-log"
