@@ -337,6 +337,10 @@ impl Sessions {
 }
 
 #[cfg(test)]
+#[path = "fuzz_tests.rs"]
+mod fuzz_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

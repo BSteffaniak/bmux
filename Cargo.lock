@@ -5104,6 +5104,7 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh",
  "libc",
+ "proptest",
  "qrcode",
  "redb",
  "serde",
