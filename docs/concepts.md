@@ -148,6 +148,29 @@ Older providers lacking the versioned catalog/history interfaces return explicit
 errors rather than silently substituting another order. To approximate the old
 finder ordering, use `alphabetical`, `relevance`, and `in_order` respectively.
 
+### When the server is slow or goes away
+
+An attachment never ends because a request failed. A banner on the top row
+says what is wrong until it is resolved:
+
+- "server not responding — retrying…": requests keep timing out; input still
+  goes to your panes.
+- "connection lost — reconnecting (attempt N, next in Xs)": the connection
+  dropped. The last screen stays up and the client reconnects in place, with
+  backoff, to the same session and tab, then redraws it. A bare `bmux` starts
+  the server again if none runs (unless it was stopped on purpose); an explicit
+  `bmux attach` waits for one. `q` quits, `d` detaches locally; other keys are
+  dropped (there is nothing to send them to). A paired remote host
+  (`--target`) is tried for at least two minutes, and not at all once it has
+  revoked this device; the client then exits with the command that resumes
+  the session.
+- "view out of sync with the server: … press r to retry": the server refused
+  to resync the view several times in a row; it is not retried again until
+  you press `r`.
+
+If the session no longer exists once the server is back, the client exits
+with "session no longer exists — attach ended".
+
 ## Architecture Boundary
 
 BMUX core is domain-agnostic. Workspaces, tabs, and permissions are

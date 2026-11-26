@@ -1,5 +1,6 @@
 pub mod adapters;
 mod committed_source;
+pub mod connection_banner;
 mod display_capture;
 pub mod events;
 pub mod frontend_bindings;
@@ -21,7 +22,7 @@ mod prompt_search;
 pub mod prompt_ui;
 pub mod provider;
 mod published_presentations;
-mod reconnect;
+pub mod reconnect;
 pub mod render;
 mod replay_log;
 pub mod runtime;

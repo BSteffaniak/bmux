@@ -1,500 +1,455 @@
-//! Resume an attachment whose connector-backed connection dropped.
+//! Reconnecting an attachment in place.
 //!
-//! When the server stream of a connector-backed attach closes, or a call
-//! fails after the connection recorded a transport failure (see
-//! [`connection_loss_as_drop`]), the attach loop has already torn down its view and dropped every input it had not
-//! written: nothing whose delivery is uncertain is kept, so nothing is
-//! replayed. This loop reconnects through the same connector with capped
-//! backoff and attaches again; the new attachment starts from the server's
-//! snapshot of the same session.
+//! When the connection to the server is lost, the attach client keeps the
+//! terminal in attach mode, keeps the last frame on screen under a
+//! [`ConnectionBanner::Reconnecting`] banner, and reconnects with backoff
+//! ([`reconnect_in_place`]) through the connector the attachment was started
+//! with ([`AttachReconnect`]). Each attempt connects, then re-admits the
+//! attachment (the caller's `reattach`); the attach loop then re-registers
+//! what it holds with the server and rehydrates the view.
 
+use super::connection_banner::{BannerAction, ConnectionBanner};
+use super::state::AttachExitReason;
+use crate::runtime::KernelClientFactory;
+use bmux_client::BmuxClient;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
-use anyhow::Result;
+/// How long to wait before each reconnect attempt: doubling from `base` up to
+/// `max`, spread by up to `jitter_permille` thousandths either way so clients
+/// that lost the same server do not all come back at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectBackoff {
+    base: Duration,
+    max: Duration,
+    jitter_permille: u64,
+}
 
-use super::runtime::AttachRunOutcome;
-use super::state::AttachExitReason;
-use uuid::Uuid;
+impl ReconnectBackoff {
+    /// The attach client's in-place reconnect: 300ms doubling to 5s, ±20%.
+    pub const ATTACH: Self = Self {
+        base: Duration::from_millis(300),
+        max: Duration::from_secs(5),
+        jitter_permille: 200,
+    };
 
-/// The session an attachment is on, published by the attach loop each time it
-/// changes and kept after the attachment ends, however it ends: an attachment
-/// that fails with an error reports no session of its own.
-#[derive(Clone, Debug, Default)]
-pub struct AttachedSessionCell(Arc<Mutex<Option<Uuid>>>);
-
-impl AttachedSessionCell {
-    pub fn set(&self, session: Uuid) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some(session);
+    /// A schedule without jitter (tests time it exactly).
+    #[cfg(test)]
+    #[must_use]
+    pub const fn fixed(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            jitter_permille: 0,
         }
+    }
+
+    /// The delay before attempt `attempt` (from 1); `seed` picks the jitter.
+    #[must_use]
+    pub fn delay(self, attempt: u32, seed: u64) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(20);
+        let nominal = self.base.saturating_mul(1 << exponent).min(self.max);
+        if self.jitter_permille == 0 {
+            return nominal;
+        }
+        let spread = splitmix64(seed ^ u64::from(attempt)) % (2 * self.jitter_permille + 1);
+        let nominal_ms = u64::try_from(nominal.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(
+            nominal_ms.saturating_mul(1000 - self.jitter_permille + spread) / 1000,
+        )
+    }
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// A jitter seed that differs between processes and runs.
+#[must_use]
+pub fn jitter_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    splitmix64(u64::from(nanos) ^ (u64::from(std::process::id()) << 32))
+}
+
+/// One reconnect attempt, as its connector sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct AttachReconnectAttempt {
+    /// Attempts since the connection was lost, this one included.
+    pub number: u32,
+    /// How long the connection has been lost.
+    pub outage: Duration,
+    /// How long this attempt waited before connecting.
+    pub backoff: Duration,
+    /// The server said it was stopping before the connection dropped: a
+    /// connector that could start a server only waits for one.
+    pub server_stopped: bool,
+}
+
+/// Marks a connector failure that retrying cannot fix (attach it with
+/// `error.context(ReconnectGiveUp)`): reconnecting stops, the attachment ends
+/// as [`AttachExitReason::ConnectionLost`].
+#[derive(Clone, Copy, Debug)]
+pub struct ReconnectGiveUp;
+
+impl std::fmt::Display for ReconnectGiveUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reconnecting cannot succeed")
+    }
+}
+
+/// A connector's connect failure as the reconnect loop sees it: marked
+/// [`ReconnectGiveUp`] when the host refused this device itself (the
+/// saved-host connector reports a revoked or unpaired device as an I/O
+/// `PermissionDenied`), since no retry can succeed.
+#[must_use]
+pub fn connector_connect_error(error: bmux_client::ClientError) -> anyhow::Error {
+    let refused = matches!(
+        &error,
+        bmux_client::ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io))
+            if io.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    let error = crate::connection::map_client_connect_error(error);
+    if refused {
+        error.context(ReconnectGiveUp)
+    } else {
+        error
+    }
+}
+
+/// Reconnect attempts of a connector-backed (remote) attachment before it
+/// gives up: with the attach backoff, at least two minutes of trying (longer
+/// while dials to an unreachable host wait out their own timeouts), which
+/// outlasts a typical network change.
+pub const CONNECTOR_RECONNECT_MAX_ATTEMPTS: u32 = 34;
+
+/// A new connection for the attachment.
+pub struct AttachConnection {
+    pub client: BmuxClient,
+    /// The kernel client factory for this connection, when the attachment's
+    /// plugin commands need one bound to it (otherwise the old one is kept).
+    pub kernel_client_factory: Option<KernelClientFactory>,
+}
+
+impl From<BmuxClient> for AttachConnection {
+    fn from(client: BmuxClient) -> Self {
+        Self {
+            client,
+            kernel_client_factory: None,
+        }
+    }
+}
+
+pub type AttachConnectFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<AttachConnection>> + Send>>;
+type AttachConnector = Arc<dyn Fn(AttachReconnectAttempt) -> AttachConnectFuture + Send + Sync>;
+
+/// When reconnect attempts run, and how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    /// `None`: until the user quits.
+    pub max_attempts: Option<u32>,
+    pub backoff: ReconnectBackoff,
+    /// The other side asked to wait this long before the first attempt
+    /// (instead of the first backoff).
+    pub first_delay: Option<Duration>,
+}
+
+impl ReconnectPolicy {
+    /// Attempts until the user quits, on the attach backoff.
+    pub const UNTIL_QUIT: Self = Self {
+        max_attempts: None,
+        backoff: ReconnectBackoff::ATTACH,
+        first_delay: None,
+    };
+
+    fn delay(&self, attempt: u32, seed: u64) -> Duration {
+        match self.first_delay {
+            Some(delay) if attempt == 1 => delay,
+            _ => self.backoff.delay(attempt, seed),
+        }
+    }
+}
+
+/// How an attachment reconnects after its connection is lost: the same
+/// connection path it was started with.
+#[derive(Clone)]
+pub struct AttachReconnect {
+    connect: AttachConnector,
+    policy: ReconnectPolicy,
+}
+
+impl AttachReconnect {
+    /// Reconnect with `connect`, until the user quits.
+    pub fn new<F, Fut>(connect: F) -> Self
+    where
+        F: Fn(AttachReconnectAttempt) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<AttachConnection>> + Send + 'static,
+    {
+        Self {
+            connect: Arc::new(move |attempt| Box::pin(connect(attempt))),
+            policy: ReconnectPolicy::UNTIL_QUIT,
+        }
+    }
+
+    /// Give up after `max_attempts` failed attempts (`None`: never).
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.policy.max_attempts = max_attempts;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_policy(mut self, policy: ReconnectPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     #[must_use]
-    pub fn get(&self) -> Option<Uuid> {
-        self.0.lock().ok().and_then(|slot| *slot)
+    pub const fn policy(&self) -> &ReconnectPolicy {
+        &self.policy
+    }
+
+    /// Connect for `attempt`.
+    pub fn connect(&self, attempt: AttachReconnectAttempt) -> AttachConnectFuture {
+        (self.connect)(attempt)
     }
 }
 
-/// The session to resume after a drop: the one the user was last on (the
-/// tracked session, else the one the ended run reported), or the previous
-/// target when neither is known. A follower keeps following instead.
-#[must_use]
-pub fn resume_session(
-    previous: Option<String>,
-    following: bool,
-    last_attached: Option<Uuid>,
-    reported: Option<Uuid>,
-) -> Option<String> {
-    if following {
-        return previous;
-    }
-    last_attached
-        .or(reported)
-        .map(|session| session.to_string())
-        .or(previous)
+pub type ProviderReopenFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn bmux_client::AttachSession>>> + Send>>;
+type ProviderReopener =
+    Arc<dyn Fn(Option<bmux_client::AttachResumeState>) -> ProviderReopenFuture + Send + Sync>;
+
+/// How a native provider attachment reopens its provider after the
+/// connection to it is lost: from the view it validated so far, when it can
+/// resume (`Some`), else fresh.
+#[derive(Clone)]
+pub struct ProviderReopen {
+    open: ProviderReopener,
+    policy: ReconnectPolicy,
 }
 
-/// Reconnect attempts after one drop before giving up: with the backoff
-/// below, at least two minutes of trying (longer while dials to an
-/// unreachable host wait out their own timeouts), which outlasts a typical
-/// network change.
-pub const RECONNECT_MAX_ATTEMPTS: usize = 20;
-const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(250);
-const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(8);
-
-/// Delay before reconnect attempt `attempt` (1-based): doubling from 250 ms,
-/// capped at 8 s.
-#[must_use]
-pub fn reconnect_backoff(attempt: usize) -> Duration {
-    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-    RECONNECT_BASE_BACKOFF
-        .checked_mul(2_u32.saturating_pow(exponent))
-        .map_or(RECONNECT_MAX_BACKOFF, |delay| {
-            delay.min(RECONNECT_MAX_BACKOFF)
-        })
-}
-
-/// Discard keystrokes queued on the controlling terminal while the
-/// attachment was down, so a resumed attachment never sends input typed
-/// before it was ready.
-pub fn discard_pending_terminal_input() {
-    #[cfg(unix)]
+impl ProviderReopen {
+    pub fn new<F, Fut>(open: F) -> Self
+    where
+        F: Fn(Option<bmux_client::AttachResumeState>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<Box<dyn bmux_client::AttachSession>>> + Send + 'static,
     {
-        // SAFETY: `tcflush` on this process's stdin descriptor only drops
-        // queued, unread input; it fails harmlessly when stdin is not a tty.
-        let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Console::{
-            FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
-        };
-        // SAFETY: flushing the standard input console buffer only drops
-        // queued, unread input events; it fails harmlessly without a console.
-        let _ = unsafe { FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE)) };
-    }
-}
-
-/// Treat an attachment that failed because its connection was lost as a drop.
-///
-/// `transport_failure` is the connection's first recorded transport failure
-/// (its stream failed or a request got no reply in time). Any error after such
-/// a failure is a consequence of the lost connection, so the attachment ends
-/// as [`AttachExitReason::StreamClosed`] and resumes; without one, the error
-/// is a real attach failure and is returned unchanged.
-///
-/// # Errors
-/// Returns `result`'s error when the connection recorded no failure.
-pub fn connection_loss_as_drop(
-    result: Result<AttachRunOutcome>,
-    transport_failure: Option<String>,
-) -> Result<AttachRunOutcome> {
-    match (result, transport_failure) {
-        (Err(error), Some(reason)) => {
-            tracing::warn!(
-                reason = %reason,
-                error = %format!("{error:#}"),
-                "attach.connection_lost"
-            );
-            Ok(AttachRunOutcome {
-                status_code: 1,
-                exit_reason: AttachExitReason::StreamClosed,
-                resume: None,
-                attached_session_id: None,
-            })
+        Self {
+            open: Arc::new(move |resume| Box::pin(open(resume))),
+            policy: ReconnectPolicy::UNTIL_QUIT,
         }
-        (result, _) => result,
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_policy(mut self, policy: ReconnectPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> &ReconnectPolicy {
+        &self.policy
+    }
+
+    /// Reopen the provider, resuming from `resume` when it is `Some`.
+    pub fn open(&self, resume: Option<bmux_client::AttachResumeState>) -> ProviderReopenFuture {
+        (self.open)(resume)
     }
 }
 
-/// Whether a connector refused this device itself: the saved-host connector
-/// reports a revoked or unpaired device as an I/O `PermissionDenied`.
-fn is_refused(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+/// What reconnecting ended with.
+pub enum ReconnectEnd<T> {
+    /// The attachment is back, re-admitted as `T`.
+    Reattached(T),
+    /// The attachment ends this way (the user left, the session is gone, or
+    /// the attempts ran out).
+    Exit(AttachExitReason),
+}
+
+/// Why one attempt to re-admit the attachment failed.
+pub enum ReattachFailure {
+    /// Try again later.
+    Retry(anyhow::Error),
+    /// The server is back, but the attached session (or followed client) is
+    /// not.
+    Gone,
+}
+
+/// Terminal input while reconnecting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectInput {
+    /// A plain key press.
+    Key(char),
+    /// The screen changed size or was uncovered: paint the banner again.
+    Repaint,
+    /// The terminal went away; the attachment ends this way.
+    Closed(AttachExitReason),
+    /// Nothing the banner answers (dropped: there is nothing to send it to).
+    Ignored,
+}
+
+/// The terminal side of reconnecting: its input, and where the banner shows.
+pub trait ReconnectHost {
+    fn next_input(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReconnectInput>> + Send + '_>>;
+
+    /// Show `banner` over what the terminal shows.
+    ///
+    /// # Errors
+    /// Returns the terminal write failure.
+    fn show(&mut self, banner: &ConnectionBanner) -> anyhow::Result<()>;
+}
+
+/// The exit a modal banner's action asks for.
+#[must_use]
+pub const fn banner_exit(action: BannerAction) -> Option<AttachExitReason> {
+    match action {
+        BannerAction::Quit => Some(AttachExitReason::Quit),
+        BannerAction::DetachLocal => Some(AttachExitReason::Detached),
+        BannerAction::Retry => None,
+    }
+}
+
+/// What `input` does while `banner` shows: `Some` ends reconnecting.
+fn answer(
+    host: &mut (impl ReconnectHost + ?Sized),
+    banner: &ConnectionBanner,
+    input: ReconnectInput,
+) -> anyhow::Result<Option<AttachExitReason>> {
+    Ok(match input {
+        ReconnectInput::Key(key) => banner.action_for(key).and_then(banner_exit),
+        ReconnectInput::Closed(reason) => Some(reason),
+        ReconnectInput::Repaint => {
+            host.show(banner)?;
+            None
+        }
+        ReconnectInput::Ignored => None,
     })
 }
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// The effects a resumable attachment needs; tests substitute their own.
-pub trait ResumableAttach: Send {
-    /// The connection an attachment runs on.
-    type Client: Send;
-
-    /// Human label of the connection target, for messages.
-    fn target_label(&self) -> &str;
-
-    /// The session the user was last attached to, tracked across runs.
-    fn last_attached_session(&self) -> Option<Uuid> {
-        None
-    }
-
-    /// Run one attachment to completion on `client`.
-    fn run<'a>(
-        &'a mut self,
-        client: Self::Client,
-        session: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<AttachRunOutcome>>;
-
-    /// Open (and prepare) a replacement client through the same connector.
-    fn reconnect(&mut self) -> BoxFuture<'_, Result<Self::Client>>;
-
-    fn sleep(&mut self, delay: Duration) -> BoxFuture<'_, ()>;
-
-    /// Show a one-line status to the user (the terminal is restored here).
-    fn notify(&mut self, message: &str);
+/// When the countdown on a banner due at `due` next changes (it shows whole
+/// seconds left, rounded up).
+fn next_countdown_change(now: Instant, due: Instant) -> Instant {
+    let left = due.saturating_duration_since(now);
+    let shown = left.as_millis().div_ceil(1000);
+    let next = u64::try_from(shown.saturating_sub(1)).map_or(Duration::ZERO, Duration::from_secs);
+    due.checked_sub(next).unwrap_or(due).max(now)
 }
 
-/// Run `driver` until the attachment ends for any reason other than a lost
-/// connection, reconnecting after each drop.
+/// Reconnect a lost attachment in place: wait out the backoff, then run
+/// `attempt_once` (connect and re-admit the attachment), until that
+/// succeeds, the session is gone, the attempts run out, or the user leaves.
+/// The banner says which attempt is next and when; keys it does not answer
+/// are dropped.
 ///
 /// # Errors
-/// Returns attach failures, or a resumable-message error after
-/// [`RECONNECT_MAX_ATTEMPTS`] failed reconnects.
-pub async fn run_resumable<D: ResumableAttach>(
-    driver: &mut D,
-    client: D::Client,
-    session: Option<String>,
-    following: bool,
-) -> Result<AttachRunOutcome> {
-    let mut client = client;
-    let mut session = session;
+/// Returns a terminal failure (showing the banner, reading input).
+pub async fn reconnect_in_place<H, T, A, Fut>(
+    host: &mut H,
+    policy: &ReconnectPolicy,
+    server_stopped: bool,
+    seed: u64,
+    mut attempt_once: A,
+) -> anyhow::Result<ReconnectEnd<T>>
+where
+    H: ReconnectHost + ?Sized,
+    A: FnMut(AttachReconnectAttempt) -> Fut,
+    Fut: Future<Output = Result<T, ReattachFailure>>,
+{
+    let lost_at = Instant::now();
+    let mut attempt = 0_u32;
     loop {
-        let outcome = driver.run(client, session.as_deref()).await?;
-        if !outcome.exit_reason.server_went_away() {
-            return Ok(outcome);
+        if policy
+            .max_attempts
+            .is_some_and(|max_attempts| attempt >= max_attempts)
+        {
+            tracing::warn!(attempts = attempt, "attach.reconnect.gave_up");
+            return Ok(ReconnectEnd::Exit(AttachExitReason::ConnectionLost));
         }
-        // Resume the session the user was last on, even if it was chosen by
-        // name or switched to after the attachment started.
-        session = resume_session(
-            session,
-            following,
-            driver.last_attached_session(),
-            outcome.attached_session_id,
-        );
-        client = reconnect_with_backoff(driver, session.as_deref()).await?;
-    }
-}
-
-async fn reconnect_with_backoff<D: ResumableAttach>(
-    driver: &mut D,
-    session: Option<&str>,
-) -> Result<D::Client> {
-    for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
-        let delay = reconnect_backoff(attempt);
-        let message = format!(
-            "bmux: connection to '{}' lost; reconnecting (attempt {attempt}/{RECONNECT_MAX_ATTEMPTS}) in {} ms…",
-            driver.target_label(),
-            delay.as_millis()
-        );
-        driver.notify(&message);
-        driver.sleep(delay).await;
-        match driver.reconnect().await {
-            Ok(client) => return Ok(client),
-            Err(error) => {
-                tracing::warn!(attempt, error = %format!("{error:#}"), "attach.reconnect.failed");
-                // The host refuses this device (revoked, never paired): no
-                // retry can succeed, so the attachment ends now.
-                if is_refused(&error) {
-                    return Err(error);
+        attempt = attempt.saturating_add(1);
+        let backoff = policy.delay(attempt, seed);
+        let due = Instant::now() + backoff;
+        loop {
+            let now = Instant::now();
+            if now >= due {
+                break;
+            }
+            let banner = ConnectionBanner::Reconnecting {
+                attempt,
+                next_in: Some(due - now),
+            };
+            host.show(&banner)?;
+            tokio::select! {
+                () = tokio::time::sleep_until(next_countdown_change(now, due)) => {}
+                input = host.next_input() => {
+                    if let Some(reason) = answer(host, &banner, input?)? {
+                        return Ok(ReconnectEnd::Exit(reason));
+                    }
                 }
-                let message = format!("bmux: reconnect failed: {error:#}");
-                driver.notify(&message);
+            }
+        }
+
+        let banner = ConnectionBanner::Reconnecting {
+            attempt,
+            next_in: None,
+        };
+        host.show(&banner)?;
+        let reattached = attempt_once(AttachReconnectAttempt {
+            number: attempt,
+            outage: lost_at.elapsed(),
+            backoff,
+            server_stopped,
+        });
+        tokio::pin!(reattached);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut reattached => break outcome,
+                input = host.next_input() => {
+                    if let Some(reason) = answer(host, &banner, input?)? {
+                        return Ok(ReconnectEnd::Exit(reason));
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(reattached) => {
+                tracing::info!(
+                    attempt,
+                    outage_ms = lost_at.elapsed().as_millis(),
+                    "attach.reconnect.reattached"
+                );
+                return Ok(ReconnectEnd::Reattached(reattached));
+            }
+            Err(ReattachFailure::Gone) => {
+                tracing::info!(attempt, "attach.reconnect.session_gone");
+                host.show(&ConnectionBanner::Gone)?;
+                return Ok(ReconnectEnd::Exit(AttachExitReason::SessionGone));
+            }
+            Err(ReattachFailure::Retry(error))
+                if error.downcast_ref::<ReconnectGiveUp>().is_some() =>
+            {
+                tracing::warn!(attempt, error = %format!("{error:#}"), "attach.reconnect.gave_up");
+                return Ok(ReconnectEnd::Exit(AttachExitReason::ConnectionLost));
+            }
+            Err(ReattachFailure::Retry(error)) => {
+                tracing::info!(attempt, error = %format!("{error:#}"), "attach.reconnect.attempt_failed");
             }
         }
     }
-    let resume = session.map_or_else(String::new, |session| format!(" attach {session}"));
-    anyhow::bail!(
-        "connection to '{target}' lost and {RECONNECT_MAX_ATTEMPTS} reconnect attempts failed; \
-         input typed after the drop was not sent. Resume with `bmux --target {target}{resume}`",
-        target = driver.target_label(),
-    )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::VecDeque;
-
-    fn outcome(exit_reason: AttachExitReason, session: Option<Uuid>) -> AttachRunOutcome {
-        AttachRunOutcome {
-            status_code: 0,
-            exit_reason,
-            resume: None,
-            attached_session_id: session,
-        }
-    }
-
-    /// Clients are numbered so tests can see which connection each run used.
-    #[derive(Default)]
-    struct Mock {
-        outcomes: VecDeque<AttachRunOutcome>,
-        reconnect_results: VecDeque<bool>,
-        runs: Vec<(u32, Option<String>)>,
-        tracked: Option<Uuid>,
-        sleeps: Vec<Duration>,
-        notices: Vec<String>,
-        next_client: u32,
-    }
-
-    impl ResumableAttach for Mock {
-        type Client = u32;
-
-        fn target_label(&self) -> &'static str {
-            "desktop"
-        }
-
-        fn last_attached_session(&self) -> Option<Uuid> {
-            self.tracked
-        }
-
-        fn run<'a>(
-            &'a mut self,
-            client: u32,
-            session: Option<&'a str>,
-        ) -> BoxFuture<'a, Result<AttachRunOutcome>> {
-            self.runs.push((client, session.map(str::to_owned)));
-            let outcome = self.outcomes.pop_front().expect("scripted outcome");
-            Box::pin(async move { Ok(outcome) })
-        }
-
-        fn reconnect(&mut self) -> BoxFuture<'_, Result<u32>> {
-            let ok = self.reconnect_results.pop_front().unwrap_or(false);
-            self.next_client += 1;
-            let client = self.next_client;
-            Box::pin(async move {
-                if ok {
-                    Ok(client)
-                } else {
-                    Err(anyhow::anyhow!("host offline"))
-                }
-            })
-        }
-
-        fn sleep(&mut self, delay: Duration) -> BoxFuture<'_, ()> {
-            self.sleeps.push(delay);
-            Box::pin(async {})
-        }
-
-        fn notify(&mut self, message: &str) {
-            self.notices.push(message.to_owned());
-        }
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(future)
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps() {
-        assert_eq!(reconnect_backoff(1), Duration::from_millis(250));
-        assert_eq!(reconnect_backoff(2), Duration::from_millis(500));
-        assert_eq!(reconnect_backoff(6), Duration::from_secs(8));
-        assert_eq!(reconnect_backoff(60), Duration::from_secs(8));
-        let budget: Duration = (1..=RECONNECT_MAX_ATTEMPTS).map(reconnect_backoff).sum();
-        assert!(budget > Duration::from_secs(90), "{budget:?}");
-    }
-
-    #[test]
-    fn a_refused_device_is_not_retried() {
-        let refused = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "this device's access was revoked on the host",
-        ))
-        .context("desktop");
-        assert!(is_refused(&refused));
-        assert!(!is_refused(&anyhow::anyhow!("the host did not answer")));
-    }
-
-    #[test]
-    fn detach_and_quit_end_without_reconnecting() {
-        for reason in [AttachExitReason::Detached, AttachExitReason::Quit] {
-            let mut mock = Mock {
-                outcomes: VecDeque::from([outcome(reason, None)]),
-                ..Mock::default()
-            };
-            let result = block_on(run_resumable(&mut mock, 0, Some("main".into()), false)).unwrap();
-            assert_eq!(result.exit_reason, reason);
-            assert_eq!(mock.next_client, 0);
-            assert_eq!(mock.notices, Vec::<String>::new());
-        }
-    }
-
-    #[test]
-    fn a_drop_resumes_the_attached_session_on_a_new_client() {
-        let session = Uuid::new_v4();
-        let mut mock = Mock {
-            outcomes: VecDeque::from([
-                outcome(AttachExitReason::StreamClosed, Some(session)),
-                outcome(AttachExitReason::Detached, Some(session)),
-            ]),
-            reconnect_results: VecDeque::from([false, true]),
-            ..Mock::default()
-        };
-        let result = block_on(run_resumable(&mut mock, 0, Some("main".into()), false)).unwrap();
-        assert_eq!(result.exit_reason, AttachExitReason::Detached);
-        assert_eq!(
-            mock.runs,
-            [(0, Some("main".into())), (2, Some(session.to_string()))]
-        );
-        assert_eq!(mock.sleeps, [reconnect_backoff(1), reconnect_backoff(2)]);
-        assert!(mock.notices[0].contains("reconnecting (attempt 1/"));
-        assert!(
-            mock.notices
-                .iter()
-                .any(|notice| notice.contains("host offline"))
-        );
-    }
-
-    #[test]
-    fn errors_after_a_transport_failure_are_drops() {
-        let lost = connection_loss_as_drop(
-            Err(anyhow::anyhow!(
-                "attach failed: request timed out after 30s"
-            )),
-            Some("request timed out after 30s".into()),
-        )
-        .unwrap();
-        assert_eq!(lost.exit_reason, AttachExitReason::StreamClosed);
-        assert_eq!(lost.attached_session_id, None);
-
-        let error = connection_loss_as_drop(Err(anyhow::anyhow!("session not found")), None)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "session not found");
-
-        let detached = connection_loss_as_drop(
-            Ok(outcome(AttachExitReason::Detached, None)),
-            Some("stream closed".into()),
-        )
-        .unwrap();
-        assert_eq!(detached.exit_reason, AttachExitReason::Detached);
-    }
-
-    #[test]
-    fn resume_targets_the_session_the_user_was_last_on() {
-        let first = Uuid::new_v4();
-        let switched = Uuid::new_v4();
-        // Tracked switch wins over the run's report and the original name.
-        assert_eq!(
-            resume_session(Some("work".into()), false, Some(switched), Some(first)),
-            Some(switched.to_string())
-        );
-        // An error-ended run reports nothing; the tracked session still counts.
-        assert_eq!(
-            resume_session(Some("work".into()), false, Some(switched), None),
-            Some(switched.to_string())
-        );
-        assert_eq!(
-            resume_session(Some("work".into()), false, None, Some(first)),
-            Some(first.to_string())
-        );
-        assert_eq!(
-            resume_session(Some("work".into()), false, None, None),
-            Some("work".into())
-        );
-        assert_eq!(
-            resume_session(None, true, Some(switched), Some(first)),
-            None
-        );
-    }
-
-    #[test]
-    fn an_error_ended_run_resumes_the_tracked_session() {
-        let switched = Uuid::new_v4();
-        let mut mock = Mock {
-            outcomes: VecDeque::from([
-                // What connection_loss_as_drop yields: no session of its own.
-                outcome(AttachExitReason::StreamClosed, None),
-                outcome(AttachExitReason::Detached, None),
-            ]),
-            reconnect_results: VecDeque::from([true]),
-            tracked: Some(switched),
-            ..Mock::default()
-        };
-        block_on(run_resumable(&mut mock, 0, Some("main".into()), false)).unwrap();
-        assert_eq!(
-            mock.runs,
-            [(0, Some("main".into())), (1, Some(switched.to_string()))]
-        );
-    }
-
-    #[test]
-    fn a_lost_connection_resumes_like_a_closed_stream() {
-        let mut mock = Mock {
-            outcomes: VecDeque::from([
-                outcome(AttachExitReason::ConnectionLost, None),
-                outcome(AttachExitReason::Detached, None),
-            ]),
-            reconnect_results: VecDeque::from([true]),
-            ..Mock::default()
-        };
-        let result = block_on(run_resumable(&mut mock, 0, Some("main".into()), false)).unwrap();
-        assert_eq!(result.exit_reason, AttachExitReason::Detached);
-        assert_eq!(mock.runs.len(), 2);
-    }
-
-    #[test]
-    fn following_keeps_the_follow_selection() {
-        let mut mock = Mock {
-            outcomes: VecDeque::from([
-                outcome(AttachExitReason::StreamClosed, Some(Uuid::new_v4())),
-                outcome(AttachExitReason::Quit, None),
-            ]),
-            reconnect_results: VecDeque::from([true]),
-            ..Mock::default()
-        };
-        block_on(run_resumable(&mut mock, 0, None, true)).unwrap();
-        assert_eq!(mock.runs, [(0, None), (1, None)]);
-    }
-
-    #[test]
-    fn gives_up_with_a_resumable_message_after_the_bound() {
-        let mut mock = Mock {
-            outcomes: VecDeque::from([outcome(AttachExitReason::StreamClosed, None)]),
-            ..Mock::default()
-        };
-        let error = block_on(run_resumable(&mut mock, 0, Some("work".into()), false))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            mock.next_client,
-            u32::try_from(RECONNECT_MAX_ATTEMPTS).unwrap()
-        );
-        assert_eq!(mock.runs.len(), 1);
-        assert!(error.contains("reconnect attempts failed"), "{error}");
-        assert!(
-            error.contains("bmux --target desktop attach work"),
-            "{error}"
-        );
-    }
-}
+#[path = "reconnect_tests.rs"]
+mod tests;

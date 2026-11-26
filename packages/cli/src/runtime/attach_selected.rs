@@ -120,6 +120,7 @@ pub(super) async fn run_attach(
     } else {
         None
     };
+    let reopen = provider.reopener();
     let session = provider
         .open(
             None,
@@ -143,10 +144,28 @@ pub(super) async fn run_attach(
             // Caller-process plugin commands run with this selected runtime
             // (and its owner), carried explicitly into the attachment.
             Some(state.clone()),
+            // Reconnects to the same runtime; never starts a server.
+            Some(local_attach_reconnect(config.clone(), paths.clone())),
+            Some(reopen),
         ),
     )
     .await
     .map(|outcome| outcome.status_code)
+}
+
+/// Reconnect an attachment to the selected runtime's local server.
+fn local_attach_reconnect(
+    config: BmuxConfig,
+    paths: ConfigPaths,
+) -> super::attach::reconnect::AttachReconnect {
+    super::attach::reconnect::AttachReconnect::new(move |_| {
+        let (config, paths) = (config.clone(), paths.clone());
+        async move {
+            Ok(connect_local(&config, &paths, "bmux-cli-attach-reconnect")
+                .await?
+                .into())
+        }
+    })
 }
 
 /// Connect to the selected runtime's local server.

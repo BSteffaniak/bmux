@@ -157,7 +157,7 @@ pub async fn run_attach_with_client(
     follow: Option<&str>,
     global: bool,
 ) -> Result<AttachRunOutcome> {
-    run_session_attach_with_client(client, target, follow, global, None).await
+    run_session_attach_with_client(client, target, follow, global, None, None).await
 }
 
 pub fn submit_prompt_request(

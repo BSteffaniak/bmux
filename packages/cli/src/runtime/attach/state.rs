@@ -60,6 +60,8 @@ pub enum AttachExitReason {
     /// attachment stopped cleanly and may be re-established on a new
     /// connection.
     ConnectionLost,
+    /// The connection came back but the attached session no longer exists.
+    SessionGone,
     Quit,
 }
 
@@ -71,13 +73,14 @@ impl AttachExitReason {
             Self::Detached => "detached",
             Self::StreamClosed => "stream_closed",
             Self::ConnectionLost => "connection_lost",
+            Self::SessionGone => "session_gone",
             Self::Quit => "quit",
         }
     }
 
     /// Whether the attachment ended because the server side went away (its
     /// stream closed or the connection was lost), not by the user's choice.
-    /// Reconnecting wrappers re-attach on exactly these.
+    /// (An attachment that can reconnect does so in place before ending.)
     #[must_use]
     pub const fn server_went_away(self) -> bool {
         matches!(self, Self::StreamClosed | Self::ConnectionLost)
@@ -86,7 +89,7 @@ impl AttachExitReason {
 
 /// How the attachment's server round trips have been going: the state the
 /// attach failure policy (`ipc_policy`) keeps between failures.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttachLinkHealth {
     /// Transient failures (timeouts, unavailable server) since the last
     /// successful round trip.
@@ -103,6 +106,14 @@ pub struct AttachLinkHealth {
     /// reached the server): the resync asks the server what is attached
     /// instead of assuming the old target.
     pub retarget_unconfirmed: bool,
+    /// Resyncs the server refused in a row.
+    pub consecutive_rejected_resyncs: u32,
+    /// Resyncs were refused [`Self::STALL_AFTER_REJECTED_RESYNCS`] times in a
+    /// row: no more are tried until the user asks (this says why).
+    pub stalled: Option<String>,
+    /// The server said it is stopping: the connection dropping next is
+    /// expected, and reconnecting must not start a server again.
+    pub server_stopping: bool,
 }
 
 impl AttachLinkHealth {
@@ -111,6 +122,10 @@ impl AttachLinkHealth {
     pub const UNRESPONSIVE_AFTER: u32 = 3;
     const RESYNC_BASE_DELAY: Duration = Duration::from_millis(250);
     const RESYNC_MAX_DELAY: Duration = Duration::from_secs(5);
+
+    /// Refused resyncs in a row after which they stop being retried on
+    /// their own.
+    pub const STALL_AFTER_REJECTED_RESYNCS: u32 = 5;
 
     /// A request completed: the server is answering again.
     pub const fn note_round_trip(&mut self) {
@@ -145,19 +160,63 @@ impl AttachLinkHealth {
     }
 
     /// A resync brought the view level with the server.
-    pub const fn resync_succeeded(&mut self) {
+    pub fn resync_succeeded(&mut self) {
         self.resync_pending = false;
         self.resync_not_before = None;
         self.resync_failures = 0;
         self.retarget_unconfirmed = false;
         self.consecutive_transient = 0;
+        self.consecutive_rejected_resyncs = 0;
+        self.stalled = None;
     }
 
-    /// A resync attempt failed: try again after a growing delay.
+    /// A resync attempt failed: try again after a growing delay, unless
+    /// resyncs stalled.
     pub fn resync_failed(&mut self, now: Instant) {
+        if self.stalled.is_some() {
+            self.cancel_resync();
+            return;
+        }
         self.resync_pending = true;
         self.resync_failures = self.resync_failures.saturating_add(1);
         self.resync_not_before = Some(now + self.resync_delay());
+    }
+
+    /// The server refused a resync (`reason`); enough in a row stall them.
+    pub fn note_resync_rejected(&mut self, reason: String) {
+        self.consecutive_rejected_resyncs = self.consecutive_rejected_resyncs.saturating_add(1);
+        if self.consecutive_rejected_resyncs >= Self::STALL_AFTER_REJECTED_RESYNCS {
+            self.stalled = Some(reason);
+        }
+    }
+
+    /// A resync failed some other way than being refused: the refusals are
+    /// no longer in a row.
+    pub const fn note_resync_not_rejected(&mut self) {
+        self.consecutive_rejected_resyncs = 0;
+    }
+
+    /// The user asked to retry stalled resyncs: one attempt now. Another
+    /// refusal stalls them again at once.
+    pub fn retry_stalled(&mut self) {
+        if self.stalled.take().is_some() {
+            self.resync_failures = 0;
+            self.resync_pending = true;
+            self.resync_not_before = Some(Instant::now());
+        }
+    }
+
+    /// What the connection banner says about this link while it is
+    /// connected, if anything.
+    #[must_use]
+    pub fn banner(&self) -> Option<super::connection_banner::ConnectionBanner> {
+        use super::connection_banner::ConnectionBanner;
+        if let Some(reason) = &self.stalled {
+            return Some(ConnectionBanner::Stalled {
+                reason: reason.clone(),
+            });
+        }
+        self.unresponsive().then_some(ConnectionBanner::Degraded)
     }
 
     /// Nothing to resync (the attachment has no target).

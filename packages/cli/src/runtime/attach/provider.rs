@@ -132,6 +132,39 @@ impl ResolvedProviderAttach {
         Arc::clone(&self.provider)
     }
 
+    /// Reopens this target's provider after its connection is lost (native
+    /// provider sessions only; a server attachment reconnects instead).
+    #[must_use]
+    pub fn reopener(&self) -> super::reconnect::ProviderReopen {
+        let provider = Arc::clone(&self.provider);
+        let resolved = Arc::clone(&self.resolved);
+        super::reconnect::ProviderReopen::new(move |resume| {
+            let provider = Arc::clone(&provider);
+            let resolved = Arc::clone(&resolved);
+            async move {
+                let session = provider
+                    .open(
+                        resolved,
+                        resume,
+                        bmux_client::AttachProviderOpenContext {
+                            fallback_client: None,
+                            endpoint_connector: Some(Arc::new(
+                                crate::connection::CliAttachEndpointConnector,
+                            )),
+                            viewport: bmux_terminal::terminal::size().ok(),
+                        },
+                    )
+                    .await?;
+                match session.backend {
+                    bmux_client::AttachProviderBackend::Session(session) => Ok(session),
+                    bmux_client::AttachProviderBackend::Legacy(_) => {
+                        anyhow::bail!("attach provider reopened as a server attachment")
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn open(
         self,
         resume: Option<bmux_client::AttachResumeState>,
@@ -448,6 +481,7 @@ mod tests {
                 detached: Arc::clone(&detached),
             }),
             &mut terminal,
+            None,
         )
         .await
         .expect("recoverable disconnect");
@@ -474,6 +508,7 @@ mod tests {
                 detached: Arc::new(Mutex::new(0)),
             }),
             &mut terminal,
+            None,
         )
         .await
         .expect_err("mismatched resume must fail");
@@ -566,6 +601,7 @@ mod tests {
                 sends: Arc::clone(&sends),
             }),
             &mut terminal,
+            None,
         )
         .await
         .expect("run batching session");
@@ -716,6 +752,7 @@ mod tests {
         let outcome = super::super::runtime::run_native_attach_session_with_terminal(
             native_session,
             &mut terminal,
+            None,
         )
         .await
         .expect("run synthetic provider");

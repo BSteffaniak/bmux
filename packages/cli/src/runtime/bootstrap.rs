@@ -22,7 +22,7 @@ const BOOTSTRAP_RECORDING_START_ENV: &str = "BMUX_BOOTSTRAP_RECORDING_START";
 use super::plugin_kernel::RuntimeLoggingHandle;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
-    activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file, connect_with_context,
+    activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file,
     deactivate_loaded_plugins, dispatch_loaded_plugin_event, load_enabled_plugins,
     map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
     register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
@@ -80,9 +80,44 @@ pub(super) async fn run_default_server_attach(
     let target = resolve_default_attach_target(&mut client).await?;
     tracing::info!(session_id = %target, "attach.bootstrap.target_resolved");
     let target = target.to_string();
-    run_session_attach_with_client(client, Some(target.as_str()), None, false, None)
-        .await
-        .map(|outcome| outcome.status_code)
+    // A connector-backed client reconnects through its connector.
+    let reconnect = selected.is_local().then(default_attach_reconnect);
+    run_session_attach_with_client(
+        client,
+        Some(target.as_str()),
+        None,
+        false,
+        None,
+        reconnect,
+    )
+    .await
+    .map(|outcome| outcome.status_code)
+}
+
+/// The default local attach reconnects the way it connected: it starts the
+/// server when none runs (unless the server announced it was stopping).
+fn default_attach_reconnect() -> super::attach::reconnect::AttachReconnect {
+    super::attach::reconnect::AttachReconnect::new(move |attempt| async move {
+        if !attempt.server_stopped {
+            ensure_server_running_for_default_attach(ConnectionContext::new(Some("local")), None)
+                .await?;
+        }
+        Ok(BmuxClient::connect_default("bmux-cli-default-attach-reconnect")
+            .await
+            .map_err(map_client_connect_error)?
+            .into())
+    })
+}
+
+/// An explicit local attach reconnects to the local server without starting
+/// one.
+fn explicit_attach_reconnect() -> super::attach::reconnect::AttachReconnect {
+    super::attach::reconnect::AttachReconnect::new(move |_| async move {
+        Ok(BmuxClient::connect_default("bmux-cli-attach-reconnect")
+            .await
+            .map_err(map_client_connect_error)?
+            .into())
+    })
 }
 
 pub(super) async fn ensure_server_running_for_default_attach(
@@ -1251,6 +1286,7 @@ pub(super) async fn run_session_attach(
     );
     let provider = super::attach::provider::resolve(target)?;
     if !provider.requires_fallback_client() {
+        let reopen = provider.reopener();
         let session = provider
             .open(
                 None,
@@ -1263,22 +1299,30 @@ pub(super) async fn run_session_attach(
             .await?;
         return Box::pin(
             super::attach::runtime::run_session_attach_with_provider_session(
-                session, target, follow, global, None,
+                session,
+                target,
+                follow,
+                global,
+                None,
+                None,
+                Some(reopen),
             ),
         )
         .await
         .map(|outcome| outcome.status_code);
     }
-    let client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-attach",
-        connection_context,
-    )
-    .await?;
+    let selected = crate::connection::SelectedTarget::resolve(connection_context).await?;
+    // The stale-build policy is about this machine's server.
+    if selected.is_local() {
+        crate::connection::apply_stale_build_policy(ConnectionPolicyScope::Normal)?;
+    }
+    let client = selected.connect("bmux-cli-attach").await?;
     tracing::info!("attach.bootstrap.explicit_connected");
-    run_session_attach_with_client(client, target, follow, global, None)
-        .await
-        .map(|outcome| outcome.status_code)
+    // A connector-backed client reconnects through its connector.
+    let reconnect = selected.is_local().then(explicit_attach_reconnect);
+    run_session_attach_with_client(client, target, follow, global, None, reconnect)
+    .await
+    .map(|outcome| outcome.status_code)
 }
 
 /// A readable attach failure that keeps the client error, so the attach loop

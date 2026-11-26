@@ -8,10 +8,13 @@
 //!   ends as [`AttachExitReason::StreamClosed`].
 //! - [`AttachIpcFailure::Transient`]: the server is slow; the loop keeps
 //!   running, says so in the status line and resyncs the view.
-//! - [`AttachIpcFailure::ConnectionLost`]: the attachment stops cleanly as
-//!   [`AttachExitReason::ConnectionLost`].
+//! - [`AttachIpcFailure::ConnectionLost`]: the attach loop stops as
+//!   [`AttachExitReason::ConnectionLost`]; an attachment that can reconnect
+//!   does so in place (see `reconnect`), otherwise it ends cleanly.
 //! - [`AttachIpcFailure::Rejected`] / [`AttachIpcFailure::Protocol`]: shown in
-//!   the status line; the loop keeps running.
+//!   the status line; the loop keeps running. Resyncs refused
+//!   [`super::state::AttachLinkHealth::STALL_AFTER_REJECTED_RESYNCS`] times in
+//!   a row stop being retried until the user asks (the connection banner).
 //! - [`AttachIpcFailure::Local`]: a failure on this side (not the server's):
 //!   stays fatal.
 
@@ -183,6 +186,15 @@ pub fn absorb_attach_failure(
     // A step may name a more specific one it failed in.
     let op = error.downcast_ref::<AttachOp>().copied().unwrap_or(op);
     let failure = classify_attach_error(&error);
+    if op == AttachOp::Resync {
+        if failure == AttachIpcFailure::Rejected {
+            view_state
+                .link
+                .note_resync_rejected(format!("{op} failed: {}", failure_text(&error)));
+        } else {
+            view_state.link.note_resync_not_rejected();
+        }
+    }
     match failure {
         AttachIpcFailure::Gone => {
             tracing::info!(op = op.label(), error = %format!("{error:#}"), "attach.failure.gone");

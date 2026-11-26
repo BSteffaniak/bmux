@@ -1027,6 +1027,7 @@ pub async fn run_native_with_client(
         Some(config),
         None,
         observer,
+        None,
     ))
     .await
 }
@@ -1382,9 +1383,6 @@ async fn native_committed_text(
 
 pub struct RealAttachTerminal {
     terminal: bmux_attach_pipeline::terminal::TerminalIo<HostWriter>,
-    /// Where the attach loop publishes the session it is attached to, for a
-    /// caller that outlives this attachment (reconnect resumes it).
-    attached_session: Option<super::reconnect::AttachedSessionCell>,
 }
 
 impl RealAttachTerminal {
@@ -1404,18 +1402,7 @@ impl RealAttachTerminal {
                         .as_deref(),
                 ),
             ),
-            attached_session: None,
         })
-    }
-
-    /// Publish every attached-session change to `cell`.
-    #[must_use]
-    pub fn with_attached_session_cell(
-        mut self,
-        cell: Option<super::reconnect::AttachedSessionCell>,
-    ) -> Self {
-        self.attached_session = cell;
-        self
     }
 }
 
@@ -1823,12 +1810,6 @@ fn headless_image_capabilities_from_env() -> bmux_image::host_caps::HostImageCap
 }
 
 impl AttachTerminal for RealAttachTerminal {
-    fn set_attached_session_id(&self, session_id: Uuid) {
-        if let Some(cell) = &self.attached_session {
-            cell.set(session_id);
-        }
-    }
-
     fn output_backlogged(&self) -> bool {
         self.terminal.writer().backlogged()
     }
@@ -4324,25 +4305,30 @@ pub type ReconnectPrepare = std::sync::Arc<
 #[derive(Default)]
 pub struct ClientAttachOptions {
     pub kernel_client_factory: Option<KernelClientFactory>,
-    /// Applied to every replacement client of a resumed attachment.
+    /// Applied to every replacement client of a connector-backed attachment
+    /// that reconnects.
     pub prepare: Option<ReconnectPrepare>,
     /// Pins the attachment to this config instead of the process config.
     pub config: Option<BmuxConfig>,
     /// The selected runtime a caller-process plugin command runs with.
     pub command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
+    /// Reconnects the attachment in place when its connection is lost. A
+    /// connector-backed client without one reconnects through its connector.
+    pub reconnect: Option<super::reconnect::AttachReconnect>,
 }
 
-/// Attach on `client`. A connector-backed client resumes after a dropped
-/// connection (see [`super::reconnect`]); a local client attaches once.
+/// Attach on `client`. With `reconnect`, or on a connector-backed client, a
+/// lost connection is reconnected in place (see [`super::reconnect`]).
 ///
 /// # Errors
-/// Returns attachment failures, or a resumable error once reconnecting gives up.
+/// Returns attachment failures.
 pub async fn run_session_attach_with_client(
     client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
 ) -> Result<AttachRunOutcome> {
     Box::pin(run_session_attach_with_client_options(
         client,
@@ -4351,6 +4337,7 @@ pub async fn run_session_attach_with_client(
         global,
         ClientAttachOptions {
             kernel_client_factory,
+            reconnect,
             ..ClientAttachOptions::default()
         },
     ))
@@ -4360,7 +4347,7 @@ pub async fn run_session_attach_with_client(
 /// [`run_session_attach_with_client`] with explicit options.
 ///
 /// # Errors
-/// Returns attachment failures, or a resumable error once reconnecting gives up.
+/// Returns attachment failures.
 pub async fn run_session_attach_with_client_options(
     client: BmuxClient,
     target: Option<&str>,
@@ -4373,39 +4360,55 @@ pub async fn run_session_attach_with_client_options(
         prepare,
         config,
         command_state,
+        reconnect,
     } = options;
-    let Some(origin) = client.transport_origin().cloned() else {
-        return Box::pin(run_session_attach_once(
-            client,
-            target,
-            follow,
-            global,
-            kernel_client_factory,
-            config,
-            command_state,
-        ))
-        .await;
+    let origin = client.transport_origin().cloned();
+    let (kernel_client_factory, reconnect) = match &origin {
+        // Plugin kernel calls and reconnects must reach the connector's
+        // server, never a local one.
+        Some(origin) => (
+            kernel_client_factory.or_else(|| Some(connector_kernel_client_factory(origin))),
+            reconnect.or_else(|| Some(connector_attach_reconnect(origin, prepare))),
+        ),
+        None => (kernel_client_factory, reconnect),
     };
-    // Plugin kernel calls must reach the connector's server, never a local one.
-    let kernel_client_factory =
-        kernel_client_factory.or_else(|| Some(connector_kernel_client_factory(&origin)));
-    let mut driver = ConnectorAttach {
-        origin,
-        attached_session: super::reconnect::AttachedSessionCell::default(),
-        follow: follow.map(str::to_owned),
+    let provider = super::provider::resolve(target)?;
+    let reopen = provider.reopener();
+    let session = provider
+        .open(
+            None,
+            bmux_client::AttachProviderOpenContext {
+                fallback_client: Some(client),
+                endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                viewport: terminal::size().ok(),
+            },
+        )
+        .await?;
+    let outcome = Box::pin(run_provider_session(
+        session,
+        target,
+        follow,
         global,
         kernel_client_factory,
-        prepare,
         config,
         command_state,
-    };
-    Box::pin(super::reconnect::run_resumable(
-        &mut driver,
-        client,
-        target.map(str::to_owned),
-        follow.is_some(),
+        reconnect,
+        Some(reopen),
     ))
-    .await
+    .await?;
+    if let Some(origin) = &origin
+        && outcome.exit_reason == AttachExitReason::ConnectionLost
+    {
+        // Reconnecting gave up: say how to come back to where the user was.
+        let resume = outcome
+            .attached_session_id
+            .map_or_else(String::new, |session| format!(" attach {session}"));
+        eprintln!(
+            "bmux: input typed after the drop was not sent. Resume with `bmux --target {}{resume}`",
+            origin.target()
+        );
+    }
+    Ok(outcome)
 }
 
 /// A kernel-bridge client factory that opens each client through `origin`.
@@ -4424,137 +4427,37 @@ pub fn connector_kernel_client_factory(
     })
 }
 
-struct ConnectorAttach {
-    origin: bmux_client::TransportOrigin,
-    /// The session the user was last attached to, across runs.
-    attached_session: super::reconnect::AttachedSessionCell,
-    follow: Option<String>,
-    global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
+/// Reconnect a connector-backed attachment through the connector that opened
+/// it, preparing each new client like the first. A device the host refuses
+/// (revoked, never paired) ends reconnecting at once; otherwise attempts stop
+/// after [`super::reconnect::CONNECTOR_RECONNECT_MAX_ATTEMPTS`].
+fn connector_attach_reconnect(
+    origin: &bmux_client::TransportOrigin,
     prepare: Option<ReconnectPrepare>,
-    config: Option<BmuxConfig>,
-    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
-}
-
-impl super::reconnect::ResumableAttach for ConnectorAttach {
-    type Client = BmuxClient;
-
-    fn target_label(&self) -> &str {
-        self.origin.target()
-    }
-
-    fn last_attached_session(&self) -> Option<Uuid> {
-        self.attached_session.get()
-    }
-
-    fn run<'a>(
-        &'a mut self,
-        client: BmuxClient,
-        session: Option<&'a str>,
-    ) -> super::reconnect::BoxFuture<'a, Result<AttachRunOutcome>> {
-        // A connection that dies mid-request surfaces as an error from
-        // whichever call was in flight (often flattened into text by typed
-        // dispatch), not as a closed event stream. The connection's own
-        // failure record tells the two apart: when it recorded a failure, the
-        // attachment ended because the connection was lost, and it resumes.
-        let transport_failure = client.transport_failure();
-        let run = run_session_attach_once_tracked(
-            client,
-            session,
-            self.follow.as_deref(),
-            self.global,
-            self.kernel_client_factory.clone(),
-            self.config.clone(),
-            self.command_state.clone(),
-            Some(self.attached_session.clone()),
-        );
-        Box::pin(async move {
-            super::reconnect::connection_loss_as_drop(run.await, transport_failure.reason())
-        })
-    }
-
-    fn reconnect(&mut self) -> super::reconnect::BoxFuture<'_, Result<BmuxClient>> {
-        Box::pin(async move {
-            let client = self
-                .origin
+) -> super::reconnect::AttachReconnect {
+    let origin = origin.clone();
+    super::reconnect::AttachReconnect::new(move |attempt| {
+        let (origin, prepare) = (origin.clone(), prepare.clone());
+        async move {
+            tracing::info!(
+                target = origin.target(),
+                attempt = attempt.number,
+                outage_ms = duration_millis_u64(attempt.outage),
+                backoff_ms = duration_millis_u64(attempt.backoff),
+                "attach.reconnect.connector_dial"
+            );
+            let client = origin
                 .connect("bmux-cli-attach-reconnect")
                 .await
-                .map_err(crate::connection::map_client_connect_error)?;
-            let client = match &self.prepare {
+                .map_err(super::reconnect::connector_connect_error)?;
+            let client = match prepare {
                 Some(prepare) => prepare(client).await?,
                 None => client,
             };
-            // Keystrokes typed while disconnected are never sent.
-            super::reconnect::discard_pending_terminal_input();
-            Ok(client)
-        })
-    }
-
-    fn sleep(&mut self, delay: Duration) -> super::reconnect::BoxFuture<'_, ()> {
-        Box::pin(tokio::time::sleep(delay))
-    }
-
-    fn notify(&mut self, message: &str) {
-        eprintln!("{message}");
-    }
-}
-
-async fn run_session_attach_once(
-    client: BmuxClient,
-    target: Option<&str>,
-    follow: Option<&str>,
-    global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
-    config: Option<BmuxConfig>,
-    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
-) -> Result<AttachRunOutcome> {
-    Box::pin(run_session_attach_once_tracked(
-        client,
-        target,
-        follow,
-        global,
-        kernel_client_factory,
-        config,
-        command_state,
-        None,
-    ))
-    .await
-}
-
-/// [`run_session_attach_once`], publishing the attached session to `attached_session`.
-#[allow(clippy::too_many_arguments)] // The attach entry parameters plus the tracking cell.
-async fn run_session_attach_once_tracked(
-    client: BmuxClient,
-    target: Option<&str>,
-    follow: Option<&str>,
-    global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
-    config: Option<BmuxConfig>,
-    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
-    attached_session: Option<super::reconnect::AttachedSessionCell>,
-) -> Result<AttachRunOutcome> {
-    let provider = super::provider::resolve(target)?;
-    let session = provider
-        .open(
-            None,
-            bmux_client::AttachProviderOpenContext {
-                fallback_client: Some(client),
-                endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
-                viewport: terminal::size().ok(),
-            },
-        )
-        .await?;
-    Box::pin(run_provider_session(
-        session,
-        target,
-        follow,
-        global,
-        kernel_client_factory,
-        config,
-        command_state,
-        attached_session,
-    ))
-    .await
+            Ok(client.into())
+        }
+    })
+    .with_max_attempts(Some(super::reconnect::CONNECTOR_RECONNECT_MAX_ATTEMPTS))
 }
 
 /// Run an independent output-only local view through the authorized attach path.
@@ -4657,6 +4560,8 @@ pub async fn run_session_attach_with_provider_session(
     follow: Option<&str>,
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
+    reopen: Option<super::reconnect::ProviderReopen>,
 ) -> Result<AttachRunOutcome> {
     Box::pin(run_session_attach_with_provider_session_config(
         session,
@@ -4666,6 +4571,8 @@ pub async fn run_session_attach_with_provider_session(
         kernel_client_factory,
         None,
         None,
+        reconnect,
+        reopen,
     ))
     .await
 }
@@ -4675,8 +4582,13 @@ pub async fn run_session_attach_with_provider_session(
 /// `None` loads the process attach config; `Some` pins both legacy and
 /// provider-owned attachments to that config.
 ///
+/// `reconnect` reconnects a legacy (server) attachment in place when its
+/// connection is lost, `reopen` a native provider attachment; without them,
+/// the attachment ends.
+///
 /// # Errors
 /// Returns attachment, input, or presentation failures.
+#[allow(clippy::too_many_arguments)] // The attach entry contract plus its reconnect path.
 pub async fn run_session_attach_with_provider_session_config(
     session: bmux_client::AttachProviderSession,
     original_target: Option<&str>,
@@ -4685,6 +4597,8 @@ pub async fn run_session_attach_with_provider_session_config(
     kernel_client_factory: Option<KernelClientFactory>,
     config: Option<BmuxConfig>,
     command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
+    reopen: Option<super::reconnect::ProviderReopen>,
 ) -> Result<AttachRunOutcome> {
     Box::pin(run_provider_session(
         session,
@@ -4694,12 +4608,13 @@ pub async fn run_session_attach_with_provider_session_config(
         kernel_client_factory,
         config,
         command_state,
-        None,
+        reconnect,
+        reopen,
     ))
     .await
 }
 
-#[allow(clippy::too_many_arguments)] // The attach entry parameters plus the tracking cell.
+#[allow(clippy::too_many_arguments)] // The attach entry contract plus its reconnect path.
 async fn run_provider_session(
     session: bmux_client::AttachProviderSession,
     original_target: Option<&str>,
@@ -4708,14 +4623,14 @@ async fn run_provider_session(
     kernel_client_factory: Option<KernelClientFactory>,
     config: Option<BmuxConfig>,
     command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
-    attached_session: Option<super::reconnect::AttachedSessionCell>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
+    reopen: Option<super::reconnect::ProviderReopen>,
 ) -> Result<AttachRunOutcome> {
     let effective_target = session.target.as_deref().or(original_target);
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
-            let mut terminal =
-                RealAttachTerminal::new()?.with_attached_session_cell(attached_session);
-            Box::pin(run_session_attach_with_terminal_config_observer(
+            let mut terminal = RealAttachTerminal::new()?;
+            Box::pin(run_session_attach_with_terminal_reconnecting(
                 client,
                 effective_target,
                 follow,
@@ -4725,6 +4640,7 @@ async fn run_provider_session(
                 config,
                 command_state,
                 None,
+                reconnect,
             ))
             .await
         }
@@ -4737,25 +4653,26 @@ async fn run_provider_session(
                     NATIVE_CONFIG_LOADER.with(|slot| slot.replace(Some(loader))),
                 )
             });
-            let mut terminal =
-                RealAttachTerminal::new()?.with_attached_session_cell(attached_session);
-            run_native_attach_session_with_terminal(provider_session, &mut terminal).await
+            let mut terminal = RealAttachTerminal::new()?;
+            run_native_attach_session_with_terminal(provider_session, &mut terminal, reopen).await
         }
     }
 }
 
 /// Run a native provider attach session on `terminal`, restoring it on every
-/// exit (also an error or cancellation).
+/// exit (also an error or cancellation). With `reopen`, a provider whose
+/// connection is lost is reopened in place (see [`super::reconnect`]).
 pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
     session: Box<dyn AttachSession>,
     terminal: &mut T,
+    reopen: Option<super::reconnect::ProviderReopen>,
 ) -> Result<AttachRunOutcome> {
     let mut host = TerminalAttachHost(terminal);
     let mut guard = AttachRestoreGuard {
         terminal: &mut host,
         armed: true,
     };
-    let result = run_native_attach_session_inner(session, &mut *guard.terminal.0).await;
+    let result = run_native_attach_session_inner(session, &mut *guard.terminal.0, reopen).await;
     if let Err(error) = result {
         let restored = guard.terminal.restore_after_attach_ui();
         guard.armed = false;
@@ -4768,32 +4685,81 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
     result
 }
 
-/// What a failed native provider event stream means for the attachment: the
-/// provider detached (the stream ended) or its transport failed (the
-/// connection is lost). A continuity violation is not recoverable here (the
-/// native path has no resync): it stays an error.
-const fn native_event_failure_exit(error: &bmux_client::AttachSessionError) -> Option<AttachExitReason> {
-    match error {
-        bmux_client::AttachSessionError::Detached => Some(AttachExitReason::StreamClosed),
-        bmux_client::AttachSessionError::Provider { .. } => Some(AttachExitReason::ConnectionLost),
-        _ => None,
+/// What a failed native provider event stream means for the attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeEventFailure {
+    /// The provider detached: the attachment ends.
+    Detached,
+    /// The provider's transport failed: the connection is lost, the view it
+    /// validated so far can resume.
+    TransportLost,
+    /// The provider broke stream continuity: what the view holds cannot be
+    /// trusted, only a fresh view can follow.
+    Continuity,
+}
+
+impl NativeEventFailure {
+    const fn of(error: &bmux_client::AttachSessionError) -> Self {
+        match error {
+            bmux_client::AttachSessionError::Detached => Self::Detached,
+            bmux_client::AttachSessionError::Provider { .. } => Self::TransportLost,
+            _ => Self::Continuity,
+        }
     }
 }
 
-#[allow(clippy::too_many_lines)] // Native provider loop keeps continuity, scene, input, and detach state synchronized.
+/// How one native provider session stopped.
+enum NativeSessionEnd {
+    /// The attachment ends this way.
+    Finished(AttachRunOutcome),
+    /// The provider connection was lost. Reopening it (resuming from
+    /// `resume`, after `retry_after` when the provider asked for a wait) may
+    /// continue the attachment; otherwise it ends as `otherwise`.
+    Lost {
+        resume: Option<bmux_client::AttachResumeState>,
+        retry_after: Option<Duration>,
+        otherwise: Result<AttachRunOutcome>,
+    },
+}
+
+/// The terminal of a native provider attachment while it reopens: keys
+/// answer the banner, painted on the top row over the last scene.
+struct NativeReconnectHost<'a, T: AttachTerminal>(&'a mut T);
+
+impl<T: AttachTerminal> super::reconnect::ReconnectHost for NativeReconnectHost<'_, T> {
+    fn next_input(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<super::reconnect::ReconnectInput>> + Send + '_>> {
+        use super::reconnect::ReconnectInput;
+        let event = self.0.next_event();
+        Box::pin(async move {
+            Ok(match event.await? {
+                None => ReconnectInput::Closed(AttachExitReason::Quit),
+                Some(Event::Key(key)) => {
+                    banner_key(&key).map_or(ReconnectInput::Ignored, ReconnectInput::Key)
+                }
+                Some(Event::Resize(..) | Event::FocusGained) => ReconnectInput::Repaint,
+                Some(_) => ReconnectInput::Ignored,
+            })
+        })
+    }
+
+    fn show(&mut self, banner: &super::connection_banner::ConnectionBanner) -> Result<()> {
+        let geometry = self.0.geometry();
+        super::connection_banner::paint(&mut *self.0, banner, 0, geometry.cols)?;
+        Ok(())
+    }
+}
+
 async fn run_native_attach_session_inner<T: AttachTerminal>(
     mut session: Box<dyn AttachSession>,
     terminal: &mut T,
+    reopen: Option<super::reconnect::ProviderReopen>,
 ) -> Result<AttachRunOutcome> {
-    let mut continuity = AttachContinuityValidator::default();
-    let mut controls = AttachControlValidator::default();
-    let snapshot = session
+    let mut snapshot = session
         .initial_snapshot()
         .await
         .map_err(|error| anyhow::anyhow!("attach provider snapshot failed: {error}"))?;
-    continuity
-        .apply_snapshot(&snapshot)
-        .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
 
     let native_config = match load_attach_config() {
         Ok(config) => config,
@@ -4811,6 +4777,94 @@ async fn run_native_attach_session_inner<T: AttachTerminal>(
     )?;
     let mut input_processor =
         InputProcessor::new(attach_keymap_from_config(&native_config), keyboard_enhanced);
+    let reconnect_seed = super::reconnect::jitter_seed();
+
+    let outcome = loop {
+        let ended = run_native_provider_session(
+            session.as_mut(),
+            snapshot,
+            terminal,
+            &mut input_processor,
+            keyboard_enhanced,
+        )
+        .await?;
+        let (resume, retry_after, otherwise) = match ended {
+            NativeSessionEnd::Finished(outcome) => break outcome,
+            NativeSessionEnd::Lost {
+                resume,
+                retry_after,
+                otherwise,
+            } => (resume, retry_after, otherwise),
+        };
+        let Some(reopen) = reopen.as_ref() else {
+            break otherwise?;
+        };
+        let policy = super::reconnect::ReconnectPolicy {
+            first_delay: retry_after,
+            ..*reopen.policy()
+        };
+        warn!(resumable = resume.is_some(), "attach.provider.reopen.start");
+        let reopened = super::reconnect::reconnect_in_place(
+            &mut NativeReconnectHost(&mut *terminal),
+            &policy,
+            false,
+            reconnect_seed,
+            |_| {
+                let open = reopen.open(resume.clone());
+                async move {
+                    use super::reconnect::ReattachFailure;
+                    let mut session = open.await.map_err(ReattachFailure::Retry)?;
+                    let snapshot = session.initial_snapshot().await.map_err(|error| {
+                        ReattachFailure::Retry(anyhow::anyhow!(
+                            "attach provider snapshot failed: {error}"
+                        ))
+                    })?;
+                    Ok((session, snapshot))
+                }
+            },
+        )
+        .await?;
+        match reopened {
+            super::reconnect::ReconnectEnd::Reattached((reopened, reopened_snapshot)) => {
+                session = reopened;
+                snapshot = reopened_snapshot;
+            }
+            super::reconnect::ReconnectEnd::Exit(exit_reason) => {
+                break AttachRunOutcome {
+                    status_code: attach_exit_status_code(exit_reason),
+                    exit_reason,
+                    resume,
+                    attached_session_id: None,
+                };
+            }
+        }
+    };
+
+    let detach_result = session.detach().await;
+    terminal.restore_after_attach_ui()?;
+    if let Err(error) = detach_result
+        && !outcome.exit_reason.server_went_away()
+    {
+        return Err(anyhow::anyhow!("attach provider detach failed: {error}"));
+    }
+    Ok(outcome)
+}
+
+/// Run one native provider session from its initial `snapshot` until it
+/// stops.
+#[allow(clippy::too_many_lines)] // Native provider loop keeps continuity, scene, input, and detach state synchronized.
+async fn run_native_provider_session<T: AttachTerminal>(
+    session: &mut dyn AttachSession,
+    snapshot: AttachProviderSnapshot,
+    terminal: &mut T,
+    input_processor: &mut InputProcessor,
+    keyboard_enhanced: bool,
+) -> Result<NativeSessionEnd> {
+    let mut continuity = AttachContinuityValidator::default();
+    let mut controls = AttachControlValidator::default();
+    continuity
+        .apply_snapshot(&snapshot)
+        .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
     let mut scene = snapshot.scene.clone();
     let mut pane_buffers = provider_pane_buffers_from_snapshot(&snapshot)?;
     let mut terminal_graphics_cache = TerminalGraphicsCache::new();
@@ -4839,26 +4893,40 @@ async fn run_native_attach_session_inner<T: AttachTerminal>(
         .map_err(|error| anyhow::anyhow!("attach provider viewport failed: {error}"))?;
     ensure_provider_ack("viewport", &ack)?;
 
-    let outcome = loop {
+    let ended = loop {
         tokio::select! {
             biased;
             event = session.next_event() => {
                 let event = match event {
                     Ok(event) => event,
-                    Err(error) => match native_event_failure_exit(&error) {
-                        Some(exit_reason) => {
-                            warn!(%error, "attach provider event stream ended");
-                            break AttachRunOutcome {
-                                status_code: attach_exit_status_code(exit_reason),
-                                exit_reason,
+                    Err(error) => {
+                        warn!(%error, "attach provider event stream ended");
+                        let finished = |exit_reason| AttachRunOutcome {
+                            status_code: attach_exit_status_code(exit_reason),
+                            exit_reason,
+                            resume: None,
+                            attached_session_id: None,
+                        };
+                        break match NativeEventFailure::of(&error) {
+                            NativeEventFailure::Detached => {
+                                NativeSessionEnd::Finished(finished(AttachExitReason::StreamClosed))
+                            }
+                            NativeEventFailure::TransportLost => NativeSessionEnd::Lost {
+                                resume: Some(continuity.resume_state()),
+                                retry_after: None,
+                                otherwise: Ok(finished(AttachExitReason::ConnectionLost)),
+                            },
+                            NativeEventFailure::Continuity => NativeSessionEnd::Lost {
                                 resume: None,
-                                attached_session_id: None,
-                            };
-                        }
-                        None => anyhow::bail!("attach provider event failed: {error}"),
-                    },
+                                retry_after: None,
+                                otherwise: Err(anyhow::anyhow!(
+                                    "attach provider event failed: {error}"
+                                )),
+                            },
+                        };
+                    }
                 };
-                if let Some(event_outcome) = handle_native_provider_event(
+                if let Some(event_end) = handle_native_provider_event(
                     terminal,
                     &mut continuity,
                     &mut scene,
@@ -4867,7 +4935,7 @@ async fn run_native_attach_session_inner<T: AttachTerminal>(
                     &mut focused_stream,
                     event,
                 )? {
-                    break event_outcome;
+                    break event_end;
                 }
             }
             event = terminal.next_event() => {
@@ -4883,12 +4951,12 @@ async fn run_native_attach_session_inner<T: AttachTerminal>(
                     };
                     command_sequence = command_sequence.saturating_add(1);
                     match handle_native_provider_terminal_event(
-                        session.as_mut(),
+                        session,
                         &continuity,
                         &mut controls,
                         &scene,
                         &pane_buffers,
-                        &mut input_processor,
+                        input_processor,
                         focused_stream.as_ref(),
                         command_sequence,
                         keyboard_enhanced,
@@ -4913,32 +4981,24 @@ async fn run_native_attach_session_inner<T: AttachTerminal>(
                     }
                 };
                 // Everything typed before a detach or the end of input is still delivered.
-                if let Err(error) = flush_native_provider_input(session.as_mut(), &mut burst).await
+                if let Err(error) = flush_native_provider_input(session, &mut burst).await
                     && let Some(exit_reason) = native_provider_request_failure(&error)
                 {
                     exit = exit.or(Some(exit_reason));
                 }
                 if let Some(exit_reason) = exit {
-                    break AttachRunOutcome {
+                    break NativeSessionEnd::Finished(AttachRunOutcome {
                         status_code: 0,
                         exit_reason,
                         resume: None,
                         attached_session_id: None,
-                    };
+                    });
                 }
             }
         }
     };
-
-    let detach_result = session.detach().await;
     let _ = controls.detach();
-    terminal.restore_after_attach_ui()?;
-    if let Err(error) = detach_result
-        && !outcome.exit_reason.server_went_away()
-    {
-        return Err(anyhow::anyhow!("attach provider detach failed: {error}"));
-    }
-    Ok(outcome)
+    Ok(ended)
 }
 
 /// A failed provider request: a provider that detached ends the attachment
@@ -4963,12 +5023,18 @@ fn handle_native_provider_event<W: AttachTerminal>(
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     focused_stream: &mut Option<AttachStreamCursor>,
     event: AttachProviderEvent,
-) -> Result<Option<AttachRunOutcome>> {
+) -> Result<Option<NativeSessionEnd>> {
     match event {
         AttachProviderEvent::Delta(delta) => {
-            continuity
-                .apply_delta(&delta)
-                .map_err(|error| anyhow::anyhow!("invalid attach provider delta: {error}"))?;
+            if let Err(error) = continuity.apply_delta(&delta) {
+                // Only a fresh view can follow a delta that breaks continuity.
+                warn!(%error, "attach provider delta broke continuity");
+                return Ok(Some(NativeSessionEnd::Lost {
+                    resume: None,
+                    retry_after: None,
+                    otherwise: Err(anyhow::anyhow!("invalid attach provider delta: {error}")),
+                }));
+            }
             if let Some(replacement) = delta.changes.iter().find_map(|change| {
                 if let AttachProviderChange::Scene(replacement) = change {
                     Some(replacement)
@@ -4987,34 +5053,39 @@ fn handle_native_provider_event<W: AttachTerminal>(
             Ok(None)
         }
         AttachProviderEvent::Disconnected(disconnect) => {
-            let resume = if disconnect.recoverable {
-                let validated = continuity.resume_state();
-                if let Some(candidate) = disconnect.resume {
-                    if candidate != validated {
-                        anyhow::bail!(
-                            "attach provider disconnect resume state did not match validated state"
-                        );
-                    }
-                    Some(candidate)
-                } else {
-                    Some(validated)
-                }
-            } else {
-                None
+            if !disconnect.recoverable {
+                return Ok(Some(NativeSessionEnd::Finished(AttachRunOutcome {
+                    status_code: 1,
+                    exit_reason: AttachExitReason::StreamClosed,
+                    resume: None,
+                    attached_session_id: None,
+                })));
+            }
+            let validated = continuity.resume_state();
+            let resume = match disconnect.resume {
+                Some(candidate) if candidate != validated => anyhow::bail!(
+                    "attach provider disconnect resume state did not match validated state"
+                ),
+                Some(candidate) => candidate,
+                None => validated,
             };
-            Ok(Some(AttachRunOutcome {
-                status_code: u8::from(!disconnect.recoverable),
-                exit_reason: AttachExitReason::StreamClosed,
-                resume,
-                attached_session_id: None,
+            Ok(Some(NativeSessionEnd::Lost {
+                resume: Some(resume.clone()),
+                retry_after: disconnect.retry_after_ms.map(Duration::from_millis),
+                otherwise: Ok(AttachRunOutcome {
+                    status_code: 0,
+                    exit_reason: AttachExitReason::StreamClosed,
+                    resume: Some(resume),
+                    attached_session_id: None,
+                }),
             }))
         }
-        AttachProviderEvent::Detached => Ok(Some(AttachRunOutcome {
+        AttachProviderEvent::Detached => Ok(Some(NativeSessionEnd::Finished(AttachRunOutcome {
             status_code: 0,
             exit_reason: AttachExitReason::Detached,
             resume: None,
             attached_session_id: None,
-        })),
+        }))),
     }
 }
 
@@ -5506,6 +5577,36 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
 ) -> Result<AttachRunOutcome> {
+    Box::pin(run_session_attach_with_terminal_reconnecting(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        terminal,
+        config,
+        command_state,
+        observer,
+        None,
+    ))
+    .await
+}
+
+/// [`run_session_attach_with_terminal_config_observer`] that reconnects in
+/// place with `reconnect` when the connection to the server is lost.
+#[allow(clippy::too_many_arguments)] // The attach entry contract plus its reconnect path.
+pub async fn run_session_attach_with_terminal_reconnecting<T: AttachTerminal + ?Sized>(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
+    config: Option<BmuxConfig>,
+    command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
+    observer: Option<super::observer::AttachObserverPublisher>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
+) -> Result<AttachRunOutcome> {
     Box::pin(run_session_attach_with_host(
         client,
         target,
@@ -5516,6 +5617,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         config,
         command_state,
         observer,
+        reconnect,
     ))
     .await
 }
@@ -5548,6 +5650,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     config: Option<BmuxConfig>,
     command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
 ) -> Result<AttachRunOutcome> {
     let mut guard = AttachRestoreGuard {
         terminal,
@@ -5563,6 +5666,7 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
         config,
         command_state,
         observer,
+        reconnect,
     )
     .await;
     if let Err(error) = result {
@@ -5577,17 +5681,337 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
     result
 }
 
+/// Who the attachment is admitted as: the original attach's choice, kept to
+/// admit it again after a reconnect.
+#[derive(Clone, Copy, Debug)]
+struct AttachAdmission {
+    follow_target_id: Option<Uuid>,
+    global: bool,
+    observation_only: bool,
+}
+
+/// What the attachment is admitted to.
+#[derive(Clone, Copy, Debug)]
+enum AdmissionTarget<'a> {
+    /// The session the user selected (unused when following a client).
+    Selected(Option<&'a SessionSelector>),
+    /// The session (and context) the attachment showed when its connection
+    /// was lost.
+    Attached {
+        session_id: Uuid,
+        context_id: Option<Uuid>,
+    },
+}
+
+/// Why admitting the attachment failed.
+#[derive(Debug)]
+enum AdmissionError {
+    /// The session (or the followed client) does not exist.
+    TargetGone(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+impl AdmissionError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::TargetGone(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
+impl From<anyhow::Error> for AdmissionError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<ClientError> for AdmissionError {
+    fn from(error: ClientError) -> Self {
+        Self::Failed(map_attach_client_error(error))
+    }
+}
+
+impl From<TypedServiceClientError> for AdmissionError {
+    fn from(error: TypedServiceClientError) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+/// An attach grant the server refused because its target does not exist is
+/// [`AdmissionError::TargetGone`].
+fn grant_error(error: ClientError) -> AdmissionError {
+    let gone = matches!(
+        &error,
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::NotFound,
+            ..
+        }
+    );
+    let error = map_attach_client_error(error);
+    if gone {
+        AdmissionError::TargetGone(error)
+    } else {
+        AdmissionError::Failed(error)
+    }
+}
+
+/// Admit this connection's client to the attachment: follow the leader if
+/// following, then open the attach stream on the target. Returns this
+/// client's id and what it attached to.
+async fn admit_attachment(
+    client: &mut BmuxClient,
+    admission: AttachAdmission,
+    target: AdmissionTarget<'_>,
+) -> std::result::Result<(Uuid, bmux_client::AttachOpenInfo), AdmissionError> {
+    if let Some(leader_client_id) = admission.follow_target_id {
+        client.subscribe_events().await?;
+        clients_state::client::current_client(client)
+            .await?
+            .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?;
+        bmux_clients_plugin_api::clients_commands::client::set_following(
+            client,
+            Some(leader_client_id),
+            admission.global,
+        )
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
+    }
+
+    let self_client_id = clients_state::client::current_client(client)
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
+        .id;
+
+    let attach_info = if admission.observation_only {
+        use bmux_pane_runtime_plugin_api::attach_runtime_commands as commands;
+        if admission.follow_target_id.is_some() {
+            return Err(
+                anyhow::anyhow!("independent observers cannot follow client identity").into(),
+            );
+        }
+        let selector = observer_session_selector(target)?;
+        let grant = match commands::client::observer_grant(client, selector).await? {
+            Ok(grant) => grant,
+            Err(commands::AttachCommandError::SessionNotFound) => {
+                return Err(AdmissionError::TargetGone(anyhow::anyhow!(
+                    "observer grant rejected: session not found"
+                )));
+            }
+            Err(error) => return Err(anyhow::anyhow!("observer grant rejected: {error:?}").into()),
+        };
+        let ready = commands::client::observer_open(client, grant.session_id, grant.token)
+            .await?
+            .map_err(|error| anyhow::anyhow!("observer open rejected: {error:?}"))?;
+        bmux_client::AttachOpenInfo {
+            context_id: ready.context_id,
+            session_id: ready.session_id,
+            can_write: false,
+        }
+    } else if let Some(leader_client_id) = admission.follow_target_id {
+        let context_id = follow_leader_context(client, leader_client_id).await?;
+        let grant = client
+            .attach_context_grant(ContextSelector::ById(context_id))
+            .await
+            .map_err(grant_error)?;
+        client.open_attach_stream_info(&grant).await?
+    } else {
+        let grant = match target {
+            AdmissionTarget::Selected(selector) => {
+                let selector = selector
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("attach requires a session target"))?;
+                client.attach_grant(selector).await
+            }
+            AdmissionTarget::Attached {
+                context_id: Some(context_id),
+                ..
+            } => {
+                client
+                    .attach_context_grant(ContextSelector::ById(context_id))
+                    .await
+            }
+            AdmissionTarget::Attached {
+                session_id,
+                context_id: None,
+            } => client.attach_grant(SessionSelector::ById(session_id)).await,
+        }
+        .map_err(grant_error)?;
+        client.open_attach_stream_info(&grant).await?
+    };
+    Ok((self_client_id, attach_info))
+}
+
+/// The observer grant selector for `target`.
+fn observer_session_selector(
+    target: AdmissionTarget<'_>,
+) -> std::result::Result<
+    bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector,
+    AdmissionError,
+> {
+    use bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector as Selector;
+    Ok(match target {
+        AdmissionTarget::Selected(Some(SessionSelector::ById(id))) => Selector {
+            id: Some(*id),
+            name: None,
+        },
+        AdmissionTarget::Attached { session_id, .. } => Selector {
+            id: Some(session_id),
+            name: None,
+        },
+        AdmissionTarget::Selected(Some(SessionSelector::ByName(name))) => Selector {
+            id: None,
+            name: Some(name.clone()),
+        },
+        AdmissionTarget::Selected(None) => {
+            return Err(anyhow::anyhow!("observer requires session").into());
+        }
+    })
+}
+
+/// The context the followed client `leader_client_id` has selected.
+async fn follow_leader_context(
+    client: &mut BmuxClient,
+    leader_client_id: Uuid,
+) -> std::result::Result<Uuid, AdmissionError> {
+    // Inline follow target resolution using BmuxClient (before streaming upgrade).
+    let clients = typed_list_clients_bmux(client).await?;
+    let leader = clients
+        .into_iter()
+        .find(|entry| entry.id == leader_client_id)
+        .ok_or_else(|| AdmissionError::TargetGone(anyhow::anyhow!("follow target not found")))?;
+    if let Some(context_id) = leader.selected_context_id {
+        return Ok(context_id);
+    }
+    let Some(session_id) = leader.selected_session_id else {
+        return Err(anyhow::anyhow!("follow target has no selected context").into());
+    };
+    let contexts = typed_list_contexts_bmux(client).await?;
+    contexts
+        .into_iter()
+        .find(|ctx| {
+            ctx.attributes
+                .get("bmux.session_id")
+                .is_some_and(|v| v == &session_id.to_string())
+        })
+        .map(|ctx| ctx.id)
+        .ok_or_else(|| anyhow::anyhow!("follow target has no selected context").into())
+}
+
+/// A connection re-admitted to the attachment after a reconnect.
+struct Reattached {
+    client: StreamingBmuxClient,
+    kernel_client_factory: Option<KernelClientFactory>,
+    self_client_id: Uuid,
+    info: bmux_client::AttachOpenInfo,
+}
+
+/// Re-admit the attachment on a new connection and subscribe it to what the
+/// attach loop listens to.
+async fn reattach_attachment(
+    connection: super::reconnect::AttachConnection,
+    admission: AttachAdmission,
+    target: AdmissionTarget<'static>,
+) -> std::result::Result<Reattached, super::reconnect::ReattachFailure> {
+    use super::reconnect::ReattachFailure;
+    let mut client = connection.client;
+    let (self_client_id, info) = match admit_attachment(&mut client, admission, target).await {
+        Ok(admitted) => admitted,
+        Err(AdmissionError::TargetGone(error)) => {
+            tracing::info!(error = %format!("{error:#}"), "attach.reconnect.target_gone");
+            return Err(ReattachFailure::Gone);
+        }
+        Err(AdmissionError::Failed(error)) => return Err(ReattachFailure::Retry(error)),
+    };
+    let subscribed = async {
+        let mut client = StreamingBmuxClient::from_client(client)?;
+        client.subscribe_events().await?;
+        client.enable_event_push().await?;
+        Ok::<_, ClientError>(client)
+    }
+    .await;
+    match subscribed {
+        Ok(client) => Ok(Reattached {
+            client,
+            kernel_client_factory: connection.kernel_client_factory,
+            self_client_id,
+            info,
+        }),
+        Err(error) => Err(ReattachFailure::Retry(map_attach_client_error(error))),
+    }
+}
+
+/// The attach terminal while reconnecting: its keys answer the banner, which
+/// is painted straight over the last frame.
+struct ReconnectBannerHost<'a, T: AttachHost + ?Sized> {
+    terminal: &'a mut T,
+    layouts: Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+}
+
+impl<T: AttachHost + ?Sized> super::reconnect::ReconnectHost for ReconnectBannerHost<'_, T> {
+    fn next_input(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<super::reconnect::ReconnectInput>> + Send + '_>> {
+        use super::reconnect::ReconnectInput;
+        let closed = if self.terminal.presentation_only() {
+            AttachExitReason::Detached
+        } else {
+            AttachExitReason::StreamClosed
+        };
+        let event = self.terminal.next_event();
+        Box::pin(async move {
+            let Some(event) = event.await? else {
+                return Ok(ReconnectInput::Closed(closed));
+            };
+            Ok(match event {
+                AttachHostEvent::Terminal(Event::Key(key)) => {
+                    banner_key(&key).map_or(ReconnectInput::Ignored, ReconnectInput::Key)
+                }
+                AttachHostEvent::Terminal(Event::Resize(..) | Event::FocusGained) => {
+                    ReconnectInput::Repaint
+                }
+                AttachHostEvent::Native(NativeAttachEvent::Close) => {
+                    ReconnectInput::Closed(AttachExitReason::Detached)
+                }
+                _ => ReconnectInput::Ignored,
+            })
+        })
+    }
+
+    fn show(&mut self, banner: &super::connection_banner::ConnectionBanner) -> Result<()> {
+        let geometry = self.terminal.geometry();
+        let row =
+            super::local_presentation::banner_row(&self.layouts, geometry.cols, geometry.rows);
+        if let Some(output) = self.terminal.output() {
+            super::connection_banner::paint(output, banner, row, geometry.cols)?;
+        }
+        Ok(())
+    }
+}
+
+/// The character of a plain key press a banner may answer.
+fn banner_key(key: &KeyEvent) -> Option<char> {
+    let KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    (key.kind != KeyEventKind::Release
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+    .then_some(character)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One existing BMUX reducer, shared by output backends.
 async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
-    kernel_client_factory: Option<KernelClientFactory>,
+    mut kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
     config: Option<BmuxConfig>,
     command_state: Option<crate::runtime::plugin_runtime::RuntimeCommandState>,
     observer: Option<super::observer::AttachObserverPublisher>,
+    reconnect: Option<super::reconnect::AttachReconnect>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -5652,106 +6076,23 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let mut appearance_rx = Some(appearance_rx_raw);
     let mut runtime_appearance = (*initial_appearance).clone();
 
-    if let Some(leader_client_id) = follow_target_id {
-        client
-            .subscribe_events()
-            .await
-            .map_err(map_attach_client_error)?;
-        clients_state::client::current_client(&mut client)
-            .await?
-            .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?;
-        bmux_clients_plugin_api::clients_commands::client::set_following(
-            &mut client,
-            Some(leader_client_id),
-            global,
-        )
-        .await?
-        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
-    }
-
+    let admission = AttachAdmission {
+        follow_target_id,
+        global,
+        observation_only: terminal.observation_only(),
+    };
     tracing::info!("attach.runtime.whoami_start");
-    let self_client_id = clients_state::client::current_client(&mut client)
-        .await?
-        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
-        .id;
+    let target_selector = target.map(parse_session_selector);
+    let (self_client_id, attach_info) = admit_attachment(
+        &mut client,
+        admission,
+        AdmissionTarget::Selected(target_selector.as_ref()),
+    )
+    .await
+    .map_err(AdmissionError::into_error)?;
+    let mut self_client_id = self_client_id;
     crate::runtime::set_logging_client_id(self_client_id.to_string());
     tracing::info!(client_id = %self_client_id, "attach.client_log.initialized");
-
-    let attach_info = if terminal.observation_only() {
-        use bmux_pane_runtime_plugin_api::attach_runtime_commands as commands;
-        anyhow::ensure!(
-            follow_target_id.is_none(),
-            "independent observers cannot follow client identity"
-        );
-        let selector = match parse_session_selector(
-            target.ok_or_else(|| anyhow::anyhow!("observer requires session"))?,
-        ) {
-            SessionSelector::ById(id) => commands::SessionSelector {
-                id: Some(id),
-                name: None,
-            },
-            SessionSelector::ByName(name) => commands::SessionSelector {
-                id: None,
-                name: Some(name),
-            },
-        };
-        let grant = commands::client::observer_grant(&mut client, selector)
-            .await?
-            .map_err(|error| anyhow::anyhow!("observer grant rejected: {error:?}"))?;
-        let ready = commands::client::observer_open(&mut client, grant.session_id, grant.token)
-            .await?
-            .map_err(|error| anyhow::anyhow!("observer open rejected: {error:?}"))?;
-        bmux_client::AttachOpenInfo {
-            context_id: ready.context_id,
-            session_id: ready.session_id,
-            can_write: false,
-        }
-    } else if let Some(leader_client_id) = follow_target_id {
-        // Inline follow target resolution using BmuxClient (before streaming upgrade).
-        let clients = typed_list_clients_bmux(&mut client)
-            .await
-            .map_err(map_attach_client_error)?;
-        let leader = clients
-            .into_iter()
-            .find(|entry| entry.id == leader_client_id)
-            .ok_or_else(|| anyhow::anyhow!("follow target not found"))?;
-        let context_id = if let Some(cid) = leader.selected_context_id {
-            cid
-        } else if let Some(sid) = leader.selected_session_id {
-            let contexts = typed_list_contexts_bmux(&mut client)
-                .await
-                .map_err(map_attach_client_error)?;
-            contexts
-                .into_iter()
-                .find(|ctx| {
-                    ctx.attributes
-                        .get("bmux.session_id")
-                        .is_some_and(|v| v == &sid.to_string())
-                })
-                .map(|ctx| ctx.id)
-                .ok_or_else(|| anyhow::anyhow!("follow target has no selected context"))?
-        } else {
-            anyhow::bail!("follow target has no selected context");
-        };
-        let grant = client
-            .attach_context_grant(ContextSelector::ById(context_id))
-            .await
-            .map_err(map_attach_client_error)?;
-        client
-            .open_attach_stream_info(&grant)
-            .await
-            .map_err(map_attach_client_error)?
-    } else {
-        let target = target.expect("target is present when not follow");
-        let grant = client
-            .attach_grant(parse_session_selector(target))
-            .await
-            .map_err(map_attach_client_error)?;
-        client
-            .open_attach_stream_info(&grant)
-            .await
-            .map_err(map_attach_client_error)?
-    };
 
     terminal.attachment_committed();
     let local_transport = client.is_local_transport();
@@ -6003,6 +6344,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     // per-pane rects at attach entry. Subsequent layout changes flow
     // through the loop-body call to
     // `notify_extensions_of_layout` at the layout-refresh site.
+    // Whether the attachment ended with a connection to tell the server on.
+    let mut connection_alive = true;
     let attach_result = async {
     let initial_layout = view_state.cached_layout_state.clone();
     let _ = notify_extensions_of_layout(
@@ -6147,6 +6490,13 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let mut publication_tick = tokio::time::interval(Duration::from_secs(1));
     publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observer_capture_pending = false;
+    // What was painted straight over the screen while no frame could be
+    // rendered; a rendered frame replaces it.
+    let mut unrendered_paint: Option<UnrenderedPaint> = None;
+    let reconnect_seed = super::reconnect::jitter_seed();
+    // Each pass is one connection to the server: a lost one is reconnected in
+    // place (see `reconnect`) and the attach loop resumes on the new one.
+    'connection: loop {
     'attach_loop: loop {
         if view_state.prompt.discard_cancelled_scoped() {
             view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
@@ -6258,8 +6608,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {
                 let Some(server_event) = event else {
-                    // Event stream closed — server disconnected.
-                    exit_reason = AttachExitReason::StreamClosed;
+                    // The event stream closes only with the connection.
+                    exit_reason = AttachExitReason::ConnectionLost;
                     break;
                 };
                 perf_window.record_wake(AttachWakeSource::Server);
@@ -6315,6 +6665,34 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     };
                     break 'attach_loop;
                 };
+                // A modal connection banner takes the keys: there is nothing
+                // to send them to (see `connection_banner`).
+                if let AttachHostEvent::Terminal(event) = &result
+                    && let Some(banner) = view_state
+                        .link
+                        .banner()
+                        .filter(super::connection_banner::ConnectionBanner::modal)
+                {
+                    match event {
+                        Event::Key(key) => {
+                            match banner_key(key).and_then(|key| banner.action_for(key)) {
+                                Some(super::connection_banner::BannerAction::Retry) => {
+                                    view_state.link.retry_stalled();
+                                }
+                                Some(action) => {
+                                    if let Some(reason) = super::reconnect::banner_exit(action) {
+                                        exit_reason = reason;
+                                        break 'attach_loop;
+                                    }
+                                }
+                                None => {}
+                            }
+                            break 'host_input;
+                        }
+                        Event::Mouse(_) | Event::Paste(_) => break 'host_input,
+                        Event::Resize(..) | Event::FocusGained | Event::FocusLost => {}
+                    }
+                }
                 view_state.pane_zoom.shared_pointer_root = None;
                 let result = match result {
                     AttachHostEvent::Native(NativeAttachEvent::PointerAt { identity, point, event }) => {
@@ -6704,7 +7082,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 Ok(server_event) => server_event,
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    exit_reason = AttachExitReason::StreamClosed;
+                    exit_reason = AttachExitReason::ConnectionLost;
                     burst_requested_exit = true;
                     break;
                 }
@@ -6809,6 +7187,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         super::local_presentation::publish_notification(
             &view_state.presentation_surfaces,
             view_state.transient_status.as_deref(),
+            geometry.cols,
+            geometry.rows,
+        );
+        super::local_presentation::publish_banner(
+            &view_state.presentation_surfaces,
+            view_state.link.banner().as_ref(),
             geometry.cols,
             geometry.rows,
         );
@@ -7026,6 +7410,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         } }
 
         let Some(layout_state) = view_state.cached_layout_state.clone() else {
+            // No frame until the view is rebuilt: say what is happening anyway.
+            paint_without_frame(terminal, &mut view_state, &mut unrendered_paint)?;
             continue;
         };
 
@@ -7054,6 +7440,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 None,
             )?;
             view_state.transient_status_presented(Instant::now());
+            unrendered_paint = None;
             terminal.present_pointer_shape(view_state.pointer_shape)?;
             flush_visual_projection_updates(&mut client, &mut view_state).await;
 
@@ -7330,6 +7717,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             None,
         )?;
         view_state.transient_status_presented(Instant::now());
+        unrendered_paint = None;
         terminal.present_pointer_shape(view_state.pointer_shape)?;
         flush_visual_projection_updates(&mut client, &mut view_state).await;
 
@@ -7367,9 +7755,90 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         )
         .await;
     }
+    // A lost connection is reconnected in place when the attachment knows how.
+    let Some(reconnect) = reconnect.as_ref().filter(|_| exit_reason == AttachExitReason::ConnectionLost) else {
+        break 'connection;
+    };
+    connection_alive = false;
+    // Input held for a barrier the lost connection can no longer settle.
+    if let Some(&generation) = producer_fences.values().next() {
+        producer_fences.clear();
+        if let Err(error) = terminal.resume_private_input(generation) {
+            warn!(%error, "attach.reconnect.resume_input_failed");
+        }
+    }
+    let admission = AttachAdmission {
+        follow_target_id,
+        global,
+        observation_only: view_state.observation_only,
+    };
+    let target = AdmissionTarget::Attached {
+        session_id: view_state.attached_id,
+        context_id: view_state.attached_context_id,
+    };
+    tracing::warn!(session_id = %view_state.attached_id, "attach.reconnect.start");
+    let mut host = ReconnectBannerHost {
+        terminal: &mut *terminal,
+        layouts: view_state.presentation_layouts.clone(),
+    };
+    let reconnected = super::reconnect::reconnect_in_place(
+        &mut host,
+        reconnect.policy(),
+        view_state.link.server_stopping,
+        reconnect_seed,
+        |attempt| {
+            let connect = reconnect.connect(attempt);
+            async move {
+                let connection = connect
+                    .await
+                    .map_err(super::reconnect::ReattachFailure::Retry)?;
+                reattach_attachment(connection, admission, target).await
+            }
+        },
+    )
+    .await;
+    let reattached = match reconnected {
+        Ok(super::reconnect::ReconnectEnd::Reattached(reattached)) => reattached,
+        Ok(super::reconnect::ReconnectEnd::Exit(reason)) => {
+            exit_reason = reason;
+            break 'connection;
+        }
+        Err(error) => return Err(error),
+    };
+    connection_alive = true;
+    client = reattached.client;
+    if let Some(factory) = reattached.kernel_client_factory {
+        kernel_client_factory = Some(factory);
+    }
+    self_client_id = reattached.self_client_id;
+    crate::runtime::set_logging_client_id(self_client_id.to_string());
+    view_state.self_client_id = Some(self_client_id);
+    resume_view_after_reconnect(&mut view_state, reattached.info);
+    terminal.set_attached_session_id(view_state.attached_id);
+    // What this attachment registered with the old connection: registered
+    // again as the loop runs (output push, input barriers), or re-read here.
+    producer_barriers_announced = false;
+    producer_barrier_tick = tokio::time::interval(Duration::from_millis(20));
+    producer_barrier_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    unrendered_paint = None;
+    render_deferred = false;
+    #[cfg(feature = "bundled-plugin-decoration")]
+    if let Ok(scene) = bmux_decoration_plugin_api::decoration_view_v1::client::scene(&mut client).await {
+        bmux_decoration_plugin_renderer::publish_relayed_scene_on(&view_state.presentation_events, scene);
+    }
+    if let Ok(entries) = typed_list_windows_attach(&mut client).await {
+        let snapshot = authoritative_window_list_snapshot(entries, 0);
+        last_window_list_revision = snapshot.revision;
+        view_state.cached_tab_list = Some(std::sync::Arc::new(snapshot.clone()));
+        let _ = view_state
+            .presentation_events
+            .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
+    }
+    refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
+    }
     // ── After 'attach_loop ──
 
-    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
+    if connection_alive && perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         let mut payload = serde_json::json!({
             "attach_runtime_ms": duration_millis_u64(attach_started_at.elapsed()),
             "exit_reason": exit_reason.label(),
@@ -7439,22 +7908,26 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     super::local_presentation::uninstall(&view_state.presentation_surfaces);
     view_state.presentation_surfaces.clear();
     view_state.presentation_layouts.clear();
-    let exit_reason = attach_result
-        .as_ref()
-        .ok()
-        .map(|outcome| outcome.exit_reason);
-    if exit_reason != Some(AttachExitReason::Detached)
-        && exit_reason != Some(AttachExitReason::ConnectionLost)
-    {
-        let _ = client.detach().await;
-    }
-    if follow_target_id.is_some() && exit_reason != Some(AttachExitReason::ConnectionLost) {
-        let _ = bmux_clients_plugin_api::clients_commands::client::set_following(
-            &mut client,
-            None,
-            false,
-        )
-        .await;
+    // Without a connection there is no one to release anything on the server
+    // with; it releases what this client held when the connection dropped.
+    if connection_alive {
+        let exit_reason = attach_result
+            .as_ref()
+            .ok()
+            .map(|outcome| outcome.exit_reason);
+        if exit_reason != Some(AttachExitReason::Detached)
+            && exit_reason != Some(AttachExitReason::ConnectionLost)
+        {
+            let _ = client.detach().await;
+        }
+        if follow_target_id.is_some() && exit_reason != Some(AttachExitReason::ConnectionLost) {
+            let _ = bmux_clients_plugin_api::clients_commands::client::set_following(
+                &mut client,
+                None,
+                false,
+            )
+            .await;
+        }
     }
     display_capture.close_all();
     // Release every activation-bound frontend channel with this attachment.
@@ -7464,15 +7937,18 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     {
         warn!(%error, "attach.frontends.deactivate_failed");
     }
-    if let Some(source) = view_state.committed_source.take() {
+    if let Some(source) = view_state.committed_source.take()
+        && connection_alive
+    {
         source.unregister(&mut client).await;
     }
     // Await the empty retirement barrier after all layout updates, also on error.
-    if let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::close(
-        &mut client,
-        view_state.decoration_lifetime,
-    )
-    .await
+    if connection_alive
+        && let Err(error) = bmux_decoration_plugin_api::decoration_view_v1::client::close(
+            &mut client,
+            view_state.decoration_lifetime,
+        )
+        .await
     {
         tracing::debug!(%error, "closing caller-scoped decoration view");
     }
@@ -7564,6 +8040,16 @@ async fn handle_attach_stream_server_event(
     pane_output_pending: &mut bool,
 ) -> Result<AttachServerEventHandling> {
     let mut image_fetch_requested = false;
+
+    if matches!(server_event, bmux_client::ServerEvent::ServerStopping) {
+        // The connection drops next; reconnecting then must not start a
+        // server again.
+        view_state.link.server_stopping = true;
+        return Ok(AttachServerEventHandling {
+            control: AttachLoopControl::Continue,
+            image_fetch_requested,
+        });
+    }
 
     if let bmux_client::ServerEvent::DeviceSealBrokerRequest {
         request_id,
@@ -8382,6 +8868,101 @@ fn discard_attach_view(view_state: &mut AttachViewState) {
     view_state
         .dirty
         .mark_full_frame(AttachDirtySource::SnapshotHydration);
+}
+
+/// What was painted straight over the screen while no frame could be rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnrenderedPaint {
+    banner: Option<super::connection_banner::ConnectionBanner>,
+    status: Option<String>,
+    geometry: TerminalGeometry,
+}
+
+/// With no layout to render a frame from (the view is being rebuilt), paint
+/// the connection banner and the status message straight over the screen
+/// when they change, so the user still sees what is happening. The next
+/// rendered frame repaints in full.
+fn paint_without_frame<T: AttachHost + ?Sized>(
+    terminal: &mut T,
+    view_state: &mut AttachViewState,
+    painted: &mut Option<UnrenderedPaint>,
+) -> Result<()> {
+    use super::connection_banner::{fit_row, paint, paint_row};
+    let geometry = terminal.geometry();
+    let next = UnrenderedPaint {
+        banner: view_state.link.banner(),
+        status: view_state.transient_status.clone(),
+        geometry,
+    };
+    let unchanged = painted.as_ref().map_or_else(
+        || next.banner.is_none() && next.status.is_none(),
+        |painted| *painted == next,
+    );
+    if unchanged || geometry.rows == 0 {
+        return Ok(());
+    }
+    let banner_row = super::local_presentation::banner_row(
+        &view_state.presentation_layouts,
+        geometry.cols,
+        geometry.rows,
+    );
+    let status_row = geometry.rows - 1;
+    let Some(output) = terminal.output() else {
+        return Ok(());
+    };
+    let blank = fit_row("", geometry.cols);
+    match &next.banner {
+        Some(banner) => paint(output, banner, banner_row, geometry.cols)?,
+        None => paint_row(output, banner_row, &blank, None)?,
+    }
+    if status_row != banner_row {
+        let status = next
+            .status
+            .as_deref()
+            .map_or_else(|| blank.clone(), |status| fit_row(status, geometry.cols));
+        paint_row(output, status_row, &status, None)?;
+    }
+    super::presenter::forget(view_state);
+    *painted = Some(next);
+    Ok(())
+}
+
+/// Point the view at what a reconnected connection attached to, and have the
+/// loop rebuild it from the server: everything the old connection registered
+/// or delivered is gone with it. The last frame stays on screen until the
+/// rehydrated one replaces it in full.
+fn resume_view_after_reconnect(
+    view_state: &mut AttachViewState,
+    info: bmux_client::AttachOpenInfo,
+) {
+    view_state.attached_id = info.session_id;
+    view_state.attached_context_id = info.context_id;
+    view_state.can_write = info.can_write && !view_state.observation_only;
+    view_state.input_suspended = false;
+    view_state.last_attach_view_revision = None;
+    // Registered again (or found unsupported) on the new connection.
+    view_state.output_push = super::state::OutputPush::default();
+    view_state.link = super::state::AttachLinkHealth::default();
+    view_state.link.request_resync();
+    view_state.dirty.layout_needs_refresh = true;
+    view_state
+        .dirty
+        .mark_full_frame(AttachDirtySource::SnapshotHydration);
+    // The screen was painted over while reconnecting.
+    super::presenter::forget(view_state);
+    if view_state.committed_source.take().is_some() {
+        view_state.set_transient_status(
+            "reconnected; committed view publication stopped with the old connection",
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+    } else {
+        view_state.set_transient_status(
+            "reconnected to server",
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
 }
 
 /// Bring the view level with what the server says is attached: after a
@@ -10532,7 +11113,10 @@ fn publish_attach_local_presentation(
 /// connection is not a clean exit, though the attachment stopped cleanly.
 pub const fn attach_exit_status_code(reason: AttachExitReason) -> u8 {
     match reason {
-        AttachExitReason::Detached | AttachExitReason::Quit | AttachExitReason::StreamClosed => 0,
+        AttachExitReason::Detached
+        | AttachExitReason::Quit
+        | AttachExitReason::StreamClosed
+        | AttachExitReason::SessionGone => 0,
         AttachExitReason::ConnectionLost => 1,
     }
 }
@@ -10542,6 +11126,7 @@ pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static st
         AttachExitReason::Detached | AttachExitReason::Quit => None,
         AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
         AttachExitReason::ConnectionLost => Some("attach ended: connection to server lost"),
+        AttachExitReason::SessionGone => Some(super::connection_banner::GONE_MESSAGE),
     }
 }
 
