@@ -101,6 +101,24 @@ async fn resolve_selected_browser_config(
     Ok(configure_browser_host(assets, web_only, settings))
 }
 
+/// Connect the browser view's attachment, and how it reconnects in place to
+/// the same target (as `bmux attach` does).
+async fn connect_browser_view(
+    connection_context: ConnectionContext<'_>,
+) -> Result<(
+    bmux_client::BmuxClient,
+    super::attach::reconnect::AttachReconnect,
+)> {
+    let client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-web-attach",
+        connection_context,
+    )
+    .await?;
+    let reconnect = super::bootstrap::explicit_attach_reconnect(&client);
+    Ok((client, reconnect))
+}
+
 pub(super) async fn run(
     target: Option<&str>,
     follow: Option<&str>,
@@ -125,12 +143,7 @@ pub(super) async fn run(
     let control = host.view_control();
     let resize_control = control.clone();
     let (publisher, mut observer) = start_browser_observer(feed_publisher, control);
-    let client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-web-attach",
-        connection_context,
-    )
-    .await?;
+    let (client, reconnect) = connect_browser_view(connection_context).await?;
     let (driver, viewport) =
         super::attach::headless::headless_attach_channel(super::attach::input::TerminalGeometry {
             cols: 80,
@@ -141,14 +154,27 @@ pub(super) async fn run(
         if web_only {
             Box::pin(
                 super::attach::runtime::run_session_attach_with_client_headless(
-                    client, target, follow, global, None, driver, publisher,
+                    client,
+                    target,
+                    follow,
+                    global,
+                    None,
+                    driver,
+                    publisher,
+                    Some(reconnect),
                 ),
             )
             .await
         } else {
             Box::pin(
                 super::attach::runtime::run_session_attach_with_client_observer(
-                    client, target, follow, global, None, publisher,
+                    client,
+                    target,
+                    follow,
+                    global,
+                    None,
+                    publisher,
+                    Some(reconnect),
                 ),
             )
             .await

@@ -154,7 +154,7 @@ pub(super) async fn run_attach(
 }
 
 /// Reconnect an attachment to the selected runtime's local server.
-fn local_attach_reconnect(
+pub(super) fn local_attach_reconnect(
     config: BmuxConfig,
     paths: ConfigPaths,
 ) -> super::attach::reconnect::AttachReconnect {

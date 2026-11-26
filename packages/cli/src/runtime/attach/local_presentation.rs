@@ -149,6 +149,17 @@ fn publish_row(
     let _ = registry.publish(owner, PluginSurfaceSnapshot { revision, surfaces });
 }
 
+/// Which publication of the attach-local rows `registry` holds: it changes
+/// whenever a row is published or taken down.
+#[must_use]
+pub fn rows_revision(registry: &PluginSurfaceRegistry) -> [Option<u64>; 2] {
+    [OWNER, BANNER_OWNER].map(|owner| {
+        registry
+            .owner_snapshot(owner)
+            .map(|snapshot| snapshot.revision)
+    })
+}
+
 pub fn uninstall(registry: &PluginSurfaceRegistry) {
     registry.remove_owner(OWNER);
     registry.remove_owner(BANNER_OWNER);

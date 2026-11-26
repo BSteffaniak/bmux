@@ -62,6 +62,7 @@ const fn policy(max_attempts: Option<u32>) -> ReconnectPolicy {
         max_attempts,
         backoff: ReconnectBackoff::fixed(Duration::from_millis(100), Duration::from_millis(400)),
         first_delay: None,
+        gone_confirmations: 2,
     }
 }
 
@@ -162,7 +163,7 @@ async fn the_countdown_is_repainted_as_whole_seconds_pass() {
     let policy = ReconnectPolicy {
         max_attempts: None,
         backoff: ReconnectBackoff::fixed(Duration::from_millis(2_500), Duration::from_secs(5)),
-        first_delay: None,
+        ..policy(None)
     };
     let end = reconnect_in_place(&mut host, &policy, false, 0, failing_then_ok(0))
         .await
@@ -259,6 +260,40 @@ async fn a_session_gone_after_reconnecting_ends_with_the_gone_banner() {
     assert_eq!(
         host.shown.last().map(|(_, banner)| banner),
         Some(&ConnectionBanner::Gone)
+    );
+    // Concluded on the second answer in a row, after a backoff.
+    assert_eq!(
+        host.attempts_started(),
+        [
+            (1, Duration::from_millis(100)),
+            (2, Duration::from_millis(300)),
+        ]
+    );
+}
+
+/// A server back before it restored its sessions answers "not found" once;
+/// that alone does not end the attachment.
+#[tokio::test(start_paused = true)]
+async fn one_gone_answer_is_not_proof_the_session_is_gone() {
+    let mut host = ScriptedHost::new([]);
+    let end = reconnect_in_place(&mut host, &policy(None), false, 0, |attempt| {
+        // Gone, refused, gone, then back: a failure between gone answers
+        // starts the count again.
+        std::future::ready(match attempt.number {
+            1 | 3 => Err(ReattachFailure::Gone),
+            2 => Err(ReattachFailure::Retry(anyhow::anyhow!(
+                "connection refused"
+            ))),
+            number => Ok(number),
+        })
+    })
+    .await
+    .unwrap();
+    assert!(matches!(end, ReconnectEnd::Reattached(4)));
+    assert!(
+        host.shown
+            .iter()
+            .all(|(_, banner)| *banner != ConnectionBanner::Gone)
     );
 }
 

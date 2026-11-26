@@ -160,6 +160,10 @@ pub struct ReconnectPolicy {
     /// The other side asked to wait this long before the first attempt
     /// (instead of the first backoff).
     pub first_delay: Option<Duration>,
+    /// How many attempts in a row must find the session gone before the
+    /// attachment ends: a server that has just come back may answer before
+    /// it has restored its sessions, so one answer is not proof.
+    pub gone_confirmations: u32,
 }
 
 impl ReconnectPolicy {
@@ -168,6 +172,7 @@ impl ReconnectPolicy {
         max_attempts: None,
         backoff: ReconnectBackoff::ATTACH,
         first_delay: None,
+        gone_confirmations: 2,
     };
 
     fn delay(&self, attempt: u32, seed: u64) -> Duration {
@@ -370,6 +375,8 @@ where
 {
     let lost_at = Instant::now();
     let mut attempt = 0_u32;
+    // Attempts in a row that found the session gone.
+    let mut gone_answers = 0_u32;
     loop {
         if policy
             .max_attempts
@@ -433,7 +440,16 @@ where
                 return Ok(ReconnectEnd::Reattached(reattached));
             }
             Err(ReattachFailure::Gone) => {
-                tracing::info!(attempt, "attach.reconnect.session_gone");
+                gone_answers = gone_answers.saturating_add(1);
+                if gone_answers < policy.gone_confirmations {
+                    tracing::info!(
+                        attempt,
+                        gone_answers,
+                        "attach.reconnect.session_gone_unconfirmed"
+                    );
+                    continue;
+                }
+                tracing::info!(attempt, gone_answers, "attach.reconnect.session_gone");
                 host.show(&ConnectionBanner::Gone)?;
                 return Ok(ReconnectEnd::Exit(AttachExitReason::SessionGone));
             }
@@ -444,6 +460,7 @@ where
                 return Ok(ReconnectEnd::Exit(AttachExitReason::ConnectionLost));
             }
             Err(ReattachFailure::Retry(error)) => {
+                gone_answers = 0;
                 tracing::info!(attempt, error = %format!("{error:#}"), "attach.reconnect.attempt_failed");
             }
         }

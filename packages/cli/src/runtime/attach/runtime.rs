@@ -993,6 +993,11 @@ pub async fn run_native_with_client(
     config: BmuxConfig,
     mut host: NativeAttachHost,
 ) -> Result<AttachRunOutcome> {
+    // A lost connection reconnects in place to the same runtime's server
+    // (never starting one), when the host named that runtime's paths.
+    let reconnect = host.config_paths.clone().map(|paths| {
+        crate::runtime::attach_selected::local_attach_reconnect(config.clone(), paths)
+    });
     let _config_scope =
         NativeConfigScope(NATIVE_CONFIG_PATHS.with(|slot| slot.replace(host.config_paths.take())));
     let _loader_scope = NativeConfigLoaderScope(
@@ -1027,7 +1032,7 @@ pub async fn run_native_with_client(
         Some(config),
         None,
         observer,
-        None,
+        reconnect,
     ))
     .await
 }
@@ -4431,7 +4436,7 @@ pub fn connector_kernel_client_factory(
 /// it, preparing each new client like the first. A device the host refuses
 /// (revoked, never paired) ends reconnecting at once; otherwise attempts stop
 /// after [`super::reconnect::CONNECTOR_RECONNECT_MAX_ATTEMPTS`].
-fn connector_attach_reconnect(
+pub fn connector_attach_reconnect(
     origin: &bmux_client::TransportOrigin,
     prepare: Option<ReconnectPrepare>,
 ) -> super::reconnect::AttachReconnect {
@@ -4473,6 +4478,7 @@ pub async fn run_session_attach_with_client_headless(
     kernel_client_factory: Option<KernelClientFactory>,
     mut driver: super::headless::HeadlessAttachDriver,
     observer: super::observer::AttachObserverPublisher,
+    reconnect: Option<super::reconnect::AttachReconnect>,
 ) -> Result<AttachRunOutcome> {
     let provider = super::provider::resolve(target)?;
     if driver.observe_only {
@@ -4491,7 +4497,7 @@ pub async fn run_session_attach_with_client_headless(
     let effective_target = session.target.as_deref().or(target);
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
-            Box::pin(run_session_attach_with_terminal_config_observer(
+            Box::pin(run_session_attach_with_terminal_reconnecting(
                 client,
                 effective_target,
                 follow,
@@ -4501,6 +4507,7 @@ pub async fn run_session_attach_with_client_headless(
                 None,
                 None,
                 Some(observer),
+                reconnect,
             ))
             .await
         }
@@ -4519,6 +4526,7 @@ pub async fn run_session_attach_with_client_observer(
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
     observer: super::observer::AttachObserverPublisher,
+    reconnect: Option<super::reconnect::AttachReconnect>,
 ) -> Result<AttachRunOutcome> {
     let provider = super::provider::resolve(target)?;
     let session = provider
@@ -4535,7 +4543,7 @@ pub async fn run_session_attach_with_client_observer(
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
             let mut terminal = RealAttachTerminal::new()?;
-            Box::pin(run_session_attach_with_terminal_config_observer(
+            Box::pin(run_session_attach_with_terminal_reconnecting(
                 client,
                 effective_target,
                 follow,
@@ -4545,6 +4553,7 @@ pub async fn run_session_attach_with_client_observer(
                 None,
                 None,
                 Some(observer),
+                reconnect,
             ))
             .await
         }
@@ -4733,13 +4742,14 @@ impl<T: AttachTerminal> super::reconnect::ReconnectHost for NativeReconnectHost<
         use super::reconnect::ReconnectInput;
         let event = self.0.next_event();
         Box::pin(async move {
-            Ok(match event.await? {
-                None => ReconnectInput::Closed(AttachExitReason::Quit),
-                Some(Event::Key(key)) => {
-                    banner_key(&key).map_or(ReconnectInput::Ignored, ReconnectInput::Key)
-                }
-                Some(Event::Resize(..) | Event::FocusGained) => ReconnectInput::Repaint,
-                Some(_) => ReconnectInput::Ignored,
+            let Some(event) = event.await? else {
+                return Ok(ReconnectInput::Closed(AttachExitReason::Quit));
+            };
+            Ok(match banner_input(&AttachHostEvent::Terminal(event)) {
+                BannerInput::Key(key) => ReconnectInput::Key(key),
+                BannerInput::Repaint => ReconnectInput::Repaint,
+                BannerInput::Close => ReconnectInput::Closed(AttachExitReason::Detached),
+                BannerInput::Drop | BannerInput::Other => ReconnectInput::Ignored,
             })
         })
     }
@@ -5941,10 +5951,14 @@ async fn reattach_attachment(
 }
 
 /// The attach terminal while reconnecting: its keys answer the banner, which
-/// is painted straight over the last frame.
+/// is painted straight over the last frame, or, on a host that only presents
+/// frames (native, headless), shown in a frame by `present`.
 struct ReconnectBannerHost<'a, T: AttachHost + ?Sized> {
     terminal: &'a mut T,
     layouts: Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+    present: &'a mut (
+                dyn FnMut(&mut T, &super::connection_banner::ConnectionBanner) -> Result<()> + Send
+            ),
 }
 
 impl<T: AttachHost + ?Sized> super::reconnect::ReconnectHost for ReconnectBannerHost<'_, T> {
@@ -5962,22 +5976,19 @@ impl<T: AttachHost + ?Sized> super::reconnect::ReconnectHost for ReconnectBanner
             let Some(event) = event.await? else {
                 return Ok(ReconnectInput::Closed(closed));
             };
-            Ok(match event {
-                AttachHostEvent::Terminal(Event::Key(key)) => {
-                    banner_key(&key).map_or(ReconnectInput::Ignored, ReconnectInput::Key)
-                }
-                AttachHostEvent::Terminal(Event::Resize(..) | Event::FocusGained) => {
-                    ReconnectInput::Repaint
-                }
-                AttachHostEvent::Native(NativeAttachEvent::Close) => {
-                    ReconnectInput::Closed(AttachExitReason::Detached)
-                }
-                _ => ReconnectInput::Ignored,
+            Ok(match banner_input(&event) {
+                BannerInput::Key(key) => ReconnectInput::Key(key),
+                BannerInput::Repaint => ReconnectInput::Repaint,
+                BannerInput::Close => ReconnectInput::Closed(AttachExitReason::Detached),
+                BannerInput::Drop | BannerInput::Other => ReconnectInput::Ignored,
             })
         })
     }
 
     fn show(&mut self, banner: &super::connection_banner::ConnectionBanner) -> Result<()> {
+        if self.terminal.presentation_only() {
+            return (self.present)(&mut *self.terminal, banner);
+        }
         let geometry = self.terminal.geometry();
         let row =
             super::local_presentation::banner_row(&self.layouts, geometry.cols, geometry.rows);
@@ -5985,6 +5996,55 @@ impl<T: AttachHost + ?Sized> super::reconnect::ReconnectHost for ReconnectBanner
             super::connection_banner::paint(output, banner, row, geometry.cols)?;
         }
         Ok(())
+    }
+}
+
+/// What a host event means while a modal connection banner shows, for
+/// terminal and native hosts alike: the attach loop and reconnecting both
+/// read keys through this one table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BannerInput {
+    /// A plain key press the banner may answer.
+    Key(char),
+    /// The screen changed size or was uncovered: paint the banner again.
+    Repaint,
+    /// The host closed the view: an explicit detach.
+    Close,
+    /// Input with nothing to send it to: dropped.
+    Drop,
+    /// Not input (presentation bookkeeping): handled as usual.
+    Other,
+}
+
+fn banner_input(event: &AttachHostEvent) -> BannerInput {
+    use bmux_frontend_runtime::input::InputEvent;
+    match event {
+        AttachHostEvent::Terminal(Event::Key(key)) => {
+            banner_key(key).map_or(BannerInput::Drop, BannerInput::Key)
+        }
+        AttachHostEvent::Terminal(Event::Resize(..) | Event::FocusGained)
+        | AttachHostEvent::Native(NativeAttachEvent::Resize { .. }) => BannerInput::Repaint,
+        AttachHostEvent::Native(NativeAttachEvent::Input(InputEvent::Key(key))) => {
+            TerminalKeyEvent::from_native(key)
+                .and_then(|key| key.to_terminal())
+                .as_ref()
+                .and_then(banner_key)
+                .map_or(BannerInput::Drop, BannerInput::Key)
+        }
+        AttachHostEvent::Terminal(Event::Mouse(_) | Event::Paste(_))
+        | AttachHostEvent::Native(
+            NativeAttachEvent::Input(_)
+            | NativeAttachEvent::PointerAt { .. }
+            | NativeAttachEvent::Mouse { .. }
+            | NativeAttachEvent::Motion { .. }
+            | NativeAttachEvent::Scroll { .. }
+            | NativeAttachEvent::PasteFromClipboard
+            | NativeAttachEvent::Accessibility { .. },
+        ) => BannerInput::Drop,
+        AttachHostEvent::Native(NativeAttachEvent::Close) => BannerInput::Close,
+        AttachHostEvent::Terminal(Event::FocusLost) | AttachHostEvent::Native(_) => {
+            BannerInput::Other
+        }
     }
 }
 
@@ -6514,6 +6574,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         // wakes the loop to render once, against what the host then shows.
         let output_backlogged = terminal.output_backlogged();
         let resync_due = view_state.link.resync_due();
+        let status_expires = view_state.transient_status_until;
         let capture_deadline = if observer_capture_pending {
             view_state
                 .observer
@@ -6560,6 +6621,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     source.poll(&mut client, snapshot.as_deref()).await;
                 }
             }
+            // Armed only while a status message shows: take it down when it
+            // expires, not on whatever event comes next.
+            () = async {
+                match status_expires {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             // This timer is armed only for deferred damage, never idle polling.
             () = async {
                 match capture_deadline {
@@ -6667,15 +6736,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 };
                 // A modal connection banner takes the keys: there is nothing
                 // to send them to (see `connection_banner`).
-                if let AttachHostEvent::Terminal(event) = &result
-                    && let Some(banner) = view_state
-                        .link
-                        .banner()
-                        .filter(super::connection_banner::ConnectionBanner::modal)
+                if let Some(banner) = view_state
+                    .link
+                    .banner()
+                    .filter(super::connection_banner::ConnectionBanner::modal)
                 {
-                    match event {
-                        Event::Key(key) => {
-                            match banner_key(key).and_then(|key| banner.action_for(key)) {
+                    match banner_input(&result) {
+                        BannerInput::Key(key) => {
+                            match banner.action_for(key) {
                                 Some(super::connection_banner::BannerAction::Retry) => {
                                     view_state.link.retry_stalled();
                                 }
@@ -6689,8 +6757,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                             }
                             break 'host_input;
                         }
-                        Event::Mouse(_) | Event::Paste(_) => break 'host_input,
-                        Event::Resize(..) | Event::FocusGained | Event::FocusLost => {}
+                        BannerInput::Drop => break 'host_input,
+                        BannerInput::Repaint | BannerInput::Close | BannerInput::Other => {}
                     }
                 }
                 view_state.pane_zoom.shared_pointer_root = None;
@@ -7158,7 +7226,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
 
         // ── Post-event processing: layout, output fetch, render ──────
 
-        let _ = view_state.clear_expired_transient_status(Instant::now());
         let geometry = terminal.geometry();
         view_state.driver_geometry = Some(geometry);
         let selection = bmux_tabs_plugin_api::tabs_local_view::TabSelection {
@@ -7184,18 +7251,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             geometry,
             &runtime_appearance,
         );
-        super::local_presentation::publish_notification(
-            &view_state.presentation_surfaces,
-            view_state.transient_status.as_deref(),
-            geometry.cols,
-            geometry.rows,
-        );
-        super::local_presentation::publish_banner(
-            &view_state.presentation_surfaces,
-            view_state.link.banner().as_ref(),
-            geometry.cols,
-            geometry.rows,
-        );
+        publish_attach_local_rows(&mut view_state, geometry, Instant::now());
 
         let scrollback_config = &attach_config.behavior.scrollback;
         let now = Instant::now();
@@ -7777,14 +7833,48 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         context_id: view_state.attached_context_id,
     };
     tracing::warn!(session_id = %view_state.attached_id, "attach.reconnect.start");
+    let server_stopping = view_state.link.server_stopping;
+    let layouts = view_state.presentation_layouts.clone();
+    // A presentation-only host shows the banner in a frame over the last view.
+    let mut present_banner = |terminal: &mut T, banner: &super::connection_banner::ConnectionBanner| -> Result<()> {
+        let geometry = terminal.geometry();
+        super::local_presentation::publish_banner(
+            &view_state.presentation_surfaces,
+            Some(banner),
+            geometry.cols,
+            geometry.rows,
+        );
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        let Some(layout_state) = view_state.cached_layout_state.clone() else {
+            return Ok(());
+        };
+        let help_scroll = view_state.help_overlay_scroll;
+        render_attach_frame_to_output(
+            terminal.output(),
+            &mut view_state,
+            &layout_state,
+            &runtime_appearance,
+            &attach_help_lines,
+            help_scroll,
+            &attach_config.behavior.damage,
+            attach_config.logs.client.slow_terminal_write_ms,
+            &mut display_capture,
+            geometry,
+            None,
+        )?;
+        Ok(())
+    };
     let mut host = ReconnectBannerHost {
         terminal: &mut *terminal,
-        layouts: view_state.presentation_layouts.clone(),
+        layouts,
+        present: &mut present_banner,
     };
     let reconnected = super::reconnect::reconnect_in_place(
         &mut host,
         reconnect.policy(),
-        view_state.link.server_stopping,
+        server_stopping,
         reconnect_seed,
         |attempt| {
             let connect = reconnect.connect(attempt);
@@ -8868,6 +8958,37 @@ fn discard_attach_view(view_state: &mut AttachViewState) {
     view_state
         .dirty
         .mark_full_frame(AttachDirtySource::SnapshotHydration);
+}
+
+/// Publish the attach-local rows (status message, connection banner) as they
+/// stand at `now`, taking down an expired status message. A row that changed
+/// is reconciled into the frame rendered next, so the content under a row
+/// taken down is repainted with it, not left blank until another change.
+fn publish_attach_local_rows(
+    view_state: &mut AttachViewState,
+    geometry: TerminalGeometry,
+    now: Instant,
+) {
+    let _ = view_state.clear_expired_transient_status(now);
+    let surfaces = &view_state.presentation_surfaces;
+    let before = super::local_presentation::rows_revision(surfaces);
+    super::local_presentation::publish_notification(
+        surfaces,
+        view_state.transient_status.as_deref(),
+        geometry.cols,
+        geometry.rows,
+    );
+    super::local_presentation::publish_banner(
+        surfaces,
+        view_state.link.banner().as_ref(),
+        geometry.cols,
+        geometry.rows,
+    );
+    if super::local_presentation::rows_revision(surfaces) != before {
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+    }
 }
 
 /// What was painted straight over the screen while no frame could be rendered.
@@ -20967,6 +21088,106 @@ mod tests {
             !shown.contains("default/tab-2") && shown.contains("after the prompt"),
             "{shown}"
         );
+    }
+
+    /// An expired status message leaves the pane content under its row, as a
+    /// full repaint would show it, not a blank row.
+    #[test]
+    fn an_expired_status_message_repaints_the_row_under_it() {
+        let panes = [Uuid::new_v4(), Uuid::new_v4()];
+        let open = || {
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                session_id: Uuid::new_v4(),
+                context_id: None,
+                can_write: true,
+            });
+            install_bundled_render_extensions(&mut state);
+            state
+        };
+        let mut drawn = open();
+        let mut presented = open();
+        let layout = presenter_test_layout(&mut drawn, panes);
+        presenter_test_layout(&mut presented, panes);
+        let screen = || {
+            bmux_terminal_grid::TerminalGridStream::new(
+                80,
+                24,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .unwrap()
+        };
+        let mut screens = [screen(), screen()];
+        let lines = (0..40).fold(String::new(), |mut lines, line| {
+            let _ = std::fmt::Write::write_fmt(&mut lines, format_args!("line {line}\r\n"));
+            lines
+        });
+        let ttl = Duration::from_secs(1);
+        let start = Instant::now();
+        for (step, status) in [None, Some("reconnected to server"), None]
+            .into_iter()
+            .enumerate()
+        {
+            drawn.terminal_presenter.forget();
+            screens[0] = screen();
+            for (state, screen) in [&mut drawn, &mut presented].into_iter().zip(&mut screens) {
+                match (step, status) {
+                    (0, _) => {
+                        for pane in panes {
+                            state
+                                .pane_buffers
+                                .get_mut(&pane)
+                                .unwrap()
+                                .terminal_grid
+                                .process(lines.as_bytes());
+                            state
+                                .dirty
+                                .mark_pane_dirty(pane, AttachDirtySource::PaneOutput);
+                        }
+                    }
+                    (_, Some(message)) => {
+                        state.set_transient_status(message, start, ttl);
+                        state.transient_status_presented(start);
+                    }
+                    (_, None) => {}
+                }
+                // The loop's post-event processing (the status expires in
+                // the last step), then the frame. Nothing else marks the
+                // frame dirty: the row's own change must.
+                let now = if step == 2 { start + ttl } else { start };
+                publish_attach_local_rows(state, TerminalGeometry { cols: 80, rows: 24 }, now);
+                assert_eq!(state.transient_status.as_deref(), status);
+                let mut bytes = Vec::new();
+                render_attach_frame_to_writer(
+                    &mut bytes,
+                    state,
+                    &layout,
+                    &RuntimeAppearance::default(),
+                    &[],
+                    0,
+                    &bmux_config::DamageBehaviorConfig::default(),
+                    u64::MAX,
+                    &mut DisplayCaptureFanout::default(),
+                    TerminalGeometry { cols: 80, rows: 24 },
+                    None,
+                )
+                .unwrap();
+                screen.process(&bytes);
+            }
+            let shown = bmux_terminal_grid::visible_text(screens[1].grid(), 0, 24);
+            assert_eq!(
+                shown.contains("reconnected to server"),
+                status.is_some(),
+                "step {step}:\n{shown}"
+            );
+            for row in 0..24 {
+                assert_eq!(
+                    presenter_test_row(&screens[1], row),
+                    presenter_test_row(&screens[0], row),
+                    "step {step}, row {row}: presented\n{shown}\nrepainted\n{}",
+                    bmux_terminal_grid::visible_text(screens[0].grid(), 0, 24),
+                );
+            }
+        }
     }
 
     fn render_observed_test_frame(state: &mut AttachViewState, layout: &AttachLayoutState) {

@@ -1192,7 +1192,7 @@ fn fast_reconnect_policy() -> super::super::reconnect::ReconnectPolicy {
             Duration::from_millis(20),
             Duration::from_millis(40),
         ),
-        first_delay: None,
+        ..super::super::reconnect::ReconnectPolicy::UNTIL_QUIT
     }
 }
 
@@ -1333,10 +1333,12 @@ async fn a_lost_connection_reconnects_in_place_and_rehydrates_the_view() {
 async fn a_session_gone_after_reconnecting_ends_the_attachment_cleanly() {
     let (client, first) = FakeAttachServer::connect(FakeSession::Present).await;
     let second = Arc::new(Mutex::new(None::<FakeAttachServer>));
-    let slots: ServerSlots = Arc::new(Mutex::new(VecDeque::from([Some((
-        FakeSession::Gone,
-        Arc::clone(&second),
-    ))])));
+    let third = Arc::new(Mutex::new(None::<FakeAttachServer>));
+    // Gone on two reconnects in a row: one answer alone is not proof.
+    let slots: ServerSlots = Arc::new(Mutex::new(VecDeque::from([
+        Some((FakeSession::Gone, Arc::clone(&second))),
+        Some((FakeSession::Gone, Arc::clone(&third))),
+    ])));
     let (inner, _handle) = HeadlessAttachTerminal::new(80, 24);
     let restored = Arc::new(AtomicUsize::new(0));
     let mut terminal = CountingTerminal {
@@ -1548,4 +1550,76 @@ async fn a_provider_transport_loss_resumes_and_a_continuity_break_starts_fresh()
         .map(|(resume, _)| resume.is_some())
         .collect();
     assert_eq!(resumes, [true, false]);
+}
+
+/// What the observer's latest frame shows, row by row.
+fn observed_text(observer: &super::super::observer::AttachObserver) -> String {
+    observer.latest().map_or_else(String::new, |snapshot| {
+        let buffer = snapshot.prepared.buffer();
+        (0..24)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// A host that only presents frames (headless, native) shows the
+/// reconnecting banner in a frame, and reconnects in place like a terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_presentation_only_view_reconnects_in_place_with_the_banner_in_a_frame() {
+    let (client, first) = FakeAttachServer::connect(FakeSession::Present).await;
+    let second = Arc::new(Mutex::new(None::<FakeAttachServer>));
+    let slots: ServerSlots = Arc::new(Mutex::new(VecDeque::from([
+        None,
+        Some((FakeSession::Present, Arc::clone(&second))),
+    ])));
+    let (mut driver, viewport) =
+        super::super::headless::headless_attach_channel(TerminalGeometry { cols: 80, rows: 24 })
+            .unwrap();
+    let (publisher, observer) = super::super::observer::attach_observer_channel();
+    let reconnect = scripted_reconnect(Arc::clone(&slots));
+    let attach = tokio::spawn(async move {
+        run_session_attach_with_terminal_reconnecting(
+            client,
+            Some(&FAKE_SESSION.to_string()),
+            None,
+            false,
+            None,
+            &mut driver,
+            Some(BmuxConfig::default()),
+            None,
+            Some(publisher),
+            Some(reconnect),
+        )
+        .await
+    });
+    eventually("the first hydrate", || {
+        first.served("attach-snapshot-state") > 0
+    })
+    .await;
+    first.kill.notify_one();
+    eventually("the reconnecting banner in a frame", || {
+        observed_text(&observer).contains("connection lost")
+    })
+    .await;
+    eventually("the rehydrate on the new connection", || {
+        second
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|server| server.served("attach-snapshot-state") > 0)
+    })
+    .await;
+    eventually("the banner taken down", || {
+        !observed_text(&observer).contains("connection lost")
+    })
+    .await;
+    assert!(!attach.is_finished(), "the attach loop keeps running");
+    viewport.close();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), attach)
+        .await
+        .expect("closing the view ends the attachment")
+        .unwrap()
+        .expect("a clean exit");
+    assert_eq!(outcome.exit_reason, AttachExitReason::Detached);
 }

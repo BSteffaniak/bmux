@@ -232,6 +232,9 @@ where
         None,
         driver,
         publisher,
+        // The parent owns this worker's lifetime: a lost server ends it, and
+        // the parent decides whether to start another.
+        None,
     );
     let (mut reader, mut writer) = tokio::io::split(writer);
     let output = pump(&mut writer, &mut receiver, max_fps);

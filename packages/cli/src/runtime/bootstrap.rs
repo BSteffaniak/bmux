@@ -82,16 +82,9 @@ pub(super) async fn run_default_server_attach(
     let target = target.to_string();
     // A connector-backed client reconnects through its connector.
     let reconnect = selected.is_local().then(default_attach_reconnect);
-    run_session_attach_with_client(
-        client,
-        Some(target.as_str()),
-        None,
-        false,
-        None,
-        reconnect,
-    )
-    .await
-    .map(|outcome| outcome.status_code)
+    run_session_attach_with_client(client, Some(target.as_str()), None, false, None, reconnect)
+        .await
+        .map(|outcome| outcome.status_code)
 }
 
 /// The default local attach reconnects the way it connected: it starts the
@@ -102,16 +95,24 @@ fn default_attach_reconnect() -> super::attach::reconnect::AttachReconnect {
             ensure_server_running_for_default_attach(ConnectionContext::new(Some("local")), None)
                 .await?;
         }
-        Ok(BmuxClient::connect_default("bmux-cli-default-attach-reconnect")
-            .await
-            .map_err(map_client_connect_error)?
-            .into())
+        Ok(
+            BmuxClient::connect_default("bmux-cli-default-attach-reconnect")
+                .await
+                .map_err(map_client_connect_error)?
+                .into(),
+        )
     })
 }
 
-/// An explicit local attach reconnects to the local server without starting
-/// one.
-fn explicit_attach_reconnect() -> super::attach::reconnect::AttachReconnect {
+/// An explicit attach reconnects the way it connected, without starting a
+/// server: a connector-backed client through its connector, any other to the
+/// local server.
+pub(super) fn explicit_attach_reconnect(
+    client: &BmuxClient,
+) -> super::attach::reconnect::AttachReconnect {
+    if let Some(origin) = client.transport_origin() {
+        return super::attach::runtime::connector_attach_reconnect(origin, None);
+    }
     super::attach::reconnect::AttachReconnect::new(move |_| async move {
         Ok(BmuxClient::connect_default("bmux-cli-attach-reconnect")
             .await
@@ -1318,11 +1319,10 @@ pub(super) async fn run_session_attach(
     }
     let client = selected.connect("bmux-cli-attach").await?;
     tracing::info!("attach.bootstrap.explicit_connected");
-    // A connector-backed client reconnects through its connector.
-    let reconnect = selected.is_local().then(explicit_attach_reconnect);
-    run_session_attach_with_client(client, target, follow, global, None, reconnect)
-    .await
-    .map(|outcome| outcome.status_code)
+    let reconnect = explicit_attach_reconnect(&client);
+    run_session_attach_with_client(client, target, follow, global, None, Some(reconnect))
+        .await
+        .map(|outcome| outcome.status_code)
 }
 
 /// A readable attach failure that keeps the client error, so the attach loop

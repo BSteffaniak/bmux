@@ -1008,3 +1008,77 @@ async fn native_text_plugin_capture_has_one_owner_and_never_falls_through_to_pty
     assert!(native_capture_committed_text(&mut view, "blocked"));
     assert_eq!(received.lock().unwrap().len(), 3);
 }
+
+/// A native host's keys answer a modal connection banner exactly as a
+/// terminal's do: one table for both, in the loop and while reconnecting.
+#[test]
+fn native_and_terminal_keys_answer_the_banner_alike() {
+    use bmux_frontend_runtime::input::{
+        InputEvent, KeyEvent as NativeKey, LogicalKey, PhysicalKey,
+    };
+    let native = |character: &str, phase, modifiers| {
+        AttachHostEvent::Native(NativeAttachEvent::Input(InputEvent::Key(NativeKey {
+            physical: PhysicalKey::Unidentified,
+            logical: LogicalKey::Character(character.into()),
+            phase,
+            modifiers,
+            text: Some(character.into()),
+        })))
+    };
+    let terminal = |character, kind, modifiers| {
+        AttachHostEvent::Terminal(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char(character),
+            modifiers,
+            kind,
+        )))
+    };
+    for key in ['q', 'd', 'r'] {
+        let text = key.to_string();
+        assert_eq!(
+            banner_input(&native(&text, KeyPhase::Press, Modifiers::default())),
+            BannerInput::Key(key)
+        );
+        assert_eq!(
+            banner_input(&terminal(key, KeyEventKind::Press, KeyModifiers::NONE)),
+            BannerInput::Key(key)
+        );
+    }
+    // Releases and chords are not banner keys on either host.
+    assert_eq!(
+        banner_input(&native("q", KeyPhase::Release, Modifiers::default())),
+        BannerInput::Drop
+    );
+    assert_eq!(
+        banner_input(&native(
+            "q",
+            KeyPhase::Press,
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            }
+        )),
+        BannerInput::Drop
+    );
+    assert_eq!(
+        banner_input(&terminal('q', KeyEventKind::Press, KeyModifiers::CONTROL)),
+        BannerInput::Drop
+    );
+    assert_eq!(
+        banner_input(&AttachHostEvent::Native(NativeAttachEvent::Close)),
+        BannerInput::Close
+    );
+    assert_eq!(
+        banner_input(&AttachHostEvent::Native(NativeAttachEvent::Resize {
+            columns: 80,
+            rows: 24,
+            viewport_generation: 2,
+        })),
+        BannerInput::Repaint
+    );
+    assert_eq!(
+        banner_input(&AttachHostEvent::Native(
+            NativeAttachEvent::PasteFromClipboard
+        )),
+        BannerInput::Drop
+    );
+}
