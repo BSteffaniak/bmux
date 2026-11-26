@@ -36,7 +36,9 @@ pub enum DeviceMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "type")]
 pub enum HostMessage {
-    Pending { phrase: String },
+    Pending {
+        phrase: String,
+    },
     /// `role` is the role the owner granted (the pairing session's), which
     /// may differ from the one the device asked for.
     Approved {
@@ -44,7 +46,9 @@ pub enum HostMessage {
         host_name: String,
         role: Role,
     },
-    Refused { reason: Refusal },
+    Refused {
+        reason: Refusal,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

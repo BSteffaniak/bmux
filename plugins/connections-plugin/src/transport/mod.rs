@@ -21,6 +21,8 @@ pub mod close {
     pub const REVOKED: u32 = 403;
     /// No pairing session is open.
     pub const NO_PAIRING: u32 = 404;
+    /// The host is at a connection or stream limit; try again later.
+    pub const BUSY: u32 = 429;
     /// Hosting stopped.
     pub const STOPPING: u32 = 503;
     /// Normal close.

@@ -105,10 +105,19 @@ async fn pair_device(
     manager: &Arc<ConnectionManager>,
     approve: bool,
 ) -> anyhow::Result<crate::pairing::client::Paired> {
+    pair_named(fixture, manager, "laptop", approve).await
+}
+
+async fn pair_named(
+    fixture: &Fixture,
+    manager: &Arc<ConnectionManager>,
+    name: &str,
+    approve: bool,
+) -> anyhow::Result<crate::pairing::client::Paired> {
     let opened = blocking(|| {
         fixture
             .host
-            .begin_pairing(Role::Full, Some("laptop".into()), Duration::from_secs(60))
+            .begin_pairing(Role::Full, Some(name.into()), Duration::from_secs(60))
     })
     .unwrap();
     let link = PairingLink::decode(&opened.link).unwrap();
@@ -423,4 +432,83 @@ async fn links_carry_external_addresses_and_the_configured_relay() {
     assert_eq!(link.relay.as_deref(), Some("http://127.0.0.1:9/"));
     assert!(opened.expires_at > crate::trust::now_secs() + 500);
     blocking(|| host.stop()).unwrap();
+}
+
+/// Opens a stream to the host and sends one frame, so the host sees it.
+async fn open_and_send(
+    manager: &ConnectionManager,
+    fixture: &Fixture,
+) -> bmux_ipc::transport::ErasedIpcStream {
+    let (mut stream, _) = manager
+        .open_stream(&route(fixture), Duration::from_secs(10))
+        .await
+        .unwrap();
+    let envelope = bmux_ipc::Envelope::new(1, bmux_ipc::EnvelopeKind::Request, b"x".to_vec());
+    stream.send_envelope(&envelope).await.unwrap();
+    stream
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_streams_are_bounded_per_connection_and_in_total() {
+    use crate::transport::listener::MAX_REMOTE_STREAMS;
+    let mut fixture = hosting();
+    let first = device();
+    let second = device();
+    pair_named(&fixture, &first, "first", true).await.unwrap();
+    pair_named(&fixture, &second, "second", true).await.unwrap();
+
+    // One connection holds at most 32 streams: the 33rd waits for QUIC credit.
+    let mut clients = Vec::new();
+    let mut served = Vec::new();
+    for _ in 0..32 {
+        clients.push(open_and_send(&first, &fixture).await);
+        served.push(
+            tokio::time::timeout(Duration::from_secs(10), fixture.accepted.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let waiting = tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut stream, _) = first
+            .open_stream(&route(&fixture), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let envelope = bmux_ipc::Envelope::new(1, bmux_ipc::EnvelopeKind::Request, b"x".to_vec());
+        stream.send_envelope(&envelope).await
+    })
+    .await;
+    assert!(waiting.is_err(), "a 33rd stream on one connection opened");
+    assert!(fixture.accepted.try_recv().is_err());
+
+    // Every device together holds at most MAX_REMOTE_STREAMS; past it a stream is reset.
+    for _ in 32..MAX_REMOTE_STREAMS {
+        clients.push(open_and_send(&second, &fixture).await);
+        served.push(
+            tokio::time::timeout(Duration::from_secs(10), fixture.accepted.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let mut refused = open_and_send(&second, &fixture).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), refused.recv_envelope())
+            .await
+            .unwrap()
+            .is_err(),
+        "a stream past the total limit was served"
+    );
+    assert!(fixture.accepted.try_recv().is_err());
+
+    // A stream the server finishes frees its share.
+    drop(served.pop());
+    let _admitted = open_and_send(&second, &fixture).await;
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), fixture.accepted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.recv_envelope().await.unwrap().payload, b"x");
+    drop(clients);
+    blocking(|| fixture.host.stop()).unwrap();
 }

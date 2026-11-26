@@ -234,6 +234,7 @@ pub fn refusal(connection: &iroh::endpoint::Connection) -> Option<String> {
         ),
         close::REVOKED => Some("this device's access was revoked on the host".to_owned()),
         close::STOPPING => Some("the host stopped remote access".to_owned()),
+        close::BUSY => Some("the host is at its connection limit; try again shortly".to_owned()),
         close::NO_PAIRING => Some(
             "the host has no pairing open; run `bmux remote pair` on the host and use the new link"
                 .to_owned(),
