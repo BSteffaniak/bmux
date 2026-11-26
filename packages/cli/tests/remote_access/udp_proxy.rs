@@ -16,6 +16,7 @@ struct Shared {
     stop: AtomicBool,
     blackhole: AtomicBool,
     forwarded: AtomicU64,
+    forwarded_bytes: AtomicU64,
     dropped: AtomicU64,
 }
 
@@ -69,6 +70,9 @@ impl UdpProxy {
                     };
                     if upstream.send(&buffer[..len]).is_ok() {
                         shared.forwarded.fetch_add(1, Ordering::SeqCst);
+                        shared
+                            .forwarded_bytes
+                            .fetch_add(len as u64, Ordering::SeqCst);
                     }
                 }
                 for reply in replies.lock().expect("reply threads").drain(..) {
@@ -98,6 +102,12 @@ impl UdpProxy {
     #[must_use]
     pub fn forwarded(&self) -> u64 {
         self.shared.forwarded.load(Ordering::SeqCst)
+    }
+
+    /// Datagram payload bytes forwarded in either direction so far.
+    #[must_use]
+    pub fn forwarded_bytes(&self) -> u64 {
+        self.shared.forwarded_bytes.load(Ordering::SeqCst)
     }
 
     /// Datagrams dropped while blackholed.
@@ -148,6 +158,9 @@ fn spawn_reply(
             }
             if front.send_to(&buffer[..len], source).is_ok() {
                 shared.forwarded.fetch_add(1, Ordering::SeqCst);
+                shared
+                    .forwarded_bytes
+                    .fetch_add(len as u64, Ordering::SeqCst);
             }
         }
     })

@@ -32,8 +32,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use harness::{
-    COLS, Client, Host, PREFIX, PREFIX_KEYMAP, QUIET, RemoteSettings, Role, STEP, Term,
-    lines_with, marker, pair, pair_only, reserve_udp_port,
+    COLS, Client, Host, PREFIX, PREFIX_KEYMAP, QUIET, RemoteSettings, Role, STEP, Term, lines_with,
+    marker, pair, pair_only, reserve_udp_port,
 };
 use probe::{Dial, PAIR_ALPN, Peer, SESSION_ALPN, assert_refused};
 use relay::LocalRelay;
@@ -1141,4 +1141,161 @@ fn local_split_reaches_every_attach_of_the_tab() {
     prefixed(&mut second, b"%");
     second.wait_screen("a vertical split", STEP, two_pane_border);
     first.wait_screen("the other attach's split", STEP, two_pane_border);
+}
+
+// ---------------------------------------------------------------------------------------
+// Performance budgets (docs/development/remote-access-architecture.md, "Budgets").
+// ---------------------------------------------------------------------------------------
+
+/// Pairing (dial + proof, then approval), attach over the paired connection, and keystroke
+/// to echo, each timed apart from process and server startup. The thresholds are generous
+/// ceilings for slow, loaded CI machines, not targets: they catch a regression of an order
+/// of magnitude (a poll interval, a retry loop, a per-key round trip) without flaking.
+/// Run with `--no-capture` to see the measurements.
+#[test]
+fn budget_pairing_attach_and_keystroke_round_trip() {
+    const PAIR_BUDGET: Duration = Duration::from_secs(10);
+    const ATTACH_BUDGET: Duration = Duration::from_secs(15);
+    const KEY_MEDIAN_BUDGET: Duration = Duration::from_millis(1_000);
+    const KEY_MAX_BUDGET: Duration = Duration::from_secs(5);
+    const IDLE_WINDOW: Duration = Duration::from_secs(10);
+    const BULK_LINES: u64 = 400_000;
+    const IDLE_PACKETS_BUDGET: u64 = 150;
+    const IDLE_BYTES_BUDGET: u64 = 30_000;
+
+    // As in gate 4: the host binds IPv4 and the client IPv6, so the proxy, which counts
+    // what crosses the wire, is the only path.
+    let host_port = reserve_udp_port();
+    let proxy = UdpProxy::start(
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+        SocketAddr::from(([127, 0, 0, 1], host_port)),
+    );
+    let mut settings = RemoteSettings::loopback_host(host_port);
+    settings.external_addrs = vec![proxy.addr()];
+    let host = Host::start("budget-h", settings);
+    host.new_session("work");
+    let mut owner_view = host.attach("work");
+    owner_view.wait_attached();
+    let client = Client::new(
+        "budget-c",
+        &RemoteSettings {
+            bind_addr: Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))),
+            ..RemoteSettings::default()
+        },
+    );
+
+    // Both commands are up (excluded); the clock starts when the link is pasted.
+    let mut owner = host.terminal(
+        "host-pair",
+        &["remote", "pair", "--role", "full", "--name", DEVICE],
+    );
+    let link = owner.expect("Pairing link: (bmux-pair:[^ \\t\\r\\n\\x1b]+)", STEP)[1].clone();
+    let mut viewer = client.terminal(
+        "client-pair",
+        &[
+            "connect",
+            "--pair",
+            "--name",
+            ALIAS,
+            "--device-name",
+            DEVICE,
+        ],
+    );
+    viewer.expect("Pairing link \\(input hidden\\): ", STEP);
+    let pasted = Instant::now();
+    viewer.send(format!("{link}\r").as_bytes());
+    viewer.expect(&format!("Verify on the host: {}", harness::PHRASE), STEP);
+    let proof = pasted.elapsed();
+    owner.expect("\\[y/N\\]", STEP);
+    let approved = Instant::now();
+    owner.send(b"y\r");
+    viewer.expect(&format!("Paired\\. Saved host: {ALIAS}"), STEP);
+    let approval = approved.elapsed();
+    let saved = Instant::now();
+    viewer.wait_attached();
+    let attach = saved.elapsed();
+
+    let local = keystroke_echo_times(&mut owner_view, "LOCAL");
+    let remote = keystroke_echo_times(&mut viewer, "REMOTE");
+    let median = |samples: &[Duration]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort();
+        sorted[sorted.len() / 2]
+    };
+    let (local_median, remote_median) = (median(&local), median(&remote));
+    let remote_max = remote.iter().max().copied().unwrap_or_default();
+
+    // Idle: only QUIC keepalives and path probes cross the wire, never bmux frames.
+    std::thread::sleep(Duration::from_secs(2));
+    let (packets, bytes) = (proxy.forwarded(), proxy.forwarded_bytes());
+    viewer.assert_never_shows("nothing", IDLE_WINDOW);
+    let idle_packets = proxy.forwarded() - packets;
+    let idle_bytes = proxy.forwarded_bytes() - bytes;
+
+    // Output volume: a few MiB printed costs the frames the viewer is shown, not the bytes.
+    let done = marker("bulk-done");
+    let bytes = proxy.forwarded_bytes();
+    owner_view.send(
+        format!(
+            "seq 1 {BULK_LINES}; {}",
+            String::from_utf8(harness::printf_line(&done)).unwrap()
+        )
+        .as_bytes(),
+    );
+    viewer.wait_text(&done, STEP);
+    let bulk_bytes = proxy.forwarded_bytes() - bytes;
+    let output_bytes: u64 = (1..=BULK_LINES)
+        .map(|n: u64| n.to_string().len() as u64 + 1)
+        .sum();
+
+    eprintln!(
+        "remote-access budgets: pair proof {proof:?}, approval {approval:?}, attach {attach:?}, \
+         keystroke echo median local {local_median:?} remote {remote_median:?} (max {remote_max:?}), \
+         idle {idle_packets} datagrams / {idle_bytes} bytes in {IDLE_WINDOW:?}, \
+         bulk output {output_bytes} bytes cost {bulk_bytes} wire bytes"
+    );
+    assert!(proof <= PAIR_BUDGET, "dial and proof took {proof:?}");
+    assert!(approval <= PAIR_BUDGET, "approval took {approval:?}");
+    assert!(attach <= ATTACH_BUDGET, "attach took {attach:?}");
+    assert!(
+        remote_median <= KEY_MEDIAN_BUDGET,
+        "remote keystroke echo median {remote_median:?} (local {local_median:?})"
+    );
+    assert!(
+        remote_max <= KEY_MAX_BUDGET,
+        "slowest remote keystroke echo {remote_max:?}"
+    );
+    // Measured about 5 datagrams (under 400 bytes) a second: QUIC keepalives and path
+    // probes. Anything bmux pushed while idle would add frames on top.
+    assert!(
+        idle_packets <= IDLE_PACKETS_BUDGET && idle_bytes <= IDLE_BYTES_BUDGET,
+        "idle viewer: {idle_packets} datagrams, {idle_bytes} bytes in {IDLE_WINDOW:?}"
+    );
+    // Measured about a quarter of the output volume; streaming every output byte would
+    // cost at least the volume itself.
+    assert!(
+        bulk_bytes < output_bytes,
+        "printing {output_bytes} bytes cost {bulk_bytes} bytes on the wire"
+    );
+}
+
+/// Types a unique marker at the shell prompt one key at a time and returns how long each
+/// key took to show on `term`'s screen, then clears the line.
+fn keystroke_echo_times(term: &mut Term, label: &str) -> Vec<Duration> {
+    let typed = marker(label);
+    // A unique prefix first, so every later check matches only this run's keys.
+    let (prefix, rest) = typed.split_at(label.len() + 1);
+    term.send(prefix.as_bytes());
+    term.wait_text(prefix, STEP);
+    let mut shown = prefix.to_owned();
+    let mut samples = Vec::new();
+    for key in rest.chars() {
+        shown.push(key);
+        let sent = Instant::now();
+        term.send(key.to_string().as_bytes());
+        term.wait_text(&shown, STEP);
+        samples.push(sent.elapsed());
+    }
+    term.send(b"\x15"); // ctrl+u: clear the line
+    samples
 }

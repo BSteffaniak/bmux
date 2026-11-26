@@ -43,7 +43,7 @@ passthrough = true
 "#;
 
 /// The phrase both sides show: four groups of four lowercase hex digits.
-const PHRASE: &str = "([0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4})";
+pub const PHRASE: &str = "([0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4})";
 
 fn regex(pattern: &str) -> Regex {
     // The workspace builds `regex` without Unicode classes; patterns here are ASCII only.
