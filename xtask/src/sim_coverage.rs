@@ -34,6 +34,8 @@ pub fn check(cargo: &std::ffi::OsStr, simulation: &Path, name: &str, args: &[Str
     let status = Command::new(cargo)
         .current_dir(simulation)
         .env("CARGO_TARGET_DIR", &target)
+        // Instrumented build scripts write profiles too: here, not in the packages' directories.
+        .env("LLVM_PROFILE_FILE", target.join("build-profiles").join("%p-%m.profraw"))
         // Joined with simulation/.cargo/config.toml's flags.
         .args(["build", "--release", "--config", r#"build.rustflags=["-C", "instrument-coverage"]"#])
         .args(["--package", name])
