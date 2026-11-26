@@ -40,6 +40,7 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_config::{BmuxConfig, ConfigPaths};
+pub use bmux_ipc::ErrorClass;
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{
     ErasedIpcStream, ErasedIpcStreamReader, ErasedIpcStreamWriter, IpcStreamReader,
@@ -52,7 +53,10 @@ use bmux_ipc::{
     encode,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
-use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
+use bmux_plugin_sdk::{
+    TransportFailure as TypedTransportFailure, TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
+    TypedServiceClientError,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -166,6 +170,110 @@ pub enum ClientError {
     },
     #[error("invalid principal id in {path}: {value}")]
     PrincipalIdParse { path: String, value: String },
+    /// A typed request or response did not have the shape both peers agree
+    /// on (encoding, decoding, response kind).
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    /// A typed request failed on this side, or for a reason its transport
+    /// could not classify.
+    #[error("{0}")]
+    Local(String),
+}
+
+impl ClientError {
+    /// The generic class of this error: whether the request may be retried
+    /// on the same connection, the connection is gone, the server rejected
+    /// the request, or the peers disagree about the protocol.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::Timeout(_) => ErrorClass::Transient,
+            Self::ServerError { code, .. } => code.class(),
+            // Every transport I/O failure means the connection is unusable,
+            // not only an unexpected EOF.
+            Self::Transport(IpcTransportError::Io(_)) => ErrorClass::ConnectionLost,
+            Self::Transport(
+                IpcTransportError::FrameEncode(_) | IpcTransportError::FrameDecode(_),
+            )
+            | Self::Serialization(_)
+            | Self::RequestIdMismatch { .. }
+            | Self::UnexpectedEnvelopeKind { .. }
+            | Self::UnexpectedResponse(_)
+            | Self::ProtocolIncompatible { .. }
+            | Self::Protocol(_) => ErrorClass::Protocol,
+            Self::Transport(IpcTransportError::UnsupportedEndpoint)
+            | Self::ConfigLoad(_)
+            | Self::PrincipalIdRead { .. }
+            | Self::PrincipalIdWrite { .. }
+            | Self::PrincipalIdParse { .. }
+            | Self::Local(_) => ErrorClass::Local,
+        }
+    }
+
+    /// Turn a failed typed service call back into the client error of the
+    /// same kind, so callers see a timeout as [`Self::Timeout`], a lost
+    /// connection as [`Self::Transport`] I/O, and a server rejection as
+    /// [`Self::ServerError`] with the server's code. `context` (usually the
+    /// operation name) prefixes the message where the variant has one.
+    #[must_use]
+    pub fn from_typed_service_error(context: &str, error: &TypedServiceClientError) -> Self {
+        match error {
+            TypedServiceClientError::Dispatch(error) => {
+                Self::from_typed_dispatch_error(context, error)
+            }
+            error @ TypedServiceClientError::Encode { .. } => {
+                Self::Local(format!("{context}: {error}"))
+            }
+            error @ TypedServiceClientError::Decode { .. } => {
+                Self::Protocol(format!("{context}: {error}"))
+            }
+        }
+    }
+
+    /// See [`Self::from_typed_service_error`].
+    #[must_use]
+    pub fn from_typed_dispatch_error(context: &str, error: &TypedDispatchClientError) -> Self {
+        let message = || format!("{context} typed dispatch failed: {error}");
+        match error {
+            TypedDispatchClientError::Transport { failure, .. } => match *failure {
+                TypedTransportFailure::Timeout { after } => Self::Timeout(after.unwrap_or_default()),
+                TypedTransportFailure::ConnectionLost(kind) => {
+                    Self::Transport(IpcTransportError::Io(std::io::Error::new(kind, message())))
+                }
+                TypedTransportFailure::Unavailable => Self::ServerError {
+                    code: ErrorCode::Unavailable,
+                    message: message(),
+                },
+                TypedTransportFailure::Protocol => Self::Protocol(message()),
+                TypedTransportFailure::Other => Self::Local(message()),
+            },
+            TypedDispatchClientError::Server { code, .. } => Self::ServerError {
+                code: *code,
+                message: message(),
+            },
+            TypedDispatchClientError::UnexpectedResponse { .. } => Self::Protocol(message()),
+        }
+    }
+
+    /// How a typed-dispatch transport reports this failure; server
+    /// rejections are reported as `Server`, never through this.
+    fn typed_transport_failure(&self) -> TypedTransportFailure {
+        match self {
+            Self::Timeout(after) => TypedTransportFailure::Timeout {
+                after: Some(*after),
+            },
+            Self::Transport(IpcTransportError::Io(error)) => {
+                TypedTransportFailure::ConnectionLost(error.kind())
+            }
+            other => match other.class() {
+                ErrorClass::Protocol => TypedTransportFailure::Protocol,
+                ErrorClass::Transient
+                | ErrorClass::ConnectionLost
+                | ErrorClass::Rejected
+                | ErrorClass::Local => TypedTransportFailure::Other,
+            },
+        }
+    }
 }
 
 /// Main client API for communicating with bmux server.
@@ -770,13 +878,21 @@ fn map_client_error(
     err: ClientError,
 ) -> TypedDispatchClientError {
     match err {
-        ClientError::ServerError { code, message } => {
-            TypedDispatchClientError::server(interface, operation, format!("{code:?}: {message}"))
-        }
+        ClientError::ServerError { code, message } => TypedDispatchClientError::server_code(
+            interface,
+            operation,
+            code,
+            format!("{code:?}: {message}"),
+        ),
         ClientError::UnexpectedResponse(details) => {
             TypedDispatchClientError::unexpected_response(interface, operation, details)
         }
-        other => TypedDispatchClientError::transport(interface, operation, other.to_string()),
+        other => TypedDispatchClientError::transport_failure(
+            interface,
+            operation,
+            other.typed_transport_failure(),
+            other.to_string(),
+        ),
     }
 }
 
@@ -1677,9 +1793,10 @@ impl TypedDispatchClient for StreamingBmuxClient {
                 .map_err(|err| map_client_error(&iface_for_err, &op_for_err, err))?
             {
                 Response::Ok(ResponsePayload::ServiceInvoked { payload }) => Ok(payload),
-                Response::Err(error) => Err(TypedDispatchClientError::server(
+                Response::Err(error) => Err(TypedDispatchClientError::server_code(
                     iface_for_err,
                     op_for_err,
+                    error.code,
                     format!("{:?}: {}", error.code, error.message),
                 )),
                 Response::Ok(_) => Err(TypedDispatchClientError::unexpected_response(
@@ -1959,6 +2076,174 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    mod error_class {
+        use super::super::{
+            ClientError, ErrorClass, ErrorCode, IpcTransportError, TypedTransportFailure,
+            TypedDispatchClientError, TypedServiceClientError, map_client_error,
+        };
+        use std::io::ErrorKind;
+        use std::time::Duration;
+
+        fn io(kind: ErrorKind) -> ClientError {
+            ClientError::Transport(IpcTransportError::Io(std::io::Error::new(kind, "x")))
+        }
+
+        #[test]
+        fn client_errors_classify_by_kind() {
+            assert_eq!(
+                ClientError::Timeout(Duration::from_secs(5)).class(),
+                ErrorClass::Transient
+            );
+            for kind in [
+                ErrorKind::UnexpectedEof,
+                ErrorKind::ConnectionReset,
+                ErrorKind::BrokenPipe,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::Other,
+            ] {
+                assert_eq!(io(kind).class(), ErrorClass::ConnectionLost, "{kind:?}");
+            }
+            for (code, class) in [
+                (ErrorCode::Timeout, ErrorClass::Transient),
+                (ErrorCode::Unavailable, ErrorClass::Transient),
+                (ErrorCode::NotFound, ErrorClass::Rejected),
+                (ErrorCode::Internal, ErrorClass::Rejected),
+                (ErrorCode::ServiceIncompatible, ErrorClass::Rejected),
+            ] {
+                let error = ClientError::ServerError {
+                    code,
+                    message: String::new(),
+                };
+                assert_eq!(error.class(), class, "{code:?}");
+            }
+            assert_eq!(
+                ClientError::UnexpectedResponse("x").class(),
+                ErrorClass::Protocol
+            );
+            assert_eq!(
+                ClientError::RequestIdMismatch {
+                    expected: 1,
+                    actual: 2
+                }
+                .class(),
+                ErrorClass::Protocol
+            );
+            assert_eq!(
+                ClientError::Transport(IpcTransportError::UnsupportedEndpoint).class(),
+                ErrorClass::Local
+            );
+            assert_eq!(
+                ClientError::PrincipalIdParse {
+                    path: "p".into(),
+                    value: "v".into()
+                }
+                .class(),
+                ErrorClass::Local
+            );
+        }
+
+        /// A client error survives the trip through a typed service call:
+        /// out through `map_client_error`, back through `from_typed_*`.
+        fn round_trip(error: ClientError) -> ClientError {
+            ClientError::from_typed_service_error(
+                "some-op",
+                &TypedServiceClientError::Dispatch(map_client_error("iface", "op", error)),
+            )
+        }
+
+        #[test]
+        fn typed_round_trip_keeps_timeout() {
+            let error = round_trip(ClientError::Timeout(Duration::from_secs(5)));
+            assert!(
+                matches!(error, ClientError::Timeout(after) if after == Duration::from_secs(5)),
+                "{error:?}"
+            );
+        }
+
+        #[test]
+        fn typed_round_trip_keeps_lost_connection_kind_and_context() {
+            let error = round_trip(io(ErrorKind::ConnectionReset));
+            let ClientError::Transport(IpcTransportError::Io(io_error)) = &error else {
+                panic!("expected transport I/O, got {error:?}");
+            };
+            assert_eq!(io_error.kind(), ErrorKind::ConnectionReset);
+            assert!(error.to_string().contains("some-op"), "{error}");
+            assert_eq!(error.class(), ErrorClass::ConnectionLost);
+        }
+
+        #[test]
+        fn typed_round_trip_keeps_server_code_and_message() {
+            let error = round_trip(ClientError::ServerError {
+                code: ErrorCode::NotFound,
+                message: "gone".into(),
+            });
+            let ClientError::ServerError { code, message } = &error else {
+                panic!("expected server error, got {error:?}");
+            };
+            assert_eq!(*code, ErrorCode::NotFound);
+            assert!(
+                message.contains("some-op typed dispatch failed"),
+                "{message}"
+            );
+            assert!(message.contains("gone"), "{message}");
+        }
+
+        #[test]
+        fn typed_round_trip_keeps_protocol_and_local_classes() {
+            assert_eq!(
+                round_trip(ClientError::UnexpectedResponse("expected service invoked")).class(),
+                ErrorClass::Protocol
+            );
+            assert_eq!(
+                round_trip(ClientError::RequestIdMismatch {
+                    expected: 1,
+                    actual: 2
+                })
+                .class(),
+                ErrorClass::Protocol
+            );
+            assert_eq!(
+                round_trip(ClientError::Transport(
+                    IpcTransportError::UnsupportedEndpoint
+                ))
+                .class(),
+                ErrorClass::Local
+            );
+            assert_eq!(
+                ClientError::from_typed_service_error(
+                    "op",
+                    &TypedServiceClientError::Decode {
+                        op: "op".into(),
+                        details: "bad".into()
+                    }
+                )
+                .class(),
+                ErrorClass::Protocol
+            );
+        }
+
+        #[test]
+        fn host_unavailable_becomes_transient_server_error() {
+            let error = ClientError::from_typed_dispatch_error(
+                "op",
+                &TypedDispatchClientError::transport_failure(
+                    "iface",
+                    "op",
+                    TypedTransportFailure::Unavailable,
+                    "full",
+                ),
+            );
+            assert!(matches!(
+                error,
+                ClientError::ServerError {
+                    code: ErrorCode::Unavailable,
+                    ..
+                }
+            ));
+            assert_eq!(error.class(), ErrorClass::Transient);
+        }
+    }
 
     #[test]
     fn checked_guard_rejects_raw_and_pipeline_bypass() {

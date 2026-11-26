@@ -386,15 +386,17 @@ impl std::fmt::Display for ServiceCompatibilityError {
 impl std::error::Error for ServiceCompatibilityError {}
 
 fn service_invocation_error_code(error: &anyhow::Error) -> ErrorCode {
-    if error.downcast_ref::<ServiceCompatibilityError>().is_some()
-        || matches!(
-            error.downcast_ref::<bmux_plugin_sdk::PluginError>(),
-            Some(bmux_plugin_sdk::PluginError::ServiceProtocol { .. })
-        )
-    {
-        ErrorCode::ServiceIncompatible
-    } else {
-        ErrorCode::Internal
+    if error.downcast_ref::<ServiceCompatibilityError>().is_some() {
+        return ErrorCode::ServiceIncompatible;
+    }
+    match error.downcast_ref::<bmux_plugin_sdk::PluginError>() {
+        Some(bmux_plugin_sdk::PluginError::ServiceProtocol { .. }) => {
+            ErrorCode::ServiceIncompatible
+        }
+        // The host gave up waiting; the request itself was not wrong.
+        Some(bmux_plugin_sdk::PluginError::HostTimeout { .. }) => ErrorCode::Timeout,
+        Some(bmux_plugin_sdk::PluginError::HostUnavailable { .. }) => ErrorCode::Unavailable,
+        _ => ErrorCode::Internal,
     }
 }
 
@@ -3342,7 +3344,7 @@ async fn handle_connection(
         };
         if !supports_service_contract_v2
             && let Response::Err(error) = &mut response
-            && matches!(error.code, ErrorCode::UnsupportedRepresentation | ErrorCode::ServiceIncompatible)
+            && error.code.requires_service_contract_v2()
         {
             error.code = ErrorCode::Internal;
         }
@@ -5469,6 +5471,28 @@ mod tests {
             service_invocation_error_code(&unrelated),
             ErrorCode::Internal
         );
+    }
+
+    #[test]
+    fn host_waits_that_give_up_are_transient_not_internal() {
+        let timed_out = anyhow::Error::new(bmux_plugin_sdk::PluginError::HostTimeout {
+            details: "slot wait".into(),
+        })
+        .context("native provider invocation");
+        assert_eq!(
+            service_invocation_error_code(&timed_out),
+            ErrorCode::Timeout
+        );
+        let unavailable = anyhow::Error::new(bmux_plugin_sdk::PluginError::HostUnavailable {
+            details: "executor gone".into(),
+        });
+        assert_eq!(
+            service_invocation_error_code(&unavailable),
+            ErrorCode::Unavailable
+        );
+        // A timeout message alone is not a classification.
+        let text = anyhow::anyhow!("timed out waiting");
+        assert_eq!(service_invocation_error_code(&text), ErrorCode::Internal);
     }
 
     #[tokio::test]

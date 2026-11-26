@@ -857,7 +857,7 @@ impl HostCallbackExecutor {
         job: SelectedRequestJob,
         wait: std::time::Duration,
     ) -> bmux_plugin_sdk::Result<()> {
-        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        let unavailable = |details| bmux_plugin_sdk::PluginError::HostUnavailable { details };
         let nested = holds_host_slot();
         let permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -870,15 +870,15 @@ impl HostCallbackExecutor {
                     .spawn(async move { tokio::time::timeout(wait, slots.acquire_owned()).await })
                     .await
                     .map_err(|_| {
-                        protocol(
+                        unavailable(
                             "host callback executor unavailable; callback not dispatched".into(),
                         )
                     })?
-                    .map_err(|_| {
-                        protocol("host callback executor saturated; callback not dispatched".into())
+                    .map_err(|_| bmux_plugin_sdk::PluginError::HostTimeout {
+                        details: "host callback executor saturated; callback not dispatched".into(),
                     })?
                     .map_err(|_| {
-                        protocol(
+                        unavailable(
                             "host callback executor unavailable; callback not dispatched".into(),
                         )
                     })?
@@ -890,7 +890,7 @@ impl HostCallbackExecutor {
                 job();
             }))
             .map_err(|_| {
-                protocol("host callback executor unavailable; callback not dispatched".into())
+                unavailable("host callback executor unavailable; callback not dispatched".into())
             })
     }
 
@@ -1133,6 +1133,10 @@ impl AuthenticatedServiceInvocation {
         invocation: Option<&bmux_plugin_runtime::InvocationScope>,
     ) -> bmux_plugin_sdk::Result<Vec<u8>> {
         let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        // The host giving up (no slot, no worker, no reply in time) is not a
+        // fault in the request; type it so callers can classify it.
+        let timed_out = |details| bmux_plugin_sdk::PluginError::HostTimeout { details };
+        let unavailable = |details| bmux_plugin_sdk::PluginError::HostUnavailable { details };
         if request.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
             return Err(protocol("authenticated request exceeds bound".into()));
         }
@@ -1163,7 +1167,7 @@ impl AuthenticatedServiceInvocation {
                     take()
                 };
                 Some(permit.ok_or_else(|| {
-                    protocol("selected host executor saturated; request not dispatched".into())
+                    timed_out("selected host executor saturated; request not dispatched".into())
                 })?)
             }
         };
@@ -1213,11 +1217,11 @@ impl AuthenticatedServiceInvocation {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(job)) => {
                 executor.sender.send(job).map_err(|_| {
-                    protocol("selected host executor unavailable; request not dispatched".into())
+                    unavailable("selected host executor unavailable; request not dispatched".into())
                 })?;
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                return Err(protocol(
+                return Err(unavailable(
                     "selected host executor unavailable; request not dispatched".into(),
                 ));
             }
@@ -1226,7 +1230,7 @@ impl AuthenticatedServiceInvocation {
             receiver
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .map_err(|_| {
-                    protocol(
+                    timed_out(
                         "selected host response unconfirmed; outcome unknown, do not replay".into(),
                     )
                 })?
@@ -1288,9 +1292,11 @@ impl AuthenticatedServiceInvocation {
             let _ = sender.send(result);
         });
         executor.submit(&reactor, job, HOST_SLOT_WAIT).await?;
-        receiver.await.map_err(|_| {
-            protocol("host callback response lost; outcome unknown, do not replay".into())
-        })?
+        receiver
+            .await
+            .map_err(|_| bmux_plugin_sdk::PluginError::HostUnavailable {
+                details: "host callback response lost; outcome unknown, do not replay".into(),
+            })?
     }
 
     pub(in crate::runtime) fn cancellation(&self) -> bmux_plugin_sdk::ServiceCancellation {

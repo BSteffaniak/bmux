@@ -286,9 +286,9 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
         );
     }
 
-    if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error
-        && io_error.kind() == std::io::ErrorKind::UnexpectedEof
-    {
+    // Any transport I/O failure (EOF, reset, broken pipe, a reader that went
+    // away) means the connection is gone, not only an unexpected EOF.
+    if error.class() == bmux_ipc::ErrorClass::ConnectionLost {
         let paths = ConfigPaths::default();
         let runtime = std::env::var("BMUX_RUNTIME_NAME")
             .ok()
@@ -296,7 +296,7 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "default".to_string());
         return anyhow::anyhow!(
-            "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
+            "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.\nCause: {error}",
             local_ipc_endpoint_label_for_error(&paths)
         );
     }
@@ -777,6 +777,28 @@ mod tests {
     #[test]
     fn cross_slot_check_noop_without_metadata() {
         check_cross_slot_mismatch(Some("dev"), None).unwrap();
+    }
+
+    #[test]
+    fn map_client_connect_error_reports_every_lost_connection() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = map_client_connect_error(ClientError::Transport(IpcTransportError::Io(
+                std::io::Error::new(kind, "reader task dropped"),
+            )));
+            let message = error.to_string();
+            assert!(
+                message.contains("server connection lost unexpectedly"),
+                "{kind:?}: {message}"
+            );
+            assert!(message.contains("reader task dropped"), "{message}");
+        }
+        let timeout =
+            map_client_connect_error(ClientError::Timeout(std::time::Duration::from_secs(5)));
+        assert!(!timeout.to_string().contains("connection lost"));
     }
 
     #[test]

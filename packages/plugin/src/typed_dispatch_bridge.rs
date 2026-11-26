@@ -78,7 +78,7 @@ where
                     .call_service_raw(capability, kind, interface_id, operation, payload)
             };
             result.map_err(|error| {
-                TypedDispatchClientError::transport(interface_id, operation, error.to_string())
+                TypedDispatchClientError::from_host_error(interface_id, operation, &error)
             })
         }
     }
@@ -270,6 +270,15 @@ impl TypedDispatchClient for AsyncServiceClient {
     ) -> Result<Vec<u8>, TypedDispatchClientError> {
         let error =
             |message: &str| TypedDispatchClientError::transport(interface_id, operation, message);
+        let failed = |failure, message: &str| {
+            TypedDispatchClientError::transport_failure(interface_id, operation, failure, message)
+        };
+        let closed = |message: &str| {
+            failed(
+                bmux_plugin_sdk::TransportFailure::ConnectionLost(std::io::ErrorKind::BrokenPipe),
+                message,
+            )
+        };
         if payload.len() > MAX_ASYNC_SERVICE_BYTES
             || [capability, interface_id, operation]
                 .iter()
@@ -295,7 +304,7 @@ impl TypedDispatchClient for AsyncServiceClient {
                 self.sender
                     .reserve()
                     .await
-                    .map_err(|_| error("async service route closed"))?,
+                    .map_err(|_| closed("async service route closed"))?,
             )
         } else {
             None
@@ -315,17 +324,18 @@ impl TypedDispatchClient for AsyncServiceClient {
             self.sender
                 .try_send(request)
                 .map_err(|failure| match failure {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        error("async service route full")
-                    }
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => failed(
+                        bmux_plugin_sdk::TransportFailure::Unavailable,
+                        "async service route full",
+                    ),
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        error("async service route closed")
+                        closed("async service route closed")
                     }
                 })?;
         }
         let result = receiver
             .await
-            .map_err(|_| error("async service response closed"))?
+            .map_err(|_| closed("async service response closed"))?
             .map_err(|message| error(&message))?;
         if result.len() > MAX_ASYNC_SERVICE_BYTES {
             return Err(error("async service response exceeds size limit"));

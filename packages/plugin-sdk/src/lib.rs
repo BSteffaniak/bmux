@@ -166,6 +166,8 @@ macro_rules! storage_key {
         $crate::StorageKey::from_validated_literal($key)
     }};
 }
+/// Generic failure class; owned by `bmux_ipc`, re-exported for typed-client callers.
+pub use bmux_ipc::ErrorClass;
 pub use plugin_support::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
     TypedServiceRegistrationContext,
@@ -203,7 +205,7 @@ pub use typed_dispatch::{
     TypedServiceHandle, TypedServiceKey, TypedServiceRegistry,
 };
 pub use typed_dispatch_client::{
-    StreamingTypedServiceEndpoint, TypedDispatchClient, TypedDispatchClientError,
+    StreamingTypedServiceEndpoint, TransportFailure, TypedDispatchClient, TypedDispatchClientError,
     TypedDispatchClientResult, TypedServiceClientError, TypedServiceClientResult,
     TypedServiceEndpoint, invoke_typed_service, invoke_typed_streaming_service,
 };

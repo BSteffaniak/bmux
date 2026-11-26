@@ -581,6 +581,60 @@ pub enum ErrorCode {
     /// The caller's principal is not allowed this request (for example a
     /// remote principal on a route its role does not grant).
     PermissionDenied,
+    /// The server could not serve the request now (capacity exhausted, a
+    /// host worker gone, a response lost) although the request itself was
+    /// valid. Retrying later may succeed.
+    Unavailable,
+}
+
+impl ErrorCode {
+    /// Whether this code is newer than service contract v1: the server lowers
+    /// it to [`ErrorCode::Internal`] for clients that predate service contract v2.
+    #[must_use]
+    pub const fn requires_service_contract_v2(self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedRepresentation | Self::ServiceIncompatible | Self::Unavailable
+        )
+    }
+
+    /// The generic class of a server-reported error with this code.
+    #[must_use]
+    pub const fn class(self) -> ErrorClass {
+        match self {
+            Self::Timeout | Self::Unavailable => ErrorClass::Transient,
+            Self::NotFound
+            | Self::AlreadyExists
+            | Self::InvalidRequest
+            | Self::VersionMismatch
+            | Self::Internal
+            | Self::UnsupportedRepresentation
+            | Self::ServiceIncompatible
+            | Self::PermissionDenied => ErrorClass::Rejected,
+        }
+    }
+}
+
+/// Generic classification of a failed request, independent of what the
+/// request was for. Callers use it to decide whether to retry, reconnect, or
+/// report the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorClass {
+    /// The request did not complete in time, or the server could not serve it
+    /// now. The connection is still usable; the outcome may be unknown.
+    Transient,
+    /// The connection to the server failed (EOF, reset, broken pipe, reader
+    /// gone). Further requests on it will fail.
+    ConnectionLost,
+    /// The server processed the request and rejected it with an error code.
+    Rejected,
+    /// The peers disagree about the wire format (encoding, framing, envelope,
+    /// response shape, or protocol negotiation).
+    Protocol,
+    /// The failure happened locally before anything reached the server
+    /// (configuration, identity files, unsupported endpoint), or could not be
+    /// classified.
+    Local,
 }
 
 /// Error details returned over IPC.
@@ -778,6 +832,43 @@ mod tests {
         }
         assert_eq!(encode(&ErrorCode::UnsupportedRepresentation).unwrap(), [6]);
         assert_eq!(encode(&ErrorCode::ServiceIncompatible).unwrap(), [7]);
+        assert_eq!(encode(&ErrorCode::PermissionDenied).unwrap(), [8]);
+        assert_eq!(encode(&ErrorCode::Unavailable).unwrap(), [9]);
+        assert_eq!(decode::<ErrorCode>(&[9]).unwrap(), ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn error_code_classes_separate_transient_from_rejected() {
+        assert_eq!(ErrorCode::Timeout.class(), ErrorClass::Transient);
+        assert_eq!(ErrorCode::Unavailable.class(), ErrorClass::Transient);
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyExists,
+            ErrorCode::InvalidRequest,
+            ErrorCode::VersionMismatch,
+            ErrorCode::Internal,
+            ErrorCode::UnsupportedRepresentation,
+            ErrorCode::ServiceIncompatible,
+        ] {
+            assert_eq!(code.class(), ErrorClass::Rejected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn only_codes_after_internal_need_service_contract_v2() {
+        for (code, needs_v2) in [
+            (ErrorCode::NotFound, false),
+            (ErrorCode::AlreadyExists, false),
+            (ErrorCode::InvalidRequest, false),
+            (ErrorCode::VersionMismatch, false),
+            (ErrorCode::Timeout, false),
+            (ErrorCode::Internal, false),
+            (ErrorCode::UnsupportedRepresentation, true),
+            (ErrorCode::ServiceIncompatible, true),
+            (ErrorCode::Unavailable, true),
+        ] {
+            assert_eq!(code.requires_service_contract_v2(), needs_v2, "{code:?}");
+        }
     }
 
     #[test]
@@ -1052,6 +1143,9 @@ mod tests {
             ErrorCode::VersionMismatch,
             ErrorCode::Timeout,
             ErrorCode::Internal,
+            ErrorCode::UnsupportedRepresentation,
+            ErrorCode::ServiceIncompatible,
+            ErrorCode::Unavailable,
         ];
         for code in &codes {
             assert_roundtrip(code);

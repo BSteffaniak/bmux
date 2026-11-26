@@ -251,6 +251,17 @@ pub enum PluginError {
     #[error("rejected before dispatch: {details}")]
     RejectedBeforeDispatch { details: String },
 
+    /// The host gave up waiting (for a worker slot or for a response) before
+    /// the call completed. The request itself was not rejected; whether its
+    /// effect happened may be unknown, so it must not be replayed blindly.
+    #[error("host timed out: {details}")]
+    HostTimeout { details: String },
+
+    /// The host could not run the call now (its worker pool or executor is
+    /// gone, or the response was lost). The request itself was not rejected.
+    #[error("host unavailable: {details}")]
+    HostUnavailable { details: String },
+
     #[error("unsupported host operation: {operation}")]
     UnsupportedHostOperation { operation: &'static str },
 

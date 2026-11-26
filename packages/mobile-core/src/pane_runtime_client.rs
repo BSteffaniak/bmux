@@ -62,8 +62,8 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
                 encoded: snapshot.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("pointer-grid-v2 snapshots", err),
-        Err(err) => typed_dispatch_error("pointer-grid-v2 snapshots", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v2 snapshots", &err),
+        Err(err) => typed_dispatch_error("pointer-grid-v2 snapshots", &err),
     }
 }
 
@@ -97,8 +97,8 @@ pub async fn attach_pane_frames_streaming(
                 .collect(),
             state.frames_still_pending,
         )),
-        Ok(Err(err)) => typed_server_error("pointer-grid-v2 frames", err),
-        Err(err) => typed_dispatch_error("pointer-grid-v2 frames", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v2 frames", &err),
+        Err(err) => typed_dispatch_error("pointer-grid-v2 frames", &err),
     }
 }
 
@@ -110,8 +110,8 @@ pub async fn reset_attach_pane_frames_streaming(
 ) -> ClientResult<()> {
     match attach_state::client::attach_pane_frames_reset(client, session_id, pane_ids).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", err),
-        Err(err) => typed_dispatch_error("attach-pane-frames-reset", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", &err),
+        Err(err) => typed_dispatch_error("attach-pane-frames-reset", &err),
     }
 }
 
@@ -324,8 +324,8 @@ async fn attach_grant(
             context_id: grant.context_id,
             expires_at_epoch_ms: grant.expires_epoch_ms,
         }),
-        Ok(Err(err)) => typed_server_error("attach-session", err),
-        Err(err) => typed_dispatch_error("attach-session", err),
+        Ok(Err(err)) => typed_server_error("attach-session", &err),
+        Err(err) => typed_dispatch_error("attach-session", &err),
     }
 }
 
@@ -339,8 +339,8 @@ async fn open_attach_stream_info(
             session_id: ready.session_id,
             can_write: ready.can_write,
         }),
-        Ok(Err(err)) => typed_server_error("attach-open", err),
-        Err(err) => typed_dispatch_error("attach-open", err),
+        Ok(Err(err)) => typed_server_error("attach-open", &err),
+        Err(err) => typed_dispatch_error("attach-open", &err),
     }
 }
 
@@ -373,8 +373,8 @@ async fn attach_set_viewport_with_insets(
     .await
     {
         Ok(Ok(set)) => Ok((set.cols, set.rows)),
-        Ok(Err(err)) => typed_server_error("attach-set-viewport", err),
-        Err(err) => typed_dispatch_error("attach-set-viewport", err),
+        Ok(Err(err)) => typed_server_error("attach-set-viewport", &err),
+        Err(err) => typed_dispatch_error("attach-set-viewport", &err),
     }
 }
 
@@ -385,8 +385,8 @@ async fn attach_input(
 ) -> ClientResult<usize> {
     match attach_commands::client::attach_input(client, session_id, data).await {
         Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
-        Ok(Err(err)) => typed_server_error("attach-input", err),
-        Err(err) => typed_dispatch_error("attach-input", err),
+        Ok(Err(err)) => typed_server_error("attach-input", &err),
+        Err(err) => typed_dispatch_error("attach-input", &err),
     }
 }
 
@@ -396,8 +396,8 @@ async fn attach_layout(
 ) -> ClientResult<AttachLayoutState> {
     match attach_state::client::attach_layout_state(client, session_id).await {
         Ok(Ok(layout)) => decode_attach_layout(&layout),
-        Ok(Err(err)) => typed_server_error("attach-layout-state", err),
-        Err(err) => typed_dispatch_error("attach-layout-state", err),
+        Ok(Err(err)) => typed_server_error("attach-layout-state", &err),
+        Err(err) => typed_dispatch_error("attach-layout-state", &err),
     }
 }
 
@@ -409,16 +409,16 @@ async fn attach_snapshot(
     let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
     match attach_state::client::attach_snapshot_state(client, session_id, max_bytes_u32).await {
         Ok(Ok(snap)) => decode_attach_snapshot(snap),
-        Ok(Err(err)) => typed_server_error("attach-snapshot-state", err),
-        Err(err) => typed_dispatch_error("attach-snapshot-state", err),
+        Ok(Err(err)) => typed_server_error("attach-snapshot-state", &err),
+        Err(err) => typed_dispatch_error("attach-snapshot-state", &err),
     }
 }
 
 async fn detach(client: &mut impl bmux_plugin_sdk::TypedDispatchClient) -> ClientResult<()> {
     match attach_commands::client::detach(client).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => typed_server_error("detach", err),
-        Err(err) => typed_dispatch_error("detach", err),
+        Ok(Err(err)) => typed_server_error("detach", &err),
+        Err(err) => typed_dispatch_error("detach", &err),
     }
 }
 
@@ -522,16 +522,46 @@ fn session_selector(selector: SessionSelector) -> attach_commands::SessionSelect
     }
 }
 
-fn typed_server_error<T>(operation: &str, err: impl std::fmt::Debug) -> ClientResult<T> {
+/// The error code a pane-runtime domain rejection reports to callers.
+trait DomainErrorCode: std::fmt::Debug {
+    fn error_code(&self) -> ErrorCode;
+}
+
+impl DomainErrorCode for attach_state::AttachStateError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound => ErrorCode::NotFound,
+            Self::NotAttached => ErrorCode::InvalidRequest,
+            Self::Failed { .. } => ErrorCode::Internal,
+        }
+    }
+}
+
+impl DomainErrorCode for attach_commands::AttachCommandError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound | Self::ContextNotFound => ErrorCode::NotFound,
+            Self::InvalidGrant | Self::ExpiredGrant | Self::Denied { .. } => {
+                ErrorCode::InvalidRequest
+            }
+            Self::Failed { .. } => ErrorCode::Internal,
+        }
+    }
+}
+
+/// The provider answered `operation` with a domain rejection.
+fn typed_server_error<T>(operation: &str, err: &impl DomainErrorCode) -> ClientResult<T> {
     Err(ClientError::ServerError {
-        code: ErrorCode::Internal,
+        code: err.error_code(),
         message: format!("{operation} failed: {err:?}"),
     })
 }
 
-fn typed_dispatch_error<T>(operation: &str, err: impl std::fmt::Display) -> ClientResult<T> {
-    Err(ClientError::ServerError {
-        code: ErrorCode::Internal,
-        message: format!("{operation} typed dispatch failed: {err}"),
-    })
+/// The typed call for `operation` did not get an answer from its provider:
+/// keep its kind (timeout, lost connection, server code) for the caller.
+fn typed_dispatch_error<T>(
+    operation: &str,
+    err: &bmux_plugin_sdk::TypedServiceClientError,
+) -> ClientResult<T> {
+    Err(ClientError::from_typed_service_error(operation, err))
 }

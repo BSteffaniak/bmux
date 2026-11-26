@@ -18720,26 +18720,41 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
     }
 }
 
+/// Whether `error` means the attached session's runtime is gone, so the attach
+/// stream has ended.
+///
+/// Only server rejections qualify: a timeout, a lost connection or a protocol
+/// failure is never a closed stream (see [`ClientError::class`]). Within a
+/// rejection, the code is checked first, then the text: neither shape has a
+/// structured form. A missing session runtime is reported as `NotFound` with the
+/// runtime's own wording, and a native pane-runtime provider failing with ABI
+/// status 4 reaches the client only as the server's `Internal` diagnostic.
 pub fn is_attach_stream_closed_error(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::ServerError { code: bmux_ipc::ErrorCode::NotFound, message }
-            if message.contains("session runtime not found")
-    ) || matches!(
-        error,
-        ClientError::ServerError { code: bmux_ipc::ErrorCode::Internal, message }
-            if message.contains("plugin 'bmux.pane_runtime' service invocation failed with status 4")
-    )
+    let ClientError::ServerError { code, message } = error else {
+        return false;
+    };
+    match code {
+        bmux_ipc::ErrorCode::NotFound => message.contains("session runtime not found"),
+        bmux_ipc::ErrorCode::Internal => {
+            message.contains("plugin 'bmux.pane_runtime' service invocation failed with status 4")
+        }
+        _ => false,
+    }
 }
 
+/// Whether `error` is the pane runtime refusing a client that is no longer
+/// attached.
+///
+/// Only server rejections qualify (never a timeout or a lost connection). The
+/// pane runtime reports this case only as a failure reason, with no structured
+/// variant, so the reason text is what identifies it.
 pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::ServerError { message, .. }
-            if message.contains("not attached to session runtime")
-                || (message.contains("attach-pane-output-batch typed dispatch failed")
-                    && message.contains("expected service invoked"))
-    )
+    error.class() == bmux_ipc::ErrorClass::Rejected
+        && matches!(
+            error,
+            ClientError::ServerError { message, .. }
+                if message.contains("not attached to session runtime")
+        )
 }
 #[cfg(test)]
 #[path = "native_input_tests.rs"]
@@ -22393,6 +22408,65 @@ mod tests {
         };
 
         assert!(is_attach_stream_closed_error(&error));
+    }
+
+    #[test]
+    fn attach_end_classifiers_never_match_transient_or_lost_connections() {
+        let timeout = ClientError::from_typed_dispatch_error(
+            "attach-pane-frames",
+            &bmux_plugin_sdk::TypedDispatchClientError::transport_failure(
+                "attach-runtime-state",
+                "attach-pane-frames",
+                bmux_plugin_sdk::TransportFailure::Timeout {
+                    after: Some(std::time::Duration::from_secs(5)),
+                },
+                "not attached to session runtime; session runtime not found",
+            ),
+        );
+        assert!(matches!(timeout, ClientError::Timeout(_)));
+        assert!(!is_attach_stream_closed_error(&timeout));
+        assert!(!is_attach_not_attached_runtime_error(&timeout));
+
+        let lost = ClientError::from_typed_dispatch_error(
+            "attach-pane-frames",
+            &bmux_plugin_sdk::TypedDispatchClientError::transport_failure(
+                "attach-runtime-state",
+                "attach-pane-frames",
+                bmux_plugin_sdk::TransportFailure::ConnectionLost(
+                    std::io::ErrorKind::UnexpectedEof,
+                ),
+                "not attached to session runtime",
+            ),
+        );
+        assert_eq!(lost.class(), bmux_ipc::ErrorClass::ConnectionLost);
+        assert!(!is_attach_stream_closed_error(&lost));
+        assert!(!is_attach_not_attached_runtime_error(&lost));
+
+        // The status-4 text only counts as an Internal rejection.
+        let transient = ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Unavailable,
+            message: "plugin 'bmux.pane_runtime' service invocation failed with status 4".into(),
+        };
+        assert!(!is_attach_stream_closed_error(&transient));
+    }
+
+    #[test]
+    fn attach_end_classifiers_keep_server_rejections() {
+        let missing = ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::NotFound,
+            message: "session runtime not found".into(),
+        };
+        assert!(is_attach_stream_closed_error(&missing));
+        let not_attached = ClientError::from_typed_dispatch_error(
+            "attach-input",
+            &bmux_plugin_sdk::TypedDispatchClientError::server_code(
+                "attach-runtime-commands",
+                "attach-input",
+                bmux_ipc::ErrorCode::Internal,
+                "Internal: client is not attached to session runtime",
+            ),
+        );
+        assert!(is_attach_not_attached_runtime_error(&not_attached));
     }
 
     #[test]

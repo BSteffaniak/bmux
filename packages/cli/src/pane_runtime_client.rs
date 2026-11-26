@@ -37,7 +37,93 @@ async fn pointer_grid_available(
             bmux_plugin_sdk::TypedDispatchClientError::Server { details, .. },
         ))
             if details.contains("no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v2' operation='capabilities'") => Ok(false),
-        Err(error) => typed_dispatch_error("pointer-grid capabilities", error),
+        Err(error) => typed_dispatch_error("pointer-grid capabilities", &error),
+    }
+}
+
+#[cfg(test)]
+mod typed_error_tests {
+    use super::*;
+    use bmux_plugin_sdk::{TransportFailure, TypedDispatchClientError, TypedServiceClientError};
+
+    fn dispatch(error: TypedDispatchClientError) -> ClientError {
+        typed_dispatch_error::<()>(
+            "attach-retarget-context",
+            &TypedServiceClientError::Dispatch(error),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn timed_out_dispatch_stays_a_timeout() {
+        let error = dispatch(TypedDispatchClientError::transport_failure(
+            "attach-runtime-commands",
+            "attach-retarget-context",
+            TransportFailure::Timeout {
+                after: Some(std::time::Duration::from_secs(5)),
+            },
+            "request timed out after 5s",
+        ));
+        assert!(
+            matches!(error, ClientError::Timeout(after) if after.as_secs() == 5),
+            "{error:?}"
+        );
+        assert_eq!(error.class(), bmux_ipc::ErrorClass::Transient);
+    }
+
+    #[test]
+    fn lost_connection_and_server_codes_survive_dispatch() {
+        let lost = dispatch(TypedDispatchClientError::transport_failure(
+            "attach-runtime-commands",
+            "attach-retarget-context",
+            TransportFailure::ConnectionLost(std::io::ErrorKind::BrokenPipe),
+            "reader task dropped before response",
+        ));
+        assert_eq!(lost.class(), bmux_ipc::ErrorClass::ConnectionLost);
+        assert!(
+            lost.to_string().contains("attach-retarget-context"),
+            "{lost}"
+        );
+
+        let rejected = dispatch(TypedDispatchClientError::server_code(
+            "attach-runtime-commands",
+            "attach-retarget-context",
+            ErrorCode::Unavailable,
+            "Unavailable: host unavailable",
+        ));
+        assert!(matches!(
+            &rejected,
+            ClientError::ServerError { code: ErrorCode::Unavailable, message }
+                if message.contains("attach-retarget-context")
+        ));
+    }
+
+    #[test]
+    fn domain_rejections_report_their_own_code() {
+        let error = typed_server_error::<()>(
+            "attach-retarget-context",
+            &AttachCommands::AttachCommandError::ContextNotFound,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            ClientError::ServerError { code: ErrorCode::NotFound, message }
+                if message.contains("attach-retarget-context")
+        ));
+        let error = typed_server_error::<()>(
+            "attach-layout-state",
+            &AttachState::AttachStateError::Failed {
+                reason: "boom".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::ServerError {
+                code: ErrorCode::Internal,
+                ..
+            }
+        ));
     }
 }
 
@@ -184,8 +270,8 @@ pub async fn attach_pane_grid_snapshot_state(
                 encoded: snapshot.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", &err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", &err),
     }
 }
 
@@ -221,8 +307,8 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
                 encoded: snapshot.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", &err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", &err),
     }
 }
 
@@ -261,8 +347,8 @@ pub async fn attach_pane_grid_window_state_streaming(
                 encoded: window.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("attach-pane-grid-window-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-grid-window-state", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-window-state", &err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-window-state", &err),
     }
 }
 
@@ -277,8 +363,8 @@ pub async fn pane_scrollback_rule_metadata_streaming(
             shell: pane.shell,
             active_command: pane.active_command,
         }),
-        Ok(Err(err)) => typed_server_error("get-pane", err),
-        Err(err) => typed_dispatch_error("get-pane", err),
+        Ok(Err(err)) => typed_server_error("get-pane", &err),
+        Err(err) => typed_dispatch_error("get-pane", &err),
     }
 }
 
@@ -295,7 +381,10 @@ pub async fn fetch_captured_history_line(
 ) -> ClientResult<bmux_terminal_grid::HistoryLineAssembly> {
     use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
     if u64::from(line_index) >= capture.history_line_count {
-        return typed_server_error("history-line", "line outside capture");
+        return Err(ClientError::ServerError {
+            code: ErrorCode::InvalidRequest,
+            message: "history-line failed: \"line outside capture\"".into(),
+        });
     }
     let mut line = HistoryLineAssembly::new(
         capture.capture_id.as_u128(),
@@ -1953,10 +2042,12 @@ mod history_tests {
                 super::AttachState::SERVICE_CONTRACT,
                 &payload,
             )
-            .map_err(|error| bmux_plugin_sdk::TypedDispatchClientError::Server {
-                interface: interface.to_string(),
-                operation: operation.to_string(),
-                details: error.to_string(),
+            .map_err(|error| {
+                bmux_plugin_sdk::TypedDispatchClientError::server(
+                    interface,
+                    operation,
+                    error.to_string(),
+                )
             })?;
             let reply = bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
                 &mut HistoryClient,
@@ -3924,8 +4015,8 @@ pub async fn attach_pane_scrollback_pin_streaming(
                 stream_end: pin.stream_end,
             })
         }
-        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-pin", err),
-        Err(err) => typed_dispatch_error("attach-pane-scrollback-pin", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-pin", &err),
+        Err(err) => typed_dispatch_error("attach-pane-scrollback-pin", &err),
     }
 }
 
@@ -3939,8 +4030,8 @@ pub async fn attach_pane_scrollback_unpin_streaming(
         .await
     {
         Ok(Ok(ack)) => Ok(ack.released),
-        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-unpin", err),
-        Err(err) => typed_dispatch_error("attach-pane-scrollback-unpin", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-unpin", &err),
+        Err(err) => typed_dispatch_error("attach-pane-scrollback-unpin", &err),
     }
 }
 
@@ -3978,8 +4069,8 @@ pub async fn attach_pane_frames_streaming(
                 .collect(),
             state.frames_still_pending,
         )),
-        Ok(Err(err)) => typed_server_error("attach-pane-frames", err),
-        Err(err) => typed_dispatch_error("attach-pane-frames", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames", &err),
+        Err(err) => typed_dispatch_error("attach-pane-frames", &err),
     }
 }
 
@@ -3991,8 +4082,8 @@ pub async fn reset_attach_pane_frames_streaming(
 ) -> ClientResult<()> {
     match AttachState::client::attach_pane_frames_reset(client, session_id, pane_ids).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", err),
-        Err(err) => typed_dispatch_error("attach-pane-frames-reset", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", &err),
+        Err(err) => typed_dispatch_error("attach-pane-frames-reset", &err),
     }
 }
 
@@ -4014,8 +4105,8 @@ pub async fn attach_pane_frame_push_streaming(
     .await
     {
         Ok(Ok(push)) => Ok(push.enabled),
-        Ok(Err(err)) => typed_server_error("attach-pane-frame-push", err),
-        Err(err) => typed_dispatch_error("attach-pane-frame-push", err),
+        Ok(Err(err)) => typed_server_error("attach-pane-frame-push", &err),
+        Err(err) => typed_dispatch_error("attach-pane-frame-push", &err),
     }
 }
 
@@ -4171,8 +4262,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                 context_id: grant.context_id,
                 expires_at_epoch_ms: grant.expires_epoch_ms,
             }),
-            Ok(Err(err)) => typed_server_error("attach-session", err),
-            Err(err) => typed_dispatch_error("attach-session", err),
+            Ok(Err(err)) => typed_server_error("attach-session", &err),
+            Err(err) => typed_dispatch_error("attach-session", &err),
         }
     }
 
@@ -4193,8 +4284,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                 context_id: grant.context_id,
                 expires_at_epoch_ms: grant.expires_epoch_ms,
             }),
-            Ok(Err(err)) => typed_server_error("attach-context", err),
-            Err(err) => typed_dispatch_error("attach-context", err),
+            Ok(Err(err)) => typed_server_error("attach-context", &err),
+            Err(err) => typed_dispatch_error("attach-context", &err),
         }
     }
 
@@ -4239,8 +4330,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                 session_id: ready.session_id,
                 can_write: ready.can_write,
             }),
-            Ok(Err(err)) => typed_server_error("attach-retarget-context", err),
-            Err(err) => typed_dispatch_error("attach-retarget-context", err),
+            Ok(Err(err)) => typed_server_error("attach-retarget-context", &err),
+            Err(err) => typed_dispatch_error("attach-retarget-context", &err),
         }
     }
 
@@ -4255,16 +4346,16 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                 session_id: ready.session_id,
                 can_write: ready.can_write,
             }),
-            Ok(Err(err)) => typed_server_error("attach-open", err),
-            Err(err) => typed_dispatch_error("attach-open", err),
+            Ok(Err(err)) => typed_server_error("attach-open", &err),
+            Err(err) => typed_dispatch_error("attach-open", &err),
         }
     }
 
     async fn detach(&mut self) -> ClientResult<()> {
         match AttachCommands::client::detach(self).await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => typed_server_error("detach", err),
-            Err(err) => typed_dispatch_error("detach", err),
+            Ok(Err(err)) => typed_server_error("detach", &err),
+            Err(err) => typed_dispatch_error("detach", &err),
         }
     }
 
@@ -4272,8 +4363,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
     async fn set_attach_policy(&mut self, allow_detach: bool) -> ClientResult<()> {
         match AttachCommands::client::set_client_attach_policy(self, allow_detach).await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => typed_server_error("set-client-attach-policy", err),
-            Err(err) => typed_dispatch_error("set-client-attach-policy", err),
+            Ok(Err(err)) => typed_server_error("set-client-attach-policy", &err),
+            Err(err) => typed_dispatch_error("set-client-attach-policy", &err),
         }
     }
 
@@ -4281,8 +4372,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
     async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> ClientResult<usize> {
         match AttachCommands::client::attach_input(self, session_id, data).await {
             Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
-            Ok(Err(err)) => typed_server_error("attach-input", err),
-            Err(err) => typed_dispatch_error("attach-input", err),
+            Ok(Err(err)) => typed_server_error("attach-input", &err),
+            Err(err) => typed_dispatch_error("attach-input", &err),
         }
     }
 
@@ -4296,8 +4387,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         let bytes_len = data.len();
         match PaneCommands::client::pane_direct_input(self, session_id, pane_id, data).await {
             Ok(Ok(_ack)) => Ok(bytes_len),
-            Ok(Err(err)) => typed_server_error("pane-direct-input", err),
-            Err(err) => typed_dispatch_error("pane-direct-input", err),
+            Ok(Err(err)) => typed_server_error("pane-direct-input", &err),
+            Err(err) => typed_dispatch_error("pane-direct-input", &err),
         }
     }
 
@@ -4337,16 +4428,16 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         .await
         {
             Ok(Ok(set)) => Ok((set.cols, set.rows)),
-            Ok(Err(err)) => typed_server_error("attach-set-viewport", err),
-            Err(err) => typed_dispatch_error("attach-set-viewport", err),
+            Ok(Err(err)) => typed_server_error("attach-set-viewport", &err),
+            Err(err) => typed_dispatch_error("attach-set-viewport", &err),
         }
     }
 
     async fn attach_layout(&mut self, session_id: Uuid) -> ClientResult<AttachLayoutState> {
         match AttachState::client::attach_layout_state(self, session_id).await {
             Ok(Ok(layout)) => decode_attach_layout(&layout),
-            Ok(Err(err)) => typed_server_error("attach-layout-state", err),
-            Err(err) => typed_dispatch_error("attach-layout-state", err),
+            Ok(Err(err)) => typed_server_error("attach-layout-state", &err),
+            Err(err) => typed_dispatch_error("attach-layout-state", &err),
         }
     }
 
@@ -4374,8 +4465,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                     .collect(),
                 output_still_pending: batch.output_still_pending,
             }),
-            Ok(Err(err)) => typed_server_error("attach-pane-output-batch", err),
-            Err(err) => typed_dispatch_error("attach-pane-output-batch", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-output-batch", &err),
+            Err(err) => typed_dispatch_error("attach-pane-output-batch", &err),
         }
     }
 
@@ -4393,8 +4484,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                     code: ErrorCode::Internal,
                     message: format!("decode pane-images deltas: {e}"),
                 }),
-            Ok(Err(err)) => typed_server_error("attach-pane-images", err),
-            Err(err) => typed_dispatch_error("attach-pane-images", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-images", &err),
+            Err(err) => typed_dispatch_error("attach-pane-images", &err),
         }
     }
 
@@ -4406,8 +4497,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
         match AttachState::client::attach_snapshot_state(self, session_id, max_bytes_u32).await {
             Ok(Ok(snap)) => decode_attach_snapshot(snap),
-            Ok(Err(err)) => typed_server_error("attach-snapshot-state", err),
-            Err(err) => typed_dispatch_error("attach-snapshot-state", err),
+            Ok(Err(err)) => typed_server_error("attach-snapshot-state", &err),
+            Err(err) => typed_dispatch_error("attach-snapshot-state", &err),
         }
     }
 
@@ -4443,8 +4534,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
                     .map(pane_input_mode_from_record)
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             }),
-            Ok(Err(err)) => typed_server_error("attach-pane-snapshot-state", err),
-            Err(err) => typed_dispatch_error("attach-pane-snapshot-state", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-snapshot-state", &err),
+            Err(err) => typed_dispatch_error("attach-pane-snapshot-state", &err),
         }
     }
 }
@@ -4722,8 +4813,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                 context_id: grant.context_id,
                 expires_at_epoch_ms: grant.expires_epoch_ms,
             }),
-            Ok(Err(err)) => typed_server_error("attach-session", err),
-            Err(err) => typed_dispatch_error("attach-session", err),
+            Ok(Err(err)) => typed_server_error("attach-session", &err),
+            Err(err) => typed_dispatch_error("attach-session", &err),
         }
     }
 
@@ -4744,8 +4835,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                 context_id: grant.context_id,
                 expires_at_epoch_ms: grant.expires_epoch_ms,
             }),
-            Ok(Err(err)) => typed_server_error("attach-context", err),
-            Err(err) => typed_dispatch_error("attach-context", err),
+            Ok(Err(err)) => typed_server_error("attach-context", &err),
+            Err(err) => typed_dispatch_error("attach-context", &err),
         }
     }
 
@@ -4790,8 +4881,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                 session_id: ready.session_id,
                 can_write: ready.can_write,
             }),
-            Ok(Err(err)) => typed_server_error("attach-retarget-context", err),
-            Err(err) => typed_dispatch_error("attach-retarget-context", err),
+            Ok(Err(err)) => typed_server_error("attach-retarget-context", &err),
+            Err(err) => typed_dispatch_error("attach-retarget-context", &err),
         }
     }
 
@@ -4806,16 +4897,16 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                 session_id: ready.session_id,
                 can_write: ready.can_write,
             }),
-            Ok(Err(err)) => typed_server_error("attach-open", err),
-            Err(err) => typed_dispatch_error("attach-open", err),
+            Ok(Err(err)) => typed_server_error("attach-open", &err),
+            Err(err) => typed_dispatch_error("attach-open", &err),
         }
     }
 
     async fn detach(&mut self) -> ClientResult<()> {
         match AttachCommands::client::detach(self).await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => typed_server_error("detach", err),
-            Err(err) => typed_dispatch_error("detach", err),
+            Ok(Err(err)) => typed_server_error("detach", &err),
+            Err(err) => typed_dispatch_error("detach", &err),
         }
     }
 
@@ -4823,8 +4914,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
     async fn set_attach_policy(&mut self, allow_detach: bool) -> ClientResult<()> {
         match AttachCommands::client::set_client_attach_policy(self, allow_detach).await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => typed_server_error("set-client-attach-policy", err),
-            Err(err) => typed_dispatch_error("set-client-attach-policy", err),
+            Ok(Err(err)) => typed_server_error("set-client-attach-policy", &err),
+            Err(err) => typed_dispatch_error("set-client-attach-policy", &err),
         }
     }
 
@@ -4832,8 +4923,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
     async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> ClientResult<usize> {
         match AttachCommands::client::attach_input(self, session_id, data).await {
             Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
-            Ok(Err(err)) => typed_server_error("attach-input", err),
-            Err(err) => typed_dispatch_error("attach-input", err),
+            Ok(Err(err)) => typed_server_error("attach-input", &err),
+            Err(err) => typed_dispatch_error("attach-input", &err),
         }
     }
 
@@ -4847,8 +4938,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         let bytes_len = data.len();
         match PaneCommands::client::pane_direct_input(self, session_id, pane_id, data).await {
             Ok(Ok(_ack)) => Ok(bytes_len),
-            Ok(Err(err)) => typed_server_error("pane-direct-input", err),
-            Err(err) => typed_dispatch_error("pane-direct-input", err),
+            Ok(Err(err)) => typed_server_error("pane-direct-input", &err),
+            Err(err) => typed_dispatch_error("pane-direct-input", &err),
         }
     }
 
@@ -4888,16 +4979,16 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         .await
         {
             Ok(Ok(set)) => Ok((set.cols, set.rows)),
-            Ok(Err(err)) => typed_server_error("attach-set-viewport", err),
-            Err(err) => typed_dispatch_error("attach-set-viewport", err),
+            Ok(Err(err)) => typed_server_error("attach-set-viewport", &err),
+            Err(err) => typed_dispatch_error("attach-set-viewport", &err),
         }
     }
 
     async fn attach_layout(&mut self, session_id: Uuid) -> ClientResult<AttachLayoutState> {
         match AttachState::client::attach_layout_state(self, session_id).await {
             Ok(Ok(layout)) => decode_attach_layout(&layout),
-            Ok(Err(err)) => typed_server_error("attach-layout-state", err),
-            Err(err) => typed_dispatch_error("attach-layout-state", err),
+            Ok(Err(err)) => typed_server_error("attach-layout-state", &err),
+            Err(err) => typed_dispatch_error("attach-layout-state", &err),
         }
     }
 
@@ -4925,8 +5016,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                     .collect(),
                 output_still_pending: batch.output_still_pending,
             }),
-            Ok(Err(err)) => typed_server_error("attach-pane-output-batch", err),
-            Err(err) => typed_dispatch_error("attach-pane-output-batch", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-output-batch", &err),
+            Err(err) => typed_dispatch_error("attach-pane-output-batch", &err),
         }
     }
 
@@ -4944,8 +5035,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                     code: ErrorCode::Internal,
                     message: format!("decode pane-images deltas: {e}"),
                 }),
-            Ok(Err(err)) => typed_server_error("attach-pane-images", err),
-            Err(err) => typed_dispatch_error("attach-pane-images", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-images", &err),
+            Err(err) => typed_dispatch_error("attach-pane-images", &err),
         }
     }
 
@@ -4957,8 +5048,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
         match AttachState::client::attach_snapshot_state(self, session_id, max_bytes_u32).await {
             Ok(Ok(snap)) => decode_attach_snapshot(snap),
-            Ok(Err(err)) => typed_server_error("attach-snapshot-state", err),
-            Err(err) => typed_dispatch_error("attach-snapshot-state", err),
+            Ok(Err(err)) => typed_server_error("attach-snapshot-state", &err),
+            Err(err) => typed_dispatch_error("attach-snapshot-state", &err),
         }
     }
 
@@ -4994,8 +5085,8 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
                     .map(pane_input_mode_from_record)
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             }),
-            Ok(Err(err)) => typed_server_error("attach-pane-snapshot-state", err),
-            Err(err) => typed_dispatch_error("attach-pane-snapshot-state", err),
+            Ok(Err(err)) => typed_server_error("attach-pane-snapshot-state", &err),
+            Err(err) => typed_dispatch_error("attach-pane-snapshot-state", &err),
         }
     }
 }
@@ -5138,18 +5229,66 @@ fn pane_runtime_context_selector(selector: ContextSelector) -> AttachCommands::C
     }
 }
 
-fn typed_server_error<T>(operation: &str, err: impl std::fmt::Debug) -> ClientResult<T> {
+/// The error code a pane-runtime domain rejection reports to callers.
+trait DomainErrorCode: std::fmt::Debug {
+    fn error_code(&self) -> ErrorCode;
+}
+
+impl DomainErrorCode for AttachState::AttachStateError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound => ErrorCode::NotFound,
+            Self::NotAttached => ErrorCode::InvalidRequest,
+            Self::Failed { .. } => ErrorCode::Internal,
+        }
+    }
+}
+
+impl DomainErrorCode for AttachCommands::AttachCommandError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound | Self::ContextNotFound => ErrorCode::NotFound,
+            Self::InvalidGrant | Self::ExpiredGrant | Self::Denied { .. } => {
+                ErrorCode::InvalidRequest
+            }
+            Self::Failed { .. } => ErrorCode::Internal,
+        }
+    }
+}
+
+impl DomainErrorCode for PaneState::PaneStateError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound | Self::PaneNotFound => ErrorCode::NotFound,
+        }
+    }
+}
+
+impl DomainErrorCode for PaneCommands::PaneCommandError {
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::SessionNotFound | Self::PaneNotFound => ErrorCode::NotFound,
+            Self::Denied { .. } => ErrorCode::InvalidRequest,
+            Self::Failed { .. } => ErrorCode::Internal,
+        }
+    }
+}
+
+/// The provider answered `operation` with a domain rejection.
+fn typed_server_error<T>(operation: &str, err: &impl DomainErrorCode) -> ClientResult<T> {
     Err(ClientError::ServerError {
-        code: ErrorCode::Internal,
+        code: err.error_code(),
         message: format!("{operation} failed: {err:?}"),
     })
 }
 
-fn typed_dispatch_error<T>(operation: &str, err: impl std::fmt::Display) -> ClientResult<T> {
-    Err(ClientError::ServerError {
-        code: ErrorCode::Internal,
-        message: format!("{operation} typed dispatch failed: {err}"),
-    })
+/// The typed call for `operation` did not get an answer from its provider:
+/// keep its kind (timeout, lost connection, server code) for the caller.
+fn typed_dispatch_error<T>(
+    operation: &str,
+    err: &bmux_plugin_sdk::TypedServiceClientError,
+) -> ClientResult<T> {
+    Err(ClientError::from_typed_service_error(operation, err))
 }
 
 #[cfg(unix)]

@@ -21,16 +21,52 @@
 
 use std::future::Future;
 
-use bmux_ipc::InvokeServiceKind;
+use bmux_ipc::{ErrorClass, ErrorCode, InvokeServiceKind};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{CapabilityId, InterfaceId, OperationId, ServiceInterfaceDescriptor, ServiceKind};
+use crate::{
+    CapabilityId, InterfaceId, OperationId, PluginError, ServiceInterfaceDescriptor, ServiceKind,
+};
+
+/// Why a typed-dispatch transport failed, kept so callers can tell a slow
+/// peer from a dead connection without parsing the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// The request was sent but no reply arrived in time (`after` this long,
+    /// when the transport knows). The connection may still be usable; the
+    /// request's outcome is unknown.
+    Timeout { after: Option<std::time::Duration> },
+    /// The host could not run the request now (capacity exhausted, executor
+    /// gone, response lost). The request itself was not rejected.
+    Unavailable,
+    /// The connection failed with this I/O error kind (EOF, reset, broken
+    /// pipe, reader gone).
+    ConnectionLost(std::io::ErrorKind),
+    /// The peers disagree about the wire format (encoding, framing, envelope).
+    Protocol,
+    /// Anything else (local configuration, an unclassified failure).
+    Other,
+}
+
+impl TransportFailure {
+    /// The generic class of this transport failure.
+    #[must_use]
+    pub const fn class(self) -> ErrorClass {
+        match self {
+            Self::Timeout { .. } | Self::Unavailable => ErrorClass::Transient,
+            Self::ConnectionLost(_) => ErrorClass::ConnectionLost,
+            Self::Protocol => ErrorClass::Protocol,
+            Self::Other => ErrorClass::Local,
+        }
+    }
+}
 
 /// Errors returned by [`TypedDispatchClient::invoke_service_raw`].
 ///
 /// Every concrete transport (`bmux_client`, test fakes) maps its own
 /// error taxonomy into this narrow enum so typed-client helpers can
-/// surface a single stable error type to callers.
+/// surface a single stable error type to callers. The structured `failure`
+/// and `code` fields keep the failure's kind; `details` is for humans.
 #[derive(Debug, thiserror::Error)]
 pub enum TypedDispatchClientError {
     /// The transport failed (connection reset, timeout, serialization).
@@ -38,6 +74,7 @@ pub enum TypedDispatchClientError {
     Transport {
         interface: String,
         operation: String,
+        failure: TransportFailure,
         details: String,
     },
     /// The server returned a protocol-level error for the invocation.
@@ -45,6 +82,8 @@ pub enum TypedDispatchClientError {
     Server {
         interface: String,
         operation: String,
+        /// The code the server reported.
+        code: ErrorCode,
         details: String,
     },
     /// The server returned a response of an unexpected shape (not
@@ -58,28 +97,70 @@ pub enum TypedDispatchClientError {
 }
 
 impl TypedDispatchClientError {
+    /// A transport failure of unknown kind ([`TransportFailure::Other`]).
     #[must_use]
     pub fn transport(
         interface: impl Into<String>,
         operation: impl Into<String>,
         details: impl Into<String>,
     ) -> Self {
+        Self::transport_failure(interface, operation, TransportFailure::Other, details)
+    }
+
+    /// A transport failure of a known kind.
+    #[must_use]
+    pub fn transport_failure(
+        interface: impl Into<String>,
+        operation: impl Into<String>,
+        failure: TransportFailure,
+        details: impl Into<String>,
+    ) -> Self {
         Self::Transport {
             interface: interface.into(),
             operation: operation.into(),
+            failure,
             details: details.into(),
         }
     }
 
+    /// A host-side call failure, classified by its [`PluginError`] variant
+    /// (a host that gave up waiting is transient, not an unknown failure).
+    #[must_use]
+    pub fn from_host_error(
+        interface: impl Into<String>,
+        operation: impl Into<String>,
+        error: &PluginError,
+    ) -> Self {
+        let failure = match error {
+            PluginError::HostTimeout { .. } => TransportFailure::Timeout { after: None },
+            PluginError::HostUnavailable { .. } => TransportFailure::Unavailable,
+            _ => TransportFailure::Other,
+        };
+        Self::transport_failure(interface, operation, failure, error.to_string())
+    }
+
+    /// A server rejection without a known code ([`ErrorCode::Internal`]).
     #[must_use]
     pub fn server(
         interface: impl Into<String>,
         operation: impl Into<String>,
         details: impl Into<String>,
     ) -> Self {
+        Self::server_code(interface, operation, ErrorCode::Internal, details)
+    }
+
+    /// A server rejection carrying the server's code.
+    #[must_use]
+    pub fn server_code(
+        interface: impl Into<String>,
+        operation: impl Into<String>,
+        code: ErrorCode,
+        details: impl Into<String>,
+    ) -> Self {
         Self::Server {
             interface: interface.into(),
             operation: operation.into(),
+            code,
             details: details.into(),
         }
     }
@@ -94,6 +175,29 @@ impl TypedDispatchClientError {
             interface: interface.into(),
             operation: operation.into(),
             details: details.into(),
+        }
+    }
+
+    /// The generic class of this failure.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::Transport { failure, .. } => failure.class(),
+            Self::Server { code, .. } => code.class(),
+            Self::UnexpectedResponse { .. } => ErrorClass::Protocol,
+        }
+    }
+}
+
+impl TypedServiceClientError {
+    /// The generic class of this failure. Encoding a request is a local
+    /// failure; decoding a response is a protocol disagreement.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::Dispatch(error) => error.class(),
+            Self::Encode { .. } => ErrorClass::Local,
+            Self::Decode { .. } => ErrorClass::Protocol,
         }
     }
 }
@@ -643,5 +747,93 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("if/op"), "{msg}");
         assert!(msg.contains("eof"), "{msg}");
+    }
+
+    #[test]
+    fn error_classes_follow_structured_kind() {
+        use std::io::ErrorKind;
+        let transport =
+            |failure| TypedDispatchClientError::transport_failure("if", "op", failure, "x");
+        assert_eq!(
+            transport(TransportFailure::Timeout { after: None }).class(),
+            ErrorClass::Transient
+        );
+        assert_eq!(
+            transport(TransportFailure::Unavailable).class(),
+            ErrorClass::Transient
+        );
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert_eq!(
+                transport(TransportFailure::ConnectionLost(kind)).class(),
+                ErrorClass::ConnectionLost
+            );
+        }
+        assert_eq!(
+            transport(TransportFailure::Protocol).class(),
+            ErrorClass::Protocol
+        );
+        assert_eq!(
+            TypedDispatchClientError::transport("if", "op", "x").class(),
+            ErrorClass::Local
+        );
+        let rejected =
+            TypedDispatchClientError::server_code("if", "op", ErrorCode::NotFound, "gone");
+        assert_eq!(rejected.class(), ErrorClass::Rejected);
+        assert!(matches!(
+            rejected,
+            TypedDispatchClientError::Server {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
+        assert_eq!(
+            TypedDispatchClientError::server_code("if", "op", ErrorCode::Unavailable, "busy")
+                .class(),
+            ErrorClass::Transient
+        );
+        assert!(matches!(
+            TypedDispatchClientError::server("if", "op", "x"),
+            TypedDispatchClientError::Server {
+                code: ErrorCode::Internal,
+                ..
+            }
+        ));
+        assert_eq!(
+            TypedDispatchClientError::unexpected_response("if", "op", "x").class(),
+            ErrorClass::Protocol
+        );
+        assert_eq!(
+            TypedServiceClientError::Decode {
+                op: "op".into(),
+                details: "x".into()
+            }
+            .class(),
+            ErrorClass::Protocol
+        );
+    }
+
+    #[test]
+    fn host_errors_keep_their_wait_classification() {
+        let timeout = TypedDispatchClientError::from_host_error(
+            "if",
+            "op",
+            &PluginError::HostTimeout {
+                details: "slot".into(),
+            },
+        );
+        assert_eq!(timeout.class(), ErrorClass::Transient);
+        assert!(timeout.to_string().contains("host timed out: slot"));
+        let other = TypedDispatchClientError::from_host_error(
+            "if",
+            "op",
+            &PluginError::ServiceProtocol {
+                details: "bad".into(),
+            },
+        );
+        assert_eq!(other.class(), ErrorClass::Local);
     }
 }

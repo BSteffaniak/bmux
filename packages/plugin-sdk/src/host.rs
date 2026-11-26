@@ -305,7 +305,7 @@ impl crate::TypedDispatchClient for BoundHostServicePort {
         let operation = operation.to_owned();
         async move {
             future.await.map_err(|error| {
-                crate::TypedDispatchClientError::transport(interface, operation, error.to_string())
+                crate::TypedDispatchClientError::from_host_error(interface, operation, &error)
             })
         }
     }
