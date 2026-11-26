@@ -12716,7 +12716,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "anyhow",
  "bmux_terminal",
@@ -17102,7 +17102,7 @@ dependencies = [
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 
 [[package]]
 name = "simvar_utils"
@@ -18208,7 +18208,7 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "flume 0.12.0",
  "futures 0.3.34",
@@ -18228,7 +18228,7 @@ dependencies = [
 [[package]]
 name = "switchy_async_cargo"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "clap",
  "pretty_env_logger",
@@ -18253,7 +18253,7 @@ dependencies = [
 [[package]]
 name = "switchy_async_macros"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -18308,7 +18308,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "log 0.4.35",
  "switchy_simulation",
@@ -18333,7 +18333,7 @@ dependencies = [
 [[package]]
 name = "switchy_fs"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "libc",
  "log 0.4.35",
@@ -18390,7 +18390,7 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "libc",
  "switchy_simulation",
@@ -18411,7 +18411,7 @@ dependencies = [
 [[package]]
 name = "switchy_random"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "getrandom 0.4.3",
  "libm",
@@ -18442,7 +18442,7 @@ dependencies = [
 [[package]]
 name = "switchy_simulation"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 
 [[package]]
 name = "switchy_tcp"
@@ -18483,7 +18483,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "switchy_simulation",
  "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
@@ -18504,7 +18504,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#16c560e999ef106ef266892cbaaefbc7cf2e7409"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#534b73923990b135c94bee7eb9cdf57039435c1d"
 dependencies = [
  "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",

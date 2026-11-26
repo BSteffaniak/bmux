@@ -609,11 +609,24 @@ impl Events {
     }
 }
 
+/// Every process on `switchy_pty`: Unix natively, and the simulation under every personality.
+/// What differs between systems follows [`switchy_pty::behavior`]:
+///
+/// * **Process groups** (Unix): the process leads its own session on a terminal; interrupting
+///   and killing signal its group, and only the process may keep the terminal open.
+/// * **Jobs** (Windows): the process runs in a kill-on-close job, so killing (and interrupting,
+///   which a console cannot be sent from outside) ends everything it started. Its console keeps
+///   its own cursor, as nothing answers a startup query, and is closed once the process exits,
+///   as a console's output ends only then. With its output captured or its input fed, it runs
+///   without the console, on pipes (a console cannot redirect only some of its streams).
 #[cfg(any(unix, feature = "simulator"))]
 mod platform {
     use std::io;
 
-    use switchy_pty::{PtyInput, PtyMaster, PtyPair, PtyPipeReader, PtyReader, Signal, Stdio};
+    use switchy_pty::{
+        PtyChild, PtyInput, PtyJob, PtyMaster, PtyOptions, PtyPair, PtyPipeReader, PtyReader,
+        Signal, SpawnCommand, Stdio,
+    };
     use switchy_thread::sync::atomic::{AtomicBool, Ordering};
     use switchy_thread::sync::{Arc, Mutex, PoisonError, mpsc};
 
@@ -622,18 +635,31 @@ mod platform {
         PtySize, PtyWriter, QUEUE, spawn_named,
     };
 
-    pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
+    /// A terminal: everything works.
+    const TERMINAL: PtyCapabilities = PtyCapabilities {
         terminal: true,
         resize: true,
         input: true,
         signals: true,
     };
 
+    /// How the process is ended.
+    #[derive(Debug)]
+    enum Ending {
+        /// Signal its process group (Unix).
+        Group,
+        /// Terminate its job (Windows); dropped with the control, which ends the job too.
+        Job(PtyJob),
+    }
+
     #[derive(Debug)]
     pub struct Control {
-        /// The terminal's near side, non-blocking.
-        master: Arc<PtyMaster>,
+        /// The terminal's near side, non-blocking; `None` once closed (a console after the
+        /// process exits) or for a process on pipes.
+        master: Arc<Mutex<Option<Arc<PtyMaster>>>>,
         pid: u32,
+        capabilities: PtyCapabilities,
+        ending: Ending,
         exited: Arc<AtomicBool>,
         /// Set once the exit is reported; the reader and writer threads then stop.
         closed: Arc<AtomicBool>,
@@ -648,18 +674,28 @@ mod platform {
             self.pid
         }
 
-        // Uniform with platforms whose capabilities depend on the process.
-        #[allow(clippy::unused_self)]
         pub const fn capabilities(&self) -> PtyCapabilities {
-            CAPABILITIES
+            self.capabilities
+        }
+
+        fn master(&self) -> Option<Arc<PtyMaster>> {
+            self.master
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
 
         pub fn resize(&self, size: PtySize) -> io::Result<()> {
-            self.master.resize(size)
+            // A closed console, or pipes: nothing to resize.
+            self.master().map_or(Ok(()), |master| master.resize(size))
         }
 
         pub fn interrupt(&self) -> io::Result<()> {
-            self.signal(Signal::Interrupt)
+            match &self.ending {
+                Ending::Group => self.signal(Signal::Interrupt),
+                // A console cannot be interrupted from outside: stopped, as killing does.
+                Ending::Job(job) => job.terminate(),
+            }
         }
 
         pub fn stop_output(&self) {
@@ -667,7 +703,10 @@ mod platform {
         }
 
         pub fn kill(&self) -> io::Result<()> {
-            self.signal(Signal::Kill)
+            match &self.ending {
+                Ending::Group => self.signal(Signal::Kill),
+                Ending::Job(job) => job.terminate(),
+            }
         }
 
         pub fn writer(&self) -> io::Result<PtyWriter> {
@@ -675,7 +714,10 @@ mod platform {
             if let Some(writer) = writer.as_ref() {
                 return Ok(writer.clone());
             }
-            let mut input = self.master.clone_writer()?;
+            let master = self
+                .master()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+            let mut input = master.clone_writer()?;
             let (sender, queued) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
             spawn_named("bmux-pty-writer", move || {
                 for bytes in queued {
@@ -695,7 +737,9 @@ mod platform {
             // The process is not reaped while this handle exists (see `_reap_guard`), so its
             // id, which names the group, cannot belong to another process yet. After the exit
             // with nothing holding the terminal there is nothing left to signal.
-            if self.exited.load(Ordering::Acquire) && !self.master.has_peer() {
+            if self.exited.load(Ordering::Acquire)
+                && !self.master().is_some_and(|master| master.has_peer())
+            {
                 return Ok(());
             }
             switchy_pty::signal_group(self.pid, signal)
@@ -728,7 +772,7 @@ mod platform {
     /// A non-blocking stream a reader thread drains.
     enum Source {
         Terminal(PtyReader),
-        Stdout(PtyPipeReader),
+        Pipe(PtyPipeReader),
     }
 
     /// Reads a non-blocking stream, returning end of file once output is `closed` and the
@@ -748,14 +792,14 @@ mod platform {
                 }
                 let read = match &mut self.source {
                     Source::Terminal(reader) => reader.read(buffer),
-                    Source::Stdout(reader) => reader.read(buffer),
+                    Source::Pipe(reader) => reader.read(buffer),
                 };
                 match read {
                     Ok(read) => return Ok(read),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         match &self.source {
                             Source::Terminal(reader) => reader.wait_readable(POLL)?,
-                            Source::Stdout(reader) => reader.wait_readable(POLL)?,
+                            Source::Pipe(reader) => reader.wait_readable(POLL)?,
                         };
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -765,20 +809,105 @@ mod platform {
         }
     }
 
-    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
-        let PtyPair { slave, master } = PtyPair::open(size)?;
+    /// The command `spec` describes, its streams on the terminal, on pipes alone (`on_pipes`),
+    /// or with standard output captured or input fed.
+    fn command(spec: &PtyCommand, on_pipes: bool) -> SpawnCommand {
         let mut command = spec.spawn_command();
-        if spec.capture_stdout {
+        if on_pipes {
             command
-                .stdin(Stdio::Null)
+                .stdin(if spec.input.is_some() {
+                    Stdio::Piped
+                } else {
+                    Stdio::Null
+                })
                 .stdout(Stdio::Piped)
-                .stderr(Stdio::Terminal)
+                .stderr(Stdio::Piped)
                 .controlling_terminal(false);
+        } else {
+            if spec.capture_stdout {
+                command
+                    .stdin(Stdio::Null)
+                    .stdout(Stdio::Piped)
+                    .stderr(Stdio::Terminal)
+                    .controlling_terminal(false);
+            }
+            if spec.input.is_some() {
+                command.stdin(Stdio::Piped);
+            }
         }
-        if spec.input.is_some() {
-            command.stdin(Stdio::Piped);
+        command
+    }
+
+    /// Start a reader thread for each of the process's output streams: the terminal (when it
+    /// has one) and its stdout and stderr pipes (standard output reported as
+    /// [`PtyEvent::Stdout`] when `capture`). How many, and where each reports finishing.
+    fn read_streams(
+        events: &Events,
+        exited: &Arc<AtomicBool>,
+        terminal: Option<&PtyMaster>,
+        child: &mut PtyChild,
+        capture: bool,
+    ) -> io::Result<(usize, mpsc::Receiver<bool>)> {
+        let (done, finished) = mpsc::channel();
+        let mut readers = 0;
+        let mut read = |source: Source, event: fn(Vec<u8>) -> PtyEvent| {
+            readers += 1;
+            events.read(
+                Polled {
+                    source,
+                    closed: Arc::clone(&events.closed),
+                    exited: Arc::clone(exited),
+                },
+                event,
+                done.clone(),
+            );
+        };
+        if let Some(terminal) = terminal {
+            read(
+                Source::Terminal(terminal.try_clone_reader()?),
+                PtyEvent::Output,
+            );
         }
-        let mut child = slave.spawn(&command)?;
+        if let Some(stdout) = child.take_stdout() {
+            stdout.set_nonblocking(true)?;
+            let event: fn(Vec<u8>) -> PtyEvent = if capture {
+                PtyEvent::Stdout
+            } else {
+                PtyEvent::Output
+            };
+            read(Source::Pipe(stdout), event);
+        }
+        if let Some(stderr) = child.take_stderr() {
+            stderr.set_nonblocking(true)?;
+            read(Source::Pipe(stderr), PtyEvent::Output);
+        }
+        Ok((readers, finished))
+    }
+
+    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
+        let behavior = switchy_pty::behavior();
+        let jobs = !behavior.process_groups;
+        // Windows: a console cannot redirect only some streams, so with any redirected the
+        // process runs on pipes alone.
+        let on_pipes = behavior.console_on_all_streams_or_none
+            && (spec.capture_stdout || spec.input.is_some());
+        let PtyPair { slave, master } = PtyPair::open_with(
+            size,
+            PtyOptions {
+                // Nothing here answers a console's startup cursor query, and typed bytes are
+                // passed on as they are (the terminal they come from is not ours to switch to
+                // win32 input mode).
+                inherit_cursor: false,
+                win32_input_mode: false,
+            },
+        )?;
+        let command = command(spec, on_pipes);
+        let (mut child, ending) = if jobs {
+            let job = PtyJob::new()?;
+            (slave.spawn_in(&command, &job)?, Ending::Job(job))
+        } else {
+            (slave.spawn(&command)?, Ending::Group)
+        };
         if let (Some(input), Some(mut pipe)) = (spec.input.clone(), child.take_stdin()) {
             // On its own thread, so a full pipe cannot block the caller; then closed.
             spawn_named("bmux-pty-input", move || {
@@ -789,43 +918,47 @@ mod platform {
         // Only the process may keep the terminal's far side open, so its exit closes it.
         drop(command);
         drop(slave);
-        // Reads and writes poll, so neither can wedge on a terminal kept open elsewhere.
-        master.set_nonblocking(true)?;
         let exited = Arc::new(AtomicBool::new(false));
         let (events, receiver) = Events::new();
-        let (done, finished) = mpsc::channel();
-        let mut readers = 1;
-        events.read(
-            Polled {
-                source: Source::Terminal(master.try_clone_reader()?),
-                closed: Arc::clone(&events.closed),
-                exited: Arc::clone(&exited),
-            },
-            PtyEvent::Output,
-            done.clone(),
-        );
-        if let Some(stdout) = child.take_stdout() {
-            stdout.set_nonblocking(true)?;
-            readers += 1;
-            events.read(
-                Polled {
-                    source: Source::Stdout(stdout),
-                    closed: Arc::clone(&events.closed),
-                    exited: Arc::clone(&exited),
-                },
-                PtyEvent::Stdout,
-                done,
-            );
+        let master = if on_pipes {
+            // The process has no terminal: its pipes are all there is.
+            drop(master);
+            None
         } else {
-            drop(done);
-        }
+            // Reads and writes poll, so neither can wedge on a terminal kept open elsewhere.
+            master.set_nonblocking(true)?;
+            Some(Arc::new(master))
+        };
+        let (readers, finished) = read_streams(
+            &events,
+            &exited,
+            master.as_deref(),
+            &mut child,
+            spec.capture_stdout,
+        )?;
+        let capabilities = if on_pipes {
+            PtyCapabilities {
+                terminal: false,
+                resize: false,
+                input: false,
+                signals: false,
+            }
+        } else {
+            PtyCapabilities {
+                signals: !jobs,
+                ..TERMINAL
+            }
+        };
         let closed = Arc::clone(&events.closed);
         let pid = child.id();
+        let master = Arc::new(Mutex::new(master));
         let (reap_guard, reap_when_released) = mpsc::channel::<()>();
         let control = PtyControl::new(
             Control {
-                master: Arc::new(master),
+                master: Arc::clone(&master),
                 pid,
+                capabilities,
+                ending,
                 exited: Arc::clone(&exited),
                 closed,
                 writer: Mutex::new(None),
@@ -833,11 +966,7 @@ mod platform {
             },
             size,
         );
-        // Reported as soon as it exits, but reaped only once no control handle could still
-        // signal its group: until then the zombie keeps its id (and the group's) from reuse.
-        let waiting = Arc::new(Mutex::new(Some(child)));
-        let reaping = Arc::clone(&waiting);
-        super::report_exit(
+        report(
             events,
             Exit {
                 readers,
@@ -846,6 +975,34 @@ mod platform {
                 grace: spec.drain_grace,
                 status: Arc::clone(&control.status),
             },
+            child,
+            behavior.output_ends_with_console.then_some(master),
+            reap_when_released,
+        );
+        Ok(PtyProcess {
+            events: receiver,
+            control,
+            exited: false,
+        })
+    }
+
+    /// Report `child`'s exit as it happens, closing `console` then (a console's output ends
+    /// only once it is closed), and reap it once `reap_when_released` says no control handle
+    /// is left.
+    fn report(
+        events: Events,
+        exit: Exit,
+        child: PtyChild,
+        console: Option<Arc<Mutex<Option<Arc<PtyMaster>>>>>,
+        reap_when_released: mpsc::Receiver<()>,
+    ) {
+        // Reported as soon as it exits, but reaped only once no control handle could still
+        // signal its group: until then the zombie keeps its id (and the group's) from reuse.
+        let waiting = Arc::new(Mutex::new(Some(child)));
+        let reaping = Arc::clone(&waiting);
+        super::report_exit(
+            events,
+            exit,
             move || {
                 let mut child = waiting
                     .lock()
@@ -853,6 +1010,12 @@ mod platform {
                     .take()?;
                 let exit = child.wait_unreaped().or_else(|_| child.wait());
                 *waiting.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
+                if let Some(console) = &console {
+                    console
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                }
                 exit.ok().map(|exit| PtyExit::from_child_exit(&exit))
             },
             move || {
@@ -867,11 +1030,6 @@ mod platform {
                 }
             },
         );
-        Ok(PtyProcess {
-            events: receiver,
-            control,
-            exited: false,
-        })
     }
 }
 
