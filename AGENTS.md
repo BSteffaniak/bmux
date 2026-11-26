@@ -187,7 +187,10 @@ links, found from its dependency graph:
 
 Before a simulation starts running a crate marked `runs = false` (or an external crate audited
 `not-run`), remove that claim so the check scans it (or audit it for real); `cargo sim NAME
---coverage` (nightly) runs NAME instrumented and fails if a line of such a crate ran. A std lock must never be held across a switch point: simulations
+--coverage` (nightly) runs NAME instrumented and fails if a line of such a crate ran.
+`cargo sim NAME --clock-reads` (nightly, `SIMULATOR_CLOCK_READS=fail`) runs NAME with a probe
+that counts real clock reads inside runs, by caller: read `switchy_time`'s clock instead, or
+allow a caller whose reads never reach a run in `xtask/src/sim_clock_reads.rs`, with why. A std lock must never be held across a switch point: simulations
 poll tasks on several workers.
 
 Simulation builds (cargo run in `simulation/`, as `cargo sim` does) read

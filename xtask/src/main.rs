@@ -3,6 +3,7 @@ mod artifacts;
 mod bterm;
 mod bterm_run;
 mod build;
+mod sim_clock_reads;
 mod sim_coverage;
 
 use artifacts::{Result, error};
@@ -254,6 +255,17 @@ fn simulate(args: &[String]) -> Result<()> {
             .cloned()
             .collect();
         return sim_coverage::check(&cargo, &root.join("simulation"), name, &rest);
+    }
+    if args[1..].iter().any(|arg| arg == "--clock-reads") {
+        // `cargo sim NAME --clock-reads [ARGS]`: run NAME with the clock probe loaded, listing
+        // the real clock reads its runs make.
+        let rest: Vec<String> = args[1..]
+            .iter()
+            .filter(|arg| *arg != "--clock-reads")
+            .skip_while(|arg| *arg == "--")
+            .cloned()
+            .collect();
+        return sim_clock_reads::check(&cargo, &root.join("simulation"), name, &rest);
     }
     let mut command = std::process::Command::new(cargo);
     command

@@ -28,6 +28,7 @@ cargo sim pane-runtime --fleet                     # continuously, printing find
 cargo sim pty --regression                         # its pinned seeds
 cargo sim pane-runtime --check                     # is everything it links deterministic?
 cargo sim pane-runtime --coverage                  # did a crate claimed never to run, run?
+cargo sim pane-runtime --clock-reads               # did a run read the real clock?
 ```
 
 `cargo sim NAME [ARGS]` (an alias for `cargo xtask sim`) builds and runs member
@@ -38,6 +39,12 @@ audit list in `determinism.toml`. `--coverage` builds `NAME` instrumented for co
 (in `target/sim-coverage`), runs it, and fails if a line ran of a crate claimed never to run
 (a local crate's `runs = false`, an external crate's `not-run` audit); it needs LLVM's tools (`rustup component add llvm-tools-preview`, `nix build
 .#llvm-tools`, or `LLVM_PROFDATA` and `LLVM_COV`).
+
+`--clock-reads` builds `NAME` with symbols (in `target/sim-clock-reads`) and runs it with
+MoosicBox's `switchy_clock_probe` loaded (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on
+macOS), which counts every real clock read made inside a run, by caller. It lists them
+(`SIMULATOR_CLOCK_READS=fail` fails on any not allowed): the simulators' own reads and
+`foldhash` seeding its hashers are allowed, `SIMULATOR_CLOCK_READS_ALLOW` adds more.
 
 Cargo runs in this directory, so builds read `.cargo/config.toml`: `getrandom` (uuid, rand's
 OS generator, hasher seeds) draws from the run's seed. Runs are configured through simvar's
