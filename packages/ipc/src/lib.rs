@@ -78,6 +78,9 @@ pub const CORE_CAPABILITY_SERVICE_INVOCATION: &str = "core.service_invocation";
 pub const CAPABILITY_SERVICE_CALLER_PLUGIN_V1: &str = "core.service_invocation.caller_plugin.v1";
 pub const CORE_CAPABILITY_EVENT_STREAM: &str = "core.event_stream";
 pub const CORE_CAPABILITY_LIFECYCLE: &str = "core.lifecycle";
+/// Optional: the peer accepts [`Request::WithDeadline`], so a client can tell
+/// the server how long it will wait for each reply.
+pub const CAPABILITY_REQUEST_DEADLINE_V1: &str = "core.request_deadline.v1";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
@@ -171,6 +174,7 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CAPABILITY_SERVICE_CALLER_PLUGIN_V1.to_string(),
         CORE_CAPABILITY_EVENT_STREAM.to_string(),
         CORE_CAPABILITY_LIFECYCLE.to_string(),
+        CAPABILITY_REQUEST_DEADLINE_V1.to_string(),
     ];
     // Advertise compression capabilities when compiled in.
     // Note: Frame compression capabilities are NOT advertised by default
@@ -391,6 +395,115 @@ pub enum Request {
         #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
+    /// `request`, with how long its sender will wait for the reply.
+    ///
+    /// The budget is relative (milliseconds from when the server reads the
+    /// request), so it needs no shared clock. A server that has not started
+    /// `request` when the budget runs out answers [`ErrorCode::Timeout`]
+    /// without running it; one that has started it lets it finish, but stops
+    /// the host waits nested inside it at the deadline. Only the outermost
+    /// request of a connection may carry a deadline. Appended to preserve
+    /// existing binary enum discriminants; only sent to peers that negotiated
+    /// [`CAPABILITY_REQUEST_DEADLINE_V1`].
+    WithDeadline {
+        budget_ms: u64,
+        request: Box<Self>,
+    },
+}
+
+/// How a request may run relative to the other requests of its connection.
+///
+/// A server runs the requests of one connection in the order it reads them,
+/// except that it may run [`Self::Concurrent`] requests alongside the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOrdering {
+    /// Runs alone: after every earlier request of the connection has finished,
+    /// and before any later one starts. For requests that change the
+    /// connection itself (its event delivery, the server's lifecycle).
+    Exclusive,
+    /// Runs after every earlier ordered request of the connection has
+    /// finished, so effects apply in the order the client sent them.
+    Ordered,
+    /// Reads, or effects that do not depend on the connection's other
+    /// requests: may run while earlier requests still run, and may finish
+    /// before them. A client that needs to read its own write waits for the
+    /// write's reply before sending the read.
+    Concurrent,
+}
+
+impl InvokeServiceKind {
+    /// How a service invocation of this kind may run on its connection.
+    #[must_use]
+    pub const fn ordering(self) -> RequestOrdering {
+        match self {
+            Self::Query => RequestOrdering::Concurrent,
+            Self::Command => RequestOrdering::Ordered,
+        }
+    }
+}
+
+impl Request {
+    /// How this request may run relative to the other requests of its
+    /// connection. Declared here, once per variant, so a new request has to
+    /// choose.
+    #[must_use]
+    pub fn ordering(&self) -> RequestOrdering {
+        match self {
+            // Handshake-only, server lifecycle and the connection's own event
+            // delivery state.
+            Self::Hello { .. }
+            | Self::CurrentStreamProvenance
+            | Self::ServerStop
+            | Self::SubscribeEvents
+            | Self::PollEvents { .. }
+            | Self::EnableEventPush => RequestOrdering::Exclusive,
+            Self::Ping
+            | Self::WhoAmIPrincipal
+            | Self::ServerStatus
+            // Brokered for, and answered to, other clients: never ordered
+            // behind this connection's own work.
+            | Self::DeviceSealBroker { .. }
+            | Self::DeviceSealBrokerResponse { .. } => RequestOrdering::Concurrent,
+            Self::InvokeService { kind, .. } | Self::InvokeServiceAsPlugin { kind, .. } => {
+                kind.ordering()
+            }
+            Self::InvokeServicePipeline { pipeline } => {
+                if pipeline
+                    .steps
+                    .iter()
+                    .all(|step| step.kind.ordering() == RequestOrdering::Concurrent)
+                {
+                    RequestOrdering::Concurrent
+                } else {
+                    RequestOrdering::Ordered
+                }
+            }
+            Self::EmitOnPluginBus { .. } => RequestOrdering::Ordered,
+            Self::WithDeadline { request, .. } => request.ordering(),
+        }
+    }
+
+    /// Wrap this request with the time its sender will wait for the reply.
+    #[must_use]
+    pub fn with_deadline(self, budget: std::time::Duration) -> Self {
+        Self::WithDeadline {
+            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+            request: Box::new(self),
+        }
+    }
+
+    /// Split a request into the request to run and its budget, if it has one.
+    /// Only the outermost deadline is unwrapped; a nested one stays in place
+    /// (and is rejected by the server).
+    #[must_use]
+    pub fn into_deadline_parts(self) -> (Self, Option<std::time::Duration>) {
+        match self {
+            Self::WithDeadline { budget_ms, request } => {
+                (*request, Some(std::time::Duration::from_millis(budget_ms)))
+            }
+            request => (request, None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -814,6 +927,81 @@ mod tests {
     #[test]
     fn protocol_version_defaults_to_current() {
         assert_eq!(ProtocolVersion::default(), ProtocolVersion::current());
+    }
+
+    #[test]
+    fn request_deadline_is_an_appended_wrapper() {
+        // Existing discriminants are unchanged; the wrapper is appended after
+        // `InvokeServiceAsPlugin`.
+        assert_eq!(encode(&Request::Ping).unwrap(), [1]);
+        let wrapped = Request::Ping.with_deadline(std::time::Duration::from_millis(5_000));
+        let bytes = encode(&wrapped).unwrap();
+        assert_eq!(bytes[0], 15);
+        let decoded: Request = decode(&bytes).unwrap();
+        assert_eq!(decoded, wrapped);
+        assert_eq!(
+            decoded.into_deadline_parts(),
+            (Request::Ping, Some(std::time::Duration::from_millis(5_000)))
+        );
+        // No wrapper, no deadline: the request is served as before.
+        assert_eq!(Request::Ping.into_deadline_parts(), (Request::Ping, None));
+        assert!(default_supported_capabilities().contains(&CAPABILITY_REQUEST_DEADLINE_V1.into()));
+    }
+
+    #[test]
+    fn request_ordering_follows_service_kind_and_wrappers() {
+        let invoke = |kind| Request::InvokeService {
+            capability: "c".into(),
+            kind,
+            interface_id: "i".into(),
+            operation: "o".into(),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            invoke(InvokeServiceKind::Query).ordering(),
+            RequestOrdering::Concurrent
+        );
+        assert_eq!(
+            invoke(InvokeServiceKind::Command).ordering(),
+            RequestOrdering::Ordered
+        );
+        assert_eq!(
+            invoke(InvokeServiceKind::Command)
+                .with_deadline(std::time::Duration::from_secs(1))
+                .ordering(),
+            RequestOrdering::Ordered
+        );
+        assert_eq!(
+            Request::EnableEventPush.ordering(),
+            RequestOrdering::Exclusive
+        );
+        let step = |kind| ServicePipelineStep {
+            capability: "c".into(),
+            kind,
+            interface_id: "i".into(),
+            operation: "o".into(),
+            payload: ServicePipelinePayload::Encoded {
+                payload: Vec::new(),
+            },
+        };
+        let pipeline = |steps| Request::InvokeServicePipeline {
+            pipeline: ServicePipelineRequest {
+                inputs: BTreeMap::new(),
+                steps,
+            },
+        };
+        assert_eq!(
+            pipeline(vec![step(InvokeServiceKind::Query)]).ordering(),
+            RequestOrdering::Concurrent
+        );
+        assert_eq!(
+            pipeline(vec![
+                step(InvokeServiceKind::Query),
+                step(InvokeServiceKind::Command)
+            ])
+            .ordering(),
+            RequestOrdering::Ordered
+        );
     }
 
     #[test]

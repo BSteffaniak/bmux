@@ -51,3 +51,21 @@ provider reload or restart; application mutations still own any stronger durable
 retry guarantees. Startup claims, committed-frame input fences, and native
 output
 receipts remain separate ownership safeguards.
+
+## Request ordering and deadlines
+
+Each IPC request declares how it runs relative to the other requests of its
+connection (`Request::ordering`): commands run one after another in the order
+the client sent them; queries may run while earlier requests still run and may
+answer first; requests that change the connection itself (event delivery,
+server lifecycle) run alone. A client that must read its own write waits for
+the write's reply first. A connection runs at most 32 requests at once.
+
+Peers that negotiate `core.request_deadline.v1` wrap each request in
+`Request::WithDeadline`, carrying how long the client waits for the reply. The
+budget is relative, so it needs no shared clock. A request whose deadline
+passes before it starts is answered with `Timeout` and never run. A started
+request is never cancelled (its outcome may be part-way through effects), but
+the host waits nested inside it (a slot for a nested call, the nested call's
+reply) stop at the deadline, after a short grace for replies. Peers without the
+capability send and receive requests exactly as before.

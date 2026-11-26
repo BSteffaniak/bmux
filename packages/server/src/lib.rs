@@ -43,6 +43,8 @@ use bmux_performance_state::{
 };
 use bmux_recording_runtime::RollingRecordingSettings;
 
+mod request_scope;
+
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
@@ -461,9 +463,28 @@ pub struct ServiceInvokeContext {
     /// Plugin a host authenticated as the originator of this invocation.
     /// `None` for host-originated calls (CLI, attach, server internals).
     caller_plugin_id: Option<Arc<str>>,
+    /// The client request this invocation serves: its deadline, and the
+    /// nested calls it waits on. Captured when the context is built.
+    scope: request_scope::RequestScope,
 }
 
 impl ServiceInvokeContext {
+    /// When the client request this invocation serves stops waiting for its
+    /// reply, if the client said. Host waits nested in the invocation should
+    /// not outlast it.
+    #[must_use]
+    pub const fn request_deadline(&self) -> Option<Instant> {
+        self.scope.deadline()
+    }
+
+    /// This context serving a request with `deadline` (for hosts that run
+    /// work on a client's behalf outside its connection, and for tests).
+    #[must_use]
+    pub fn with_request_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.scope = self.scope.with_deadline(deadline);
+        self
+    }
+
     /// Retain opaque Rust-local host context without changing transport authority.
     /// This value is never decoded from or serialized into a request.
     #[must_use]
@@ -600,7 +621,18 @@ impl ServiceInvokeContext {
         None
     }
 
+    /// Run a nested kernel request inside the client request this context
+    /// serves: it inherits that request's deadline, and is recorded as a call
+    /// the request waits on until it finishes.
     async fn execute_request(&self, request: Request) -> Result<Response> {
+        let _nested = self.scope.enter_nested(nested_call_label(&request));
+        self.scope
+            .clone()
+            .run(self.execute_request_in_scope(request))
+            .await
+    }
+
+    async fn execute_request_in_scope(&self, request: Request) -> Result<Response> {
         if let Some(response) = self.execute_stream_metadata_request(&request) {
             return Ok(response);
         }
@@ -769,11 +801,14 @@ pub const fn kernel_request_access(request: &Request) -> Option<RouteAccess> {
         | Request::EnableEventPush => Some(RouteAccess::Observe),
         Request::EmitOnPluginBus { .. } => Some(RouteAccess::Input),
         // Stopping the server, brokering the host's device seal and the
-        // host-only kernel bridge are never reachable remotely.
+        // host-only kernel bridge are never reachable remotely. A
+        // connection's deadline is unwrapped before its request is
+        // authorized; a nested one is invalid (and never runs).
         Request::ServerStop
         | Request::DeviceSealBroker { .. }
         | Request::DeviceSealBrokerResponse { .. }
-        | Request::CurrentStreamProvenance => Some(RouteAccess::OwnerLocal),
+        | Request::CurrentStreamProvenance
+        | Request::WithDeadline { .. } => Some(RouteAccess::OwnerLocal),
         Request::InvokeService { .. }
         | Request::InvokeServiceAsPlugin { .. }
         | Request::InvokeServicePipeline { .. } => None,
@@ -976,6 +1011,7 @@ async fn invoke_service_output_as(
         client_id,
         client_principal_id,
         caller_plugin_id,
+        scope: request_scope::RequestScope::current(),
     };
     let registry_timer = PhaseTimer::start();
     let dispatch = {
@@ -1011,7 +1047,7 @@ async fn invoke_service_output_as(
         ));
     };
     let invocation_timer = PhaseTimer::start();
-    let output = invocation.await?;
+    let output = request_scope::watch_invocation(&interface_id, &operation, invocation).await?;
     let invocation_us = invocation_timer.elapsed_us();
     emit_phase_timing(
         PhaseChannel::Service,
@@ -1661,6 +1697,7 @@ impl BmuxServer {
             client_id: ClientId::new(),
             client_principal_id: Uuid::nil(),
             caller_plugin_id: None,
+            scope: request_scope::RequestScope::current(),
         }
     }
 
@@ -3110,7 +3147,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let client_id = ClientId::new();
     let client_principal_id: Uuid;
-    let mut selected_session: Option<SessionId> = None;
+    let selected_session: ConnectionSelection = Arc::new(Mutex::new(None));
     let mut attached_stream_session: Option<SessionId> = None;
     let supports_service_contract_v2: bool;
     let negotiated_frame_codec: Option<
@@ -3248,6 +3285,28 @@ async fn handle_connection(
     let mut event_push_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // ── Request loop ─────────────────────────────────────────────────────
+    //
+    // Requests of one connection run in the order they arrive, except where
+    // their declared `RequestOrdering` lets them run alongside others (see
+    // `ConnectionLanes`): one slow command no longer holds up every query the
+    // client sends after it.
+
+    let request_server = RequestServer {
+        state: Arc::clone(&state),
+        shutdown_tx: shutdown_tx.clone(),
+        client_id,
+        client_principal_id,
+        frame_tx: frame_tx.clone(),
+        frame_codec: negotiated_frame_codec.clone(),
+        supports_service_contract_v2,
+    };
+    let mut lanes = ConnectionLanes::default();
+    // Reads run in a task of their own: a frame read is not cancel-safe, and
+    // the loop also waits for the requests it runs.
+    let (envelope_tx, mut envelope_rx) = mpsc::channel(1);
+    let reader_task = tokio::spawn(read_request_envelopes(reader, envelope_tx));
+    let _reader_abort = AbortOnDrop(reader_task.abort_handle());
+    let mut lease_revoked = false;
 
     let request_result: Result<()> = async {
     loop {
@@ -3256,8 +3315,18 @@ async fn handle_connection(
         }
         let received = tokio::select! {
             biased;
-            () = &mut revoked => break,
-            result = reader.recv_envelope_with_timing() => result,
+            () = &mut revoked => {
+                lease_revoked = true;
+                break;
+            }
+            Some(finished) = lanes.in_flight.join_next(), if !lanes.in_flight.is_empty() => {
+                finished_request(finished)?;
+                continue;
+            }
+            received = envelope_rx.recv(), if lanes.has_room() => match received {
+                Some(received) => received,
+                None => break,
+            },
             _ = &mut writer_done_rx => break,
             changed = connection_shutdown.changed() => {
                 if changed.is_err() || *connection_shutdown.borrow() {
@@ -3275,6 +3344,7 @@ async fn handle_connection(
             }
             Err(error) => return Err(error).context("failed receiving request envelope"),
         };
+        let received_at = Instant::now();
 
         let request_decode_started = Instant::now();
         let request = match parse_request(&envelope) {
@@ -3292,6 +3362,8 @@ async fn handle_connection(
                 continue;
             }
         };
+        let (request, budget) = request.into_deadline_parts();
+        let deadline = budget.map(|budget| received_at + budget);
         let request_decode_us = request_decode_started.elapsed().as_micros();
         // Admitted streams get the full protocol, each request checked against
         // its access class before any effect. `InvokeServiceAsPlugin` is
@@ -3315,132 +3387,62 @@ async fn handle_connection(
         // Track whether this request enables event push delivery.
         let is_enable_push = matches!(request, Request::EnableEventPush);
 
-        let request_kind = request_kind_name(&request);
-        let service_metadata = ipc_service_request_metadata(&request);
-        let exclusive = request_requires_exclusive(&request);
-        let request_record_encode_us = 0_u128;
-        let started_at = Instant::now();
-        debug!(
-            client_id = %client_id.0,
-            request_id = envelope.request_id,
-            request = request_kind,
-            exclusive,
-            "server.request.start"
-        );
-        let request_record_us = 0_u128;
-
-        let handle_started = Instant::now();
-        let mut response = tokio::select! {
-            biased;
-            () = &mut revoked => break,
-            response = handle_request(
-                &state,
-                &shutdown_tx,
-                client_id,
-                client_principal_id,
-                &mut selected_session,
-                request,
-            ) => response?,
-        };
-        if !supports_service_contract_v2
-            && let Response::Err(error) = &mut response
-            && error.code.requires_service_contract_v2()
-        {
-            error.code = ErrorCode::Internal;
+        // Revalidate after reading, immediately before request dispatch. This
+        // never downgrades an admitted stream to the ordinary local path.
+        if admitted.as_ref().is_some_and(|binding| binding.is_revoked()) {
+            lease_revoked = true;
+            break;
         }
-        let handle_us = handle_started.elapsed().as_micros();
-        let elapsed_ms = started_at.elapsed().as_millis();
-        let (response_record_encode_us, response_record_us) = match &response {
-            Response::Ok(payload) => {
-                let response_record_encode_us = 0_u128;
-                debug!(
-                    client_id = %client_id.0,
-                    request_id = envelope.request_id,
-                    request = request_kind,
-                    response = response_payload_kind_name(payload),
-                    elapsed_ms,
-                    "server.request.done"
-                );
-                (response_record_encode_us, 0_u128)
+        let ordering = request.ordering();
+        // The selected session is connection state, synced from the follow
+        // state before each request (the sync also selects the followed
+        // context). It must never run while an ordered request (which may
+        // change the selection itself) runs: ordered and exclusive requests
+        // sync when they start, after the requests before them; concurrent
+        // ones sync here, and only while no ordered request is running.
+        // Otherwise they skip it, reading the selection as it stands.
+        let selection = match ordering {
+            bmux_ipc::RequestOrdering::Ordered | bmux_ipc::RequestOrdering::Exclusive => {
+                Some(Arc::clone(&selected_session))
             }
-            Response::Err(error) => {
-                warn!(
-                    client_id = %client_id.0,
-                    request_id = envelope.request_id,
-                    request = request_kind,
-                    error_code = ?error.code,
-                    error_message = %error.message,
-                    elapsed_ms,
-                    "server.request.error"
-                );
-                (0_u128, 0_u128)
+            bmux_ipc::RequestOrdering::Concurrent => {
+                if lanes.ordered_idle() {
+                    sync_shared_connection_selection(&state, client_id, &selected_session)?;
+                }
+                None
             }
         };
-        let response_send_started = Instant::now();
-        // ServerStop has already requested shutdown. Its acknowledgement must
-        // still be queued (with the same finite capacity deadline), rather than
-        // cancelled by the shutdown it initiated.
-        let (_ack_shutdown_tx, mut ack_shutdown_rx) = watch::channel(false);
-        let response_shutdown = if matches!(response, Response::Ok(ResponsePayload::ServerStopping)) {
-            &mut ack_shutdown_rx
-        } else {
-            &mut connection_shutdown
-        };
-        let response_send_timing = match send_response_via_channel(
-            &frame_tx,
-            envelope.request_id,
-            &response,
-            response_shutdown,
-            Duration::from_secs(5),
-            negotiated_frame_codec.as_deref(),
-        ).await {
-            Ok(timing) => timing,
-            Err(err) if is_frame_too_large_error(&err) => {
-                warn!(
-                    client_id = %client_id.0,
-                    request_id = envelope.request_id,
-                    "response exceeded frame size limit, sending error to client: {err:#}"
-                );
-                send_error_via_channel(
-                    &frame_tx,
-                    envelope.request_id,
-                    ErrorCode::Internal,
-                    "response too large".to_string(),
-                    &mut connection_shutdown,
-                    Duration::from_secs(5),
-                    negotiated_frame_codec.as_deref(),
-                ).await?;
-                IpcResponseSendTiming::default()
+        let job = request_server.clone().serve(ReceivedRequest {
+            request_id: envelope.request_id,
+            request,
+            deadline,
+            selection,
+            read_timing: request_read_timing,
+            decode_us: request_decode_us,
+        });
+        match ordering {
+            bmux_ipc::RequestOrdering::Exclusive => {
+                tokio::select! {
+                    biased;
+                    () = &mut revoked => {
+                        lease_revoked = true;
+                        break;
+                    }
+                    drained = lanes.drain() => drained?,
+                }
+                tokio::select! {
+                    biased;
+                    () = &mut revoked => {
+                        lease_revoked = true;
+                        break;
+                    }
+                    served = job => served?,
+                }
             }
-            Err(err) => {
-                warn!(client_id = %client_id.0, request_id = envelope.request_id,
-                    error = %err, "response delivery failed; closing connection");
-                return Err(err);
-            }
-        };
-        let response_send_us = response_send_started.elapsed().as_micros();
-        emit_phase_timing(
-            PhaseChannel::Ipc,
-            &server_ipc_request_phase_payload(
-                request_kind,
-                service_metadata,
-                envelope.request_id,
-                &response,
-                request_read_timing.socket_read_us,
-                request_read_timing.frame_decode_us,
-                request_decode_us,
-                request_record_encode_us,
-                request_record_us,
-                handle_us,
-                response_record_encode_us,
-                response_record_us,
-                response_send_timing.response_encode,
-                response_send_timing.frame_encode,
-                response_send_timing.writer_queue,
-                response_send_us,
-                started_at.elapsed().as_micros(),
-            ),
-        );
+            bmux_ipc::RequestOrdering::Ordered => lanes.spawn_ordered(job),
+            bmux_ipc::RequestOrdering::Concurrent => lanes.spawn_concurrent(job),
+        }
+
 
         // After responding to EnableEventPush, spawn the event push task.
         // It receives events from the broadcast channel and forwards them
@@ -3644,6 +3646,15 @@ async fn handle_connection(
     Ok(())
     }.await;
 
+    // Requests already running finish: they are never cancelled mid-effect.
+    // A revoked stream lease is the exception; its requests must not continue.
+    if lease_revoked {
+        lanes.in_flight.abort_all();
+    }
+    if let Err(error) = lanes.drain().await {
+        debug!(%client_id, "request finished after its connection ended: {error:#}");
+    }
+    drop(request_server);
     drop(retained_registration);
     state.event_push_clients.lock().await.remove(&client_id);
 
@@ -3664,6 +3675,10 @@ async fn handle_connection(
     }
     finish_writer(writer_task, std::time::Duration::from_secs(5)).await;
 
+    let mut selected_session = selected_session
+        .lock()
+        .map(|selected| *selected)
+        .unwrap_or_default();
     detach_client_state_on_disconnect(
         &state,
         client_id,
@@ -3683,6 +3698,275 @@ async fn handle_connection(
     unsubscribe_events(&state, client_id)?;
 
     request_result
+}
+
+/// Most requests one connection may have running or queued at once. Past it,
+/// the connection reads no further request until one finishes.
+const MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: usize = 32;
+
+/// The requests one connection is running, by [`bmux_ipc::RequestOrdering`]:
+/// ordered requests run one after another in arrival order (each waits for
+/// the one before it), concurrent ones start at once, and exclusive ones run
+/// on the connection's own task once everything else has finished.
+#[derive(Default)]
+struct ConnectionLanes {
+    in_flight: tokio::task::JoinSet<Result<()>>,
+    /// Closes when the most recently queued ordered request has finished.
+    ordered_tail: Option<oneshot::Receiver<()>>,
+}
+
+impl ConnectionLanes {
+    fn has_room(&self) -> bool {
+        self.in_flight.len() < MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION
+    }
+
+    /// Whether no ordered request is running or queued.
+    fn ordered_idle(&mut self) -> bool {
+        match &mut self.ordered_tail {
+            None => true,
+            Some(tail) => {
+                let finished = matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+                if finished {
+                    self.ordered_tail = None;
+                }
+                finished
+            }
+        }
+    }
+
+    fn spawn_ordered(&mut self, job: impl Future<Output = Result<()>> + Send + 'static) {
+        let previous = self.ordered_tail.take();
+        let (finished, tail) = oneshot::channel::<()>();
+        self.ordered_tail = Some(tail);
+        self.in_flight.spawn(async move {
+            if let Some(previous) = previous {
+                // Closed, never sent: closing is the signal.
+                let _ = previous.await;
+            }
+            let result = job.await;
+            drop(finished);
+            result
+        });
+    }
+
+    fn spawn_concurrent(&mut self, job: impl Future<Output = Result<()>> + Send + 'static) {
+        self.in_flight.spawn(job);
+    }
+
+    /// Wait for every running and queued request to finish.
+    async fn drain(&mut self) -> Result<()> {
+        let mut first_error = None;
+        while let Some(finished) = self.in_flight.join_next().await {
+            if let Err(error) = finished_request(finished) {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.ordered_tail = None;
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+/// A request task's outcome: its own error (a response that could not be
+/// delivered), or a panic. Either ends the connection, as it did when
+/// requests ran on the connection's task.
+fn finished_request(finished: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match finished {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("request task failed: {error}")),
+    }
+}
+
+async fn read_request_envelopes(
+    mut reader: bmux_ipc::transport::ErasedIpcStreamReader,
+    envelopes: mpsc::Sender<
+        std::result::Result<(Envelope, bmux_ipc::transport::IpcReadTiming), IpcTransportError>,
+    >,
+) {
+    loop {
+        let received = reader.recv_envelope_with_timing().await;
+        let failed = received.is_err();
+        if envelopes.send(received).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// One request read from a connection, with what its run needs.
+struct ReceivedRequest {
+    request_id: u64,
+    request: Request,
+    /// When the client stops waiting for the reply, if it said.
+    deadline: Option<Instant>,
+    /// For ordered and exclusive requests, the connection selection to sync
+    /// when the request starts.
+    selection: Option<ConnectionSelection>,
+    read_timing: bmux_ipc::transport::IpcReadTiming,
+    decode_us: u128,
+}
+
+/// What a connection's requests share: who sent them, and where replies go.
+#[derive(Clone)]
+struct RequestServer {
+    state: Arc<ServerState>,
+    shutdown_tx: watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    frame_tx: mpsc::Sender<Vec<u8>>,
+    frame_codec: Option<std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>>,
+    supports_service_contract_v2: bool,
+}
+
+impl RequestServer {
+    /// Run one request and queue its reply. An error means the reply could
+    /// not be delivered (the connection ends).
+    #[allow(clippy::too_many_lines)]
+    async fn serve(self, received: ReceivedRequest) -> Result<()> {
+        let ReceivedRequest {
+            request_id,
+            request,
+            deadline,
+            selection,
+            read_timing,
+            decode_us,
+        } = received;
+        let client_id = self.client_id;
+        let request_kind = request_kind_name(&request);
+        let service_metadata = ipc_service_request_metadata(&request);
+        let exclusive = request_requires_exclusive(&request);
+        let started_at = Instant::now();
+        debug!(
+            client_id = %client_id.0,
+            request_id,
+            request = request_kind,
+            exclusive,
+            "server.request.start"
+        );
+        let handle_started = Instant::now();
+        let mut response = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // Not started, so it had no effect: safe to refuse.
+            Response::Err(ErrorResponse {
+                code: ErrorCode::Timeout,
+                message: format!(
+                    "request deadline passed before {request_kind} started; it was not run"
+                ),
+            })
+        } else {
+            if let Some(selection) = &selection {
+                sync_shared_connection_selection(&self.state, client_id, selection)?;
+            }
+            request_scope::RequestScope::root(deadline)
+                .run(dispatch_request(
+                    &self.state,
+                    &self.shutdown_tx,
+                    client_id,
+                    self.client_principal_id,
+                    request,
+                ))
+                .await?
+        };
+        if !self.supports_service_contract_v2
+            && let Response::Err(error) = &mut response
+            && error.code.requires_service_contract_v2()
+        {
+            error.code = ErrorCode::Internal;
+        }
+        let handle_us = handle_started.elapsed().as_micros();
+        let elapsed_ms = started_at.elapsed().as_millis();
+        match &response {
+            Response::Ok(payload) => {
+                debug!(
+                    client_id = %client_id.0,
+                    request_id,
+                    request = request_kind,
+                    response = response_payload_kind_name(payload),
+                    elapsed_ms,
+                    "server.request.done"
+                );
+            }
+            Response::Err(error) => {
+                warn!(
+                    client_id = %client_id.0,
+                    request_id,
+                    request = request_kind,
+                    error_code = ?error.code,
+                    error_message = %error.message,
+                    elapsed_ms,
+                    "server.request.error"
+                );
+            }
+        }
+        let response_send_started = Instant::now();
+        // ServerStop has already requested shutdown. Its acknowledgement must
+        // still be queued (with the same finite capacity deadline), rather than
+        // cancelled by the shutdown it initiated.
+        let (_ack_shutdown_tx, ack_shutdown_rx) = watch::channel(false);
+        let mut response_shutdown =
+            if matches!(response, Response::Ok(ResponsePayload::ServerStopping)) {
+                ack_shutdown_rx
+            } else {
+                self.shutdown_tx.subscribe()
+            };
+        let response_send_timing = match send_response_via_channel(
+            &self.frame_tx,
+            request_id,
+            &response,
+            &mut response_shutdown,
+            Duration::from_secs(5),
+            self.frame_codec.as_deref(),
+        )
+        .await
+        {
+            Ok(timing) => timing,
+            Err(err) if is_frame_too_large_error(&err) => {
+                warn!(
+                    client_id = %client_id.0,
+                    request_id,
+                    "response exceeded frame size limit, sending error to client: {err:#}"
+                );
+                send_error_via_channel(
+                    &self.frame_tx,
+                    request_id,
+                    ErrorCode::Internal,
+                    "response too large".to_string(),
+                    &mut self.shutdown_tx.subscribe(),
+                    Duration::from_secs(5),
+                    self.frame_codec.as_deref(),
+                )
+                .await?;
+                IpcResponseSendTiming::default()
+            }
+            Err(err) => {
+                warn!(client_id = %client_id.0, request_id,
+                    error = %err, "response delivery failed; closing connection");
+                return Err(err);
+            }
+        };
+        let response_send_us = response_send_started.elapsed().as_micros();
+        emit_phase_timing(
+            PhaseChannel::Ipc,
+            &server_ipc_request_phase_payload(
+                request_kind,
+                service_metadata,
+                request_id,
+                &response,
+                read_timing.socket_read_us,
+                read_timing.frame_decode_us,
+                decode_us,
+                0,
+                0,
+                handle_us,
+                0,
+                0,
+                response_send_timing.response_encode,
+                response_send_timing.frame_encode,
+                response_send_timing.writer_queue,
+                response_send_us,
+                started_at.elapsed().as_micros(),
+            ),
+        );
+        Ok(())
+    }
 }
 
 async fn write_queued_frames(
@@ -4018,7 +4302,38 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Bring a connection's selected session in step with the follow state (see
+/// `sync_selected_target_from_follow_state`) and move its session membership
+/// with it.
+fn sync_connection_selection(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    selected_session: &mut Option<SessionId>,
+) -> Result<()> {
+    let previous_selected_session = *selected_session;
+    sync_selected_target_from_follow_state(state, client_id, selected_session)?;
+    reconcile_selected_session_membership(
+        state,
+        client_id,
+        previous_selected_session,
+        *selected_session,
+    )
+}
+
+/// The selected session of one connection, shared by the requests it runs.
+type ConnectionSelection = Arc<Mutex<Option<SessionId>>>;
+
+fn sync_shared_connection_selection(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    selection: &ConnectionSelection,
+) -> Result<()> {
+    let mut selected = selection
+        .lock()
+        .map_err(|_| anyhow::anyhow!("connection selection lock poisoned"))?;
+    sync_connection_selection(state, client_id, &mut selected)
+}
+
 async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -4027,22 +4342,31 @@ async fn handle_request(
     selected_session: &mut Option<SessionId>,
     request: Request,
 ) -> Result<Response> {
+    sync_connection_selection(state, client_id, selected_session)?;
+    dispatch_request(state, shutdown_tx, client_id, client_principal_id, request).await
+}
+
+/// Run one request whose connection selection is already in step.
+#[allow(clippy::too_many_lines)]
+async fn dispatch_request(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    request: Request,
+) -> Result<Response> {
     let _operation_guard = if request_requires_exclusive(&request) {
         Some(state.operation_lock.lock().await)
     } else {
         None
     };
 
-    let previous_selected_session = *selected_session;
-    sync_selected_target_from_follow_state(state, client_id, selected_session)?;
-    reconcile_selected_session_membership(
-        state,
-        client_id,
-        previous_selected_session,
-        *selected_session,
-    )?;
-
     let response = match request {
+        Request::WithDeadline { .. } => Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "a request deadline is only valid on the outermost request of a connection"
+                .to_string(),
+        }),
         Request::CurrentStreamProvenance | Request::Hello { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "hello request is only valid during handshake".to_string(),
@@ -4171,6 +4495,7 @@ async fn handle_request(
                     client_id,
                     client_principal_id,
                     caller_plugin_id: None,
+                    scope: request_scope::RequestScope::current(),
                 };
                 let registry_started = std::time::Instant::now();
                 let dispatch = {
@@ -4209,7 +4534,9 @@ async fn handle_request(
 
                 let invocation_started = std::time::Instant::now();
                 let response = if let Some(invocation) = invocation {
-                    match invocation.await {
+                    match request_scope::watch_invocation(&interface_id, &operation, invocation)
+                        .await
+                    {
                         Ok(output) => Response::Ok(ResponsePayload::ServiceInvoked {
                             payload: output.payload,
                         }),
@@ -4259,6 +4586,7 @@ async fn handle_request(
                         resolver_us,
                         invocation_us,
                         level,
+                        slowest_nested = %request_scope::RequestScope::current().describe_slowest(),
                         "typed service invocation exceeded latency budget",
                     );
                 }
@@ -4463,6 +4791,24 @@ const fn response_requires_snapshot(_response: &Response) -> bool {
     false
 }
 
+/// How a nested call is named in diagnostics: a service call by its
+/// interface and operation, anything else by its request kind.
+fn nested_call_label(request: &Request) -> String {
+    match request {
+        Request::InvokeService {
+            interface_id,
+            operation,
+            ..
+        }
+        | Request::InvokeServiceAsPlugin {
+            interface_id,
+            operation,
+            ..
+        } => format!("{interface_id}.{operation}"),
+        other => request_kind_name(other).to_string(),
+    }
+}
+
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::CurrentStreamProvenance => "current_stream_provenance",
@@ -4474,6 +4820,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::InvokeService { .. } => "invoke_service",
         Request::InvokeServiceAsPlugin { .. } => "invoke_service_as_plugin",
         Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
+        Request::WithDeadline { .. } => "with_deadline",
         Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
@@ -4889,8 +5236,8 @@ async fn send_response_via_channel(
     let frame_encode_us = frame_encode_started.elapsed().as_micros();
     let queue_started = Instant::now();
     // Reserve before enqueueing: cancellation/timeout must not publish a frame.
-    // Each connection has one serial response producer, so waiting retains at
-    // most one extra bounded frame rather than spawning unbounded send tasks.
+    // A connection has at most MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION response
+    // producers, so waiting retains a bounded number of extra frames.
     let permit = tokio::select! {
         biased;
         () = async {
@@ -5262,6 +5609,228 @@ mod tests {
         std::fs::remove_file(path).unwrap(); // This fixture owns the socket pathname.
     }
 
+    /// A connected, handshaken raw client of a live connection, and what
+    /// the lane test handlers record. `slow` (a command) waits for `release`;
+    /// `fast` (a command) and `read` (a query) answer at once; `deadline` (a
+    /// query) answers whether its context carries a request deadline.
+    #[cfg(unix)]
+    struct LaneFixture {
+        peer: LocalIpcStream,
+        log: Arc<Mutex<Vec<&'static str>>>,
+        release: Arc<tokio::sync::Semaphore>,
+        _task: AbortOnDrop,
+        _listener: LocalIpcListener,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for LaneFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn lane_kind(operation: &str) -> bmux_ipc::InvokeServiceKind {
+        if matches!(operation, "read" | "deadline") {
+            bmux_ipc::InvokeServiceKind::Query
+        } else {
+            bmux_ipc::InvokeServiceKind::Command
+        }
+    }
+
+    #[cfg(unix)]
+    fn lane_request(operation: &str) -> Request {
+        Request::InvokeService {
+            capability: "test.lanes".into(),
+            kind: lane_kind(operation),
+            interface_id: "lanes/v1".into(),
+            operation: operation.into(),
+            payload: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn lane_fixture() -> LaneFixture {
+        let path = private_socket_path();
+        let endpoint = IpcEndpoint::unix_socket(path.clone());
+        let server = BmuxServer::new(endpoint.clone());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let route = |operation: &'static str| {
+            let log = Arc::clone(&log);
+            let release = Arc::clone(&release);
+            let kind = lane_kind(operation);
+            server
+                .register_service_handler(
+                    "test.lanes",
+                    kind,
+                    "lanes/v1",
+                    operation,
+                    move |_, context, _| {
+                        let log = Arc::clone(&log);
+                        let release = Arc::clone(&release);
+                        async move {
+                            if operation == "deadline" {
+                                return Ok(vec![u8::from(context.request_deadline().is_some())]);
+                            }
+                            log.lock().unwrap().push(operation);
+                            if operation == "slow" {
+                                release.acquire().await.unwrap().forget();
+                                log.lock().unwrap().push("slow done");
+                            }
+                            Ok(vec![1])
+                        }
+                    },
+                )
+                .unwrap();
+        };
+        for operation in ["slow", "fast", "read", "deadline"] {
+            route(operation);
+        }
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let mut peer = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let stream = listener.accept().await.unwrap();
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(ConnectionSlot::try_acquire(&pool).unwrap());
+        let task = tokio::spawn(handle_connection(
+            Arc::clone(&server.state),
+            server.shutdown_tx.clone(),
+            stream.into(),
+            None,
+            permit,
+        ));
+        retained_transport_request(
+            &mut peer,
+            Request::Hello {
+                contract: ProtocolContract::current(
+                    CORE_PROTOCOL_CAPABILITIES
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                ),
+                client_name: "lanes-test".into(),
+                principal_id: Uuid::new_v4(),
+            },
+        )
+        .await;
+        LaneFixture {
+            peer,
+            log,
+            release,
+            _task: AbortOnDrop(task.abort_handle()),
+            _listener: listener,
+            path,
+        }
+    }
+
+    #[cfg(unix)]
+    impl LaneFixture {
+        async fn send(&mut self, request_id: u64, request: &Request) {
+            let envelope =
+                Envelope::new(request_id, EnvelopeKind::Request, encode(request).unwrap());
+            self.peer.send_envelope(&envelope).await.unwrap();
+        }
+
+        async fn reply(&mut self) -> (u64, Response) {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), self.peer.recv_envelope())
+                .await
+                .expect("a reply")
+                .unwrap();
+            assert_eq!(envelope.kind, EnvelopeKind::Response);
+            (envelope.request_id, decode(&envelope.payload).unwrap())
+        }
+
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_command_does_not_hold_up_a_query_and_commands_stay_in_order() {
+        let mut fixture = lane_fixture().await;
+        fixture.send(2, &lane_request("slow")).await;
+        fixture.send(3, &lane_request("fast")).await;
+        fixture.send(4, &lane_request("read")).await;
+        // The query is answered while the slow command still runs.
+        let (request_id, response) = fixture.reply().await;
+        assert_eq!(request_id, 4);
+        assert!(matches!(response, Response::Ok(_)), "{response:?}");
+        // The later command waits for the earlier one.
+        assert_eq!(fixture.log(), ["slow", "read"]);
+        fixture.release.add_permits(1);
+        assert_eq!(fixture.reply().await.0, 2);
+        assert_eq!(fixture.reply().await.0, 3);
+        assert_eq!(fixture.log(), ["slow", "read", "slow done", "fast"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_whose_deadline_passes_before_it_starts_is_refused_unrun() {
+        let mut fixture = lane_fixture().await;
+        fixture.send(2, &lane_request("slow")).await;
+        fixture
+            .send(
+                3,
+                &lane_request("fast").with_deadline(Duration::from_millis(50)),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fixture.release.add_permits(1);
+        assert_eq!(fixture.reply().await.0, 2);
+        let (request_id, response) = fixture.reply().await;
+        assert_eq!(request_id, 3);
+        assert!(
+            matches!(&response, Response::Err(error) if error.code == ErrorCode::Timeout),
+            "{response:?}"
+        );
+        assert_eq!(fixture.log(), ["slow", "slow done"]);
+        // A deadline that has not passed changes nothing.
+        fixture
+            .send(
+                4,
+                &lane_request("fast").with_deadline(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(matches!(fixture.reply().await, (4, Response::Ok(_))));
+        assert_eq!(fixture.log(), ["slow", "slow done", "fast"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handlers_see_the_deadline_only_when_the_client_sends_one() {
+        let mut fixture = lane_fixture().await;
+        let invoked = |value: u8| {
+            Response::Ok(ResponsePayload::ServiceInvoked {
+                payload: vec![value],
+            })
+        };
+        // An older client sends no deadline: served exactly as before.
+        fixture.send(2, &lane_request("deadline")).await;
+        assert_eq!(fixture.reply().await, (2, invoked(0)));
+        fixture
+            .send(
+                3,
+                &lane_request("deadline").with_deadline(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(fixture.reply().await, (3, invoked(1)));
+        // Only the outermost request may carry one.
+        fixture
+            .send(
+                4,
+                &lane_request("deadline")
+                    .with_deadline(Duration::from_secs(5))
+                    .with_deadline(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(matches!(
+            fixture.reply().await,
+            (4, Response::Err(error)) if error.code == ErrorCode::InvalidRequest
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn retained_transport_liveness_tracks_registration_drop_and_poison() {
@@ -5582,6 +6151,7 @@ mod tests {
             client_id: local_id,
             client_principal_id: Uuid::new_v4(),
             caller_plugin_id: None,
+            scope: request_scope::RequestScope::current(),
             host_dispatch_context: None,
         };
         let raw = encode(&plain).unwrap();

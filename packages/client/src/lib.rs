@@ -703,7 +703,10 @@ impl BmuxClient {
             "ipc.request.start"
         );
         let encode_started = std::time::Instant::now();
-        let payload = encode(&request)?;
+        let sent =
+            with_negotiated_deadline(self.negotiated_protocol.as_ref(), self.timeout, request);
+        let payload = encode(&sent)?;
+        let (request, _) = sent.into_deadline_parts();
         let encode_us = encode_started.elapsed().as_micros();
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
@@ -1390,7 +1393,10 @@ impl StreamingBmuxClient {
         );
 
         let encode_started = std::time::Instant::now();
-        let payload = encode(&request)?;
+        let sent =
+            with_negotiated_deadline(self.negotiated_protocol.as_ref(), self.timeout, request);
+        let payload = encode(&sent)?;
+        let (request, _) = sent.into_deadline_parts();
         let encode_us = encode_started.elapsed().as_micros();
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
@@ -1845,6 +1851,29 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::EnableEventPush => "enable_event_push",
         Request::DeviceSealBroker { .. } => "device_seal_broker",
         Request::DeviceSealBrokerResponse { .. } => "device_seal_broker_response",
+        Request::WithDeadline { .. } => "with_deadline",
+    }
+}
+
+/// `request` as sent on a connection that waits `timeout` for each reply:
+/// with that deadline when the server negotiated
+/// [`bmux_ipc::CAPABILITY_REQUEST_DEADLINE_V1`], so it can refuse work nobody
+/// will wait for; unchanged for older servers.
+fn with_negotiated_deadline(
+    negotiated: Option<&NegotiatedProtocol>,
+    timeout: Duration,
+    request: Request,
+) -> Request {
+    let supported = negotiated.is_some_and(|negotiated| {
+        negotiated
+            .capabilities
+            .iter()
+            .any(|capability| capability == bmux_ipc::CAPABILITY_REQUEST_DEADLINE_V1)
+    });
+    if supported {
+        request.with_deadline(timeout)
+    } else {
+        request
     }
 }
 
@@ -2079,14 +2108,41 @@ mod tests {
 
     mod error_class {
         use super::super::{
-            ClientError, ErrorClass, ErrorCode, IpcTransportError, TypedTransportFailure,
+            ClientError, ErrorClass, ErrorCode, IpcTransportError, Request, TypedTransportFailure,
             TypedDispatchClientError, TypedServiceClientError, map_client_error,
+            with_negotiated_deadline,
         };
         use std::io::ErrorKind;
         use std::time::Duration;
 
         fn io(kind: ErrorKind) -> ClientError {
             ClientError::Transport(IpcTransportError::Io(std::io::Error::new(kind, "x")))
+        }
+
+        #[test]
+        fn requests_carry_the_timeout_as_a_deadline_only_to_servers_that_negotiated_it() {
+            let negotiated = |capabilities: Vec<String>| bmux_ipc::NegotiatedProtocol {
+                wire_epoch: bmux_ipc::CURRENT_WIRE_EPOCH,
+                revision: bmux_ipc::CURRENT_PROTOCOL_REVISION,
+                capabilities,
+            };
+            let timeout = Duration::from_millis(5_000);
+            let with_deadline =
+                negotiated(vec![bmux_ipc::CAPABILITY_REQUEST_DEADLINE_V1.to_string()]);
+            assert_eq!(
+                with_negotiated_deadline(Some(&with_deadline), timeout, Request::Ping),
+                Request::Ping.with_deadline(timeout)
+            );
+            // Older servers (and the handshake, before negotiation) get the request unchanged.
+            let older = negotiated(Vec::new());
+            assert_eq!(
+                with_negotiated_deadline(Some(&older), timeout, Request::Ping),
+                Request::Ping
+            );
+            assert_eq!(
+                with_negotiated_deadline(None, timeout, Request::Ping),
+                Request::Ping
+            );
         }
 
         #[test]
