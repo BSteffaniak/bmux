@@ -17,10 +17,12 @@
 //! This crate only runs processes. Interpreting the terminal stream (for example with
 //! `bmux_terminal_grid`) and presenting it are the caller's concern.
 //!
-//! What a platform supports is reported by [`PtyProcess::capabilities`]. On platforms without
-//! pseudo-terminal support here (anything but Unix), processes run on plain pipes: output is
-//! still streamed, but programs see no terminal, resizing has no effect, and nothing can be
-//! written while they run.
+//! What a process supports is reported by [`PtyProcess::capabilities`]. On Windows a console
+//! cannot be signalled, only stopped, so interrupting stops the process and everything it
+//! started, as killing does; and a console cannot redirect only some of its streams, so a
+//! process whose output is captured or whose input is fed runs on plain pipes: output is still
+//! streamed, but it sees no terminal, resizing has no effect, and nothing can be written while
+//! it runs.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -48,7 +50,6 @@ const CHUNK: usize = 16 * 1024;
 /// [`PtyCommand::drain_grace`] says otherwise.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// How often blocked reads and writes look up whether they should stop.
-#[cfg(any(unix, feature = "simulator"))]
 const POLL: Duration = Duration::from_millis(10);
 
 /// How a process ended.
@@ -87,7 +88,6 @@ impl PtyExit {
         self.complete
     }
 
-    #[cfg(any(unix, feature = "simulator"))]
     fn from_child_exit(exit: &ChildExit) -> Self {
         Self {
             code: if exit.signal_number().is_some() {
@@ -96,19 +96,6 @@ impl PtyExit {
                 Some(i32::from_ne_bytes(exit.exit_code().to_ne_bytes()))
             },
             signal: exit.signal_number(),
-            complete: true,
-        }
-    }
-
-    #[cfg(not(any(unix, feature = "simulator")))]
-    fn from_status(status: std::process::ExitStatus) -> Self {
-        #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
-        #[cfg(not(unix))]
-        let signal = None;
-        Self {
-            code: status.code(),
-            signal,
             complete: true,
         }
     }
@@ -251,7 +238,6 @@ impl PtyCommand {
 
     /// The process to start on a terminal: the caller's environment with this command's
     /// changes, and `TERM` unless set.
-    #[cfg(any(unix, feature = "simulator"))]
     fn spawn_command(&self) -> SpawnCommand {
         let mut command = SpawnCommand::new(&self.program);
         command.args(&self.args);
@@ -269,27 +255,6 @@ impl PtyCommand {
         }
         command
     }
-
-    // native-only: begin.
-    #[cfg(not(any(unix, feature = "simulator")))]
-    fn std_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(cwd) = &self.cwd {
-            command.current_dir(cwd);
-        }
-        if !self.env.iter().any(|(key, _)| key == "TERM") {
-            command.env("TERM", "xterm-256color");
-        }
-        for (key, value) in &self.env {
-            match value {
-                Some(value) => command.env(key, value),
-                None => command.env_remove(key),
-            };
-        }
-        command
-    }
-    // native-only: end.
 }
 
 /// A process running on a pseudo-terminal.
@@ -544,19 +509,6 @@ impl PtyWriter {
     }
 }
 
-/// Write `input` to the child's standard input on its own thread (so a full pipe cannot
-/// block the caller), then close it.
-#[cfg(not(any(unix, feature = "simulator")))]
-fn feed_input(child: &mut std::process::Child, input: Option<&Vec<u8>>) {
-    if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
-        let input = input.clone();
-        spawn_named("bmux-pty-input", move || {
-            use std::io::Write as _;
-            let _ = pipe.write_all(&input);
-        });
-    }
-}
-
 /// Shared by the threads of one process: the event queue and whether the exit was reported,
 /// after which late output is dropped so `Exited` stays last.
 #[derive(Clone)]
@@ -609,7 +561,8 @@ impl Events {
     }
 }
 
-/// Every process on `switchy_pty`: Unix natively, and the simulation under every personality.
+/// Every process on `switchy_pty`, natively (Unix and Windows) and in the simulation under every
+/// personality.
 /// What differs between systems follows [`switchy_pty::behavior`]:
 ///
 /// * **Process groups** (Unix): the process leads its own session on a terminal; interrupting
@@ -619,7 +572,6 @@ impl Events {
 ///   its own cursor, as nothing answers a startup query, and is closed once the process exits,
 ///   as a console's output ends only then. With its output captured or its input fed, it runs
 ///   without the console, on pipes (a console cannot redirect only some of its streams).
-#[cfg(any(unix, feature = "simulator"))]
 mod platform {
     use std::io;
 
@@ -1032,239 +984,6 @@ mod platform {
         );
     }
 }
-
-// native-only: begin. Windows and other non-Unix hosts are not simulated, so this code may use
-// std threads and channels directly.
-
-/// Plain pipes standing in for a terminal: output is streamed, nothing more.
-#[cfg(not(any(unix, feature = "simulator")))]
-mod pipes {
-    use std::io;
-    use std::process::Stdio;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, PoisonError, mpsc};
-    use std::time::Duration;
-
-    use super::{
-        Events, Exit, PtyCapabilities, PtyCommand, PtyControl, PtyEvent, PtyExit, PtyProcess,
-        PtySize, PtyWriter,
-    };
-
-    pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
-        terminal: false,
-        resize: false,
-        input: false,
-        signals: false,
-    };
-
-    #[derive(Debug)]
-    pub struct Control {
-        child: Arc<Mutex<std::process::Child>>,
-        pid: u32,
-        exited: Arc<AtomicBool>,
-        closed: Arc<AtomicBool>,
-    }
-
-    impl Control {
-        pub const fn id(&self) -> u32 {
-            self.pid
-        }
-
-        #[allow(clippy::unused_self)]
-        pub const fn capabilities(&self) -> PtyCapabilities {
-            CAPABILITIES
-        }
-
-        // Pipes have no terminal size.
-        #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-        pub fn resize(&self, _size: PtySize) -> io::Result<()> {
-            Ok(())
-        }
-
-        pub fn interrupt(&self) -> io::Result<()> {
-            self.kill()
-        }
-
-        pub fn stop_output(&self) {
-            self.closed.store(true, Ordering::Release);
-        }
-
-        // Pipes stand in for the terminal; nothing is written while the process runs.
-        #[allow(clippy::unused_self)]
-        pub fn writer(&self) -> io::Result<PtyWriter> {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
-        }
-
-        pub fn kill(&self) -> io::Result<()> {
-            if self.exited.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            self.child
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .kill()
-        }
-    }
-
-    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
-        let mut command = spec.std_command();
-        command
-            .stdin(if spec.input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
-        super::feed_input(&mut child, spec.input.as_ref());
-        let (events, receiver) = Events::new();
-        let (done, finished) = mpsc::channel();
-        let stdout_event = if spec.capture_stdout {
-            PtyEvent::Stdout
-        } else {
-            PtyEvent::Output
-        };
-        if let Some(stdout) = child.stdout.take() {
-            events.read(stdout, stdout_event, done.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            events.read(stderr, PtyEvent::Output, done);
-        }
-        let pid = child.id();
-        let closed = Arc::clone(&events.closed);
-        let child = Arc::new(Mutex::new(child));
-        let exited = Arc::new(AtomicBool::new(false));
-        let waited = Arc::clone(&child);
-        let control = PtyControl::new(
-            super::platform::Control::Pipes(Control {
-                child: Arc::clone(&child),
-                pid,
-                exited: Arc::clone(&exited),
-                closed,
-            }),
-            size,
-        );
-        let exit = Exit {
-            readers: 2,
-            finished,
-            exited,
-            grace: spec.drain_grace,
-            status: Arc::clone(&control.status),
-        };
-        super::report_exit(
-            events,
-            exit,
-            move || loop {
-                // Polled so `kill` can take the lock between checks.
-                match waited
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .try_wait()
-                {
-                    Ok(Some(status)) => return Some(PtyExit::from_status(status)),
-                    Ok(None) => {}
-                    Err(_) => return None,
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            },
-            || {},
-        );
-        Ok(PtyProcess {
-            events: receiver,
-            control,
-            exited: false,
-        })
-    }
-}
-
-#[cfg(all(windows, not(feature = "simulator")))]
-mod conpty;
-
-/// Where pseudo-terminals are not available, processes run on pipes; on Windows, on `ConPTY`
-/// unless standard output is captured or input is fed (a console cannot redirect only some of
-/// its streams).
-#[cfg(not(any(unix, feature = "simulator")))]
-mod platform {
-    use std::io;
-
-    use super::{PtyCapabilities, PtyCommand, PtyProcess, PtySize, PtyWriter, pipes};
-
-    #[derive(Debug)]
-    pub enum Control {
-        Pipes(pipes::Control),
-        #[cfg(windows)]
-        Conpty(super::conpty::Control),
-    }
-
-    impl Control {
-        pub const fn id(&self) -> u32 {
-            match self {
-                Self::Pipes(control) => control.id(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.id(),
-            }
-        }
-
-        pub const fn capabilities(&self) -> PtyCapabilities {
-            match self {
-                Self::Pipes(control) => control.capabilities(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.capabilities(),
-            }
-        }
-
-        pub fn resize(&self, size: PtySize) -> io::Result<()> {
-            match self {
-                Self::Pipes(control) => control.resize(size),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.resize(size),
-            }
-        }
-
-        pub fn interrupt(&self) -> io::Result<()> {
-            match self {
-                Self::Pipes(control) => control.interrupt(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.interrupt(),
-            }
-        }
-
-        pub fn kill(&self) -> io::Result<()> {
-            match self {
-                Self::Pipes(control) => control.kill(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.kill(),
-            }
-        }
-
-        pub fn stop_output(&self) {
-            match self {
-                Self::Pipes(control) => control.stop_output(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.stop_output(),
-            }
-        }
-
-        pub fn writer(&self) -> io::Result<PtyWriter> {
-            match self {
-                Self::Pipes(control) => control.writer(),
-                #[cfg(windows)]
-                Self::Conpty(control) => control.writer(),
-            }
-        }
-    }
-
-    pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
-        #[cfg(windows)]
-        if !spec.capture_stdout && spec.input.is_none() {
-            return super::conpty::spawn(spec, size);
-        }
-        pipes::spawn(spec, size)
-    }
-}
-
-// native-only: end.
 
 /// How the threads of one process learn that it ended.
 struct Exit {
