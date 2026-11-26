@@ -3,16 +3,13 @@ package io.bmux.android
 import android.util.Log
 
 enum class AlphaEventKind {
-    ImportTarget,
+    PairStart,
+    PairSuccess,
+    PairFailure,
+    ForgetHost,
     ConnectAttempt,
     ConnectSuccess,
     ConnectFailure,
-    ObservePinAttempt,
-    ObservePinSuccess,
-    ObservePinFailure,
-    DiscoveryStart,
-    DiscoveryUpdate,
-    DiscoveryStop,
     ReconnectEnabled,
     ReconnectDisabled,
 }

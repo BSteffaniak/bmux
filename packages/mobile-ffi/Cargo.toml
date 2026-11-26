@@ -23,3 +23,6 @@ uuid             = { workspace = true, features = ["v4"] }
 default = []
 
 fail-on-warnings = ["bmux_mobile_core/fail-on-warnings"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

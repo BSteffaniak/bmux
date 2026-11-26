@@ -2,28 +2,23 @@
 
 Android client for connection-first bmux remote workflows.
 
-M4 status: baseline Compose Android app module is now scaffolded with target
-import/list, connect, and host-key observe/pin flows wired to UniFFI.
+Paired-host status: the app is a paired bmux device, like `bmux connect` on a
+desktop.
 
-M5 status: discovery, reconnect, and security hardening are now wired:
+- Pairing: paste the `bmux-pair:` link from `bmux remote pair` on the host
+  (hidden input), compare the phrase both devices show, and approve on the
+  host. The host is saved with its pinned host key and granted role.
+- Paired host list with connect, terminal, reconnect and forget actions.
+- Device key and saved hosts live in the Rust core under
+  `noBackupFilesDir/bmux`; encrypted preferences keep only the last host and
+  per-host connection health.
+- Reconnect foreground service retries `connect` with exponential backoff.
+- Old saved targets (`iroh://`, `ssh://`, `host:port`) are not migrated; pair
+  again. LAN discovery and SSH host-key pinning were removed with them.
 
-- mDNS LAN discovery using Android NSD
-- reconnect foreground service with exponential backoff loop
-- encrypted local persistence for targets, pin history, discovery history,
-  and target health timestamps
-- runtime permission prompts for discovery and notifications on Android 13+
-- androidTest coverage for reconnect/backoff behavior and secure-store migration
-
-M6 status: internal alpha packaging and dogfood process are now in place:
-
-- `alpha` build type (`io.bmux.android.alpha`) for internal APK distribution
-- `packageInternalAlpha` Gradle task for one-command alpha packaging
-- lightweight alpha telemetry in logcat (`BmuxAlpha`)
-- internal test checklist and failure-capture guide
-
-M7 status (in progress): terminal architecture has started with a
-renderer/transport
-boundary and a native permissive renderer adapter (`org.connectbot:termlib`).
+Earlier milestones: M6 added the `alpha` build type (`io.bmux.android.alpha`),
+`packageInternalAlpha`, alpha telemetry in logcat (`BmuxAlpha`) and the internal
+test checklist; M7 started the terminal renderer (`org.connectbot:termlib`).
 
 ## UniFFI Kotlin Binding Task
 
@@ -57,14 +52,9 @@ Main UI file:
 
 Product direction for v1:
 
-- quick target import and connection
-- iroh, SSH, and LAN TLS connectivity
+- pair once, then connect to saved hosts from anywhere (direct or relay)
 - session selection and reconnect workflows
-- mDNS discovery support
-- strict TLS verification with optional pinning
 - background reconnect via Android foreground service
-
-Terminal emulation is out of scope for v1, but architecture should not block it.
 
 See:
 

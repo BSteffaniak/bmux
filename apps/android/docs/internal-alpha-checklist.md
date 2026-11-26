@@ -8,12 +8,15 @@
 
 ## Dogfood Validation
 
-- Add target by manual URI (`iroh://`, `ssh://`, `host:port`).
-- Start LAN discovery and import at least one discovered target.
-- Connect to one target and confirm status updates.
-- Observe and apply SSH host key pin on one SSH target.
+- On the host, run `bmux remote enable`, then `bmux remote pair`.
+- Paste the pairing link into the app, compare the phrase on both devices, and
+  approve on the host. The host appears under Paired hosts with its role.
+- Connect to the host and confirm the status updates.
+- Open a terminal, type, and confirm the host's own view shows the input.
+- Revoke the device on the host (`bmux remote revoke`) and confirm Connect now
+  reports that the host refuses this device.
 - Enable reconnect service and verify foreground notification appears.
-- Force close app, reopen, verify targets and recents persist.
+- Force close app, reopen, verify paired hosts persist.
 
 ## Failure Capture
 
@@ -29,6 +32,4 @@ Capture app/build info:
 
 ## Known Alpha Limitations
 
-- No terminal rendering UI yet (connection manager only).
-- Discovery is local network best effort and may vary by network policy.
 - Reconnect behavior is foreground-service based and not optimized for battery.

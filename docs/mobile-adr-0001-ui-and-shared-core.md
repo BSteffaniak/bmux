@@ -48,4 +48,4 @@ Tradeoffs:
 
 - M1: scaffold `packages/mobile-core` and `packages/mobile-ffi`.
 - M1: define initial stable FFI types and error codes.
-- M2+: implement SSH transport in Rust (no subprocess `ssh` dependency on mobile).
+- M2+: implement SSH transport in Rust (no subprocess `ssh` dependency on mobile). Superseded: mobile clients pair with hosts and connect over Iroh like desktop clients (`docs/mobile-ffi-contract.md`).

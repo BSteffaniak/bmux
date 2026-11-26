@@ -2,16 +2,30 @@
 
 Shared Rust domain core for bmux mobile clients.
 
-This crate provides shared Rust domain primitives for bmux mobile clients.
+A mobile client is a paired device. It pairs with a host through the host
+owner's `bmux remote pair` link and reaches saved hosts over Iroh (QUIC),
+through the same code desktop `bmux connect` uses: the connections plugin's
+`paired_hosts` module (pairing, known hosts, device key, saved-host connector)
+and `bmux_client`. This crate adds no protocol of its own.
 
 Current responsibilities:
 
-- target parsing and canonicalization
-- transport-agnostic connection state machine
-- iroh/tls/ssh transport adapters
+- paired hosts: pairing state machine over `bmux/pair/1`, saved host list,
+  rename and forget (`paired_host.rs`)
+- connection state: `connect` dials a saved host and completes the handshake
 - session metadata APIs for connection-first mobile flows
 - terminal stream session APIs (`open/poll/write/resize/close`)
 - typed diagnostic and error model for platform UIs
+
+Storage lives under one app-private directory passed to
+`ConnectionManager::new`, in the layout of a desktop client profile
+(`state/connections/...`, optional `config/bmux.toml`). All API objects share
+one process-wide Tokio runtime, because the connections plugin keeps one Iroh
+endpoint per device key for the whole process.
+
+The end-to-end check pairs `ConnectionManager` with a real isolated host and
+attaches a terminal: `cargo nextest run -p bmux_cli --test remote_access
+mobile_core`.
 
 ## Native pointer output v1
 

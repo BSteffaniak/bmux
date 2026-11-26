@@ -18,6 +18,8 @@ mod support;
 mod cluster;
 #[path = "remote_access/harness.rs"]
 mod harness;
+#[path = "remote_access/mobile.rs"]
+mod mobile;
 #[path = "remote_access/probe.rs"]
 mod probe;
 #[path = "remote_access/relay.rs"]

@@ -23,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -34,39 +35,44 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
-import io.bmux.android.terminal.TerminalEndpoint
-import io.bmux.android.terminal.TerminalPointerFrame
-import uniffi.bmux_mobile_ffi.TerminalPointerShapeFfi
 import io.bmux.android.terminal.TerminalChunkFrame
 import io.bmux.android.terminal.TerminalChunkType
 import io.bmux.android.terminal.TerminalDiagnosticFrame
+import io.bmux.android.terminal.TerminalEndpoint
 import io.bmux.android.terminal.TerminalMouseButton
 import io.bmux.android.terminal.TerminalMouseEvent
 import io.bmux.android.terminal.TerminalMouseEventKind
+import io.bmux.android.terminal.TerminalPointerFrame
 import io.bmux.android.terminal.TerminalSessionScreen
 import io.bmux.android.terminal.TerminalStatusSeverity
+import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.bmux_mobile_ffi.ConnectionStateFfi
-import uniffi.bmux_mobile_ffi.ConnectionStatusFfi
-import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
 import uniffi.bmux_mobile_ffi.MobileFfiException
+import uniffi.bmux_mobile_ffi.PairedHostFfi
+import uniffi.bmux_mobile_ffi.PairedHostRoleFfi
+import uniffi.bmux_mobile_ffi.PairingStateFfi
+import uniffi.bmux_mobile_ffi.PairingStatusFfi
 import uniffi.bmux_mobile_ffi.TerminalChunkKindFfi
 import uniffi.bmux_mobile_ffi.TerminalDiagnosticFfi
 import uniffi.bmux_mobile_ffi.TerminalMouseButtonFfi
 import uniffi.bmux_mobile_ffi.TerminalMouseEventFfi
 import uniffi.bmux_mobile_ffi.TerminalMouseEventKindFfi
 import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
-import uniffi.bmux_mobile_ffi.TerminalStatusSeverityFfi
+import uniffi.bmux_mobile_ffi.TerminalPointerShapeFfi
 import uniffi.bmux_mobile_ffi.TerminalSizeFfi
-import uniffi.bmux_mobile_ffi.TargetRecordFfi
+import uniffi.bmux_mobile_ffi.TerminalStatusSeverityFfi
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,172 +86,204 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class TargetUi(
-    val id: String,
-    val name: String,
-    val canonicalTarget: String,
-    val transport: String,
-)
+/**
+ * The app-private directory holding this device's key and saved hosts. It is excluded from
+ * backups: a restored copy of the device key on another phone would impersonate this one.
+ */
+fun mobileStorageDir(context: Context): String =
+    File(context.applicationContext.noBackupFilesDir, "bmux").absolutePath
 
-data class DiscoveredTargetUi(
-    val serviceName: String,
-    val host: String,
-    val port: Int,
+/** A saved paired host as the UI shows it. */
+data class HostUi(
+    val alias: String,
+    val hostKey: String,
+    val role: String,
+    val lastPath: String?,
 ) {
-    val targetInput: String get() = "$host:$port"
+    val shortKey: String get() = hostKey.take(12)
+}
+
+/** A pairing in progress, or the outcome of the last one. */
+data class PairingUi(
+    val id: String,
+    val status: PairingStatusFfi,
+    val phrase: String?,
+    val error: String?,
+) {
+    val finished: Boolean
+        get() = status == PairingStatusFfi.PAIRED ||
+            status == PairingStatusFfi.FAILED ||
+            status == PairingStatusFfi.CANCELLED
 }
 
 data class MainUiState(
     val loading: Boolean = false,
-    val targets: List<TargetUi> = emptyList(),
-    val discoveredTargets: List<DiscoveredTargetUi> = emptyList(),
-    val discoveryHistory: List<DiscoveredTargetUi> = emptyList(),
-    val discoveryRunning: Boolean = false,
+    val hosts: List<HostUi> = emptyList(),
+    val pairing: PairingUi? = null,
     val reconnectServiceEnabled: Boolean = false,
     val selectedSession: String = "",
-    val activeTerminalTarget: TargetUi? = null,
+    val activeTerminalHost: HostUi? = null,
     val lastConnection: String = "",
-    val lastHostKey: String = "",
     val info: String = "",
     val warning: String? = null,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val gateway = MobileGateway(application)
-    private val discovery = LanDiscoveryManager(application)
+    private var pairingPoll: Job? = null
 
     var state by mutableStateOf(MainUiState(info = gateway.startupInfo))
         private set
 
-    var newTarget by mutableStateOf("")
-    var targetName by mutableStateOf("")
+    var pairingLink by mutableStateOf("")
+    var hostAlias by mutableStateOf("")
 
     init {
-        refreshTargets()
+        refreshHosts()
     }
 
-    fun refreshTargets() {
+    fun refreshHosts() {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
-            val loaded = withContext(Dispatchers.IO) { gateway.listTargets() }
-            state = state.copy(
-                loading = false,
-                targets = loaded,
-                discoveryHistory = gateway.discoveryHistory(),
-                info = gateway.startupInfoWithSecurityState(),
+            val loaded = withContext(Dispatchers.IO) { gateway.listHosts() }
+            state = loaded.fold(
+                onSuccess = { state.copy(loading = false, hosts = it) },
+                onFailure = { state.copy(loading = false, warning = it.message) },
             )
         }
     }
 
-    fun importTarget() {
-        val source = newTarget.trim()
-        if (source.isEmpty()) {
-            state = state.copy(warning = "Target cannot be empty")
+    /** Start pairing with the host whose `bmux remote pair` link was pasted. */
+    fun startPairing() {
+        val link = pairingLink.trim()
+        if (link.isEmpty()) {
+            state = state.copy(warning = "Paste the pairing link from `bmux remote pair` on the host")
             return
         }
-        AlphaTelemetry.log(AlphaEventKind.ImportTarget, "source=$source")
-
+        AlphaTelemetry.log(AlphaEventKind.PairStart, "alias=${hostAlias.ifBlank { "auto" }}")
         viewModelScope.launch {
-            state = state.copy(loading = true, warning = null)
-            val result = withContext(Dispatchers.IO) {
-                gateway.importTarget(source, targetName.trim().ifBlank { null })
+            state = state.copy(warning = null)
+            val started = withContext(Dispatchers.IO) {
+                gateway.startPairing(link, hostAlias.trim().ifBlank { null }, deviceName())
             }
-            if (result.isFailure) {
-                state = state.copy(
-                    loading = false,
-                    warning = result.exceptionOrNull()?.message ?: "Import failed",
-                )
-                return@launch
-            }
-
-            newTarget = ""
-            targetName = ""
-            val loaded = withContext(Dispatchers.IO) { gateway.listTargets() }
-            state = state.copy(loading = false, targets = loaded)
+            started.fold(
+                onSuccess = { pairing ->
+                    // The link is single-use and secret: never keep it after it is sent.
+                    pairingLink = ""
+                    state = state.copy(pairing = pairing)
+                    followPairing(pairing.id)
+                },
+                onFailure = { state = state.copy(warning = it.message ?: "Pairing failed") },
+            )
         }
     }
 
-    fun importDiscoveredTarget(target: DiscoveredTargetUi) {
-        newTarget = target.targetInput
-        if (targetName.isBlank()) {
-            targetName = target.serviceName
+    fun cancelPairing() {
+        val pairing = state.pairing ?: return
+        pairingPoll?.cancel()
+        viewModelScope.launch {
+            val cancelled = withContext(Dispatchers.IO) { gateway.cancelPairing(pairing.id) }
+            state = state.copy(pairing = cancelled.getOrNull() ?: pairing.copy(status = PairingStatusFfi.CANCELLED))
         }
-        importTarget()
     }
 
-    fun connect(target: TargetUi) {
+    fun dismissPairing() {
+        if (state.pairing?.finished == true) {
+            state = state.copy(pairing = null)
+        }
+    }
+
+    /** Follow a pairing until it finishes. The state is local, so reading it often is cheap. */
+    private fun followPairing(id: String) {
+        pairingPoll?.cancel()
+        pairingPoll = viewModelScope.launch {
+            while (true) {
+                delay(PAIRING_POLL_MS)
+                val current = withContext(Dispatchers.IO) { gateway.pairingState(id) }.getOrElse {
+                    state = state.copy(warning = it.message)
+                    return@launch
+                }
+                state = state.copy(pairing = current)
+                if (current.finished) {
+                    when (current.status) {
+                        PairingStatusFfi.PAIRED -> {
+                            AlphaTelemetry.log(AlphaEventKind.PairSuccess, "pairing=$id")
+                            hostAlias = ""
+                            refreshHosts()
+                        }
+                        PairingStatusFfi.FAILED -> AlphaTelemetry.log(
+                            AlphaEventKind.PairFailure,
+                            "error=${current.error ?: "unknown"}",
+                        )
+                        else -> Unit
+                    }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    fun connect(host: HostUi) {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
             val session = state.selectedSession.ifBlank { null }
-            AlphaTelemetry.log(AlphaEventKind.ConnectAttempt, "target=${target.id}")
-            val result = withContext(Dispatchers.IO) { gateway.connect(target.id, session) }
-            state = if (result.isSuccess) {
-                val connection = result.getOrThrow()
-                AlphaTelemetry.log(
-                    AlphaEventKind.ConnectSuccess,
-                    "target=${target.id},status=${connection.status}",
-                )
-                state.copy(
-                    loading = false,
-                    lastConnection = "${target.name}: ${connection.status}",
-                )
-            } else {
-                AlphaTelemetry.log(
-                    AlphaEventKind.ConnectFailure,
-                    "target=${target.id},error=${result.exceptionOrNull()?.message ?: "unknown"}",
-                )
-                state.copy(
-                    loading = false,
-                    warning = result.exceptionOrNull()?.message ?: "Connection failed",
-                )
-            }
+            AlphaTelemetry.log(AlphaEventKind.ConnectAttempt, "host=${host.alias}")
+            val result = withContext(Dispatchers.IO) { gateway.connect(host.alias, session) }
+            state = result.fold(
+                onSuccess = { connection ->
+                    AlphaTelemetry.log(
+                        AlphaEventKind.ConnectSuccess,
+                        "host=${host.alias},status=${connection.status}",
+                    )
+                    state.copy(loading = false, lastConnection = "${host.alias}: ${connection.status}")
+                },
+                onFailure = { error ->
+                    AlphaTelemetry.log(
+                        AlphaEventKind.ConnectFailure,
+                        "host=${host.alias},error=${error.message ?: "unknown"}",
+                    )
+                    state.copy(loading = false, warning = error.message ?: "Connection failed")
+                },
+            )
         }
     }
 
-    fun observeAndPin(target: TargetUi) {
+    fun forget(host: HostUi) {
         viewModelScope.launch {
-            state = state.copy(loading = true, warning = null)
-            AlphaTelemetry.log(AlphaEventKind.ObservePinAttempt, "target=${target.id}")
-            val result = withContext(Dispatchers.IO) {
-                gateway.observeAndApplyPin(target.canonicalTarget)
-            }
-            state = if (result.isSuccess) {
-                AlphaTelemetry.log(AlphaEventKind.ObservePinSuccess, "target=${target.id}")
-                state.copy(loading = false, lastHostKey = result.getOrThrow())
+            val result = withContext(Dispatchers.IO) { gateway.forgetHost(host.alias) }
+            if (result.isSuccess) {
+                AlphaTelemetry.log(AlphaEventKind.ForgetHost, "host=${host.alias}")
+                state = state.copy(
+                    info = "Forgot ${host.alias}. Revoke this device on the host with `bmux remote revoke`.",
+                )
+                refreshHosts()
             } else {
-                AlphaTelemetry.log(
-                    AlphaEventKind.ObservePinFailure,
-                    "target=${target.id},error=${result.exceptionOrNull()?.message ?: "unknown"}",
-                )
-                state.copy(
-                    loading = false,
-                    warning = result.exceptionOrNull()?.message ?: "Host key check failed",
-                )
+                state = state.copy(warning = result.exceptionOrNull()?.message)
             }
         }
     }
 
-    fun setReconnectService(target: TargetUi, enabled: Boolean) {
+    fun setReconnectService(host: HostUi, enabled: Boolean) {
         if (enabled) {
-            gateway.startReconnectService(target.id, state.selectedSession.ifBlank { null })
-            AlphaTelemetry.log(AlphaEventKind.ReconnectEnabled, "target=${target.id}")
+            gateway.startReconnectService(host.alias, state.selectedSession.ifBlank { null })
+            AlphaTelemetry.log(AlphaEventKind.ReconnectEnabled, "host=${host.alias}")
         } else {
             gateway.stopReconnectService()
-            AlphaTelemetry.log(AlphaEventKind.ReconnectDisabled, "target=${target.id}")
+            AlphaTelemetry.log(AlphaEventKind.ReconnectDisabled, "host=${host.alias}")
         }
         state = state.copy(reconnectServiceEnabled = enabled)
     }
 
-    fun openTerminal(target: TargetUi) {
-        state = state.copy(activeTerminalTarget = target, warning = null)
+    fun openTerminal(host: HostUi) {
+        state = state.copy(activeTerminalHost = host, warning = null)
     }
 
     fun closeTerminal() {
-        state = state.copy(activeTerminalTarget = null)
+        state = state.copy(activeTerminalHost = null)
     }
 
-    fun openTerminal(targetId: String, session: String?, rows: Int, cols: Int): Result<String> {
-        return gateway.openTerminal(targetId, session, rows, cols)
+    fun openTerminal(host: String, session: String?, rows: Int, cols: Int): Result<String> {
+        return gateway.openTerminal(host, session, rows, cols)
     }
 
     fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<TerminalChunkFrame>> {
@@ -280,164 +318,81 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return gateway.latestTerminalFailure(terminalId)
     }
 
-    fun setDiscoveryEnabled(enabled: Boolean) {
-        if (!enabled) {
-            discovery.stop()
-            AlphaTelemetry.log(AlphaEventKind.DiscoveryStop, "user_stopped=true")
-            state = state.copy(discoveryRunning = false, discoveredTargets = emptyList())
-            return
-        }
-
-        AlphaTelemetry.log(AlphaEventKind.DiscoveryStart, "user_started=true")
-
-        discovery.start(
-            onUpdate = { discovered ->
-                gateway.recordDiscoverySnapshot(
-                    discovered.map { DiscoveredTargetUi(it.serviceName, it.host, it.port) },
-                )
-                viewModelScope.launch {
-                    AlphaTelemetry.log(AlphaEventKind.DiscoveryUpdate, "count=${discovered.size}")
-                    state = state.copy(
-                        discoveryRunning = true,
-                        discoveredTargets = discovered.map {
-                            DiscoveredTargetUi(it.serviceName, it.host, it.port)
-                        },
-                    )
-                }
-            },
-            onError = { message ->
-                viewModelScope.launch {
-                    state = state.copy(discoveryRunning = false, warning = message)
-                }
-            },
-        )
-        state = state.copy(discoveryRunning = true)
-    }
-
     fun updateSession(value: String) {
         state = state.copy(selectedSession = value)
     }
 
     override fun onCleared() {
-        discovery.stop()
+        pairingPoll?.cancel()
         super.onCleared()
+    }
+
+    private fun deviceName(): String = listOf(Build.MANUFACTURER, Build.MODEL)
+        .filter { !it.isNullOrBlank() }
+        .joinToString(" ")
+        .ifBlank { "android" }
+
+    private companion object {
+        const val PAIRING_POLL_MS = 250L
     }
 }
 
 private class MobileGateway(application: Application) {
     private val context = application.applicationContext
     private val store = SecureStore(context)
-    private val ffi = runCatching { MobileApiFfi() }.getOrNull()
+    private val ffi = runCatching { MobileApiFfi(mobileStorageDir(context)) }.getOrNull()
 
     val startupInfo: String = if (ffi != null) {
-        "FFI connected with encrypted local store"
+        "Pair a host with the link from `bmux remote pair` on it"
     } else {
-        "FFI unavailable in this runtime; offline encrypted store mode"
+        "bmux native library unavailable in this build"
     }
 
-    init {
-        store.migrateLegacyIfNeeded()
-    }
+    private fun client(): MobileApiFfi =
+        ffi ?: throw IllegalStateException("bmux native library unavailable")
 
-    fun startupInfoWithSecurityState(): String {
-        val pinnedCount = store.pinnedTargets().size
-        val lastTarget = store.lastConnectedTargetId()
-        val migrated = if (store.migrateLegacyIfNeeded()) "legacy migrated" else "secure"
-        val suffix = if (lastTarget != null) "last target tracked" else "no prior target"
-        return "$startupInfo | pinned=$pinnedCount | $suffix | $migrated"
-    }
-
-    fun listTargets(): List<TargetUi> {
-        val healthMap = store.loadTargetHealth().associateBy { it.targetId }
-        val fromFfi = runCatching { ffi?.listTargets() }
-            .getOrNull()
-            ?.map(::mapTarget)
-            ?.sortedWith(compareByDescending<TargetUi> { healthMap[it.id]?.lastSuccessMs ?: 0L }
-                .thenBy { it.name.lowercase() })
-            .orEmpty()
-        if (fromFfi.isNotEmpty()) {
-            store.saveTargets(fromFfi.map { it.toStored() })
-            return fromFfi
-        }
-        return store.loadTargets().map {
-            TargetUi(
-                id = it.id,
-                name = it.name,
-                canonicalTarget = it.canonicalTarget,
-                transport = it.transport,
+    fun listHosts(): Result<List<HostUi>> = runGatewayCall {
+        val health = store.loadHostHealth().associateBy { it.host }
+        client().listHosts()
+            .map(::mapHost)
+            .sortedWith(
+                compareByDescending<HostUi> { health[it.alias]?.lastSuccessMs ?: 0L }
+                    .thenBy { it.alias.lowercase() },
             )
-        }.sortedWith(compareByDescending<TargetUi> { healthMap[it.id]?.lastSuccessMs ?: 0L }
-            .thenBy { it.name.lowercase() })
     }
 
-    fun importTarget(source: String, displayName: String?): Result<TargetUi> {
-        val imported = if (ffi != null) {
-            val client = ffi
-            runCatching { mapTarget(client!!.importTarget(source, displayName)) }
-        } else {
-            val local = TargetUi(
-                id = "local-${System.currentTimeMillis()}",
-                name = displayName ?: source,
-                canonicalTarget = source,
-                transport = guessTransport(source),
-            )
-            Result.success(local)
-        }
+    fun startPairing(link: String, alias: String?, deviceName: String): Result<PairingUi> =
+        runGatewayCall { mapPairing(client().startPairing(link, alias, deviceName)) }
 
-        if (imported.isSuccess) {
-            val updated = listTargets().toMutableList()
-            val candidate = imported.getOrThrow()
-            if (updated.none { it.id == candidate.id }) {
-                updated.add(candidate)
-            }
-            store.saveTargets(updated.map { it.toStored() })
-        }
-        return imported
+    fun pairingState(id: String): Result<PairingUi> =
+        runGatewayCall { mapPairing(client().pairingState(id)) }
+
+    fun cancelPairing(id: String): Result<PairingUi> =
+        runGatewayCall { mapPairing(client().cancelPairing(id)) }
+
+    fun forgetHost(alias: String): Result<Unit> = runGatewayCall {
+        client().forgetHost(alias)
+        store.forgetHost(alias)
     }
 
-    fun connect(targetId: String, session: String?): Result<ConnectionStateFfi> {
-        store.saveLastConnectedTarget(targetId)
-        val connected = if (ffi != null) {
-            val client = ffi
-            runCatching { client!!.connect(targetId, session) }
-        } else {
-            Result.success(
-                ConnectionStateFfi(
-                    id = "fallback-${System.currentTimeMillis()}",
-                    targetId = targetId,
-                    status = ConnectionStatusFfi.CONNECTED,
-                    session = session,
-                    lastError = null,
-                ),
-            )
-        }
-        store.recordTargetHealth(
-            targetId = targetId,
+    fun connect(host: String, session: String?): Result<ConnectionStateFfi> {
+        store.saveLastConnectedHost(host)
+        val connected = runGatewayCall { client().connect(host, session) }
+        store.recordHostHealth(
+            host = host,
             success = connected.isSuccess,
             timestampMs = System.currentTimeMillis(),
         )
         return connected
     }
 
-    fun observeAndApplyPin(target: String): Result<String> {
-        val client = ffi
-            ?: return Result.failure(IllegalStateException("FFI host-key observation unavailable"))
-
-        return runCatching {
-            val suggestion: HostKeyPinSuggestionFfi = client.observeSshHostKeyWithPinSuggestion(target)
-            val pinned = client.applyPinSuggestionToTarget(target, suggestion)
-            store.savePinnedTarget(pinned)
-            "Pinned ${suggestion.observed.algorithm} ${suggestion.observed.fingerprintSha256.take(16)}..."
-        }
-    }
-
-    fun openTerminal(targetId: String, session: String?, rows: Int, cols: Int): Result<String> {
+    fun openTerminal(host: String, session: String?, rows: Int, cols: Int): Result<String> {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
         return runGatewayCall {
             val request = TerminalOpenRequestFfi(
-                targetId = targetId,
+                host = host,
                 session = session,
                 rows = rows.toTerminalUShort("rows"),
                 cols = cols.toTerminalUShort("cols"),
@@ -581,42 +536,30 @@ private class MobileGateway(application: Application) {
         }
     }
 
-    fun startReconnectService(targetId: String, session: String?) {
-        ConnectionForegroundService.start(context, targetId, session)
+    fun startReconnectService(host: String, session: String?) {
+        ConnectionForegroundService.start(context, host, session)
     }
 
     fun stopReconnectService() {
         ConnectionForegroundService.stop(context)
     }
 
-    fun recordDiscoverySnapshot(targets: List<DiscoveredTargetUi>) {
-        store.upsertDiscoveryHistory(
-            targets.map {
-                StoredDiscovery(
-                    serviceName = it.serviceName,
-                    host = it.host,
-                    port = it.port,
-                    lastSeenMs = System.currentTimeMillis(),
-                )
-            },
-        )
-    }
+    private fun mapHost(host: PairedHostFfi): HostUi = HostUi(
+        alias = host.alias,
+        hostKey = host.hostKey,
+        role = when (host.role) {
+            PairedHostRoleFfi.FULL -> "full"
+            PairedHostRoleFfi.VIEW_ONLY -> "view-only"
+            null -> "unknown"
+        },
+        lastPath = host.lastPath,
+    )
 
-    fun discoveryHistory(): List<DiscoveredTargetUi> {
-        return store.loadDiscoveryHistory().map {
-            DiscoveredTargetUi(
-                serviceName = it.serviceName,
-                host = it.host,
-                port = it.port,
-            )
-        }
-    }
-
-    private fun mapTarget(record: TargetRecordFfi): TargetUi = TargetUi(
-        id = record.id,
-        name = record.name,
-        canonicalTarget = record.canonicalTarget,
-        transport = record.transport.name.lowercase(),
+    private fun mapPairing(state: PairingStateFfi): PairingUi = PairingUi(
+        id = state.id,
+        status = state.status,
+        phrase = state.phrase,
+        error = state.error,
     )
 
     private fun <T> runGatewayCall(block: () -> T): Result<T> {
@@ -629,17 +572,16 @@ private class MobileGateway(application: Application) {
 
     private fun userFacingGatewayMessage(error: Throwable): String {
         val resolved = when (error) {
-            is MobileFfiException.InvalidTarget -> "invalid target: ${error.v1}"
-            is MobileFfiException.TargetNotFound -> "target not found: ${error.v1}"
+            is MobileFfiException.InvalidPairingLink -> "not a bmux pairing link: ${error.v1}"
+            is MobileFfiException.PairingNotFound -> "pairing is no longer in progress"
+            is MobileFfiException.HostNotFound -> "no saved host named ${error.v1}"
+            is MobileFfiException.HostStore -> error.v1
+            is MobileFfiException.ConnectionFailed -> error.v1
+            is MobileFfiException.InvalidArgument -> "invalid argument: ${error.v1}"
             is MobileFfiException.ConnectionNotActive -> "connection not active: ${error.v1}"
-            is MobileFfiException.SshBackendUnavailable -> "ssh backend unavailable"
-            is MobileFfiException.SshConnectionFailed -> "ssh connection failed: ${error.v1}"
             is MobileFfiException.TerminalSessionNotFound -> "terminal session ended"
             is MobileFfiException.TerminalSessionClosed -> "terminal session is closed"
             is MobileFfiException.InvalidTerminalSize -> "invalid terminal size"
-            is MobileFfiException.UnsupportedTerminalTransport -> {
-                "unsupported terminal transport: ${error.v1}"
-            }
             is MobileFfiException.TerminalBackendFailure -> error.v1
             else -> error.message
         }
@@ -661,13 +603,6 @@ private class MobileGateway(application: Application) {
         )
     }
 
-    private fun guessTransport(source: String): String = when {
-        source.startsWith("iroh://") -> "iroh"
-        source.startsWith("ssh://") || source.contains('@') -> "ssh"
-        source.startsWith("tls://") || source.contains(':') -> "tls"
-        else -> "bmux"
-    }
-
     private fun Int.toTerminalUShort(name: String): UShort {
         require(this in 1..65_535) { "$name out of range: $this" }
         return toUShort()
@@ -679,28 +614,13 @@ private class MobileGateway(application: Application) {
     }
 }
 
-private fun TargetUi.toStored(): StoredTarget = StoredTarget(
-    id = id,
-    name = name,
-    canonicalTarget = canonicalTarget,
-    transport = transport,
-)
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun MainScreen(vm: MainViewModel) {
     val state = vm.state
     val context = androidx.compose.ui.platform.LocalContext.current
-    val discoveryPermissions = remember { discoveryRuntimePermissions() }
     val notificationPermissions = remember { notificationRuntimePermissions() }
-
-    val discoveryPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { granted ->
-        if (granted.values.all { it }) {
-            vm.setDiscoveryEnabled(!state.discoveryRunning)
-        }
-    }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { _ -> }
@@ -717,17 +637,16 @@ private fun MainScreen(vm: MainViewModel) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            state.activeTerminalTarget?.let { activeTarget ->
+            state.activeTerminalHost?.let { activeHost ->
                 TerminalSessionScreen(
                     endpoint = TerminalEndpoint(
-                        id = activeTarget.id,
-                        name = activeTarget.name,
-                        canonicalTarget = activeTarget.canonicalTarget,
+                        host = activeHost.alias,
+                        description = "${activeHost.role}, host key ${activeHost.shortKey}",
                     ),
                     session = state.selectedSession.ifBlank { null },
                     onBack = vm::closeTerminal,
-                    openTerminal = { targetId, session, rows, cols ->
-                        withContext(Dispatchers.IO) { vm.openTerminal(targetId, session, rows, cols) }
+                    openTerminal = { host, session, rows, cols ->
+                        withContext(Dispatchers.IO) { vm.openTerminal(host, session, rows, cols) }
                     },
                     pollTerminalOutput = { terminalId, maxChunks ->
                         withContext(Dispatchers.IO) { vm.pollTerminalOutput(terminalId, maxChunks) }
@@ -758,39 +677,39 @@ private fun MainScreen(vm: MainViewModel) {
 
             Text(text = state.info, style = MaterialTheme.typography.bodyMedium)
 
-            OutlinedTextField(
-                value = vm.newTarget,
-                onValueChange = { vm.newTarget = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Target URI or host") },
-                placeholder = { Text("iroh://..., ssh://user@host:22, host:7443") },
-                singleLine = true,
-            )
-
-            OutlinedTextField(
-                value = vm.targetName,
-                onValueChange = { vm.targetName = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Display name (optional)") },
-                singleLine = true,
-            )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = { vm.importTarget() }) {
-                    Text("Add target")
-                }
-                Button(onClick = { vm.refreshTargets() }) {
-                    Text("Refresh")
-                }
-                Button(onClick = {
-                    if (hasAllPermissions(context, discoveryPermissions)) {
-                        vm.setDiscoveryEnabled(!state.discoveryRunning)
-                    } else {
-                        discoveryPermissionLauncher.launch(discoveryPermissions)
+            val pairing = state.pairing
+            if (pairing == null || pairing.finished) {
+                OutlinedTextField(
+                    value = vm.pairingLink,
+                    onValueChange = { vm.pairingLink = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Pairing link") },
+                    placeholder = { Text("bmux-pair:...") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = vm.hostAlias,
+                    onValueChange = { vm.hostAlias = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Save host as (optional)") },
+                    singleLine = true,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = { vm.startPairing() }) {
+                        Text("Pair")
                     }
-                }) {
-                    Text(if (state.discoveryRunning) "Stop discovery" else "Start discovery")
+                    Button(onClick = { vm.refreshHosts() }) {
+                        Text("Refresh")
+                    }
                 }
+            }
+            pairing?.let {
+                PairingCard(
+                    pairing = it,
+                    onCancel = vm::cancelPairing,
+                    onDismiss = vm::dismissPairing,
+                )
             }
 
             OutlinedTextField(
@@ -807,103 +726,42 @@ private fun MainScreen(vm: MainViewModel) {
             if (state.lastConnection.isNotEmpty()) {
                 Text(text = state.lastConnection)
             }
-            if (state.lastHostKey.isNotEmpty()) {
-                Text(text = state.lastHostKey)
-            }
-
-            if (state.discoveredTargets.isNotEmpty()) {
-                Text(text = "Discovered on LAN", fontWeight = FontWeight.SemiBold)
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(bottom = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    items(state.discoveredTargets, key = { "${it.host}:${it.port}" }) { target ->
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(10.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column {
-                                    Text(target.serviceName, fontWeight = FontWeight.SemiBold)
-                                    Text("${target.host}:${target.port}")
-                                }
-                                Button(onClick = { vm.importDiscoveredTarget(target) }) {
-                                    Text("Import")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!state.discoveryRunning && state.discoveredTargets.isEmpty() && state.discoveryHistory.isNotEmpty()) {
-                Text(text = "Recent LAN targets", fontWeight = FontWeight.SemiBold)
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(bottom = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    items(state.discoveryHistory, key = { "recent-${it.host}:${it.port}" }) { target ->
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(10.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column {
-                                    Text(target.serviceName, fontWeight = FontWeight.SemiBold)
-                                    Text("${target.host}:${target.port}")
-                                }
-                                Button(onClick = { vm.importDiscoveredTarget(target) }) {
-                                    Text("Import")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             Text(
-                text = if (state.loading) "Working..." else "Targets",
+                text = if (state.loading) "Working..." else "Paired hosts",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
             )
+            if (!state.loading && state.hosts.isEmpty()) {
+                Text(
+                    text = "No paired hosts. On the host, run `bmux remote pair` and paste its link above.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 40.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(state.targets, key = { it.id }) { target ->
-                    TargetCard(
-                        target = target,
+                items(state.hosts, key = { it.alias }) { host ->
+                    HostCard(
+                        host = host,
                         reconnectEnabled = state.reconnectServiceEnabled,
-                        onConnect = { vm.connect(target) },
-                        onTerminal = { vm.openTerminal(target) },
-                        onPin = { vm.observeAndPin(target) },
+                        onConnect = { vm.connect(host) },
+                        onTerminal = { vm.openTerminal(host) },
+                        onForget = { vm.forget(host) },
                         onToggleReconnect = {
                             if (!state.reconnectServiceEnabled && !hasAllPermissions(context, notificationPermissions)) {
                                 notificationPermissionLauncher.launch(notificationPermissions)
                             } else {
-                                vm.setReconnectService(target, !state.reconnectServiceEnabled)
+                                vm.setReconnectService(host, !state.reconnectServiceEnabled)
                             }
                         },
                     )
                 }
             }
         }
-    }
-}
-
-private fun discoveryRuntimePermissions(): Array<String> {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
-    } else {
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 }
 
@@ -925,12 +783,47 @@ private fun hasAllPermissions(context: Context, permissions: Array<String>): Boo
 }
 
 @Composable
-private fun TargetCard(
-    target: TargetUi,
+private fun PairingCard(pairing: PairingUi, onCancel: () -> Unit, onDismiss: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            when (pairing.status) {
+                PairingStatusFfi.CONNECTING -> Text("Contacting the host...")
+                PairingStatusFfi.AWAITING_APPROVAL -> {
+                    Text("Check that the host shows the same phrase, then approve it there:")
+                    Text(
+                        text = pairing.phrase.orEmpty(),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                PairingStatusFfi.PAIRED -> Text("Paired.")
+                PairingStatusFfi.FAILED -> Text(
+                    text = "Pairing failed: ${pairing.error ?: "unknown error"}",
+                    color = MaterialTheme.colorScheme.error,
+                )
+                PairingStatusFfi.CANCELLED -> Text("Pairing cancelled.")
+            }
+            if (pairing.finished) {
+                OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
+            } else {
+                OutlinedButton(onClick = onCancel) { Text("Cancel") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HostCard(
+    host: HostUi,
     reconnectEnabled: Boolean,
     onConnect: () -> Unit,
     onTerminal: () -> Unit,
-    onPin: () -> Unit,
+    onForget: () -> Unit,
     onToggleReconnect: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -940,9 +833,12 @@ private fun TargetCard(
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(text = target.name, fontWeight = FontWeight.SemiBold)
-            Text(text = target.canonicalTarget, style = MaterialTheme.typography.bodySmall)
-            Text(text = "transport: ${target.transport}", style = MaterialTheme.typography.bodySmall)
+            Text(text = host.alias, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "host key ${host.shortKey} | role ${host.role}" +
+                    (host.lastPath?.let { " | last path $it" } ?: ""),
+                style = MaterialTheme.typography.bodySmall,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onConnect) {
                     Text("Connect")
@@ -950,11 +846,11 @@ private fun TargetCard(
                 Button(onClick = onTerminal) {
                     Text("Terminal")
                 }
-                Button(onClick = onPin) {
-                    Text("Observe + Pin")
-                }
                 Button(onClick = onToggleReconnect) {
                     Text(if (reconnectEnabled) "Stop Reconnect" else "Reconnect")
+                }
+                OutlinedButton(onClick = onForget) {
+                    Text("Forget")
                 }
             }
         }

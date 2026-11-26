@@ -3,14 +3,17 @@
 #![allow(clippy::multiple_crate_versions)]
 
 //! Shared mobile domain primitives for bmux clients.
+//!
+//! A mobile client is a paired device: it pairs with a host through the
+//! host's `bmux-pair:` link and reaches saved hosts through the connections
+//! plugin's connector, exactly as `bmux connect` does on a desktop.
 
 pub mod connection;
 pub mod error;
+pub mod paired_host;
 mod pane_runtime_client;
 pub mod pointer_output;
 pub mod remote_bridge;
-pub mod ssh;
-pub mod target;
 
 pub use connection::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, TerminalChunk,
@@ -19,12 +22,6 @@ pub use connection::{
     TerminalSize, TerminalStatusSeverity,
 };
 pub use error::{MobileCoreError, Result};
-pub use ssh::{
-    EmbeddedSshBackend, HostKeyPinSuggestion, MockSshBackend, ObservedHostKey, SshBackend,
-    SshTarget, apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target,
-    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
-    observe_ssh_host_key_with_pin_suggestion, parse_ssh_target,
-};
-pub use target::{
-    CanonicalTarget, TargetInput, TargetRecord, TargetTransport, TargetUri, canonicalize_target,
+pub use paired_host::{
+    PairedHost, PairedHostRole, PairedHostStore, PairingRequest, PairingState, PairingStatus,
 };

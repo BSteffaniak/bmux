@@ -6,7 +6,7 @@ This document locks the M0 architecture for bmux mobile clients.
 
 - Ship a streamlined Android app focused on remote connection workflows.
 - Keep iOS first-class by sharing core logic in Rust via FFI.
-- Reuse existing bmux protocol/auth/target concepts instead of creating a parallel stack.
+- Reuse existing bmux protocol, pairing and connector code instead of creating a parallel stack.
 - Avoid design choices that block future terminal rendering on mobile.
 
 ## Non-Goals (M0)
@@ -42,9 +42,9 @@ work starts in M1.
 
 `mobile-core` owns:
 
-- target parsing and normalization (`bmux://`, `iroh://`, `https://`, `tls://`, SSH target forms)
+- the paired-host model: pairing state, saved hosts, connect (over the
+  connections plugin's `paired_hosts` module)
 - connection orchestration and reconnect state machine
-- transport adapters (iroh, TLS/LAN, SSH)
 - session discovery/selection metadata calls
 - diagnostics/error taxonomy for mobile UX
 
@@ -56,27 +56,24 @@ work starts in M1.
 
 ## Existing bmux Reuse Points
 
-The mobile core should be implemented by extracting/adapting existing logic
-from:
+The mobile core reuses desktop client code directly rather than extracting it:
 
-- `packages/cli/src/runtime/remote_cli.rs` target parsing and resolution
-- `packages/cli/src/connection.rs` remote connection abstraction
-- `packages/cli/src/ssh_access.rs` iroh auth/query semantics
-- `packages/config/src/lib.rs` connection target model
+- `bmux_connections_plugin::paired_hosts`: pairing link checks, the
+  `bmux/pair/1` pairing client, the known-hosts store, the device key and the
+  saved-host connector (the same code `bmux connect` uses)
+- `bmux_client`: the attach protocol over the connector's stream
 
-Cluster gateway note:
-
-- Current cluster gateway routing is plugin/CLI driven.
-- Mobile v1 connection manager remains transport-centric; cluster behavior should remain transparent when connection targets resolve to normal URLs/targets.
-- Preserve extension room for future cluster-aware UX by keeping target metadata extensible.
+Cluster note: a phone pairs with each host it reaches; cluster membership is
+never granted by pairing.
 
 ## Security and Trust Model
 
-- TLS: strict verification by default.
-- TLS pinning: supported as explicit per-target option.
-- Local data: encrypted persistence for targets, recents, trust metadata, and connection prefs.
-- Auth: reuse existing bmux auth and capability handshake model.
-- Iroh auth: support `auth=ssh` semantics from iroh target URLs.
+- Pairing: a single-use 256-bit link secret proven over a transcript bound to
+  both keys, plus a phrase both devices show; the host owner approves.
+- Host identity: the host key is pinned at pairing; a changed key is a hard
+  error, never a silent re-pair.
+- Device identity: one device key per app install, kept out of backups.
+- Authorization: the host enforces the device's role (`full` or `view-only`).
 
 ## Background Behavior (Android)
 
@@ -99,8 +96,9 @@ architecture.
 
 - M0: architecture and API contracts (this doc + FFI contract doc)
 - M1: `mobile-core` crate scaffolding and target/connect state machine
-- M2: SSH transport in shared Rust (no shelling out)
+- M2: SSH transport in shared Rust (since removed)
 - M3: `mobile-ffi` UniFFI bindings
 - M4: Android Compose app flows (targets, connect, session pick)
 - M5: discovery, background reconnect, security hardening
 - M6: alpha packaging and dogfooding
+- Paired hosts: SSH/TLS/raw-Iroh targets replaced by pairing and saved hosts

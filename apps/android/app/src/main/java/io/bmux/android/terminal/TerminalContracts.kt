@@ -3,10 +3,10 @@ package io.bmux.android.terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 
+/** A saved paired host a terminal attaches to: its alias and a short description. */
 data class TerminalEndpoint(
-    val id: String,
-    val name: String,
-    val canonicalTarget: String,
+    val host: String,
+    val description: String,
 )
 
 enum class TerminalChunkType {

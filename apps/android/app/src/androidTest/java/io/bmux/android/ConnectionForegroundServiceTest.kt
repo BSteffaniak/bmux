@@ -13,7 +13,7 @@ class ConnectionForegroundServiceTest {
     fun startAndStopActionsCanBeIssued() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val component = context.startForegroundService(
-            ConnectionForegroundService.createStartIntent(context, "target-1", "main"),
+            ConnectionForegroundService.createStartIntent(context, "desktop", "main"),
         )
         assertNotNull(component)
 

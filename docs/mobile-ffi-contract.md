@@ -1,128 +1,119 @@
-# Mobile FFI Contract (M0 Draft)
+# Mobile FFI Contract
 
-This document defines the initial API contract between platform apps and shared
-Rust.
+This document defines the API contract between platform apps and shared Rust.
 
-Status: draft for M0 alignment. Final names and signatures can evolve in M1
-before freeze.
+Status: implemented for the paired-host model
+(`docs/development/remote-access-architecture.md`, section 7). A phone is a
+paired device like any other bmux client: it pairs with a host through the
+host owner's `bmux remote pair` link and reaches saved hosts over Iroh (QUIC)
+through the connections plugin's saved-host connector. The earlier
+`ssh`/`tls`/`iroh` target model and its SSH host-key pinning APIs are gone; old
+saved targets are not migrated, so users pair again.
 
 ## Design Principles
 
 - Keep platform-facing APIs stable and coarse-grained.
 - Keep platform-neutral types in FFI (no Android/iOS concepts).
 - Return structured errors with machine-readable codes and user-safe messages.
-- Stream connection/discovery state via events, not polling-only APIs.
+- Reuse the desktop client code paths; the mobile crates add no protocol.
 
-## Proposed Crates
+## Crates
 
-- `packages/mobile-core`: internal domain logic
-- `packages/mobile-ffi`: UniFFI exports
+- `packages/mobile-core`: mobile domain logic over
+  `bmux_connections_plugin::paired_hosts` (pairing, saved hosts, connector) and
+  `bmux_client` (attach).
+- `packages/mobile-ffi`: UniFFI exports (`MobileApiFfi`).
 
-## Target Types
+## Storage
 
-`TargetInput` (import request):
+`MobileApiFfi(storage_dir)` takes one app-private directory. Every API object
+of one app passes the same directory. Under it:
 
-- source string (URI/name/host entry)
-- optional display name override
-- optional transport hints
+- `state/connections/devices/default.key`: this device's Iroh key (owner-only).
+- `state/connections/known-hosts/default.json`: saved hosts with pinned host
+  keys (owner-only, atomic replace).
+- `config/bmux.toml` (optional): connections plugin settings such as
+  `remote.relay` for self-hosted or disabled relays.
 
-`TargetRecord` (persisted):
+This is the layout of a desktop client profile. Android uses
+`noBackupFilesDir/bmux`, so a restored backup never clones the device key onto
+another phone.
 
-- `id` (stable UUID)
-- `name` (user label)
-- `canonical_target` (normalized target reference)
-- `transport` (`local`, `ssh`, `tls`, `iroh`)
-- `default_session` (optional)
-- `security` (TLS pin info, strict host key settings)
-- `metadata` (extensible map for future cluster/gateway info)
+## Host Model
 
-## Core API Surface (Draft)
+`PairedHostFfi` (persisted by the core, carries no secret):
 
-`Target APIs`
+- `alias`: the name the host is saved under
+- `host_key`: the pinned host key (Iroh endpoint id)
+- `role`: `full` or `view_only`, as granted at pairing; the host enforces the
+  current role, which its owner can change later
+- `last_path`: `direct` or `relay`, from the last connection
 
-- `import_target(input: TargetInput) -> TargetRecord`
-- `list_targets() -> Vec<TargetRecord>`
-- `update_target(record: TargetRecord) -> TargetRecord`
-- `delete_target(target_id: String) -> ()`
-- `test_target(target_id: String, timeout_ms: u64) -> TestResult`
+## Core API Surface
 
-`Connection APIs`
+Pairing:
 
-- `connect(request: ConnectRequest) -> ConnectionHandle`
-- `disconnect(handle_id: String) -> ()`
-- `reconnect(handle_id: String) -> ()`
-- `connection_status(handle_id: String) -> ConnectionStatus`
+- `start_pairing(link, alias?, device_name) -> PairingStateFfi`: checks the
+  link, then dials `bmux/pair/1` in the background. One pairing runs at a
+  time; starting another cancels the previous one.
+- `pairing_state(pairing_id) -> PairingStateFfi`: `connecting`,
+  `awaiting_approval` (with the `phrase` both devices show), `paired` (with the
+  saved `host`), `failed` (with `error`), or `cancelled`. Reading it is local;
+  the host pushes its decision over the open pairing stream.
+- `cancel_pairing(pairing_id) -> PairingStateFfi`: drops the pairing
+  connection, which withdraws the request on the host.
 
-`Session APIs`
+Saved hosts:
 
-- `list_sessions(handle_id: String) -> Vec<SessionSummary>`
-- `select_session(handle_id: String, selector: SessionSelector) -> SessionSelection`
+- `list_hosts() -> Vec<PairedHostFfi>`
+- `rename_host(alias, new_alias) -> PairedHostFfi`
+- `forget_host(alias)`: forgets the host on this device only; the host keeps
+  the device until its owner runs `bmux remote revoke`.
 
-`Discovery APIs`
+Connections:
 
-- `start_discovery() -> DiscoveryHandle`
-- `stop_discovery(handle_id: String) -> ()`
-- `discovery_events(handle_id: String) -> Stream<DiscoveryEvent>`
+- `connect(host, session?) -> ConnectionStateFfi`: dials the saved host over
+  the shared QUIC connection and completes the `Hello` handshake, so success
+  means the host answered and still accepts this device.
+- `disconnect(connection_id) -> ConnectionStateFfi`
 
-`Security APIs`
+Terminal streams (unchanged apart from addressing a host by alias):
 
-- `set_tls_pinning(target_id: String, pin: TlsPinPolicy) -> ()`
-- `clear_tls_pinning(target_id: String) -> ()`
-- `ssh_known_host_decision(input: SshHostDecisionInput) -> SshHostDecision`
+- `open_terminal(TerminalOpenRequestFfi { host, session?, rows, cols })`
+- `poll_terminal_presentation(terminal_id, max_chunks, version)`,
+  `poll_terminal_output(terminal_id, max_chunks)`
+- `write_terminal_input`, `send_terminal_mouse_event`, `resize_terminal`,
+  `close_terminal`, `terminal_state`, `terminal_diagnostics`,
+  `latest_terminal_failure`
 
-`Event Streams`
+Without an explicit session, `open_terminal` tries the session this host last
+attached, then the session with the most clients, creating one when the host
+has none.
 
-- `connection_events(handle_id: String) -> Stream<ConnectionEvent>`
-- `diagnostic_events() -> Stream<DiagnosticEvent>`
+## Error Model
 
-## Event Models (Draft)
+All calls return `Result<T, MobileFfiError>`:
 
-`ConnectionEvent`:
-
-- `connecting`
-- `connected`
-- `reconnecting`
-- `auth_required`
-- `degraded`
-- `disconnected`
-- `failed`
-
-`DiscoveryEvent`:
-
-- `candidate_found` (host/address/transport/metadata)
-- `candidate_updated`
-- `candidate_lost`
-- `scan_error`
-
-## Error Model (Draft)
-
-All public calls return `Result<T, MobileError>`.
-
-`MobileError` fields:
-
-- `code`: stable enum (`invalid_target`, `tls_verify_failed`, `ssh_auth_failed`, `timeout`, `unreachable`, `protocol_incompatible`, `internal`)
-- `message`: user-safe summary
-- `details`: optional structured debug payload
-- `retryable`: bool
-
-## Persistence Boundary
-
-FFI contract should not hardcode storage backends.
-
-- Rust core defines repository traits for targets/recents/trust records.
-- Platform layer supplies encrypted persistence adapters.
-- Android implementation target: Keystore-backed encrypted storage.
+- `invalid_pairing_link`: the text is not a `bmux-pair:` link
+- `pairing_not_found`: no such pairing in progress
+- `host_not_found`: no saved host under that alias
+- `host_store`: saved hosts could not be read or written, or an alias is
+  invalid or taken
+- `connection_failed`: unreachable host, changed host key, or a host that
+  refuses this device (revoked or never paired); the message says which
+- `invalid_argument`, `connection_not_active`, `terminal_session_not_found`,
+  `terminal_session_closed`, `invalid_terminal_size`,
+  `terminal_backend_failure`
 
 ## Backward Compatibility Rules
 
 - Additive fields only for minor updates.
 - Do not repurpose enum variants.
 - New transport capabilities must be feature-detectable.
-- Keep deprecated APIs available for at least one minor app release.
 
-## Open Items for M1
+## Open Items
 
-- Final SSH config shape for mobile (jump hosts, identity material strategy).
-- Exact discovery payload fields for mDNS candidate confidence and dedupe.
-- Threading model for stream callbacks on Kotlin/Swift runtimes.
-- Which APIs are sync vs async in UniFFI boundary.
+- Event streams instead of polling for pairing and connection state.
+- Reconnect with resume inside the core (the Android foreground service retries
+  `connect` with backoff today).
+- iOS bindings and app.

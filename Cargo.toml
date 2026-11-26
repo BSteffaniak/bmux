@@ -485,7 +485,6 @@ rustls = { version = "0.23.46", default-features = false, features = [
     "std",
     "ring",
 ] }
-rustls-native-certs = { version = "0.8.5", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
@@ -496,7 +495,6 @@ serde_json = { version = "1.0.154", default-features = false, features = [
 sha2 = { version = "0.11.1", default-features = false }
 sha2_010 = { package = "sha2", version = "0.11.1", default-features = false }
 signal-hook = { version = "0.4.6", default-features = false }
-ssh2 = { version = "0.9.7" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
 syn = { version = "3.0.10", default-features = false }
 sysinfo = { version = "0.40.4" }

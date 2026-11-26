@@ -426,6 +426,8 @@ image-sixel = [
 [dev-dependencies]
 bmux_cluster_plugin_api     = { workspace = true }
 bmux_connections_plugin_api = { workspace = true }
+# The mobile core pairs and attaches against a real host in remote-access tests.
+bmux_mobile_core            = { workspace = true }
 bmux_plugin_schema          = { workspace = true }
 # Remote-access acceptance tests drive real terminals and run a loopback relay.
 bmux_pty                   = { workspace = true, features = ["native"] }

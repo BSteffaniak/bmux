@@ -53,7 +53,7 @@ fun TerminalSessionScreen(
     endpoint: TerminalEndpoint,
     session: String?,
     onBack: () -> Unit,
-    openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
+    openTerminal: suspend (host: String, session: String?, rows: Int, cols: Int) -> Result<String>,
     pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     sendTerminalMouseEvent: suspend (terminalId: String, event: TerminalMouseEvent) -> Result<Unit>,
@@ -63,8 +63,8 @@ fun TerminalSessionScreen(
     latestTerminalFailure: suspend (terminalId: String) -> Result<String?>,
 ) {
     val clipboard = LocalClipboardManager.current
-    val renderer = remember(endpoint.id) { TermlibTerminalRenderer() }
-    val transport = remember(endpoint.id) {
+    val renderer = remember(endpoint.host) { TermlibTerminalRenderer() }
+    val transport = remember(endpoint.host) {
         CoreTerminalTransport(
             openTerminal = openTerminal,
             pollTerminalOutput = pollTerminalOutput,
@@ -77,14 +77,14 @@ fun TerminalSessionScreen(
         )
     }
 
-    var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
-    var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
-    var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
-    var diagnosticLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalDiagnosticFrame>()) }
-    var statusPanelVisible by remember(endpoint.id) { mutableStateOf(false) }
-    var statusPanelExpanded by remember(endpoint.id) { mutableStateOf(false) }
+    var connection by remember(endpoint.host) { mutableStateOf<TerminalTransportConnection?>(null) }
+    var warning by remember(endpoint.host) { mutableStateOf<String?>(null) }
+    var statusLines by remember(endpoint.host) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
+    var diagnosticLines by remember(endpoint.host) { mutableStateOf(emptyList<TerminalDiagnosticFrame>()) }
+    var statusPanelVisible by remember(endpoint.host) { mutableStateOf(false) }
+    var statusPanelExpanded by remember(endpoint.host) { mutableStateOf(false) }
 
-    LaunchedEffect(endpoint.id, session) {
+    LaunchedEffect(endpoint.host, session) {
         connection?.close()
         renderer.resetPointer()
         warning = null
@@ -134,7 +134,7 @@ fun TerminalSessionScreen(
         }
     }
 
-    DisposableEffect(endpoint.id) {
+    DisposableEffect(endpoint.host) {
         onDispose {
             connection?.close()
             renderer.dispose()
@@ -284,7 +284,7 @@ private fun shouldKeepStatusEvent(event: TerminalStatusEvent): Boolean {
 }
 
 private class CoreTerminalTransport(
-    private val openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
+    private val openTerminal: suspend (host: String, session: String?, rows: Int, cols: Int) -> Result<String>,
     private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val sendTerminalMouseEvent: suspend (terminalId: String, event: TerminalMouseEvent) -> Result<Unit>,
@@ -304,12 +304,12 @@ private class CoreTerminalTransport(
     ): TerminalTransportConnection {
         onStatus(
             TerminalStatusEvent(
-                message = "opening terminal to ${endpoint.name}...",
+                message = "opening terminal to ${endpoint.host}...",
                 severity = TerminalStatusSeverity.INFO,
             ),
         )
 
-        val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS).getOrElse { error ->
+        val terminalId = openTerminal(endpoint.host, session, DEFAULT_ROWS, DEFAULT_COLS).getOrElse { error ->
             onStatus(
                 TerminalStatusEvent(
                     message = "terminal open failed: ${error.message ?: "unknown"}",
@@ -321,7 +321,7 @@ private class CoreTerminalTransport(
 
         onStatus(
             TerminalStatusEvent(
-                message = "connected to ${endpoint.canonicalTarget}",
+                message = "connected to ${endpoint.host} (${endpoint.description})",
                 severity = TerminalStatusSeverity.INFO,
             ),
         )
@@ -643,8 +643,8 @@ private fun buildDiagnosticsReport(
 ): String {
     val report = StringBuilder()
     report.append("bmux mobile terminal diagnostics\n")
-    report.append("endpoint=").append(endpoint.name)
-        .append(" target=").append(endpoint.canonicalTarget)
+    report.append("host=").append(endpoint.host)
+        .append(" (").append(endpoint.description).append(')')
         .append('\n')
 
     val primaryCause = diagnostics.asReversed()

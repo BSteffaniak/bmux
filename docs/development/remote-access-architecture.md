@@ -273,8 +273,15 @@ about pairing, devices or Iroh.
     engine keeps a probe's conflict hint even after a heartbeat replaced the probe.
   - A worker verifies leases with a linearizable membership read, so workers are
     enrolled as voters; an observer-edge worker cannot run panes yet.
-- **Mobile.** The mobile FFI target model (`docs/mobile-ffi-contract.md`) replaces
-  `ssh`/`tls`/`iroh` with "paired host" and reuses the client crate and connector.
+- **Mobile.** The mobile target is a saved paired host (alias, pinned host key,
+  granted role; `docs/mobile-ffi-contract.md`). The mobile core pairs and
+  connects through the connections plugin's `paired_hosts` module, the same
+  pairing client, known hosts and saved-host connector `bmux connect` uses, and
+  attaches with the client crate. The approval message carries the granted
+  role, which the saved host records as a label. The `ssh`/`tls`/`iroh` target
+  transports, SSH host-key pinning and LAN discovery are deleted from the mobile
+  crates and the Android app; old saved targets are not migrated. A remote
+  access test pairs the mobile core with a real host and attaches a terminal.
 
 ### 8. Operations
 

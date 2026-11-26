@@ -17,6 +17,8 @@ bmux_attach_token_state = { workspace = true }
 bmux_attach_view_protocol = { workspace = true }
 bmux_client = { workspace = true }
 bmux_codec = { workspace = true }
+bmux_config = { workspace = true }
+bmux_connections_plugin = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
@@ -25,9 +27,7 @@ bmux_sessions_plugin_api = { workspace = true }
 bmux_tabs_plugin_api = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
-iroh = { workspace = true }
-rustls = { workspace = true }
-rustls-native-certs = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -37,17 +37,7 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-tokio-rustls = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
-
-# libssh2 needs OpenSSL on Unix and mobile targets; Windows uses its native WinCNG
-# backend, so vendoring OpenSSL there would only add a Perl build dependency.
-[target.'cfg(not(windows))'.dependencies]
-ssh2 = { workspace = true, features = ["vendored-openssl"] }
-
-[target.'cfg(windows)'.dependencies]
-ssh2 = { workspace = true }
 
 [features]
 default = []
@@ -59,6 +49,8 @@ fail-on-warnings = [
     "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_client/fail-on-warnings",
     "bmux_codec/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_connections_plugin/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
@@ -67,3 +59,6 @@ fail-on-warnings = [
     "bmux_tabs_plugin_api/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
 ]
+
+[dev-dependencies]
+tempfile = { workspace = true }

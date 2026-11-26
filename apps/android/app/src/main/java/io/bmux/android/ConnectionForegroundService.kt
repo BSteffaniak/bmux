@@ -20,7 +20,7 @@ import uniffi.bmux_mobile_ffi.MobileApiFfi
 class ConnectionForegroundService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO)
     private var reconnectJob: Job? = null
-    private val ffi by lazy { runCatching { MobileApiFfi() }.getOrNull() }
+    private val ffi by lazy { runCatching { MobileApiFfi(mobileStorageDir(this)) }.getOrNull() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -45,30 +45,31 @@ class ConnectionForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        val targetId = intent?.getStringExtra(EXTRA_TARGET_ID)
+        val host = intent?.getStringExtra(EXTRA_HOST)
         val session = intent?.getStringExtra(EXTRA_SESSION)
 
         val notification = buildNotification(channelId, "Starting reconnect loop")
 
         startForeground(1, notification)
-        startReconnectLoop(targetId, session, channelId)
+        startReconnectLoop(host, session, channelId)
         return START_STICKY
     }
 
-    private fun startReconnectLoop(targetId: String?, session: String?, channelId: String) {
-        val id = targetId ?: return
+    /** Reconnect to saved host [host] with capped backoff; each attempt dials and says hello. */
+    private fun startReconnectLoop(host: String?, session: String?, channelId: String) {
+        val alias = host ?: return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             val backoff = ReconnectBackoff()
             while (isActive) {
                 val client = ffi
                 val result = if (client != null) {
-                    runCatching { client.connect(id, session) }
+                    runCatching { client.connect(alias, session) }
                 } else {
                     Result.failure(IllegalStateException("FFI unavailable for reconnect"))
                 }
                 if (result.isSuccess) {
-                    notifyForeground(channelId, "Connected. Keeping session alive")
+                    notifyForeground(channelId, "Connected to $alias")
                     backoff.reset()
                     delay(30_000)
                 } else {
@@ -102,13 +103,13 @@ class ConnectionForegroundService : Service() {
     companion object {
         const val ACTION_START = "io.bmux.android.RECONNECT_START"
         const val ACTION_STOP = "io.bmux.android.RECONNECT_STOP"
-        const val EXTRA_TARGET_ID = "target_id"
+        const val EXTRA_HOST = "host"
         const val EXTRA_SESSION = "session"
 
-        fun createStartIntent(context: Context, targetId: String, session: String?): Intent {
+        fun createStartIntent(context: Context, host: String, session: String?): Intent {
             return Intent(context, ConnectionForegroundService::class.java)
                 .setAction(ACTION_START)
-                .putExtra(EXTRA_TARGET_ID, targetId)
+                .putExtra(EXTRA_HOST, host)
                 .putExtra(EXTRA_SESSION, session)
         }
 
@@ -117,8 +118,8 @@ class ConnectionForegroundService : Service() {
                 .setAction(ACTION_STOP)
         }
 
-        fun start(context: Context, targetId: String, session: String?) {
-            val intent = createStartIntent(context, targetId, session)
+        fun start(context: Context, host: String, session: String?) {
+            val intent = createStartIntent(context, host, session)
             context.startForegroundService(intent)
         }
 

@@ -4,8 +4,12 @@ UniFFI bridge crate for exposing `mobile-core` APIs to Android and iOS.
 
 Current status:
 
-- M3 base API is implemented with UniFFI-compatible exported objects and records.
-- The FFI surface includes target import/listing, connection state transitions, SSH host-key pinning helpers, and terminal stream APIs.
+- The FFI surface follows the paired-host model (`docs/mobile-ffi-contract.md`):
+  pairing through a `bmux-pair:` link (`start_pairing`, `pairing_state`,
+  `cancel_pairing`), saved hosts (`list_hosts`, `rename_host`, `forget_host`),
+  `connect`/`disconnect`, and terminal stream APIs addressed by host alias.
+- `MobileApiFfi(storage_dir)` takes the app-private directory that holds the
+  device key and saved hosts.
 
 Primary exported object:
 

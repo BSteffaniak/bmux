@@ -1,11 +1,9 @@
 use crate::error::{MobileCoreError, Result};
+use crate::paired_host::{PairedHost, PairedHostStore, PairingRequest, PairingState};
 use crate::remote_bridge::{BackendSessionHandle, RemoteTerminalBackend, TerminalBackend};
-use crate::ssh::{EmbeddedSshBackend, SshBackend, parse_ssh_target};
-use crate::target::{
-    CanonicalTarget, TargetInput, TargetRecord, TargetTransport, canonicalize_target,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -16,7 +14,8 @@ const PRE_OUTPUT_RECOVERY_BACKOFF_MS: u64 = 250;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionRequest {
-    pub target_id: Uuid,
+    /// Alias of a saved paired host.
+    pub host: String,
     pub session: Option<String>,
 }
 
@@ -33,7 +32,7 @@ pub enum ConnectionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionState {
     pub id: Uuid,
-    pub target_id: Uuid,
+    pub host: String,
     pub status: ConnectionStatus,
     pub session: Option<String>,
     pub last_error: Option<String>,
@@ -41,7 +40,8 @@ pub struct ConnectionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalOpenRequest {
-    pub target_id: Uuid,
+    /// Alias of a saved paired host.
+    pub host: String,
     pub session: Option<String>,
     pub rows: u16,
     pub cols: u16,
@@ -133,7 +133,7 @@ pub struct TerminalMouseEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalSessionState {
     pub id: Uuid,
-    pub target_id: Uuid,
+    pub host: String,
     pub connection_id: Uuid,
     pub session: Option<String>,
     pub status: TerminalSessionStatus,
@@ -155,158 +155,146 @@ struct TerminalSessionRuntime {
     opened_at_ms: u64,
 }
 
+/// Saved paired hosts, pairing, connections and terminal streams of one
+/// mobile client.
 pub struct ConnectionManager {
-    targets: BTreeMap<Uuid, TargetRecord>,
+    hosts: Arc<PairedHostStore>,
     connections: BTreeMap<Uuid, ConnectionState>,
     terminals: BTreeMap<Uuid, TerminalSessionRuntime>,
-    ssh_backend: Option<Arc<dyn SshBackend>>,
+    /// The session each host last attached, tried first on the next attach.
+    remembered_sessions: BTreeMap<String, String>,
     terminal_backend: Arc<dyn TerminalBackend>,
 }
 
-impl Default for ConnectionManager {
-    fn default() -> Self {
-        Self {
-            targets: BTreeMap::new(),
-            connections: BTreeMap::new(),
-            terminals: BTreeMap::new(),
-            ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
-            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
-        }
-    }
-}
-
 impl ConnectionManager {
+    /// A manager whose saved hosts and device key live under `storage_root`,
+    /// an app-private directory.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(storage_root: &Path) -> Self {
+        let hosts = Arc::new(PairedHostStore::new(storage_root));
+        let terminal_backend = Arc::new(RemoteTerminalBackend::new(Arc::clone(&hosts)));
+        Self::with_parts(hosts, terminal_backend)
     }
 
+    /// A manager with its own terminal backend (tests use a fake one).
     #[must_use]
-    pub fn with_ssh_backend(ssh_backend: Arc<dyn SshBackend>) -> Self {
-        Self {
-            targets: BTreeMap::new(),
-            connections: BTreeMap::new(),
-            terminals: BTreeMap::new(),
-            ssh_backend: Some(ssh_backend),
-            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
-        }
+    pub fn with_terminal_backend(
+        storage_root: &Path,
+        terminal_backend: Arc<dyn TerminalBackend>,
+    ) -> Self {
+        Self::with_parts(Arc::new(PairedHostStore::new(storage_root)), terminal_backend)
     }
 
-    #[must_use]
-    pub fn with_terminal_backend(terminal_backend: Arc<dyn TerminalBackend>) -> Self {
+    fn with_parts(hosts: Arc<PairedHostStore>, terminal_backend: Arc<dyn TerminalBackend>) -> Self {
         Self {
-            targets: BTreeMap::new(),
+            hosts,
             connections: BTreeMap::new(),
             terminals: BTreeMap::new(),
-            ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
+            remembered_sessions: BTreeMap::new(),
             terminal_backend,
         }
     }
 
-    #[must_use]
-    pub fn without_ssh_backend() -> Self {
-        Self {
-            targets: BTreeMap::new(),
-            connections: BTreeMap::new(),
-            terminals: BTreeMap::new(),
-            ssh_backend: None,
-            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
+    /// Every saved paired host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::HostStore`] when the saved hosts cannot be read.
+    pub fn list_hosts(&self) -> Result<Vec<PairedHost>> {
+        self.hosts.list()
+    }
+
+    /// Rename a saved host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::HostNotFound`] for an unknown alias and
+    /// [`MobileCoreError::HostStore`] for an invalid or taken new alias.
+    pub fn rename_host(&mut self, old: &str, new: &str) -> Result<PairedHost> {
+        let renamed = self.hosts.rename(old, new)?;
+        if let Some(session) = self.remembered_sessions.remove(old) {
+            self.remembered_sessions.insert(new.to_owned(), session);
         }
+        Ok(renamed)
     }
 
-    /// Import a target into in-memory storage.
+    /// Forget a saved host on this device.
     ///
     /// # Errors
     ///
-    /// Returns [`MobileCoreError::InvalidTarget`] when the source cannot be normalized.
-    pub fn import_target(&mut self, input: &TargetInput) -> Result<TargetRecord> {
-        let canonical: CanonicalTarget = canonicalize_target(input)?;
-        let id = Uuid::new_v4();
-        let default_name = canonical.uri.value.clone();
-        let name = input
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(default_name.as_str())
-            .to_string();
-
-        let record = TargetRecord {
-            id,
-            name,
-            canonical_target: canonical.uri,
-            transport: canonical.transport,
-            default_session: None,
-        };
-        self.targets.insert(id, record.clone());
-        Ok(record)
+    /// Returns [`MobileCoreError::HostNotFound`] for an unknown alias.
+    pub fn forget_host(&mut self, alias: &str) -> Result<()> {
+        self.hosts.forget(alias)?;
+        self.remembered_sessions.remove(alias);
+        Ok(())
     }
 
-    #[must_use]
-    pub fn list_targets(&self) -> Vec<TargetRecord> {
-        self.targets.values().cloned().collect()
-    }
-
-    /// Start a connection attempt for a known target.
+    /// Start pairing with the host whose `bmux-pair:` link is in `request`.
     ///
     /// # Errors
     ///
-    /// Returns [`MobileCoreError::TargetNotFound`] when `target_id` is unknown,
-    /// [`MobileCoreError::SshBackendUnavailable`] for SSH targets when no embedded
-    /// backend is configured, and parsing/backend errors for invalid SSH targets.
+    /// Returns [`MobileCoreError::InvalidPairingLink`] for a malformed link.
+    pub fn start_pairing(&self, request: PairingRequest) -> Result<PairingState> {
+        self.hosts.start_pairing(request)
+    }
+
+    /// The progress of a pairing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::PairingNotFound`] for an unknown pairing.
+    pub fn pairing_state(&self, pairing_id: Uuid) -> Result<PairingState> {
+        self.hosts.pairing_state(pairing_id)
+    }
+
+    /// Cancel a pairing in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::PairingNotFound`] for an unknown pairing.
+    pub fn cancel_pairing(&self, pairing_id: Uuid) -> Result<PairingState> {
+        self.hosts.cancel_pairing(pairing_id)
+    }
+
+    /// Connect to a saved host: dial it over the shared QUIC connection and
+    /// complete the `Hello` handshake, which proves the host still accepts
+    /// this device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::HostNotFound`] for an unknown alias and
+    /// [`MobileCoreError::ConnectionFailed`] when the host is unreachable or
+    /// refuses this device. The failed state stays queryable.
     pub fn connect(&mut self, request: ConnectionRequest) -> Result<ConnectionState> {
-        let target = self
-            .targets
-            .get(&request.target_id)
-            .ok_or_else(|| MobileCoreError::TargetNotFound(request.target_id.to_string()))?;
-
-        if target.transport == TargetTransport::Ssh {
-            let parsed = parse_ssh_target(&target.canonical_target.value)?;
-            let backend = self
-                .ssh_backend
-                .as_ref()
-                .ok_or(MobileCoreError::SshBackendUnavailable)?;
-            backend.open(&parsed)?;
-        }
-
-        let state = ConnectionState {
+        let mut state = ConnectionState {
             id: Uuid::new_v4(),
-            target_id: request.target_id,
+            host: request.host,
             status: ConnectionStatus::Connecting,
             session: request.session,
             last_error: None,
         };
+        let probed = self.terminal_backend.probe(&state.host);
+        match &probed {
+            Ok(()) => state.status = ConnectionStatus::Connected,
+            Err(error) => {
+                state.status = ConnectionStatus::Failed;
+                state.last_error = Some(error.to_string());
+            }
+        }
         self.connections.insert(state.id, state.clone());
-        Ok(state)
+        probed.map(|()| state)
     }
 
-    /// Transition an active connection to `connected`.
+    /// The state of a connection.
     ///
     /// # Errors
     ///
     /// Returns [`MobileCoreError::ConnectionNotActive`] when the connection id is unknown.
-    pub fn mark_connected(&mut self, connection_id: Uuid) -> Result<ConnectionState> {
-        let state = self
-            .connections
-            .get_mut(&connection_id)
-            .ok_or_else(|| MobileCoreError::ConnectionNotActive(connection_id.to_string()))?;
-        state.status = ConnectionStatus::Connected;
-        Ok(state.clone())
-    }
-
-    /// Transition an active connection to `failed` and store an error message.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MobileCoreError::ConnectionNotActive`] when the connection id is unknown.
-    pub fn mark_failed(&mut self, connection_id: Uuid, message: &str) -> Result<ConnectionState> {
-        let state = self
-            .connections
-            .get_mut(&connection_id)
-            .ok_or_else(|| MobileCoreError::ConnectionNotActive(connection_id.to_string()))?;
-        state.status = ConnectionStatus::Failed;
-        state.last_error = Some(message.to_string());
-        Ok(state.clone())
+    pub fn connection_state(&self, connection_id: Uuid) -> Result<ConnectionState> {
+        self.connections
+            .get(&connection_id)
+            .cloned()
+            .ok_or_else(|| MobileCoreError::ConnectionNotActive(connection_id.to_string()))
     }
 
     /// Transition an active connection to `disconnected`.
@@ -323,16 +311,16 @@ impl ConnectionManager {
         Ok(state.clone())
     }
 
-    /// Open a terminal stream for a target and optional named session.
+    /// Open a terminal stream on a saved host and optional named session.
     ///
     /// # Errors
     ///
-    /// Returns [`MobileCoreError::TargetNotFound`] for unknown targets,
+    /// Returns [`MobileCoreError::HostNotFound`] for unknown hosts,
     /// [`MobileCoreError::InvalidTerminalSize`] for invalid dimensions, and
-    /// connection errors from [`Self::connect`].
+    /// connection or attach errors from the backend.
     pub fn open_terminal(&mut self, request: TerminalOpenRequest) -> Result<TerminalSessionState> {
         let TerminalOpenRequest {
-            target_id,
+            host,
             session,
             rows,
             cols,
@@ -346,45 +334,42 @@ impl ConnectionManager {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
 
-        let target = self
-            .targets
-            .get(&target_id)
-            .ok_or_else(|| MobileCoreError::TargetNotFound(target_id.to_string()))?
-            .clone();
-        let target_name = target.name.clone();
-        let canonical_target = target.canonical_target.value.clone();
-
-        let connection = self.connect(ConnectionRequest {
-            target_id,
+        let mut connection = ConnectionState {
+            id: Uuid::new_v4(),
+            host: host.clone(),
+            status: ConnectionStatus::Connecting,
             session: requested_session.clone(),
-        })?;
-        let connection = self.mark_connected(connection.id)?;
-        let backend =
-            match self
-                .terminal_backend
-                .open(&target, requested_session, size.rows, size.cols)
-            {
-                Ok(backend) => backend,
-                Err(error) => {
-                    let _ = self.mark_failed(connection.id, &error.to_string());
-                    return Err(error);
-                }
-            };
+            last_error: None,
+        };
+        let backend = match self.terminal_backend.open(
+            &host,
+            requested_session,
+            self.remembered_sessions.get(&host).cloned(),
+            size.rows,
+            size.cols,
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                connection.status = ConnectionStatus::Failed;
+                connection.last_error = Some(error.to_string());
+                self.connections.insert(connection.id, connection);
+                return Err(error);
+            }
+        };
 
-        let attached_session = Some(backend.session_id.to_string());
-        if let Some(connection_state) = self.connections.get_mut(&connection.id) {
-            connection_state.session.clone_from(&attached_session);
-        }
-        if let Some(target_state) = self.targets.get_mut(&target_id) {
-            target_state.default_session.clone_from(&attached_session);
-        }
+        let attached_session = backend.session_id.to_string();
+        connection.status = ConnectionStatus::Connected;
+        connection.session = Some(attached_session.clone());
+        self.connections.insert(connection.id, connection.clone());
+        self.remembered_sessions
+            .insert(host.clone(), attached_session.clone());
 
         let mut runtime = TerminalSessionRuntime {
             state: TerminalSessionState {
                 id: Uuid::new_v4(),
-                target_id,
+                host,
                 connection_id: connection.id,
-                session: attached_session,
+                session: Some(attached_session),
                 status: TerminalSessionStatus::Opening,
                 size,
                 last_sequence: 0,
@@ -405,12 +390,12 @@ impl ConnectionManager {
             TerminalStatusSeverity::Info,
             Some("terminal_opened"),
             format!(
-                "opened terminal session {} for target {}",
-                runtime.state.id, target_name
+                "opened terminal session {} on host {}",
+                runtime.state.id, runtime.state.host
             ),
         );
         runtime.push_status_chunk(
-            format!("connected to {target_name} ({canonical_target})"),
+            format!("connected to {}", runtime.state.host),
             TerminalStatusSeverity::Info,
         );
         runtime.state.status = TerminalSessionStatus::Open;
@@ -825,25 +810,10 @@ impl ConnectionManager {
         ));
 
         let _ = self.terminal_backend.close(recovery.old_backend_id);
-        let Some(target) = self.targets.get(&recovery.target_id).cloned() else {
-            let Some(runtime) = self.terminals.get_mut(&terminal_id) else {
-                return false;
-            };
-            runtime.push_diagnostic(
-                "recover",
-                TerminalStatusSeverity::Error,
-                Some("recovery_target_missing"),
-                format!(
-                    "cannot retry connection: target {} no longer exists",
-                    recovery.target_id
-                ),
-            );
-            return false;
-        };
-
         let reopened = self.terminal_backend.open(
-            &target,
+            &recovery.host,
             recovery.session.clone(),
+            None,
             recovery.size.rows,
             recovery.size.cols,
         );
@@ -905,7 +875,7 @@ impl ConnectionManager {
         }
         Some(PreOutputRecoveryContext {
             old_backend_id: runtime.backend.id,
-            target_id: runtime.state.target_id,
+            host: runtime.state.host.clone(),
             session: runtime.state.session.clone(),
             size: runtime.state.size,
             attempt: runtime.pre_output_recovery_attempts.saturating_add(1),
@@ -974,7 +944,7 @@ impl TerminalSessionRuntime {
 #[derive(Debug, Clone)]
 struct PreOutputRecoveryContext {
     old_backend_id: Uuid,
-    target_id: Uuid,
+    host: String,
     session: Option<String>,
     size: TerminalSize,
     attempt: u8,
@@ -1012,7 +982,6 @@ const fn validate_terminal_size(size: TerminalSize) -> Result<()> {
 mod tests {
     use super::*;
     use crate::remote_bridge::{BackendSessionHandle, TerminalBackend};
-    use crate::ssh::MockSshBackend;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -1036,10 +1005,20 @@ mod tests {
     }
 
     impl TerminalBackend for MockTerminalBackend {
+        fn probe(&self, host: &str) -> Result<()> {
+            if host == "offline" {
+                return Err(MobileCoreError::ConnectionFailed(
+                    "offline: the host did not answer".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
         fn open(
             &self,
-            _target: &TargetRecord,
+            _host: &str,
             _session: Option<String>,
+            _remembered_session: Option<String>,
             _rows: u16,
             _cols: u16,
         ) -> Result<BackendSessionHandle> {
@@ -1110,10 +1089,15 @@ mod tests {
     }
 
     impl TerminalBackend for RecoveringTerminalBackend {
+        fn probe(&self, _host: &str) -> Result<()> {
+            Ok(())
+        }
+
         fn open(
             &self,
-            _target: &TargetRecord,
+            _host: &str,
             _session: Option<String>,
+            _remembered_session: Option<String>,
             _rows: u16,
             _cols: u16,
         ) -> Result<BackendSessionHandle> {
@@ -1208,96 +1192,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn import_and_connect_round_trip() {
-        let mut manager = ConnectionManager::new();
-        let target = manager
-            .import_target(&TargetInput {
-                source: "iroh://endpoint-123".to_string(),
-                display_name: Some("prod-host".to_string()),
-            })
-            .expect("target import should work");
+    fn manager(backend: Arc<dyn TerminalBackend>) -> (tempfile::TempDir, ConnectionManager) {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let manager = ConnectionManager::with_terminal_backend(root.path(), backend);
+        (root, manager)
+    }
 
-        let connection = manager
+    #[test]
+    fn connect_reports_reachable_and_failed_hosts() {
+        let (_root, mut manager) = manager(Arc::new(MockTerminalBackend::default()));
+        let connected = manager
             .connect(ConnectionRequest {
-                target_id: target.id,
+                host: "desktop".to_string(),
                 session: Some("main".to_string()),
             })
-            .expect("connection should start");
-
-        assert_eq!(connection.status, ConnectionStatus::Connecting);
-
-        let connected = manager
-            .mark_connected(connection.id)
-            .expect("connection should transition to connected");
+            .expect("a reachable host connects");
         assert_eq!(connected.status, ConnectionStatus::Connected);
-    }
+        assert_eq!(connected.host, "desktop");
+        assert_eq!(
+            manager
+                .disconnect(connected.id)
+                .expect("disconnect a known connection")
+                .status,
+            ConnectionStatus::Disconnected
+        );
 
-    #[test]
-    fn connect_requires_target() {
-        let mut manager = ConnectionManager::new();
-        let result = manager.connect(ConnectionRequest {
-            target_id: Uuid::new_v4(),
+        let failed = manager.connect(ConnectionRequest {
+            host: "offline".to_string(),
             session: None,
         });
-
-        assert!(matches!(result, Err(MobileCoreError::TargetNotFound(_))));
-    }
-
-    #[test]
-    fn connect_ssh_requires_backend() {
-        let mut manager = ConnectionManager::without_ssh_backend();
-        let target = manager
-            .import_target(&TargetInput {
-                source: "ssh://ops@prod.example.com:22".to_string(),
-                display_name: None,
-            })
-            .expect("target import should work");
-
-        let result = manager.connect(ConnectionRequest {
-            target_id: target.id,
-            session: None,
-        });
+        assert!(matches!(failed, Err(MobileCoreError::ConnectionFailed(_))));
         assert!(matches!(
-            result,
-            Err(MobileCoreError::SshBackendUnavailable)
+            manager.disconnect(Uuid::new_v4()),
+            Err(MobileCoreError::ConnectionNotActive(_))
         ));
     }
 
     #[test]
-    fn connect_ssh_with_embedded_backend() {
-        let mut manager = ConnectionManager::with_ssh_backend(Arc::new(MockSshBackend));
-        let target = manager
-            .import_target(&TargetInput {
-                source: "ops@prod.example.com:2222".to_string(),
-                display_name: Some("prod-ssh".to_string()),
-            })
-            .expect("target import should work");
-
-        let connection = manager
-            .connect(ConnectionRequest {
-                target_id: target.id,
-                session: Some("main".to_string()),
-            })
-            .expect("ssh connection should start");
-
-        assert_eq!(connection.status, ConnectionStatus::Connecting);
+    fn the_real_backend_rejects_hosts_that_were_never_paired() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let mut manager = ConnectionManager::new(root.path());
+        assert_eq!(manager.list_hosts().expect("list saved hosts"), Vec::new());
+        assert_eq!(
+            manager.connect(ConnectionRequest {
+                host: "desktop".to_string(),
+                session: None,
+            }),
+            Err(MobileCoreError::HostNotFound("desktop".to_string()))
+        );
+        assert_eq!(
+            manager.open_terminal(TerminalOpenRequest {
+                host: "desktop".to_string(),
+                session: None,
+                rows: 24,
+                cols: 80,
+            }),
+            Err(MobileCoreError::HostNotFound("desktop".to_string()))
+        );
+        assert_eq!(
+            manager.forget_host("desktop"),
+            Err(MobileCoreError::HostNotFound("desktop".to_string()))
+        );
     }
 
     #[test]
     fn terminal_open_write_poll_resize_close_round_trip() {
-        let mut manager =
-            ConnectionManager::with_terminal_backend(Arc::new(MockTerminalBackend::default()));
-        let target = manager
-            .import_target(&TargetInput {
-                source: "iroh://endpoint-abc".to_string(),
-                display_name: Some("demo".to_string()),
-            })
-            .expect("target import should work");
-
+        let (_root, mut manager) = manager(Arc::new(MockTerminalBackend::default()));
         let terminal = manager
             .open_terminal(TerminalOpenRequest {
-                target_id: target.id,
+                host: "desktop".to_string(),
                 session: Some("main".to_string()),
                 rows: 24,
                 cols: 80,
@@ -1378,17 +1341,9 @@ mod tests {
 
     #[test]
     fn terminal_open_rejects_zero_dimensions() {
-        let mut manager =
-            ConnectionManager::with_terminal_backend(Arc::new(MockTerminalBackend::default()));
-        let target = manager
-            .import_target(&TargetInput {
-                source: "iroh://endpoint-xyz".to_string(),
-                display_name: None,
-            })
-            .expect("target import should work");
-
+        let (_root, mut manager) = manager(Arc::new(MockTerminalBackend::default()));
         let result = manager.open_terminal(TerminalOpenRequest {
-            target_id: target.id,
+            host: "desktop".to_string(),
             session: None,
             rows: 0,
             cols: 80,
@@ -1401,19 +1356,10 @@ mod tests {
 
     #[test]
     fn poll_recovers_from_early_stream_drop_before_first_output() {
-        let mut manager = ConnectionManager::with_terminal_backend(Arc::new(
-            RecoveringTerminalBackend::default(),
-        ));
-        let target = manager
-            .import_target(&TargetInput {
-                source: "iroh://endpoint-recover".to_string(),
-                display_name: Some("recover".to_string()),
-            })
-            .expect("target import should work");
-
+        let (_root, mut manager) = manager(Arc::new(RecoveringTerminalBackend::default()));
         let terminal = manager
             .open_terminal(TerminalOpenRequest {
-                target_id: target.id,
+                host: "desktop".to_string(),
                 session: Some("main".to_string()),
                 rows: 24,
                 cols: 80,
