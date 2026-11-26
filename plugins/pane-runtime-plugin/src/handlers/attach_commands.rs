@@ -546,23 +546,39 @@ fn to_api_grant(grant: &AttachGrant) -> AttachGrantRecord {
 
 // ── Handler bodies ───────────────────────────────────────────────
 
-fn reserve_selection(
-    ctx: &NativeServiceContext,
+fn reserve_selection<C: bmux_plugin::ServiceCaller + Sync + ?Sized>(
+    caller: &C,
 ) -> Result<bmux_clients_plugin_api::clients_selection_state_v1::Selection, AttachCommandError> {
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
     let current = bmux_plugin::block_on_typed_dispatch(
         bmux_clients_plugin_api::clients_selection_state_v1::client::current(&mut client),
     )
     .map_err(|error| failed(error.to_string()))?
     .map_err(|error| failed(format!("selection unavailable: {error:?}")))?;
-    bmux_plugin::block_on_typed_dispatch(
+    let begun = bmux_plugin::block_on_typed_dispatch(
         bmux_clients_plugin_api::clients_selection_commands_v1::client::begin(
             &mut client,
             current.revision,
         ),
-    )
-    .map_err(|error| failed(error.to_string()))?
-    .map_err(|error| failed(format!("selection conflict: {error:?}")))
+    );
+    match begun {
+        Ok(reserved) => reserved.map_err(|error| failed(format!("selection conflict: {error:?}"))),
+        Err(error) => {
+            // The begin may have applied without its reply reaching us (the host gave up
+            // waiting). A reservation nobody owns would suspend this client's input and
+            // refuse every later selection until it disconnects, so release it: recovery
+            // only applies to a suspended selection at exactly the revision our begin made.
+            if let Some(reserved_revision) = current.revision.checked_add(1) {
+                let _ = bmux_plugin::block_on_typed_dispatch(
+                    bmux_clients_plugin_api::clients_selection_commands_v1::client::recover(
+                        &mut client,
+                        reserved_revision,
+                    ),
+                );
+            }
+            Err(failed(error.to_string()))
+        }
+    }
 }
 
 fn resolve_failed_selection<T>(
@@ -1127,27 +1143,25 @@ pub fn attach_retarget_context(
             };
             (context.id, selected_session_id, false)
         };
-
-    // Validate the session exists in the manager.
-    if !manager.0.contains(next_session_id) {
+    // Every failure below undoes the context selection this handler applied.
+    let undo_selection = |error: AttachCommandError| {
         if !selection_already_applied {
             restore_context_selection(&contexts, client_id, previous_selection);
         }
-        return Err(AttachCommandError::SessionNotFound);
+        error
+    };
+
+    // Validate the session exists in the manager.
+    if !manager.0.contains(next_session_id) {
+        return Err(undo_selection(AttachCommandError::SessionNotFound));
     }
 
     let previous_session = selected_target.and_then(|(_, session_id)| session_id);
-    let can_write = match session_write_allowed(host, ctx, next_session_id, client_id) {
-        Ok(allowed) => req.can_write && allowed,
-        Err(error) => {
-            if !selection_already_applied {
-                restore_context_selection(&contexts, client_id, previous_selection);
-            }
-            return Err(error);
-        }
-    };
+    let write_allowed =
+        session_write_allowed(host, ctx, next_session_id, client_id).map_err(undo_selection)?;
+    let can_write = req.can_write && write_allowed;
 
-    let reservation = reserve_selection(ctx)?;
+    let reservation = reserve_selection(ctx).map_err(undo_selection)?;
     let retargeted = match retarget_attach_stream(
         host,
         &runtime,
@@ -1165,10 +1179,7 @@ pub fn attach_retarget_context(
     ) {
         Ok(viewport) => viewport,
         Err(error) => {
-            if !selection_already_applied {
-                restore_context_selection(&contexts, client_id, previous_selection);
-            }
-            return resolve_failed_selection(ctx, reservation.revision, Err(error));
+            return resolve_failed_selection(ctx, reservation.revision, Err(undo_selection(error)));
         }
     };
     let (cols, rows, top, right, bottom, left) = retargeted;
@@ -1286,6 +1297,99 @@ mod selection_tests {
         fn attach_detach_allowed(&self, _: ClientId) -> bool {
             true
         }
+    }
+
+    /// A clients-selection provider whose `begin` applies (the selection moves to revision 5)
+    /// but, when `begin_lost`, its reply never arrives; records each `recover` revision.
+    struct SelectionHost {
+        begin_lost: bool,
+        recovered: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl bmux_plugin::ServiceCaller for SelectionHost {
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("selection uses generated services")
+        }
+
+        fn call_service_raw(
+            &self,
+            _: &str,
+            _: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_clients_plugin_api::{
+                clients_selection_commands_v1 as commands, clients_selection_state_v1 as state,
+            };
+            let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+            let payload = if checked {
+                let contract = <bmux_clients_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).expect("generated contract");
+                bmux_plugin_sdk::service_contract::decode_for(interface, contract, &payload)?
+                    .to_vec()
+            } else {
+                payload
+            };
+            let selection = |revision, suspended| state::Selection {
+                revision,
+                context_id: None,
+                session_id: None,
+                suspended,
+            };
+            let response = match operation {
+                "current" => {
+                    bmux_plugin_sdk::encode_service_message(&Ok::<_, state::SelectionError>(
+                        selection(4, false),
+                    ))?
+                }
+                "begin" if self.begin_lost => {
+                    return Err(bmux_plugin_sdk::PluginError::HostTimeout {
+                        details: "reply unconfirmed".into(),
+                    });
+                }
+                "begin" => bmux_plugin_sdk::encode_service_message(
+                    &Ok::<_, state::SelectionError>(selection(5, true)),
+                )?,
+                "recover" => {
+                    let request: commands::client::RecoverRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    self.recovered
+                        .lock()
+                        .unwrap()
+                        .push(request.expected_revision);
+                    bmux_plugin_sdk::encode_service_message(&Ok::<_, state::SelectionError>(
+                        selection(6, false),
+                    ))?
+                }
+                other => panic!("unexpected selection call {interface}/{other}"),
+            };
+            Ok(if checked {
+                bmux_plugin_sdk::service_contract::encode_response(&response)
+            } else {
+                response
+            })
+        }
+    }
+
+    #[test]
+    fn a_reservation_whose_reply_was_lost_is_released_not_left_suspended() {
+        let lost = SelectionHost {
+            begin_lost: true,
+            recovered: std::sync::Mutex::new(Vec::new()),
+        };
+        assert!(reserve_selection(&lost).is_err());
+        // Only the reservation this begin would have made (revision 4 + 1) is released.
+        assert_eq!(*lost.recovered.lock().unwrap(), [5]);
+
+        let confirmed = SelectionHost {
+            begin_lost: false,
+            recovered: std::sync::Mutex::new(Vec::new()),
+        };
+        assert_eq!(reserve_selection(&confirmed).unwrap().revision, 5);
+        assert!(confirmed.recovered.lock().unwrap().is_empty());
     }
 
     #[test]
