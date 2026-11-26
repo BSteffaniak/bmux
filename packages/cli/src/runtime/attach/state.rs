@@ -56,7 +56,125 @@ pub enum AttachUiMode {
 pub enum AttachExitReason {
     Detached,
     StreamClosed,
+    /// The connection to the server failed (a transport I/O error): the
+    /// attachment stopped cleanly and may be re-established on a new
+    /// connection.
+    ConnectionLost,
     Quit,
+}
+
+impl AttachExitReason {
+    /// The stable name of this exit reason in logs and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Detached => "detached",
+            Self::StreamClosed => "stream_closed",
+            Self::ConnectionLost => "connection_lost",
+            Self::Quit => "quit",
+        }
+    }
+
+    /// Whether the attachment ended because the server side went away (its
+    /// stream closed or the connection was lost), not by the user's choice.
+    /// Reconnecting wrappers re-attach on exactly these.
+    #[must_use]
+    pub const fn server_went_away(self) -> bool {
+        matches!(self, Self::StreamClosed | Self::ConnectionLost)
+    }
+}
+
+/// How the attachment's server round trips have been going: the state the
+/// attach failure policy (`ipc_policy`) keeps between failures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttachLinkHealth {
+    /// Transient failures (timeouts, unavailable server) since the last
+    /// successful round trip.
+    pub consecutive_transient: u32,
+    /// The view may not match the server: rehydrate it at the next
+    /// opportunity.
+    pub resync_pending: bool,
+    /// The earliest time the pending resync is attempted.
+    pub resync_not_before: Option<Instant>,
+    /// Resync attempts that failed since the last one that succeeded; spaces
+    /// out the next attempt.
+    pub resync_failures: u32,
+    /// A retarget's outcome is unknown (its request failed after it may have
+    /// reached the server): the resync asks the server what is attached
+    /// instead of assuming the old target.
+    pub retarget_unconfirmed: bool,
+}
+
+impl AttachLinkHealth {
+    /// Transient failures in a row after which the server is reported as
+    /// unresponsive rather than slow.
+    pub const UNRESPONSIVE_AFTER: u32 = 3;
+    const RESYNC_BASE_DELAY: Duration = Duration::from_millis(250);
+    const RESYNC_MAX_DELAY: Duration = Duration::from_secs(5);
+
+    /// A request completed: the server is answering again.
+    pub const fn note_round_trip(&mut self) {
+        self.consecutive_transient = 0;
+    }
+
+    /// Record one transient failure; returns how many happened in a row.
+    pub const fn note_transient(&mut self) -> u32 {
+        self.consecutive_transient = self.consecutive_transient.saturating_add(1);
+        self.consecutive_transient
+    }
+
+    #[must_use]
+    pub const fn unresponsive(&self) -> bool {
+        self.consecutive_transient >= Self::UNRESPONSIVE_AFTER
+    }
+
+    /// Schedule a resync; one already scheduled keeps its time.
+    pub fn request_resync(&mut self) {
+        self.resync_pending = true;
+        self.resync_not_before.get_or_insert_with(Instant::now);
+    }
+
+    /// When the pending resync is due, if one is pending.
+    #[must_use]
+    pub const fn resync_due(&self) -> Option<Instant> {
+        if self.resync_pending {
+            self.resync_not_before
+        } else {
+            None
+        }
+    }
+
+    /// A resync brought the view level with the server.
+    pub const fn resync_succeeded(&mut self) {
+        self.resync_pending = false;
+        self.resync_not_before = None;
+        self.resync_failures = 0;
+        self.retarget_unconfirmed = false;
+        self.consecutive_transient = 0;
+    }
+
+    /// A resync attempt failed: try again after a growing delay.
+    pub fn resync_failed(&mut self, now: Instant) {
+        self.resync_pending = true;
+        self.resync_failures = self.resync_failures.saturating_add(1);
+        self.resync_not_before = Some(now + self.resync_delay());
+    }
+
+    /// Nothing to resync (the attachment has no target).
+    pub const fn cancel_resync(&mut self) {
+        self.resync_pending = false;
+        self.resync_not_before = None;
+    }
+
+    /// How long to wait before the next resync attempt: doubling from a
+    /// quarter second per failed attempt, at most five seconds.
+    #[must_use]
+    pub fn resync_delay(&self) -> Duration {
+        let factor = 1_u32 << self.resync_failures.min(5);
+        Self::RESYNC_BASE_DELAY
+            .saturating_mul(factor)
+            .min(Self::RESYNC_MAX_DELAY)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,6 +461,8 @@ pub struct OutputPush {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    /// How server round trips have been going (attach failure policy state).
+    pub link: AttachLinkHealth,
     /// Pane frames pushed by the server.
     pub(super) output_push: OutputPush,
     /// The server said this client's input producer barriers changed.
@@ -805,6 +925,7 @@ impl AttachViewState {
     #[allow(clippy::too_many_lines)]
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            link: AttachLinkHealth::default(),
             output_push: OutputPush::default(),
             producer_barriers_changed: false,
             clipboard_permissions: std::collections::BTreeMap::new(),

@@ -187,7 +187,7 @@ pub async fn run_resumable<D: ResumableAttach>(
     let mut session = session;
     loop {
         let outcome = driver.run(client, session.as_deref()).await?;
-        if outcome.exit_reason != AttachExitReason::StreamClosed {
+        if !outcome.exit_reason.server_went_away() {
             return Ok(outcome);
         }
         // Resume the session the user was last on, even if it was chosen by
@@ -446,6 +446,21 @@ mod tests {
             mock.runs,
             [(0, Some("main".into())), (1, Some(switched.to_string()))]
         );
+    }
+
+    #[test]
+    fn a_lost_connection_resumes_like_a_closed_stream() {
+        let mut mock = Mock {
+            outcomes: VecDeque::from([
+                outcome(AttachExitReason::ConnectionLost, None),
+                outcome(AttachExitReason::Detached, None),
+            ]),
+            reconnect_results: VecDeque::from([true]),
+            ..Mock::default()
+        };
+        let result = block_on(run_resumable(&mut mock, 0, Some("main".into()), false)).unwrap();
+        assert_eq!(result.exit_reason, AttachExitReason::Detached);
+        assert_eq!(mock.runs.len(), 2);
     }
 
     #[test]

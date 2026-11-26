@@ -1987,6 +1987,7 @@ use super::super::{
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::display_capture;
+use super::ipc_policy::{AttachOp, attach_try};
 
 const ATTACH_LOCAL_PRESENTATION_STATE_KIND: bmux_plugin_sdk::PluginEventKind =
     bmux_plugin_sdk::PluginEventKind::from_static("bmux.attach/local-presentation");
@@ -4060,10 +4061,10 @@ async fn maybe_emit_attach_perf_window(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
     window: &mut AttachPerfWindow,
-) -> Result<()> {
+) {
     let elapsed = window.started_at.elapsed();
     if elapsed < Duration::from_millis(perf_emitter.window_ms()) {
-        return Ok(());
+        return;
     }
 
     if window.render_frames >= ATTACH_OVERRENDER_MIN_FRAMES
@@ -4125,7 +4126,7 @@ async fn maybe_emit_attach_perf_window(
 
     if !perf_emitter.enabled() {
         window.reset();
-        return Ok(());
+        return;
     }
 
     let payload = attach_perf_window_payload(
@@ -4136,9 +4137,8 @@ async fn maybe_emit_attach_perf_window(
     );
     perf_emitter
         .emit_with_streaming_client(client, Some(session_id), None, "attach.window", payload)
-        .await?;
+        .await;
     window.reset();
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit
@@ -4209,9 +4209,9 @@ async fn maybe_emit_attach_frame_perf(
     frame_stats: &AttachFrameRenderStats,
     first_frame_emitted: &mut bool,
     interactive_ready_emitted: &mut bool,
-) -> Result<()> {
+) {
     if !perf_emitter.enabled() {
-        return Ok(());
+        return;
     }
 
     let since_attach_start_ms = duration_millis_u64(attach_started_at.elapsed());
@@ -4230,7 +4230,7 @@ async fn maybe_emit_attach_frame_perf(
                     "scene_hydrated": scene_hydrated,
                 }),
             )
-            .await?;
+            .await;
         *first_frame_emitted = true;
     }
 
@@ -4250,7 +4250,7 @@ async fn maybe_emit_attach_frame_perf(
                     "frame_index": rendered_frame_count,
                 }),
             )
-            .await?;
+            .await;
         *interactive_ready_emitted = true;
     }
 
@@ -4271,10 +4271,8 @@ async fn maybe_emit_attach_frame_perf(
                     frame_stats,
                 ),
             )
-            .await?;
+            .await;
     }
-
-    Ok(())
 }
 
 /// Redact the configured patterns in every pane this attachment renders. A pattern that does
@@ -4746,8 +4744,44 @@ async fn run_provider_session(
     }
 }
 
-#[allow(clippy::too_many_lines)] // Native provider loop keeps continuity, scene, input, and detach state synchronized.
+/// Run a native provider attach session on `terminal`, restoring it on every
+/// exit (also an error or cancellation).
 pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
+    session: Box<dyn AttachSession>,
+    terminal: &mut T,
+) -> Result<AttachRunOutcome> {
+    let mut host = TerminalAttachHost(terminal);
+    let mut guard = AttachRestoreGuard {
+        terminal: &mut host,
+        armed: true,
+    };
+    let result = run_native_attach_session_inner(session, &mut *guard.terminal.0).await;
+    if let Err(error) = result {
+        let restored = guard.terminal.restore_after_attach_ui();
+        guard.armed = false;
+        return match restored {
+            Ok(()) => Err(error),
+            Err(restore) => Err(error.context(format!("attach restoration failed: {restore}"))),
+        };
+    }
+    guard.armed = false;
+    result
+}
+
+/// What a failed native provider event stream means for the attachment: the
+/// provider detached (the stream ended) or its transport failed (the
+/// connection is lost). A continuity violation is not recoverable here (the
+/// native path has no resync): it stays an error.
+const fn native_event_failure_exit(error: &bmux_client::AttachSessionError) -> Option<AttachExitReason> {
+    match error {
+        bmux_client::AttachSessionError::Detached => Some(AttachExitReason::StreamClosed),
+        bmux_client::AttachSessionError::Provider { .. } => Some(AttachExitReason::ConnectionLost),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Native provider loop keeps continuity, scene, input, and detach state synchronized.
+async fn run_native_attach_session_inner<T: AttachTerminal>(
     mut session: Box<dyn AttachSession>,
     terminal: &mut T,
 ) -> Result<AttachRunOutcome> {
@@ -4809,7 +4843,21 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
         tokio::select! {
             biased;
             event = session.next_event() => {
-                let event = event.map_err(|error| anyhow::anyhow!("attach provider event failed: {error}"))?;
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => match native_event_failure_exit(&error) {
+                        Some(exit_reason) => {
+                            warn!(%error, "attach provider event stream ended");
+                            break AttachRunOutcome {
+                                status_code: attach_exit_status_code(exit_reason),
+                                exit_reason,
+                                resume: None,
+                                attached_session_id: None,
+                            };
+                        }
+                        None => anyhow::bail!("attach provider event failed: {error}"),
+                    },
+                };
                 if let Some(event_outcome) = handle_native_provider_event(
                     terminal,
                     &mut continuity,
@@ -4829,12 +4877,12 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
                 let mut burst = ProviderInputBurst::default();
                 let mut next = event?;
                 let mut drained = 0_usize;
-                let exit = loop {
+                let mut exit = loop {
                     let Some(event) = next else {
                         break Some(AttachExitReason::Quit);
                     };
                     command_sequence = command_sequence.saturating_add(1);
-                    if handle_native_provider_terminal_event(
+                    match handle_native_provider_terminal_event(
                         session.as_mut(),
                         &continuity,
                         &mut controls,
@@ -4846,8 +4894,14 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
                         keyboard_enhanced,
                         &mut burst,
                         event,
-                    ).await? {
-                        break Some(AttachExitReason::Detached);
+                    ).await {
+                        Ok(true) => break Some(AttachExitReason::Detached),
+                        Ok(false) => {}
+                        Err(error) => {
+                            if let Some(exit_reason) = native_provider_request_failure(&error) {
+                                break Some(exit_reason);
+                            }
+                        }
                     }
                     drained += 1;
                     if burst.provider_changed || drained >= MAX_PROVIDER_INPUT_BURST {
@@ -4859,7 +4913,11 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
                     }
                 };
                 // Everything typed before a detach or the end of input is still delivered.
-                flush_native_provider_input(session.as_mut(), &mut burst).await?;
+                if let Err(error) = flush_native_provider_input(session.as_mut(), &mut burst).await
+                    && let Some(exit_reason) = native_provider_request_failure(&error)
+                {
+                    exit = exit.or(Some(exit_reason));
+                }
                 if let Some(exit_reason) = exit {
                     break AttachRunOutcome {
                         status_code: 0,
@@ -4876,11 +4934,25 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
     let _ = controls.detach();
     terminal.restore_after_attach_ui()?;
     if let Err(error) = detach_result
-        && outcome.exit_reason != AttachExitReason::StreamClosed
+        && !outcome.exit_reason.server_went_away()
     {
         return Err(anyhow::anyhow!("attach provider detach failed: {error}"));
     }
     Ok(outcome)
+}
+
+/// A failed provider request: a provider that detached ends the attachment
+/// (`Some`); any other failed request (input, viewport, action) loses only
+/// that request and is logged. The event stream reports a provider that died.
+fn native_provider_request_failure(error: &anyhow::Error) -> Option<AttachExitReason> {
+    if matches!(
+        error.downcast_ref::<bmux_client::AttachSessionError>(),
+        Some(bmux_client::AttachSessionError::Detached)
+    ) {
+        return Some(AttachExitReason::StreamClosed);
+    }
+    warn!(error = %format!("{error:#}"), "attach provider request failed; continuing");
+    None
 }
 
 fn handle_native_provider_event<W: AttachTerminal>(
@@ -5910,8 +5982,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let mut surface_revision_rx = view_state.presentation_surfaces.subscribe();
     refresh_observed_geometry(terminal, &mut client, view_state.attached_id).await?;
     view_state.driver_geometry = Some(terminal.geometry());
-    update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry()).await?;
-    hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
+    // Failing to attach at all ends the attach: no failure policy before the
+    // loop, only a readable message.
+    update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry())
+        .await
+        .map_err(map_attach_client_error)?;
+    hydrate_attach_state_from_snapshot(&mut client, &mut view_state)
+        .await
+        .map_err(map_attach_client_error)?;
     maybe_sync_remote_clipboard(
         &mut client,
         &mut view_state,
@@ -6085,6 +6163,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         // While the host is still taking the last frame, nothing new is rendered; its catching up
         // wakes the loop to render once, against what the host then shows.
         let output_backlogged = terminal.output_backlogged();
+        let resync_due = view_state.link.resync_due();
         let capture_deadline = if observer_capture_pending {
             view_state
                 .observer
@@ -6095,14 +6174,35 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         };
         tokio::select! {
             _ = producer_barrier_tick.tick() => {
-                sync_input_producer_barriers(
-                    &mut client,
-                    terminal,
-                    &mut producer_fences,
-                    &mut attach_input_processor,
-                    keyboard_enhanced,
-                )
-                .await?;
+                let _ = attach_try!('attach_loop, view_state, exit_reason, AttachOp::InputBarriers,
+                    sync_input_producer_barriers(
+                        &mut client,
+                        terminal,
+                        &mut producer_fences,
+                        &mut attach_input_processor,
+                        keyboard_enhanced,
+                    )
+                    .await
+                );
+            }
+            // Armed only while a resync is pending: bring the view level with
+            // the server after a failure (see `ipc_policy`).
+            () = async {
+                match resync_due {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if view_state.input_suspended {
+                    view_state.link.cancel_resync();
+                } else {
+                    match attach_try!('attach_loop, view_state, exit_reason, AttachOp::Resync,
+                        resync_attach_view(&mut client, &mut view_state).await
+                    ) {
+                        Some(()) => view_state.link.resync_succeeded(),
+                        None => view_state.link.resync_failed(Instant::now()),
+                    }
+                }
             }
             _ = publication_tick.tick(), if view_state.committed_source.is_some() => {
                 let snapshot = super::committed_source::latest(&view_state);
@@ -6164,22 +6264,24 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 };
                 perf_window.record_wake(AttachWakeSource::Server);
 
-                let handling = handle_attach_stream_server_event(
-                    server_event,
-                    &mut client,
-                    &mut attach_input_processor,
-                    follow_target_id,
-                    self_client_id,
-                    global,
-                    &attach_help_lines,
-                    &mut view_state,
-                    &mut display_capture,
-                    kernel_client_factory.as_ref(),
-                    &attach_config,
-                    &mut perf_emitter,
-                    &mut pane_output_pending,
-                )
-                .await?;
+                if let Some(handling) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::ServerEvent,
+                    handle_attach_stream_server_event(
+                        server_event,
+                        &mut client,
+                        &mut attach_input_processor,
+                        follow_target_id,
+                        self_client_id,
+                        global,
+                        &attach_help_lines,
+                        &mut view_state,
+                        &mut display_capture,
+                        kernel_client_factory.as_ref(),
+                        &attach_config,
+                        &mut perf_emitter,
+                        &mut pane_output_pending,
+                    )
+                    .await
+                ) {
                 if handling.image_fetch_requested {
                     #[cfg(any(
                         feature = "image-sixel",
@@ -6196,6 +6298,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                         exit_reason = reason;
                         break;
                     }
+                }
                 }
             }
 
@@ -6300,7 +6403,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     AttachHostEvent::Native(event) => {
                         let text_passthrough = native_text_passthrough(&attach_config, attach_input_processor.active_mode_id());
                         let pointer_is_current = native_pointer_event_is_current(&event, &view_state, terminal);
-                        let Some(event) = native_attach_input(event, &mut client, &mut view_state, pointer_is_current, text_passthrough).await? else { break 'host_input; };
+                        let Some(Some(event)) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::Input,
+                            native_attach_input(event, &mut client, &mut view_state, pointer_is_current, text_passthrough).await) else { break 'host_input; };
                         event
                     }
                 };
@@ -6312,29 +6416,34 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     display_capture.record_resize(*cols, *rows);
                 }
 
-                let control = if let Some(action) = terminal.take_owned_action() {
-                    handle_attach_action_dispatch(
-                        &mut client,
-                        bmux_plugin_sdk::ActionDispatchRequest::new(action),
-                        &mut view_state,
-                        kernel_client_factory.as_ref(),
-                        true,
-                    ).await?
+                let handled = if let Some(action) = terminal.take_owned_action() {
+                    attach_try!('attach_loop, view_state, exit_reason, AttachOp::Action,
+                        handle_attach_action_dispatch(
+                            &mut client,
+                            bmux_plugin_sdk::ActionDispatchRequest::new(action),
+                            &mut view_state,
+                            kernel_client_factory.as_ref(),
+                            true,
+                        ).await
+                    )
                 } else {
-                    handle_attach_loop_event(
-                    AttachLoopEvent::Terminal(terminal_event),
-                    &mut client,
-                    &mut attach_input_processor,
-                    follow_target_id,
-                    Some(self_client_id),
-                    global,
-                    &attach_help_lines,
-                    &mut view_state,
-                    &mut display_capture,
-                    kernel_client_factory.as_ref(),
-                )
-                .await?
+                    attach_try!('attach_loop, view_state, exit_reason, AttachOp::Action,
+                        handle_attach_loop_event(
+                            AttachLoopEvent::Terminal(terminal_event),
+                            &mut client,
+                            &mut attach_input_processor,
+                            follow_target_id,
+                            Some(self_client_id),
+                            global,
+                            &attach_help_lines,
+                            &mut view_state,
+                            &mut display_capture,
+                            kernel_client_factory.as_ref(),
+                        )
+                        .await
+                    )
                 };
+                let Some(control) = handled else { break 'host_input; };
                 match control {
                     AttachLoopControl::Continue => {}
                     AttachLoopControl::Break(reason) => {
@@ -6393,7 +6502,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     view_state.scrollback_cache.insert(request.pane, request.pin, &window);
                 }
                 if !valid || succeeded {
-                    ensure_pane_scrollback_windows(&mut client, &mut view_state, false)?;
+                    let _ = attach_try!('attach_loop, view_state, exit_reason, AttachOp::Scrollback,
+                        ensure_pane_scrollback_windows(&mut client, &mut view_state, false));
                 }
             }
 
@@ -6438,13 +6548,15 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     super::frontend_bindings::FrontendEvent::Action(admitted) => {
                         perf_window.record_wake(AttachWakeSource::ActionDispatch);
                         let action = action_dispatch::ActionDispatchRequest::new(admitted.action.clone());
-                        match handle_attach_loop_event(
-                            AttachLoopEvent::ActionDispatch(action), &mut client, &mut attach_input_processor,
-                            follow_target_id, Some(self_client_id), global, &attach_help_lines,
-                            &mut view_state, &mut display_capture, kernel_client_factory.as_ref(),
-                        ).await? {
-                            AttachLoopControl::Continue => {}
-                            AttachLoopControl::Break(reason) => { exit_reason = reason; break; }
+                        match attach_try!('attach_loop, view_state, exit_reason, AttachOp::Action,
+                            handle_attach_loop_event(
+                                AttachLoopEvent::ActionDispatch(action), &mut client, &mut attach_input_processor,
+                                follow_target_id, Some(self_client_id), global, &attach_help_lines,
+                                &mut view_state, &mut display_capture, kernel_client_factory.as_ref(),
+                            ).await
+                        ) {
+                            Some(AttachLoopControl::Continue) | None => {}
+                            Some(AttachLoopControl::Break(reason)) => { exit_reason = reason; break; }
                         }
                         drop(admitted);
                     }
@@ -6483,22 +6595,23 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             } => {
                 if let Some(dispatch_request) = dispatch_request {
                     perf_window.record_wake(AttachWakeSource::ActionDispatch);
-                    match handle_attach_loop_event(
-                        AttachLoopEvent::ActionDispatch(dispatch_request),
-                        &mut client,
-                        &mut attach_input_processor,
-                        follow_target_id,
-                        Some(self_client_id),
-                        global,
-                        &attach_help_lines,
-                        &mut view_state,
-                        &mut display_capture,
-                        kernel_client_factory.as_ref(),
-                    )
-                    .await?
-                    {
-                        AttachLoopControl::Continue => {}
-                        AttachLoopControl::Break(reason) => {
+                    match attach_try!('attach_loop, view_state, exit_reason, AttachOp::Action,
+                        handle_attach_loop_event(
+                            AttachLoopEvent::ActionDispatch(dispatch_request),
+                            &mut client,
+                            &mut attach_input_processor,
+                            follow_target_id,
+                            Some(self_client_id),
+                            global,
+                            &attach_help_lines,
+                            &mut view_state,
+                            &mut display_capture,
+                            kernel_client_factory.as_ref(),
+                        )
+                        .await
+                    ) {
+                        Some(AttachLoopControl::Continue) | None => {}
+                        Some(AttachLoopControl::Break(reason)) => {
                             exit_reason = reason;
                             break;
                         }
@@ -6545,12 +6658,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     tracing::warn!("plugin layout revision channel closed");
                     continue;
                 }
-                update_attach_viewport_with_geometry(
-                    &mut client,
-                    &view_state,
-                                terminal.geometry(),
-                )
-                .await?;
+                let _ = attach_try!('attach_loop, view_state, exit_reason, AttachOp::Resize,
+                    update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry())
+                        .await
+                );
                 view_state
                     .dirty
                     .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
@@ -6600,22 +6711,26 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             };
             burst_drained_events = burst_drained_events.saturating_add(1);
             perf_window.record_wake(AttachWakeSource::Server);
-            let handling = handle_attach_stream_server_event(
-                server_event,
-                &mut client,
-                &mut attach_input_processor,
-                follow_target_id,
-                self_client_id,
-                global,
-                &attach_help_lines,
-                &mut view_state,
-                &mut display_capture,
-                kernel_client_factory.as_ref(),
-                &attach_config,
-                &mut perf_emitter,
-                &mut pane_output_pending,
-            )
-            .await?;
+            let Some(handling) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::ServerEvent,
+                handle_attach_stream_server_event(
+                    server_event,
+                    &mut client,
+                    &mut attach_input_processor,
+                    follow_target_id,
+                    self_client_id,
+                    global,
+                    &attach_help_lines,
+                    &mut view_state,
+                    &mut display_capture,
+                    kernel_client_factory.as_ref(),
+                    &attach_config,
+                    &mut perf_emitter,
+                    &mut pane_output_pending,
+                )
+                .await
+            ) else {
+                continue;
+            };
             if handling.image_fetch_requested {
                 #[cfg(any(
                     feature = "image-sixel",
@@ -6727,8 +6842,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
 
         let mut scene_hydrated = false;
 
-        if dirty_layout_frame {
-            if refresh_observed_geometry(terminal, &mut client, view_state.attached_id).await? {
+        if dirty_layout_frame { 'layout_refresh: {
+            if attach_try!('attach_loop, view_state, exit_reason, AttachOp::Resize,
+                refresh_observed_geometry(terminal, &mut client, view_state.attached_id).await
+            ) == Some(true) {
                 view_state.driver_geometry = Some(terminal.geometry());
                 // Old retained rows and damage refer to a different coordinate
                 // system. Hydrate a complete repair before publishing anything.
@@ -6738,26 +6855,25 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 view_state
                     .dirty
                     .mark_retained_surfaces_dirty(AttachDirtySource::LayoutChanged);
-                hydrate_attach_state_from_snapshot_mode(
-                    &mut client,
-                    &mut view_state,
-                    SnapshotHydrationMode::FullResync,
-                )
-                .await?;
+                if attach_try!('attach_loop, view_state, exit_reason, AttachOp::Resync,
+                    hydrate_attach_state_from_snapshot_mode(
+                        &mut client,
+                        &mut view_state,
+                        SnapshotHydrationMode::FullResync,
+                    )
+                    .await
+                ).is_none() {
+                    break 'layout_refresh;
+                }
                 scene_hydrated = true;
                 frame_needs_render = true;
             }
             let previous_layout = view_state.cached_layout_state.clone();
-            let layout_state = match client.attach_layout(view_state.attached_id).await {
-                Ok(state) => state,
-                Err(error)
-                    if is_attach_stream_closed_error(&error)
-                        || is_attach_not_attached_runtime_error(&error) =>
-                {
-                    exit_reason = AttachExitReason::StreamClosed;
-                    break;
-                }
-                Err(error) => return Err(map_attach_client_error(error)),
+            let Some(layout_state) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::LayoutRefresh,
+                client.attach_layout(view_state.attached_id).await
+            ) else {
+                // The layout is fetched again on the next refresh.
+                break 'layout_refresh;
             };
             if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
                 frame_needs_render = true;
@@ -6780,11 +6896,15 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                                     previous,
                                     &layout_state,
                                 ) {
-                                    hydrate_attach_state_from_snapshot(
-                                        &mut client,
-                                        &mut view_state,
-                                    )
-                                    .await?;
+                                    if attach_try!('attach_loop, view_state, exit_reason, AttachOp::LayoutRefresh,
+                                        hydrate_attach_state_from_snapshot(
+                                            &mut client,
+                                            &mut view_state,
+                                        )
+                                        .await
+                                    ).is_none() {
+                                        break 'layout_refresh;
+                                    }
                                     scene_hydrated = true;
                                 } else if !revealed_pane_ids.is_empty() {
                                     let revealed =
@@ -6798,11 +6918,15 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                                     .await
                                     .is_err()
                                     {
-                                        hydrate_attach_state_from_snapshot(
-                                            &mut client,
-                                            &mut view_state,
-                                        )
-                                        .await?;
+                                        if attach_try!('attach_loop, view_state, exit_reason, AttachOp::LayoutRefresh,
+                                            hydrate_attach_state_from_snapshot(
+                                                &mut client,
+                                                &mut view_state,
+                                            )
+                                            .await
+                                        ).is_none() {
+                                            break 'layout_refresh;
+                                        }
                                         scene_hydrated = true;
                                     }
                                 }
@@ -6899,7 +7023,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 // The next frame reconciles visibility/crops against the new layout.
                 image_fetch_pending = true;
             }
-        }
+        } }
 
         let Some(layout_state) = view_state.cached_layout_state.clone() else {
             continue;
@@ -6958,14 +7082,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 &mut first_frame_emitted,
                 &mut interactive_ready_emitted,
             )
-            .await?;
+            .await;
             maybe_emit_attach_perf_window(
                 &mut perf_emitter,
                 &mut client,
                 view_state.attached_id,
                 &mut perf_window,
             )
-            .await?;
+            .await;
             pane_output_pending = false;
             continue;
         }
@@ -6989,14 +7113,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             producer_barrier_tick = tokio::time::interval(Duration::from_secs(1));
         }
         if std::mem::take(&mut view_state.producer_barriers_changed) {
-            sync_input_producer_barriers(
-                &mut client,
-                terminal,
-                &mut producer_fences,
-                &mut attach_input_processor,
-                keyboard_enhanced,
-            )
-            .await?;
+            let _ = attach_try!('attach_loop, view_state, exit_reason, AttachOp::InputBarriers,
+                sync_input_producer_barriers(
+                    &mut client,
+                    terminal,
+                    &mut producer_fences,
+                    &mut attach_input_processor,
+                    keyboard_enhanced,
+                )
+                .await
+            );
         }
         if pane_output_pending
             || view_state.scrollback_replay_pending
@@ -7031,15 +7157,17 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             if !pushed.is_empty() {
                 let applied = apply_pane_frames(&mut view_state, pushed, &mut frame_needs_render);
                 drained_any_data |= applied.had_data;
-                if !applied.failed.is_empty() {
-                    let recovered = recover_pane_frames(
-                        &mut client,
-                        &mut view_state,
-                        applied.failed,
-                        &mut frame_needs_render,
+                if !applied.failed.is_empty()
+                    && let Some(recovered) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::OutputDrain,
+                        recover_pane_frames(
+                            &mut client,
+                            &mut view_state,
+                            applied.failed,
+                            &mut frame_needs_render,
+                        )
+                        .await
                     )
-                    .await
-                    .map_err(map_attach_client_error)?;
+                {
                     drained_any_data |= recovered.had_data;
                 }
             }
@@ -7057,28 +7185,21 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             for _round in 0..read_rounds {
                 perf_window.record_drain_round();
                 let drain_call_started_at = Instant::now();
-                let (frames, still_pending) = match attach_pane_frames_streaming(
-                    &mut client,
-                    view_state.attached_id,
-                    read_pane_ids.clone(),
-                    ATTACH_FRAME_MAX_HISTORY_LINES,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error)
-                        if is_attach_stream_closed_error(&error)
-                            || is_attach_not_attached_runtime_error(&error) =>
-                    {
-                        #[allow(unused_assignments)] // Read after breaking inner drain loop
-                        {
-                            exit_reason = AttachExitReason::StreamClosed;
-                        }
-                        last_round_had_data = false;
-                        break;
-                    }
-                    Err(error) => return Err(map_attach_client_error(error)),
+                // A runtime that is gone ends the whole attachment (not only
+                // this drain); a slow server leaves the rest for the next round.
+                let Some((frames, still_pending)) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::OutputDrain,
+                    attach_pane_frames_streaming(
+                        &mut client,
+                        view_state.attached_id,
+                        read_pane_ids.clone(),
+                        ATTACH_FRAME_MAX_HISTORY_LINES,
+                    )
+                    .await
+                ) else {
+                    last_round_had_data = false;
+                    break;
                 };
+                view_state.link.note_round_trip();
                 let batch_bytes: usize = frames.iter().map(|frame| frame.encoded.len()).sum();
                 perf_window.record_drain_ipc(
                     duration_millis_u64(drain_call_started_at.elapsed()),
@@ -7087,15 +7208,17 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 let applied = apply_pane_frames(&mut view_state, frames, &mut frame_needs_render);
                 drained_any_data |= applied.had_data;
                 perf_window.record_drain_result(applied.had_data, applied.any_sync_active);
-                if !applied.failed.is_empty() {
-                    let recovered = recover_pane_frames(
-                        &mut client,
-                        &mut view_state,
-                        applied.failed,
-                        &mut frame_needs_render,
+                if !applied.failed.is_empty()
+                    && let Some(recovered) = attach_try!('attach_loop, view_state, exit_reason, AttachOp::OutputDrain,
+                        recover_pane_frames(
+                            &mut client,
+                            &mut view_state,
+                            applied.failed,
+                            &mut frame_needs_render,
+                        )
+                        .await
                     )
-                    .await
-                    .map_err(map_attach_client_error)?;
+                {
                     drained_any_data |= recovered.had_data;
                 }
                 last_round_had_data = still_pending;
@@ -7179,7 +7302,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 view_state.attached_id,
                 &mut perf_window,
             )
-            .await?;
+            .await;
             continue;
         }
 
@@ -7235,20 +7358,21 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             &mut first_frame_emitted,
             &mut interactive_ready_emitted,
         )
-        .await?;
+        .await;
         maybe_emit_attach_perf_window(
             &mut perf_emitter,
             &mut client,
             view_state.attached_id,
             &mut perf_window,
         )
-        .await?;
+        .await;
     }
+    // ── After 'attach_loop ──
 
     if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         let mut payload = serde_json::json!({
             "attach_runtime_ms": duration_millis_u64(attach_started_at.elapsed()),
-            "exit_reason": attach_exit_reason_label(exit_reason),
+            "exit_reason": exit_reason.label(),
             "rendered_frames": rendered_frame_count,
             "first_frame_recorded": first_frame_emitted,
             "interactive_ready_recorded": interactive_ready_emitted,
@@ -7269,11 +7393,11 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 "attach.exit",
                 payload,
             )
-            .await?;
+            .await;
     }
 
     tracing::info!(
-        exit_reason = attach_exit_reason_label(exit_reason),
+        exit_reason = exit_reason.label(),
         attach_runtime_ms = duration_millis_u64(attach_started_at.elapsed()),
         rendered_frames = rendered_frame_count,
         "attach.runtime.end"
@@ -7297,15 +7421,34 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         }
     }
     terminal.restore_after_attach_ui()?;
+    if let Some(message) = attach_exit_message(exit_reason)
+        && let Some(output) = terminal.output()
+    {
+        writeln!(output, "{message}")?;
+    }
+    Ok(AttachRunOutcome {
+        status_code: attach_exit_status_code(exit_reason),
+        exit_reason,
+        resume: None,
+        attached_session_id: Some(view_state.attached_id),
+    })
+    }.await;
+    // Every exit, also an error, releases what the attachment holds. The
+    // server-side releases are best-effort: the connection may be gone.
     drop(started_companions);
     super::local_presentation::uninstall(&view_state.presentation_surfaces);
     view_state.presentation_surfaces.clear();
     view_state.presentation_layouts.clear();
-
-    if exit_reason != AttachExitReason::Detached {
+    let exit_reason = attach_result
+        .as_ref()
+        .ok()
+        .map(|outcome| outcome.exit_reason);
+    if exit_reason != Some(AttachExitReason::Detached)
+        && exit_reason != Some(AttachExitReason::ConnectionLost)
+    {
         let _ = client.detach().await;
     }
-    if follow_target_id.is_some() {
+    if follow_target_id.is_some() && exit_reason != Some(AttachExitReason::ConnectionLost) {
         let _ = bmux_clients_plugin_api::clients_commands::client::set_following(
             &mut client,
             None,
@@ -7313,19 +7456,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         )
         .await;
     }
-    if let Some(message) = attach_exit_message(exit_reason)
-        && let Some(output) = terminal.output()
-    {
-        writeln!(output, "{message}")?;
-    }
     display_capture.close_all();
-    Ok(AttachRunOutcome {
-        status_code: 0,
-        exit_reason,
-        resume: None,
-        attached_session_id: Some(view_state.attached_id),
-    })
-    }.await;
     // Release every activation-bound frontend channel with this attachment.
     if let Some(frontends) = view_state.owned_frontends.take()
         && let Some(state) = view_state.command_state.as_ref()
@@ -7700,7 +7831,8 @@ async fn handle_attach_stream_server_event(
                         self_client_id,
                         attach_config,
                     )
-                    .await?;
+                    .await
+                    .context(AttachOp::ContextSwitch)?;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -8204,6 +8336,84 @@ pub fn suspend_attach_input_target(view_state: &mut AttachViewState) {
         .mark_full_frame(AttachDirtySource::SceneChanged);
 }
 
+/// Commit an attach target the server confirmed, then bring the view level
+/// with it (its viewport too when `sync_viewport`).
+///
+/// The target is what the server now has: it is never rolled back. When the
+/// view cannot be brought level, what the view holds of the previous target is
+/// dropped (no old panes under the new target, no input sent to them) and a
+/// full resync of the confirmed target is scheduled, so a half-updated view is
+/// never presented. The request is not replayed.
+async fn adopt_confirmed_attach_target(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    target: bmux_client::AttachOpenInfo,
+    sync_viewport: bool,
+) -> std::result::Result<(), ClientError> {
+    view_state.attached_id = target.session_id;
+    view_state.input_suspended = false;
+    view_state.last_attach_view_revision = None;
+    view_state.attached_context_id = target.context_id;
+    view_state.can_write = target.can_write;
+    let synced = if sync_viewport {
+        update_attach_viewport(client, view_state).await
+    } else {
+        Ok(())
+    };
+    let synced = match synced {
+        Ok(()) => hydrate_attach_state_from_snapshot(client, view_state).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = synced {
+        discard_attach_view(view_state);
+        view_state.link.request_resync();
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Forget what the view shows of its target; the next layout refresh and
+/// resync rebuild it.
+fn discard_attach_view(view_state: &mut AttachViewState) {
+    view_state.cached_layout_state = None;
+    view_state.pane_buffers.clear();
+    view_state.mouse.last_focused_pane_id = None;
+    view_state.dirty.layout_needs_refresh = true;
+    view_state
+        .dirty
+        .mark_full_frame(AttachDirtySource::SnapshotHydration);
+}
+
+/// Bring the view level with what the server says is attached: after a
+/// retarget whose outcome is unknown, adopt the server's selection, then
+/// rehydrate the whole view.
+async fn resync_attach_view(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> Result<()> {
+    if view_state.link.retarget_unconfirmed {
+        let summary = clients_state::client::current_client(client).await?;
+        if let Ok(summary) = summary
+            && let (Some(session_id), Some(context_id)) =
+                (summary.selected_session_id, summary.selected_context_id)
+            && (session_id != view_state.attached_id
+                || Some(context_id) != view_state.attached_context_id)
+        {
+            debug!(%session_id, %context_id, "attach.resync.adopt_server_target");
+            view_state.attached_id = session_id;
+            view_state.attached_context_id = Some(context_id);
+            view_state.input_suspended = false;
+            view_state.last_attach_view_revision = None;
+        }
+        view_state.link.retarget_unconfirmed = false;
+    }
+    update_attach_viewport(client, view_state).await?;
+    hydrate_attach_state_from_snapshot_mode(client, view_state, SnapshotHydrationMode::FullResync)
+        .await?;
+    view_state.dirty.layout_needs_refresh = true;
+    Ok(())
+}
+
 pub async fn retarget_attach_to_context(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -8228,7 +8438,7 @@ pub async fn retarget_attach_to_context(
     let retarget_service_started = Instant::now();
     let geometry = selected_attach_geometry(view_state);
     let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
-    let attach_info = client
+    let attach_info = match client
         .retarget_attach_context_with_insets(
             context_id,
             geometry.cols,
@@ -8238,18 +8448,36 @@ pub async fn retarget_attach_to_context(
             insets.bottom,
             insets.left,
         )
-        .await?;
+        .await
+    {
+        Ok(attach_info) => attach_info,
+        Err(error) => {
+            // Nothing here changed. A rejection left the server on the old
+            // target too; a request that timed out may still have retargeted
+            // it, so the resync asks the server what is attached instead of
+            // replaying the request.
+            if error.class() == bmux_ipc::ErrorClass::Transient {
+                view_state.link.retarget_unconfirmed = true;
+                view_state.link.request_resync();
+            }
+            return Err(error);
+        }
+    };
     let retarget_service_us = retarget_service_started.elapsed().as_micros();
     let select_us = 0_u128;
     let open_us = retarget_service_us;
-    view_state.attached_id = attach_info.session_id;
-    view_state.input_suspended = false;
-    view_state.last_attach_view_revision = None;
-    view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
-    view_state.can_write = attach_info.can_write;
     let viewport_us = 0_u128;
     let hydrate_started = Instant::now();
-    hydrate_attach_state_from_snapshot(client, view_state).await?;
+    adopt_confirmed_attach_target(
+        client,
+        view_state,
+        bmux_client::AttachOpenInfo {
+            context_id: attach_info.context_id.or(Some(context_id)),
+            ..attach_info
+        },
+        false,
+    )
+    .await?;
     let hydrate_us = hydrate_started.elapsed().as_micros();
     let catalog_started = Instant::now();
     refresh_attach_status_catalog_best_effort(client, view_state).await;
@@ -10300,18 +10528,20 @@ fn publish_attach_local_presentation(
         .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
 }
 
+/// The process status an attachment ending this way reports: a lost
+/// connection is not a clean exit, though the attachment stopped cleanly.
+pub const fn attach_exit_status_code(reason: AttachExitReason) -> u8 {
+    match reason {
+        AttachExitReason::Detached | AttachExitReason::Quit | AttachExitReason::StreamClosed => 0,
+        AttachExitReason::ConnectionLost => 1,
+    }
+}
+
 pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
     match reason {
         AttachExitReason::Detached | AttachExitReason::Quit => None,
         AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
-    }
-}
-
-pub const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
-    match reason {
-        AttachExitReason::Detached => "detached",
-        AttachExitReason::StreamClosed => "stream_closed",
-        AttachExitReason::Quit => "quit",
+        AttachExitReason::ConnectionLost => Some("attach ended: connection to server lost"),
     }
 }
 
@@ -13593,8 +13823,25 @@ async fn handle_attach_ui_action_with_scrollback(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // Snapshot hydration intentionally keeps related state transitions in one ordered flow.
+/// Hydrate the view from the server's snapshot. A failure part way leaves the
+/// view half-updated, so it always schedules a full resync; a success means the
+/// server is answering.
 async fn hydrate_attach_state_from_snapshot_mode(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mode: SnapshotHydrationMode,
+) -> std::result::Result<(), ClientError> {
+    let hydrated = hydrate_attach_state_from_snapshot_once(client, view_state, mode).await;
+    if hydrated.is_ok() {
+        view_state.link.note_round_trip();
+    } else {
+        view_state.link.request_resync();
+    }
+    hydrated
+}
+
+#[allow(clippy::too_many_lines)] // Snapshot hydration intentionally keeps related state transitions in one ordered flow.
+async fn hydrate_attach_state_from_snapshot_once(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mode: SnapshotHydrationMode,
@@ -14109,7 +14356,10 @@ async fn handle_attached_session_removed(
         return Ok(Some(AttachLoopControl::Continue));
     }
     let removed_session_id = view_state.attached_id;
-    if recover_attach_after_session_removed(client, view_state).await? {
+    if recover_attach_after_session_removed(client, view_state)
+        .await
+        .context(AttachOp::SessionRecovery)?
+    {
         view_state.set_transient_status(
             format!(
                 "session {} closed; switched to active session",
@@ -14171,26 +14421,37 @@ async fn handle_clients_plugin_event(
             {
                 return Ok(());
             }
-            let attach_info = if let Some(context_id) = context_id {
-                open_attach_for_context(client, context_id)
-                    .await
-                    .map_err(map_attach_client_error)?
+            let opened = if let Some(context_id) = context_id {
+                open_attach_for_context(client, context_id).await
             } else if view_state.attached_context_id.is_none() {
-                open_attach_for_session(client, session_id)
-                    .await
-                    .map_err(map_attach_client_error)?
+                open_attach_for_session(client, session_id).await
             } else {
                 return Ok(());
             };
-            view_state.attached_id = attach_info.session_id;
-            view_state.input_suspended = false;
-            view_state.last_attach_view_revision = None;
-            view_state.attached_context_id = attach_info.context_id.or(context_id);
-            view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state).await?;
-            hydrate_attach_state_from_snapshot(client, view_state)
-                .await
-                .map_err(map_attach_client_error)?;
+            let attach_info = match opened {
+                Ok(attach_info) => attach_info,
+                Err(error) => {
+                    // As for a retarget: an open that timed out may have
+                    // switched the server's target; ask it at the resync.
+                    if error.class() == bmux_ipc::ErrorClass::Transient {
+                        view_state.link.retarget_unconfirmed = true;
+                        view_state.link.request_resync();
+                    }
+                    return Err(map_attach_client_error(error)).context(AttachOp::FollowTarget);
+                }
+            };
+            adopt_confirmed_attach_target(
+                client,
+                view_state,
+                bmux_client::AttachOpenInfo {
+                    context_id: attach_info.context_id.or(context_id),
+                    ..attach_info
+                },
+                true,
+            )
+            .await
+            .map_err(map_attach_client_error)
+            .context(AttachOp::FollowTarget)?;
             refresh_attach_status_catalog_best_effort(client, view_state).await;
             view_state.ui_mode = AttachUiMode::Normal;
             if !view_state.can_write {
@@ -14283,13 +14544,7 @@ pub async fn recover_attach_after_session_removed(
         let Ok(attach_info) = open_attach_for_session(client, session.id).await else {
             continue;
         };
-        view_state.attached_id = attach_info.session_id;
-        view_state.input_suspended = false;
-        view_state.last_attach_view_revision = None;
-        view_state.attached_context_id = attach_info.context_id;
-        view_state.can_write = attach_info.can_write;
-        update_attach_viewport(client, view_state).await?;
-        hydrate_attach_state_from_snapshot(client, view_state).await?;
+        adopt_confirmed_attach_target(client, view_state, attach_info, true).await?;
         refresh_attach_status_catalog_best_effort(client, view_state).await;
         view_state.ui_mode = AttachUiMode::Normal;
         return Ok(true);
@@ -14732,7 +14987,9 @@ pub async fn handle_attach_terminal_event(
         view_state
             .dirty
             .mark_retained_surfaces_dirty(AttachDirtySource::LayoutChanged);
-        update_attach_viewport_with_geometry(client, view_state, geometry).await?;
+        update_attach_viewport_with_geometry(client, view_state, geometry)
+            .await
+            .context(AttachOp::Resize)?;
     }
 
     if view_state.prompt.is_active() {
@@ -14869,7 +15126,7 @@ pub async fn handle_attach_terminal_event(
                     continue;
                 };
                 if let Err(error) = send_attach_bytes_to_focused(client, view_state, bytes).await {
-                    return Err(map_attach_client_error(error));
+                    return Err(map_attach_client_error(error)).context(AttachOp::Input);
                 }
                 display_capture.record_activity(DisplayActivityKind::Input);
             }
@@ -14882,12 +15139,13 @@ pub async fn handle_attach_terminal_event(
                     // round-trip acknowledgement.  Critical failures
                     // (session removed, pane exited) are detected via
                     // server-pushed events rather than per-keystroke
-                    // responses.  Only transport-level send failures are
-                    // treated as fatal here.
+                    // responses.  A failed send goes to the attach failure
+                    // policy (`ipc_policy`): the input is lost and the
+                    // status line says so.
                     if let Err(error) =
                         send_attach_bytes_to_focused(client, view_state, bytes).await
                     {
-                        return Err(map_attach_client_error(error));
+                        return Err(map_attach_client_error(error)).context(AttachOp::Input);
                     }
                     display_capture.record_activity(DisplayActivityKind::Input);
                 }
@@ -15455,7 +15713,7 @@ async fn handle_attach_action_dispatch(
             if view_state.can_write
                 && let Err(error) = send_attach_bytes_to_focused(client, view_state, bytes).await
             {
-                return Err(map_attach_client_error(error));
+                return Err(map_attach_client_error(error)).context(AttachOp::Input);
             }
         }
         AttachEventAction::PluginCommand {
@@ -18746,16 +19004,23 @@ pub fn is_attach_stream_closed_error(error: &ClientError) -> bool {
 /// attached.
 ///
 /// Only server rejections qualify (never a timeout or a lost connection). The
-/// pane runtime reports this case only as a failure reason, with no structured
-/// variant, so the reason text is what identifies it.
+/// pane runtime reports this case as a failure reason, or as the attach state
+/// service's `NotAttached` rejection (`InvalidRequest`, `"<op> failed:
+/// NotAttached"`); neither has a structured form on the client, so the text is
+/// what identifies it.
 pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
     error.class() == bmux_ipc::ErrorClass::Rejected
         && matches!(
             error,
-            ClientError::ServerError { message, .. }
+            ClientError::ServerError { code, message }
                 if message.contains("not attached to session runtime")
+                    || (*code == bmux_ipc::ErrorCode::InvalidRequest
+                        && message.ends_with("failed: NotAttached"))
         )
 }
+#[cfg(test)]
+#[path = "attach_failure_tests.rs"]
+mod attach_failure_tests;
 #[cfg(test)]
 #[path = "native_input_tests.rs"]
 mod native_input_tests;

@@ -1281,17 +1281,19 @@ pub(super) async fn run_session_attach(
         .map(|outcome| outcome.status_code)
 }
 
+/// A readable attach failure that keeps the client error, so the attach loop
+/// can still tell a slow server from a lost connection (see
+/// [`crate::connection::ReadableClientError`]).
 pub(super) fn map_attach_client_error(error: ClientError) -> anyhow::Error {
-    match error {
-        ClientError::ServerError { code, message } => {
-            if matches!(code, bmux_ipc::ErrorCode::AlreadyExists) {
-                anyhow::anyhow!("attach failed: session already has an active attached client")
-            } else {
-                anyhow::anyhow!("attach failed: {message}")
-            }
-        }
-        other => map_client_connect_error(other),
-    }
+    let message = match &error {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::AlreadyExists,
+            ..
+        } => "attach failed: session already has an active attached client".to_string(),
+        ClientError::ServerError { message, .. } => format!("attach failed: {message}"),
+        _ => return map_client_connect_error(error),
+    };
+    crate::connection::readable_client_error(message, error)
 }
 
 pub(super) fn map_cli_client_error(error: ClientError) -> anyhow::Error {

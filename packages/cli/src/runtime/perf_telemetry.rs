@@ -96,7 +96,14 @@ pub(super) struct PerfEventEmitter {
     emitted_payload_bytes_in_window: usize,
     dropped_events_since_emit: u64,
     dropped_payload_bytes_since_emit: u64,
+    /// When a failed streaming emit was last logged, and how many failed
+    /// since without a log line.
+    last_emit_failure_logged_at: Option<Instant>,
+    unlogged_emit_failures: u64,
 }
+
+/// Failed telemetry emits are logged at most this often.
+const EMIT_FAILURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PerfEventEmitter {
     #[must_use]
@@ -108,6 +115,8 @@ impl PerfEventEmitter {
             emitted_payload_bytes_in_window: 0,
             dropped_events_since_emit: 0,
             dropped_payload_bytes_since_emit: 0,
+            last_emit_failure_logged_at: None,
+            unlogged_emit_failures: 0,
         }
     }
 
@@ -212,7 +221,25 @@ impl PerfEventEmitter {
         serde_json::Value::Object(object)
     }
 
+    /// Emit telemetry over an attach connection. Best-effort: telemetry never
+    /// interrupts the attachment, so a failure is only logged (rate-limited).
     pub(super) async fn emit_with_streaming_client(
+        &mut self,
+        client: &mut bmux_client::StreamingBmuxClient,
+        session_id: Option<Uuid>,
+        pane_id: Option<Uuid>,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) {
+        if let Err(error) = self
+            .try_emit_with_streaming_client(client, session_id, pane_id, event_name, payload)
+            .await
+        {
+            self.note_emit_failure(event_name, &error);
+        }
+    }
+
+    async fn try_emit_with_streaming_client(
         &mut self,
         client: &mut bmux_client::StreamingBmuxClient,
         session_id: Option<Uuid>,
@@ -240,6 +267,25 @@ impl PerfEventEmitter {
         )
         .await?
         .map_err(recording_plugin_error)
+    }
+
+    fn note_emit_failure(&mut self, event_name: &str, error: &anyhow::Error) {
+        let now = Instant::now();
+        if self
+            .last_emit_failure_logged_at
+            .is_some_and(|at| now.duration_since(at) < EMIT_FAILURE_LOG_INTERVAL)
+        {
+            self.unlogged_emit_failures = self.unlogged_emit_failures.saturating_add(1);
+            return;
+        }
+        tracing::warn!(
+            event_name,
+            suppressed = self.unlogged_emit_failures,
+            error = %format!("{error:#}"),
+            "perf telemetry emit failed; continuing without it"
+        );
+        self.last_emit_failure_logged_at = Some(now);
+        self.unlogged_emit_failures = 0;
     }
 }
 

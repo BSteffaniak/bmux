@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bmux_cli::attach::{self, AttachExitReason};
+use bmux_cli::attach;
 use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
 use uuid::Uuid;
@@ -82,10 +82,7 @@ async fn run_showcase(sandbox: &SandboxHarness) -> Result<()> {
         .context("plugin prompt sequence task join failed")?;
 
     println!();
-    println!(
-        "attach exit reason: {}",
-        exit_reason_name(attach_outcome.exit_reason)
-    );
+    println!("attach exit reason: {}", attach_outcome.exit_reason.label());
 
     match prompt_result {
         Ok(lines) => {
@@ -100,12 +97,4 @@ async fn run_showcase(sandbox: &SandboxHarness) -> Result<()> {
     }
 
     Ok(())
-}
-
-const fn exit_reason_name(reason: AttachExitReason) -> &'static str {
-    match reason {
-        AttachExitReason::Detached => "detached",
-        AttachExitReason::StreamClosed => "stream_closed",
-        AttachExitReason::Quit => "quit",
-    }
 }

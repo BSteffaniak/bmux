@@ -5,6 +5,7 @@ pub mod events;
 pub mod frontend_bindings;
 pub mod headless;
 pub mod input;
+pub mod ipc_policy;
 pub mod layout;
 mod local_presentation;
 mod metadata;

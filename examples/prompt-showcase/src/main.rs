@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bmux_cli::attach::{
-    self, AttachExitReason, PromptFormField, PromptFormSection, PromptOption, PromptRequest,
-    PromptResponse, PromptSubmitError, PromptValidation, PromptValue,
+    self, PromptFormField, PromptFormSection, PromptOption, PromptRequest, PromptResponse,
+    PromptSubmitError, PromptValidation, PromptValue,
 };
 use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
@@ -84,10 +84,7 @@ async fn run_showcase(sandbox: &SandboxHarness) -> Result<()> {
         .context("prompt sequence task join failed")?;
 
     println!();
-    println!(
-        "attach exit reason: {}",
-        exit_reason_name(attach_outcome.exit_reason)
-    );
+    println!("attach exit reason: {}", attach_outcome.exit_reason.label());
 
     match prompt_result {
         Ok(lines) => {
@@ -284,12 +281,4 @@ fn format_prompt_line(label: &str, response: &PromptResponse) -> String {
         PromptResponse::RejectedBusy => "rejected_busy".to_string(),
     };
     format!("{label}: {value}")
-}
-
-const fn exit_reason_name(reason: AttachExitReason) -> &'static str {
-    match reason {
-        AttachExitReason::Detached => "detached",
-        AttachExitReason::StreamClosed => "stream_closed",
-        AttachExitReason::Quit => "quit",
-    }
 }

@@ -258,16 +258,52 @@ pub fn is_server_unavailable_client_error(error: &ClientError) -> bool {
     )
 }
 
+/// A client error carrying a message written for the person at the terminal.
+///
+/// Rewriting a [`ClientError`] into a readable message must not lose what kind
+/// of failure it was: callers that recover from some failures (the attach
+/// loop) still need its [`ClientError::class`]. The message is the whole
+/// display text; the error is kept for inspection, not repeated as a source.
+#[derive(Debug)]
+pub struct ReadableClientError {
+    message: String,
+    error: ClientError,
+}
+
+impl ReadableClientError {
+    #[must_use]
+    pub const fn client_error(&self) -> &ClientError {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for ReadableClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReadableClientError {}
+
+/// `error` shown as `message`, keeping the client error for its class.
+pub fn readable_client_error(message: impl Into<String>, error: ClientError) -> anyhow::Error {
+    anyhow::Error::new(ReadableClientError {
+        message: message.into(),
+        error,
+    })
+}
+
 pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
     if let ClientError::ProtocolIncompatible { reason } = &error {
-        return anyhow::anyhow!(format_protocol_incompatibility(reason));
+        return readable_client_error(format_protocol_incompatibility(reason), error);
     }
 
     if let ClientError::ServerError { code, .. } = &error
         && *code == bmux_ipc::ErrorCode::VersionMismatch
     {
-        return anyhow::anyhow!(
-            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry."
+        return readable_client_error(
+            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry.",
+            error,
         );
     }
 
@@ -275,14 +311,16 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
         bmux_ipc::frame::FrameDecodeError::UnsupportedVersion { .. },
     )) = &error
     {
-        return anyhow::anyhow!(
-            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry."
+        return readable_client_error(
+            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry.",
+            error,
         );
     }
 
     if is_server_unavailable_client_error(&error) {
-        return anyhow::anyhow!(
-            "bmux server is not running (IPC endpoint unavailable).\nRun `bmux server start --daemon`.\nTroubleshooting: if the server is running in another shell, ensure both processes use the same runtime directory (`XDG_RUNTIME_DIR`/`TMPDIR`). On Unix, a stale socket file can also cause connection refused; remove stale runtime files or run `bmux server stop` and retry."
+        return readable_client_error(
+            "bmux server is not running (IPC endpoint unavailable).\nRun `bmux server start --daemon`.\nTroubleshooting: if the server is running in another shell, ensure both processes use the same runtime directory (`XDG_RUNTIME_DIR`/`TMPDIR`). On Unix, a stale socket file can also cause connection refused; remove stale runtime files or run `bmux server stop` and retry.",
+            error,
         );
     }
 
@@ -295,10 +333,11 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "default".to_string());
-        return anyhow::anyhow!(
+        let message = format!(
             "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.\nCause: {error}",
             local_ipc_endpoint_label_for_error(&paths)
         );
+        return readable_client_error(message, error);
     }
 
     anyhow::Error::from(error)
