@@ -796,19 +796,58 @@ fn holds_host_slot() -> bool {
 }
 
 /// Take one of `slots`, waiting (blocking this thread) at most `wait` for one to free.
+///
+/// The wait is the semaphore's own queue, driven on `runtime` (the selected host reactor), so
+/// a freed slot is handed over at once and in arrival order; this thread only blocks for the
+/// answer, which always comes within `wait`.
 fn wait_for_slot(
+    runtime: &tokio::runtime::Handle,
     slots: &Arc<tokio::sync::Semaphore>,
     wait: std::time::Duration,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        if let Ok(permit) = slots.clone().try_acquire_owned() {
-            return Some(permit);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    if let Ok(permit) = slots.clone().try_acquire_owned() {
+        return Some(permit);
+    }
+    if wait.is_zero() {
+        return None;
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let slots = slots.clone();
+    runtime.spawn(async move {
+        let permit = tokio::time::timeout(wait, slots.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let _ = sender.send(permit);
+    });
+    // A runtime shutting down drops the task, and with it the sender: no slot.
+    receiver.recv().ok().flatten()
+}
+
+/// The least a nested host call waits for its reply once the client request it serves is past
+/// its deadline. The handler has started (it may be part-way through effects), so its nested
+/// calls still run; the grace lets quick ones (a compensating step after a failure) confirm,
+/// while a call that hangs releases its thread soon after the deadline.
+const NESTED_REPLY_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How a nested kernel request is named in diagnostics: a service call by interface and
+/// operation. Never its payload.
+fn kernel_request_label(request: &[u8]) -> String {
+    match bmux_ipc::decode::<bmux_ipc::Request>(request) {
+        Ok(
+            bmux_ipc::Request::InvokeService {
+                interface_id,
+                operation,
+                ..
+            }
+            | bmux_ipc::Request::InvokeServiceAsPlugin {
+                interface_id,
+                operation,
+                ..
+            },
+        ) => format!("{interface_id}.{operation}"),
+        Ok(_) => "kernel request".to_string(),
+        Err(_) => "undecodable kernel request".to_string(),
     }
 }
 
@@ -1127,6 +1166,53 @@ impl AuthenticatedServiceInvocation {
         }
     }
 
+    /// `limit`, cut to what is left before the client request this invocation serves stops
+    /// waiting (zero once it has passed).
+    fn bounded_wait(&self, limit: std::time::Duration) -> std::time::Duration {
+        self.context.request_deadline().map_or(limit, |deadline| {
+            limit.min(deadline.saturating_duration_since(Instant::now()))
+        })
+    }
+
+    /// A selected slot for `request`: a free one; none for a caller holding a host slot (it is
+    /// admitted over the bound, see `HostCallbackExecutor`); else one waited for, blocking this
+    /// thread, at most until the client's deadline or the slot wait runs out.
+    fn selected_slot(
+        &self,
+        executor: &SelectedRequestExecutor,
+        request: &[u8],
+        in_runtime: bool,
+    ) -> bmux_plugin_sdk::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let timed_out = |details| bmux_plugin_sdk::PluginError::HostTimeout { details };
+        Ok(match executor.slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            // Admitted over the bound: a caller holding a host slot never waits for one (see
+            // `HostCallbackExecutor`).
+            Err(_) if holds_host_slot() => None,
+            Err(_) => {
+                let wait = self.bounded_wait(HOST_SLOT_WAIT);
+                let take = || wait_for_slot(&self.runtime, &executor.slots, wait);
+                let permit = if in_runtime {
+                    tokio::task::block_in_place(take)
+                } else {
+                    take()
+                };
+                Some(permit.ok_or_else(|| {
+                    let call = kernel_request_label(request);
+                    tracing::warn!(
+                        call = %call,
+                        waited_ms = wait.as_millis(),
+                        deadline_bound = wait < HOST_SLOT_WAIT,
+                        "nested host call found no free slot; not dispatched"
+                    );
+                    timed_out(format!(
+                        "selected host executor saturated; {call} not dispatched"
+                    ))
+                })?)
+            }
+        })
+    }
+
     fn dispatch_selected_request(
         &self,
         request: &[u8],
@@ -1154,23 +1240,7 @@ impl AuthenticatedServiceInvocation {
             ));
         }
         let executor = SelectedRequestExecutor::get()?;
-        let permit = match executor.slots.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            // Admitted over the bound: a caller holding a host slot never waits for one (see
-            // `HostCallbackExecutor`).
-            Err(_) if holds_host_slot() => None,
-            Err(_) => {
-                let take = || wait_for_slot(&executor.slots, HOST_SLOT_WAIT);
-                let permit = if current.is_some() {
-                    tokio::task::block_in_place(take)
-                } else {
-                    take()
-                };
-                Some(permit.ok_or_else(|| {
-                    timed_out("selected host executor saturated; request not dispatched".into())
-                })?)
-            }
-        };
+        let permit = self.selected_slot(executor, request, current.is_some())?;
         // Admission belongs to the accepted job, not to recv_timeout below.
         // Closure racing this acquisition either rejects before enqueue or must
         // wait for the owned effect to settle. Queue rejection drops the unused
@@ -1180,14 +1250,15 @@ impl AuthenticatedServiceInvocation {
             .transpose()
             .map_err(|error| protocol(error.to_string()))?;
         let authority = self.clone();
-        let request = request.to_vec();
+        let request: Arc<[u8]> = Arc::from(request);
+        let request_label_source = Arc::clone(&request);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let work = async move {
             let _permit = permit;
             let result = if authority.cancellation.is_cancelled() {
                 Err(protocol("authenticated invocation cancelled".into()))
             } else {
-                let execution = authority.context.execute_raw(request);
+                let execution = authority.context.execute_raw(request.to_vec());
                 let result = if let Some(caller) = authority.caller_plugin {
                     SELECTED_PLUGIN_CALLER.scope(caller, execution).await
                 } else {
@@ -1226,14 +1297,23 @@ impl AuthenticatedServiceInvocation {
                 ));
             }
         }
+        let reply_limit = std::time::Duration::from_secs(30);
+        let reply_wait = self
+            .bounded_wait(reply_limit)
+            .max(NESTED_REPLY_GRACE.min(reply_limit));
         let wait = move || {
-            receiver
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .map_err(|_| {
-                    timed_out(
-                        "selected host response unconfirmed; outcome unknown, do not replay".into(),
-                    )
-                })?
+            receiver.recv_timeout(reply_wait).map_err(|_| {
+                let call = kernel_request_label(&request_label_source);
+                tracing::warn!(
+                    call = %call,
+                    waited_ms = reply_wait.as_millis(),
+                    deadline_bound = reply_wait < reply_limit,
+                    "nested host call gave up waiting for its reply; outcome unknown"
+                );
+                timed_out(format!(
+                    "selected host response to {call} unconfirmed; outcome unknown, do not replay"
+                ))
+            })?
         };
         if current.is_some() && !host_thread {
             tokio::task::block_in_place(wait)
@@ -1276,6 +1356,19 @@ impl AuthenticatedServiceInvocation {
         T: Send + 'static,
         F: FnOnce() -> bmux_plugin_sdk::Result<T> + Send + 'static,
     {
+        Self::dispatch_host_callback_within(runtime, HOST_SLOT_WAIT, callback).await
+    }
+
+    /// [`Self::dispatch_host_callback`], waiting at most `wait` for a free callback slot.
+    async fn dispatch_host_callback_within<T, F>(
+        runtime: tokio::runtime::Handle,
+        wait: std::time::Duration,
+        callback: F,
+    ) -> bmux_plugin_sdk::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> bmux_plugin_sdk::Result<T> + Send + 'static,
+    {
         let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
         let executor = HostCallbackExecutor::get()?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -1291,7 +1384,7 @@ impl AuthenticatedServiceInvocation {
                 });
             let _ = sender.send(result);
         });
-        executor.submit(&reactor, job, HOST_SLOT_WAIT).await?;
+        executor.submit(&reactor, job, wait).await?;
         receiver
             .await
             .map_err(|_| bmux_plugin_sdk::PluginError::HostUnavailable {
@@ -1312,7 +1405,9 @@ impl AuthenticatedServiceInvocation {
     ) -> Result<bmux_plugin_sdk::ServiceResponse> {
         let _cancel_on_observer_drop = CancelProviderOnDrop(self.cancellation.clone());
         let runtime = self.runtime.clone();
-        Self::dispatch_host_callback(runtime, move || {
+        // A handler that has not started by the client's deadline has no effect yet: give up.
+        let wait = self.bounded_wait(HOST_SLOT_WAIT);
+        Self::dispatch_host_callback_within(runtime, wait, move || {
             provider.invoke_service_authenticated_sync(&context, self.clone())
         })
         .await
@@ -3020,6 +3115,115 @@ mod tests {
             matches!(response, Ok(bmux_ipc::ResponsePayload::ServiceInvoked { ref payload }) if payload == &[5]),
             "{response:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_selected_request_stops_waiting_for_a_slot_at_the_deadline() {
+        let directory = private_scope_directory();
+        let server = chained_server(&directory);
+        let held = hold_selected_slots(0);
+        let deadline = Instant::now() + std::time::Duration::from_millis(50);
+        let authority = AuthenticatedServiceInvocation::new(
+            server
+                .host_service_context()
+                .with_request_deadline(Some(deadline)),
+        );
+        let started = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            authority.execute_response(&service_request("test.leaf", "leaf/v1"))
+        })
+        .await
+        .unwrap();
+        drop(held);
+        // Not dispatched: refused at the deadline, not after the 30s slot wait.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&response, Err(bmux_plugin_sdk::PluginError::HostTimeout { details }) if details.contains("leaf/v1.read not dispatched")),
+            "{response:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nested_reply_wait_stops_soon_after_the_deadline() {
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Some(held)));
+        server
+            .register_service_handler(
+                "test.hung",
+                InvokeServiceKind::Query,
+                "hung/v1",
+                "read",
+                move |_, _, _| {
+                    let held = held.lock().unwrap().take();
+                    async move {
+                        if let Some(held) = held {
+                            let _ = held.await;
+                        }
+                        Ok(vec![1])
+                    }
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let authority = AuthenticatedServiceInvocation::new(
+            server
+                .host_service_context()
+                .with_request_deadline(Some(deadline)),
+        );
+        let started = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            authority.execute_response(&service_request("test.hung", "hung/v1"))
+        })
+        .await
+        .unwrap();
+        // Past the deadline the wait gets only its short grace, never the 30s limit.
+        let waited = started.elapsed();
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        assert!(waited >= NESTED_REPLY_GRACE, "{waited:?}");
+        assert!(
+            matches!(&response, Err(bmux_plugin_sdk::PluginError::HostTimeout { details }) if details.contains("hung/v1.read unconfirmed")),
+            "{response:?}"
+        );
+        drop(release);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_slot_takes_a_freed_one_at_once_or_gives_up_on_time() {
+        let runtime = tokio::runtime::Handle::current();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = slots.clone().try_acquire_owned().unwrap();
+        let (waiter_runtime, waiter_slots) = (runtime.clone(), slots.clone());
+        let started = Instant::now();
+        let waiter = tokio::task::spawn_blocking(move || {
+            wait_for_slot(
+                &waiter_runtime,
+                &waiter_slots,
+                std::time::Duration::from_secs(30),
+            )
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(held);
+        assert!(waiter.await.unwrap().is_some());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _held = slots.clone().try_acquire_owned().unwrap();
+        let (waiter_runtime, waiter_slots) = (runtime.clone(), slots.clone());
+        let none = tokio::task::spawn_blocking(move || {
+            wait_for_slot(
+                &waiter_runtime,
+                &waiter_slots,
+                std::time::Duration::from_millis(20),
+            )
+        });
+        assert!(none.await.unwrap().is_none());
+        assert!(wait_for_slot(&runtime, &slots, std::time::Duration::ZERO).is_none());
     }
 
     /// A one-slot pool with its slot held until the returned sender is dropped.
