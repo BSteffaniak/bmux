@@ -251,8 +251,8 @@ pub enum PluginError {
     #[error("rejected before dispatch: {details}")]
     RejectedBeforeDispatch { details: String },
 
-    /// The host gave up waiting (for a worker slot or for a response) before
-    /// the call completed. The request itself was not rejected; whether its
+    /// The host gave up waiting (for a worker slot or for a response), or the
+    /// provider stopped at its caller's deadline, before the call completed. The request itself was not rejected; whether its
     /// effect happened may be unknown, so it must not be replayed blindly.
     #[error("host timed out: {details}")]
     HostTimeout { details: String },

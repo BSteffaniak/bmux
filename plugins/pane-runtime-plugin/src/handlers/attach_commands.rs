@@ -15,8 +15,8 @@ use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
-use bmux_pane_runtime_state::SessionRuntimeError;
-use bmux_plugin_sdk::NativeServiceContext;
+use bmux_pane_runtime_state::{RuntimeStartPending, SessionRuntimeError};
+use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -311,6 +311,74 @@ fn failed(reason: impl Into<String>) -> AttachCommandError {
     }
 }
 
+/// Why an attach handler that may start a session runtime stopped.
+#[derive(Debug)]
+pub enum AttachStop {
+    /// A domain answer for the caller.
+    Rejected(AttachCommandError),
+    /// The caller's deadline passed while the session's runtime was starting.
+    /// The start goes on, so a later attach (the client's resync) finds it.
+    StillStarting(RuntimeStartPending),
+}
+
+impl From<AttachCommandError> for AttachStop {
+    fn from(error: AttachCommandError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+/// A typed handler's answer: a deadline stop is a service-level timeout,
+/// never a domain rejection, so the client retries instead of giving up.
+pub type AttachOutcome<T> = Result<Result<T, AttachCommandError>, ServiceResponse>;
+
+fn answer<T>(result: Result<T, AttachStop>) -> AttachOutcome<T> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(AttachStop::Rejected(error)) => Ok(Err(error)),
+        Err(AttachStop::StillStarting(pending)) => {
+            Err(ServiceResponse::deadline_exceeded(pending.to_string()))
+        }
+    }
+}
+
+/// When the caller of a handler stops waiting for its reply, read when the
+/// handler starts (the host passes the time left).
+#[derive(Debug, Clone, Copy)]
+struct CallerDeadline(Option<switchy_time::Instant>);
+
+impl CallerDeadline {
+    fn of(ctx: &NativeServiceContext) -> Self {
+        let now = switchy_time::Instant::now();
+        Self(
+            ctx.cancellation
+                .deadline()
+                .and_then(|budget| now.checked_add(budget)),
+        )
+    }
+
+    fn remaining(self) -> Option<std::time::Duration> {
+        self.0
+            .map(|deadline| deadline.saturating_duration_since(switchy_time::Instant::now()))
+    }
+}
+
+/// Start `session_id`'s runtime, waiting no longer than the caller does.
+/// Only a start still running then stops the handler; any other failure is
+/// left to the attach that follows (it reports the session missing).
+fn start_runtime_by(
+    runtime: &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
+    session_id: SessionId,
+    deadline: CallerDeadline,
+) -> Result<anyhow::Result<()>, AttachStop> {
+    match runtime.0.start_runtime_within(session_id, deadline.remaining()) {
+        Err(error) => match error.downcast::<RuntimeStartPending>() {
+            Ok(pending) => Err(AttachStop::StillStarting(pending)),
+            Err(error) => Ok(Err(error)),
+        },
+        Ok(()) => Ok(Ok(())),
+    }
+}
+
 fn caller_client_id(ctx: &NativeServiceContext) -> Result<ClientId, AttachCommandError> {
     ctx.caller_client_id
         .map(ClientId)
@@ -376,6 +444,7 @@ fn retarget_attach_stream(
     host: &crate::runtime::PaneRuntimeHost,
     runtime: &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
     follow: &bmux_client_state::FollowStateHandle,
+    deadline: CallerDeadline,
     client_id: ClientId,
     next_session_id: SessionId,
     cols: u16,
@@ -386,7 +455,7 @@ fn retarget_attach_stream(
     left_inset: u16,
     cell_pixel_width: u16,
     cell_pixel_height: u16,
-) -> Result<(u16, u16, u16, u16, u16, u16), AttachCommandError> {
+) -> Result<(u16, u16, u16, u16, u16, u16), AttachStop> {
     let previous_stream = follow.0.attached_stream_session(client_id);
     let previous_to_detach = previous_stream.filter(|prev| *prev != next_session_id);
     let retarget_result = match runtime.0.retarget_attach_stream(
@@ -404,7 +473,7 @@ fn retarget_attach_stream(
     ) {
         Ok(viewport) => Ok(viewport),
         Err(SessionRuntimeError::NotFound) => {
-            let _ = runtime.0.start_runtime(next_session_id);
+            let _ = start_runtime_by(runtime, next_session_id, deadline)?;
             runtime.0.retarget_attach_stream(
                 previous_to_detach,
                 next_session_id,
@@ -423,7 +492,7 @@ fn retarget_attach_stream(
             if let Some(removed) = runtime.0.remove_runtime(next_session_id) {
                 runtime.0.shutdown_removed_runtime(removed);
             }
-            let _ = runtime.0.start_runtime(next_session_id);
+            let _ = start_runtime_by(runtime, next_session_id, deadline)?;
             runtime.0.retarget_attach_stream(
                 previous_to_detach,
                 next_session_id,
@@ -442,7 +511,9 @@ fn retarget_attach_stream(
     };
 
     match retarget_result {
-        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => {
+            Err(failed(error.to_string()).into())
+        }
         Ok(viewport) => {
             if let Some(prev) = previous_to_detach {
                 runtime
@@ -464,9 +535,9 @@ fn retarget_attach_stream(
             Ok(viewport)
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
-            Err(AttachCommandError::SessionNotFound)
+            Err(AttachCommandError::SessionNotFound.into())
         }
-        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream")),
+        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream").into()),
     }
 }
 
@@ -589,25 +660,36 @@ fn resolve_failed_selection<T>(
     match result {
         Ok(value) => Ok(value),
         Err(original) => {
-            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
-            let recovery = bmux_plugin::block_on_typed_dispatch(
-                bmux_clients_plugin_api::clients_selection_commands_v1::client::recover(
-                    &mut client,
-                    revision,
-                ),
-            );
-            match recovery {
-                Ok(Ok(_)) => Err(original),
-                Ok(Err(
-                    bmux_clients_plugin_api::clients_selection_state_v1::SelectionError::Conflict,
-                )) => Err(failed(format!(
-                    "selection failed ({original:?}); recovery conflicted with newer selection"
-                ))),
-                other => Err(failed(format!(
-                    "selection failed ({original:?}); recovery incomplete, input may remain suspended: {other:?}"
-                ))),
-            }
+            release_selection(ctx, revision, &original)?;
+            Err(original)
         }
+    }
+}
+
+/// Release the reservation at `revision` after `original` stopped the
+/// selection; an error says the release did not complete.
+fn release_selection(
+    ctx: &NativeServiceContext,
+    revision: u64,
+    original: &dyn std::fmt::Debug,
+) -> Result<(), AttachCommandError> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    let recovery = bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_selection_commands_v1::client::recover(
+            &mut client,
+            revision,
+        ),
+    );
+    match recovery {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(bmux_clients_plugin_api::clients_selection_state_v1::SelectionError::Conflict)) => {
+            Err(failed(format!(
+                "selection failed ({original:?}); recovery conflicted with newer selection"
+            )))
+        }
+        other => Err(failed(format!(
+            "selection failed ({original:?}); recovery incomplete, input may remain suspended: {other:?}"
+        ))),
     }
 }
 
@@ -723,10 +805,19 @@ pub fn attach_open(
     host: &crate::runtime::PaneRuntimeHost,
     req: &AttachOpenArgs,
     ctx: &NativeServiceContext,
-) -> Result<AttachReady, AttachCommandError> {
+) -> AttachOutcome<AttachReady> {
+    answer(open_attach(host, req, ctx))
+}
+
+fn open_attach(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &AttachOpenArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachReady, AttachStop> {
+    let deadline = CallerDeadline::of(ctx);
     let client_id = caller_client_id(ctx)?;
     if observer_identity(host, client_id) {
-        return Err(failed("observer connection is read-only"));
+        return Err(failed("observer connection is read-only").into());
     }
     let session_id = SessionId(req.session_id);
     let runtime = host
@@ -741,7 +832,7 @@ pub fn attach_open(
         .values()
         .any(|(token, _)| *token == req.attach_token)
     {
-        return Err(AttachCommandError::InvalidGrant);
+        return Err(AttachCommandError::InvalidGrant.into());
     }
     let follow = follow_state(host)?;
 
@@ -749,24 +840,25 @@ pub fn attach_open(
     // manager has the entry but the runtime is missing).
     let manager = session_manager(host)?;
     if !manager.0.contains(session_id) {
-        return Err(AttachCommandError::SessionNotFound);
+        return Err(AttachCommandError::SessionNotFound.into());
     }
     if !runtime.0.session_exists(session_id)
-        && let Err(err) = runtime.0.start_runtime(session_id)
+        && let Err(err) = start_runtime_by(&runtime, session_id, deadline)?
     {
         return Err(failed(format!(
             "failed restarting missing session runtime {}: {err:#}",
             session_id.0
-        )));
+        ))
+        .into());
     }
 
     match tokens.0.consume(session_id, req.attach_token) {
         Ok(()) => {}
         Err(AttachTokenValidationError::NotFound | AttachTokenValidationError::SessionMismatch) => {
-            return Err(AttachCommandError::InvalidGrant);
+            return Err(AttachCommandError::InvalidGrant.into());
         }
         Err(AttachTokenValidationError::Expired) => {
-            return Err(AttachCommandError::ExpiredGrant);
+            return Err(AttachCommandError::ExpiredGrant.into());
         }
     }
 
@@ -786,21 +878,23 @@ pub fn attach_open(
     let begin_result = match runtime.0.begin_attach(session_id, client_id) {
         Ok(()) => Ok(()),
         Err(SessionRuntimeError::NotFound) => {
-            let _ = runtime.0.start_runtime(session_id);
+            let _ = start_runtime_by(&runtime, session_id, deadline)?;
             runtime.0.begin_attach(session_id, client_id)
         }
         Err(SessionRuntimeError::Closed) => {
             if let Some(removed) = runtime.0.remove_runtime(session_id) {
                 runtime.0.shutdown_removed_runtime(removed);
             }
-            let _ = runtime.0.start_runtime(session_id);
+            let _ = start_runtime_by(&runtime, session_id, deadline)?;
             runtime.0.begin_attach(session_id, client_id)
         }
         Err(err) => Err(err),
     };
 
     match begin_result {
-        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => {
+            Err(failed(error.to_string()).into())
+        }
         Ok(()) => {
             let can_write = session_write_allowed(host, ctx, session_id, client_id)?;
             runtime
@@ -827,9 +921,9 @@ pub fn attach_open(
             })
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
-            Err(AttachCommandError::SessionNotFound)
+            Err(AttachCommandError::SessionNotFound.into())
         }
-        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream")),
+        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream").into()),
     }
 }
 
@@ -1107,7 +1201,16 @@ pub fn attach_retarget_context(
     host: &crate::runtime::PaneRuntimeHost,
     req: &AttachRetargetContextArgs,
     ctx: &NativeServiceContext,
-) -> Result<AttachRetargetReady, AttachCommandError> {
+) -> AttachOutcome<AttachRetargetReady> {
+    answer(retarget_context(host, req, ctx))
+}
+
+fn retarget_context(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &AttachRetargetContextArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachRetargetReady, AttachStop> {
+    let deadline = CallerDeadline::of(ctx);
     let client_id = caller_client_id(ctx)?;
 
     let manager = session_manager(host)?;
@@ -1139,21 +1242,24 @@ pub fn attach_retarget_context(
                 .map_err(|_| AttachCommandError::ContextNotFound)?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
                 restore_context_selection(&contexts, client_id, previous_selection);
-                return Err(failed("context has no attached runtime"));
+                return Err(failed("context has no attached runtime").into());
             };
             (context.id, selected_session_id, false)
         };
     // Every failure below undoes the context selection this handler applied.
-    let undo_selection = |error: AttachCommandError| {
+    let undo = || {
         if !selection_already_applied {
             restore_context_selection(&contexts, client_id, previous_selection);
         }
+    };
+    let undo_selection = |error: AttachCommandError| {
+        undo();
         error
     };
 
     // Validate the session exists in the manager.
     if !manager.0.contains(next_session_id) {
-        return Err(undo_selection(AttachCommandError::SessionNotFound));
+        return Err(undo_selection(AttachCommandError::SessionNotFound).into());
     }
 
     let previous_session = selected_target.and_then(|(_, session_id)| session_id);
@@ -1166,6 +1272,7 @@ pub fn attach_retarget_context(
         host,
         &runtime,
         &follow,
+        deadline,
         client_id,
         next_session_id,
         req.cols,
@@ -1178,8 +1285,12 @@ pub fn attach_retarget_context(
         req.cell_pixel_height,
     ) {
         Ok(viewport) => viewport,
-        Err(error) => {
-            return resolve_failed_selection(ctx, reservation.revision, Err(undo_selection(error)));
+        Err(stop) => {
+            // Nothing was retargeted (a runtime still starting included): hand
+            // the selection back; only a release that failed outranks `stop`.
+            undo();
+            release_selection(ctx, reservation.revision, &stop)?;
+            return Err(stop);
         }
     };
     let (cols, rows, top, right, bottom, left) = retargeted;
@@ -1375,6 +1486,28 @@ mod selection_tests {
     }
 
     #[test]
+    fn a_runtime_still_starting_answers_a_timeout_not_a_rejection() {
+        let session_id = SessionId(Uuid::nil());
+        let stopped = answer::<()>(Err(AttachStop::StillStarting(RuntimeStartPending {
+            session_id,
+        })))
+        .unwrap_err();
+        assert!(stopped.error.as_ref().unwrap().is_deadline_exceeded());
+        assert_eq!(
+            answer::<()>(Err(AttachCommandError::SessionNotFound.into())).unwrap(),
+            Err(AttachCommandError::SessionNotFound)
+        );
+        let mut ctx = test_context();
+        assert!(CallerDeadline::of(&ctx).remaining().is_none());
+        ctx.cancellation = ctx
+            .cancellation
+            .with_remaining(Some(std::time::Duration::from_secs(5)));
+        let remaining = CallerDeadline::of(&ctx).remaining().unwrap();
+        assert!(remaining <= std::time::Duration::from_secs(5));
+        assert!(remaining > std::time::Duration::from_secs(4));
+    }
+
+    #[test]
     fn a_reservation_whose_reply_was_lost_is_released_not_left_suspended() {
         let lost = SelectionHost {
             begin_lost: true,
@@ -1541,15 +1674,12 @@ mod selection_tests {
         assert!(observer_identity(host, observer));
     }
 
-    #[test]
-    fn absent_permissions_is_local_fallback_but_enabled_missing_principal_fails_closed() {
+    fn test_context() -> NativeServiceContext {
         use bmux_plugin_sdk::{
             ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
             ServiceKind, ServiceRequest,
         };
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        let host = &host;
-        let mut context = NativeServiceContext {
+        NativeServiceContext {
             host_service_port: None,
             plugin_id: "bmux.pane_runtime".into(),
             request: ServiceRequest {
@@ -1587,7 +1717,14 @@ mod selection_tests {
             caller_client_id: None,
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
-        };
+        }
+    }
+
+    #[test]
+    fn absent_permissions_is_local_fallback_but_enabled_missing_principal_fails_closed() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
+        let mut context = test_context();
         let session = SessionId(crate::ids::new_uuid());
         let client = ClientId(crate::ids::new_uuid());
         assert!(session_write_allowed(host, &context, session, client).unwrap());

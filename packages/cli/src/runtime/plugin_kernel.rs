@@ -2269,8 +2269,23 @@ pub(super) fn register_plugin_service_handlers(
                         cancellation: bmux_plugin_sdk::CancellationToken::default(),
                         host_kernel_bridge: None,
                     };
+                    // The provider sees how long its caller still waits, so its own
+                    // waits can end then instead of outlasting the reply nobody reads.
+                    let remaining = invoke_context
+                        .request_deadline()
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                    if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                        return Err(bmux_plugin_sdk::PluginError::HostTimeout {
+                            details: format!(
+                                "client deadline passed before {} could start",
+                                provider_declaration.id.as_str()
+                            ),
+                        }
+                        .into());
+                    }
                     let retained = RetainedKernelContext::register(invoke_context.clone())?;
-                    service_context.cancellation = retained.cancellation();
+                    service_context.cancellation =
+                        retained.cancellation().with_remaining(remaining);
                     service_context.host_kernel_bridge = Some(retained.bridge());
                     let response = provider.invoke_service(&service_context, authority).await?;
                     let elapsed_us = started_at.elapsed().as_micros();
@@ -2281,6 +2296,13 @@ pub(super) fn register_plugin_service_handlers(
                         "plugin service handler dispatched"
                     );
                     if let Some(error) = response.error {
+                        if error.is_deadline_exceeded() {
+                            // The work may still finish; the client hears a timeout.
+                            return Err(bmux_plugin_sdk::PluginError::HostTimeout {
+                                details: error.message,
+                            }
+                            .into());
+                        }
                         anyhow::bail!(error.message);
                     }
 

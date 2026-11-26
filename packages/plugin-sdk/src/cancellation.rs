@@ -161,6 +161,29 @@ impl PluginCancellationToken {
         self.cancelled
     }
 
+    /// How long the caller still waits for this invocation's reply, from
+    /// when the host started it; `None` when the caller set no deadline.
+    /// Waits inside a handler should end by then, answering
+    /// [`crate::ServiceResponse::deadline_exceeded`]. The host also signals
+    /// cancellation when it passes.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Duration> {
+        match self.deadline_ms {
+            Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
+            None => None,
+        }
+    }
+
+    /// This token for a caller that stops waiting `remaining` from now.
+    /// A deadline under a millisecond rounds up: zero means already expired.
+    #[must_use]
+    pub fn with_remaining(mut self, remaining: Option<Duration>) -> Self {
+        self.deadline_ms = remaining.map(|remaining| {
+            u64::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(u64::MAX)
+        });
+        self
+    }
+
     /// Mark this serializable token snapshot as cancelled.
     pub const fn cancel(&mut self) {
         self.cancelled = true;
@@ -236,5 +259,15 @@ mod tests {
         let deadline = PluginCancellationToken::with_deadline(Duration::from_millis(42));
         assert!(!deadline.is_cancelled());
         assert_eq!(deadline.deadline_ms, Some(42));
+        assert_eq!(deadline.deadline(), Some(Duration::from_millis(42)));
+        let rounded =
+            PluginCancellationToken::none().with_remaining(Some(Duration::from_micros(1)));
+        assert_eq!(rounded.deadline(), Some(Duration::from_millis(1)));
+        assert_eq!(
+            PluginCancellationToken::none()
+                .with_remaining(None)
+                .deadline(),
+            None
+        );
     }
 }

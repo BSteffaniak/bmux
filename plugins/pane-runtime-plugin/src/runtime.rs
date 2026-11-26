@@ -10952,6 +10952,16 @@ struct ManagerLockHolder {
     started: switchy_time::Instant,
 }
 
+/// How a fresh-runtime start ended (`None` while it runs), shared by every
+/// caller waiting on it.
+type RuntimeStartOutcome = Option<Result<(), String>>;
+
+/// Fresh-runtime starts in flight, by session. A start runs to its end even
+/// when every caller stopped waiting for it, and a later start of the same
+/// session joins it instead of spawning a second first pane.
+type RuntimeStartsInFlight = Arc<Mutex<BTreeMap<SessionId, watch::Receiver<RuntimeStartOutcome>>>>;
+
+#[derive(Clone)]
 struct ServerSessionRuntimeAdapter {
     inner: Arc<Mutex<SessionRuntimeManager>>,
     host: PaneRuntimeHost,
@@ -10959,6 +10969,21 @@ struct ServerSessionRuntimeAdapter {
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
     current_holder: Arc<Mutex<Option<ManagerLockHolder>>>,
     retained_pin_bytes: Arc<AtomicUsize>,
+    starts: RuntimeStartsInFlight,
+}
+
+/// Ends a start's entry in [`RuntimeStartsInFlight`] however its task ends.
+struct RuntimeStartEntry {
+    starts: RuntimeStartsInFlight,
+    session_id: SessionId,
+}
+
+impl Drop for RuntimeStartEntry {
+    fn drop(&mut self) {
+        if let Ok(mut starts) = self.starts.lock() {
+            starts.remove(&self.session_id);
+        }
+    }
 }
 
 impl ServerSessionRuntimeAdapter {
@@ -11123,7 +11148,43 @@ impl ServerSessionRuntimeAdapter {
             client_write_permissions,
             current_holder: Arc::new(Mutex::new(None)),
             retained_pin_bytes,
+            starts: Arc::default(),
         }
+    }
+
+    /// The start of `session_id`'s fresh runtime: the one in flight, or a new
+    /// one. Its task owns the start, so it completes (and publishes the
+    /// runtime) whether or not anyone still waits.
+    fn join_runtime_start(
+        &self,
+        session_id: SessionId,
+    ) -> Result<watch::Receiver<RuntimeStartOutcome>> {
+        let mut starts = self
+            .starts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime starts lock poisoned"))?;
+        if let Some(start) = starts.get(&session_id) {
+            return Ok(start.clone());
+        }
+        let (finished, start) = watch::channel(None);
+        starts.insert(session_id, start.clone());
+        drop(starts);
+        let adapter = self.clone();
+        let entry = RuntimeStartEntry {
+            starts: Arc::clone(&self.starts),
+            session_id,
+        };
+        drop(switchy_async::task::spawn(async move {
+            let outcome = adapter
+                .start_fresh_runtime(session_id)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            // Published before the entry ends: a caller joining in between
+            // reads this outcome instead of starting again.
+            let _ = finished.send(Some(outcome));
+            drop(entry);
+        }));
+        Ok(start)
     }
 
     fn reserve_grid_working_set(&self) -> Result<PinReservation, SessionRuntimeError> {
@@ -11359,14 +11420,41 @@ fn frames_for_panes(
 
 impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeAdapter {
     fn start_runtime(&self, session_id: SessionId) -> anyhow::Result<()> {
+        self.start_runtime_within(session_id, None)
+    }
+
+    fn start_runtime_within(
+        &self,
+        session_id: SessionId,
+        budget: Option<Duration>,
+    ) -> anyhow::Result<()> {
         let runtime = switchy_async::runtime::Handle::try_current()?;
         anyhow::ensure!(
             runtime.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread,
             "synchronous runtime creation requires the server's multi-thread runtime"
         );
-        switchy_async::task::block_in_place(|| {
-            runtime.block_on(self.start_fresh_runtime(session_id))
-        })
+        let mut start = self.join_runtime_start(session_id)?;
+        let outcome = switchy_async::task::block_in_place(|| {
+            runtime.block_on(async move {
+                let finished = async {
+                    start
+                        .wait_for(Option::is_some)
+                        .await
+                        .ok()
+                        .and_then(|outcome| outcome.clone())
+                };
+                match budget {
+                    None => Ok(finished.await),
+                    Some(budget) => switchy_async::time::timeout(budget, finished).await,
+                }
+            })
+        });
+        match outcome {
+            Ok(Some(Ok(()))) => Ok(()),
+            Ok(Some(Err(error))) => Err(anyhow::anyhow!(error)),
+            Ok(None) => anyhow::bail!("runtime start for session {} ended unfinished", session_id.0),
+            Err(_) => Err(bmux_pane_runtime_state::RuntimeStartPending { session_id }.into()),
+        }
     }
 
     fn restore_runtime(
@@ -23792,6 +23880,52 @@ exit 7"#
         let reported = reported_shell_directory(&pane, directory.path()).await;
         shutdown_pane_handle(host, pane).await;
         assert_eq!(reported.unwrap(), directory.path().canonicalize().unwrap());
+    }
+
+    /// A caller whose deadline passes while the runtime starts gets
+    /// `RuntimeStartPending`; the start goes on, and the next start of the
+    /// session joins it rather than spawning a second first pane.
+    #[cfg(unix)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_outlasting_its_caller_finishes_and_is_joined() {
+        use bmux_pane_runtime_state::SessionRuntimeManagerApi as _;
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
+            "/bin/sh".into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
+        let session = SessionId(crate::ids::new_uuid());
+        let pending = adapter
+            .start_runtime_within(session, Some(Duration::ZERO))
+            .unwrap_err();
+        assert_eq!(
+            pending.downcast_ref::<bmux_pane_runtime_state::RuntimeStartPending>(),
+            Some(&bmux_pane_runtime_state::RuntimeStartPending {
+                session_id: session
+            })
+        );
+        assert!(adapter.starts.lock().unwrap().contains_key(&session));
+        // Joins the start in flight: a second start would fail "already exists".
+        adapter
+            .start_runtime_within(session, Some(Duration::from_secs(10)))
+            .unwrap();
+        assert!(adapter.session_exists(session));
+        assert!(adapter.starts.lock().unwrap().is_empty());
+        let removed = adapter.inner.lock().unwrap().remove_runtime(session).unwrap();
+        switchy_async::time::timeout(
+            Duration::from_secs(5),
+            shutdown_runtime_handle(&host, removed),
+        )
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]

@@ -417,7 +417,7 @@ fn route_authorized(
             Ok::<_, ServiceResponse>(attach_commands::observer_open(host, &req, ctx))
         },
         "attach-runtime-commands", "attach-open" => |req: attach_commands::AttachOpenArgs, ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::attach_open(host, &req, ctx))
+            attach_commands::attach_open(host, &req, ctx)
         },
         "attach-runtime-commands", "input-producer-barriers-v2" => |_req: serde_json::Value, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::input_producer_barriers(host, ctx))
@@ -441,7 +441,7 @@ fn route_authorized(
             Ok::<_, ServiceResponse>(attach_commands::attach_set_viewport(host, &req, ctx))
         },
         "attach-runtime-commands", "attach-retarget-context" => |req: attach_commands::AttachRetargetContextArgs, ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::attach_retarget_context(host, &req, ctx))
+            attach_commands::attach_retarget_context(host, &req, ctx)
         },
         "attach-runtime-commands", "set-client-attach-policy" => |req: attach_commands::SetClientAttachPolicyArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::set_client_attach_policy(host, req, ctx))

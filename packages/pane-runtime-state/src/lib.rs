@@ -42,8 +42,8 @@ pub use manager_handle::{
     AttachSnapshotState, FloatingPaneRuntimeSummary, ForegroundJob, HistoryEnd, HistoryFetchError,
     NoopSessionRuntimeManager, PaneAgentReport, PaneClipboardWrite, PaneProcessIdentity,
     PaneProcessSignal, PaneScreenText, PaneScrollbackMetadata, PaneSignals, RemovedRuntimeInfo,
-    RestoreRuntimeRequest, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
-    SessionRuntimeSnapshot,
+    RestoreRuntimeRequest, RuntimeStartPending, SessionRuntimeManagerApi,
+    SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};

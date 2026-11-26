@@ -297,6 +297,19 @@ pub struct ServiceError {
     pub message: String,
 }
 
+impl ServiceError {
+    /// Code of a provider that stopped waiting at its caller's deadline
+    /// ([`crate::PluginCancellationToken::deadline`]). The work it waited on
+    /// may still complete, so callers must not replay it blindly.
+    pub const DEADLINE_EXCEEDED: &'static str = "deadline_exceeded";
+
+    /// Whether the provider stopped at its caller's deadline.
+    #[must_use]
+    pub fn is_deadline_exceeded(&self) -> bool {
+        self.code == Self::DEADLINE_EXCEEDED
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceResponse {
     #[serde(with = "bmux_codec::serde_bytes_vec")]
@@ -598,6 +611,13 @@ impl ServiceResponse {
                 message: message.into(),
             }),
         }
+    }
+
+    /// The provider stopped waiting at its caller's deadline; hosts report
+    /// it as a timeout, not as a failure of the request.
+    #[must_use]
+    pub fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self::error(ServiceError::DEADLINE_EXCEEDED, message)
     }
 }
 

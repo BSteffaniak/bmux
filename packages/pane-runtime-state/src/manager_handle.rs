@@ -351,6 +351,26 @@ impl RestoreRuntimeRequest {
     }
 }
 
+/// A runtime start still running when its caller's budget ran out
+/// ([`SessionRuntimeManagerApi::start_runtime_within`]). It will publish the
+/// runtime when it is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStartPending {
+    pub session_id: SessionId,
+}
+
+impl std::fmt::Display for RuntimeStartPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session {} runtime still starting when the caller's deadline passed",
+            self.session_id.0
+        )
+    }
+}
+
+impl std::error::Error for RuntimeStartPending {}
+
 /// Trait implemented by the pane-runtime plugin's
 /// `SessionRuntimeManager`. Server + other plugins consume pane
 /// runtime exclusively through this trait object.
@@ -358,6 +378,19 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     // ── Session lifecycle ──────────────────────────────────────────
 
     fn start_runtime(&self, session_id: SessionId) -> anyhow::Result<()>;
+
+    /// [`Self::start_runtime`], waiting at most `budget` (`None`: until it
+    /// ends) for the runtime to be ready. A start that outlasts the budget
+    /// keeps going, a later start of the session joins it, and this returns
+    /// [`RuntimeStartPending`].
+    fn start_runtime_within(
+        &self,
+        session_id: SessionId,
+        budget: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
+        let _ = budget;
+        self.start_runtime(session_id)
+    }
 
     fn restore_runtime(
         &self,
