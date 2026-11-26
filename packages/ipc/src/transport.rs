@@ -14,8 +14,8 @@ mod security_policy;
 pub use security_policy::{IdentityPolicy, SymlinkPolicy, UnixSecurityPolicy};
 
 use crate::frame::{
-    FrameDecodeError, FrameEncodeError, decode_frame_compressed, decode_frame_exact, encode_frame,
-    encode_frame_compressed,
+    FrameDecodeError, FrameEncodeError, MAX_COMPRESSED_FRAME_SIZE, MAX_FRAME_PAYLOAD_SIZE,
+    decode_frame_compressed, decode_frame_exact, encode_frame, encode_frame_compressed,
 };
 use crate::{Envelope, IpcEndpoint};
 use std::io;
@@ -773,6 +773,14 @@ where
     Ok(())
 }
 
+/// Refuse a frame length read from the peer before any buffer is sized by it.
+const fn check_frame_len(actual: usize, max: usize) -> Result<(), FrameDecodeError> {
+    if actual > max {
+        return Err(FrameDecodeError::PayloadTooLarge { actual, max });
+    }
+    Ok(())
+}
+
 async fn read_frame_with_timing<T>(
     stream: &mut T,
 ) -> Result<(Envelope, IpcReadTiming), IpcTransportError>
@@ -783,6 +791,8 @@ where
     let read_started = Instant::now();
     stream.read_exact(&mut len_bytes).await?;
     let payload_len = u32::from_le_bytes(len_bytes) as usize;
+    // The length is untrusted: refuse it before allocating for it.
+    check_frame_len(payload_len, MAX_FRAME_PAYLOAD_SIZE)?;
     let mut frame = Vec::with_capacity(4 + payload_len);
     frame.extend_from_slice(&len_bytes);
     frame.resize(4 + payload_len, 0);
@@ -811,6 +821,7 @@ where
     let read_started = Instant::now();
     stream.read_exact(&mut len_bytes).await?;
     let total_len = u32::from_le_bytes(len_bytes) as usize;
+    check_frame_len(total_len, MAX_COMPRESSED_FRAME_SIZE)?;
     let mut frame = Vec::with_capacity(4 + total_len);
     frame.extend_from_slice(&len_bytes);
     frame.resize(4 + total_len, 0);

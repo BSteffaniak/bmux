@@ -144,10 +144,7 @@ impl CompressionCodec for ZstdCodec {
     }
 
     fn decompress(&self, input: &[u8]) -> Result<Vec<u8>, CompressionError> {
-        // Use a generous upper bound; the actual decompressed size is encoded
-        // in the zstd frame header so the library handles allocation.
-        zstd::bulk::decompress(input, 64 * 1024 * 1024)
-            .map_err(|e| CompressionError::DecompressFailed(e.to_string()))
+        decompress_zstd(input, MAX_DECOMPRESSED_SIZE)
     }
 
     fn threshold(&self, hint: CompressionHint) -> usize {
@@ -196,8 +193,7 @@ impl CompressionCodec for Lz4Codec {
     }
 
     fn decompress(&self, input: &[u8]) -> Result<Vec<u8>, CompressionError> {
-        lz4_flex::decompress_size_prepended(input)
-            .map_err(|e| CompressionError::DecompressFailed(e.to_string()))
+        decompress_lz4(input, MAX_DECOMPRESSED_SIZE)
     }
 
     fn threshold(&self, hint: CompressionHint) -> usize {
@@ -233,6 +229,91 @@ pub fn compress_if_worthwhile(
         || (data.to_vec(), CompressionId::None),
         |compressed| (compressed, codec.id()),
     )
+}
+
+/// Largest output any codec here produces (64 MiB). Decompressed sizes come
+/// from the (untrusted) input, so every decoder refuses more before
+/// allocating for it.
+pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "compression-zstd")]
+fn decompress_zstd(input: &[u8], max: usize) -> Result<Vec<u8>, CompressionError> {
+    use std::io::Read as _;
+    let failed = |e: std::io::Error| CompressionError::DecompressFailed(e.to_string());
+    // The header's content size is untrusted: refuse an oversized one up
+    // front, and never reserve more than `max` for it.
+    let declared = zstd::zstd_safe::get_frame_content_size(input)
+        .ok()
+        .flatten()
+        .and_then(|size| usize::try_from(size).ok());
+    if let Some(size) = declared
+        && size > max
+    {
+        return Err(CompressionError::DecompressFailed(format!(
+            "declared size {size} exceeds {max} bytes"
+        )));
+    }
+    let mut output = Vec::with_capacity(declared.unwrap_or(0).min(max));
+    // Read at most `max + 1` bytes, so an over-long stream is detected
+    // without decoding all of it.
+    zstd::stream::read::Decoder::with_buffer(input)
+        .map_err(failed)?
+        .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut output)
+        .map_err(failed)?;
+    if output.len() > max {
+        return Err(CompressionError::DecompressFailed(format!(
+            "decompressed size exceeds {max} bytes"
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "compression-lz4")]
+fn decompress_lz4(input: &[u8], max: usize) -> Result<Vec<u8>, CompressionError> {
+    // The 4-byte size prefix is untrusted: check it before the decoder
+    // allocates a buffer of that size.
+    let (size, body) = lz4_flex::block::uncompressed_size(input)
+        .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+    if size > max {
+        return Err(CompressionError::DecompressFailed(format!(
+            "declared size {size} exceeds {max} bytes"
+        )));
+    }
+    lz4_flex::decompress(body, size).map_err(|e| CompressionError::DecompressFailed(e.to_string()))
+}
+
+/// Decompress `data` based on the `CompressionId`, refusing output larger
+/// than `max` bytes before allocating for it.
+///
+/// # Errors
+///
+/// Returns [`CompressionError::DecompressFailed`] if the data is malformed
+/// or would decompress to more than `max` bytes, or
+/// [`CompressionError::UnknownCodec`] if the codec is not compiled in.
+pub fn decompress_by_id_bounded(
+    data: &[u8],
+    id: CompressionId,
+    max: usize,
+) -> Result<Vec<u8>, CompressionError> {
+    #[cfg(not(any(feature = "compression-zstd", feature = "compression-lz4")))]
+    let _ = max;
+    match id {
+        CompressionId::None => {
+            if data.len() > max {
+                return Err(CompressionError::DecompressFailed(format!(
+                    "size exceeds {max} bytes"
+                )));
+            }
+            Ok(data.to_vec())
+        }
+        #[cfg(feature = "compression-zstd")]
+        CompressionId::Zstd => decompress_zstd(data, max),
+        #[cfg(feature = "compression-lz4")]
+        CompressionId::Lz4 => decompress_lz4(data, max),
+        #[allow(unreachable_patterns)]
+        other => Err(CompressionError::UnknownCodec(other as u8)),
+    }
 }
 
 /// Decompress `data` based on the `CompressionId`.  Returns the original

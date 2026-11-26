@@ -271,7 +271,8 @@ pub fn decode_frame_compressed(frame: &[u8]) -> Result<Envelope, FrameDecodeErro
     let decompressed = match CompressionId::from_byte(comp_byte) {
         Some(CompressionId::None) => payload_bytes.to_vec(),
         Some(id) => {
-            let data = compression::decompress_by_id(payload_bytes, id)?;
+            let data =
+                compression::decompress_by_id_bounded(payload_bytes, id, MAX_FRAME_PAYLOAD_SIZE)?;
             if data.len() > MAX_FRAME_PAYLOAD_SIZE {
                 return Err(FrameDecodeError::PayloadTooLarge {
                     actual: data.len(),
@@ -319,7 +320,8 @@ pub fn try_decode_frame_compressed(
     let decompressed = match CompressionId::from_byte(comp_byte) {
         Some(CompressionId::None) => payload_bytes,
         Some(id) => {
-            let data = compression::decompress_by_id(&payload_bytes, id)?;
+            let data =
+                compression::decompress_by_id_bounded(&payload_bytes, id, MAX_FRAME_PAYLOAD_SIZE)?;
             if data.len() > MAX_FRAME_PAYLOAD_SIZE {
                 return Err(FrameDecodeError::PayloadTooLarge {
                     actual: data.len(),
