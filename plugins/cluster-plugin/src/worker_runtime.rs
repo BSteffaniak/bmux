@@ -127,6 +127,8 @@ struct WorkerRegistryInner {
     executions: BTreeMap<uuid::Uuid, WorkerRegistryEntry>,
     fence: WorkerFenceState,
     command_outcomes: WorkerCommandDedup<RegistryOutcome>,
+    /// Mutations whose effect is being applied, outside the lock.
+    applying: BTreeSet<uuid::Uuid>,
 }
 
 struct WorkerRegistryEntry {
@@ -154,6 +156,7 @@ where
                 executions: BTreeMap::new(),
                 fence: WorkerFenceState::default(),
                 command_outcomes: WorkerCommandDedup::default(),
+                applying: BTreeSet::new(),
             }),
         }
     }
@@ -279,11 +282,18 @@ where
         data: &[u8],
         monotonic_now_ms: u64,
     ) -> Result<bmux_cluster_plugin_api::cluster_types::WorkerMutationAck, WorkerServiceError> {
+        // The lease is left out of the fingerprint: a retry of the same input comes with a fresh
+        // lease from the ingress, and must be answered with the first outcome, not applied again.
         self.mutate(
             command_id,
             authority,
             WorkerOperationClass::Interactive,
-            &(authority, data),
+            &(
+                &authority.execution_id,
+                authority.generation,
+                &authority.principal_id,
+                data,
+            ),
             monotonic_now_ms,
             |execution| {
                 self.runtime
@@ -537,6 +547,13 @@ where
         {
             return outcome_mutation(outcome);
         }
+        // A retry that arrives while the first attempt is still being applied waits for its
+        // outcome rather than applying the command a second time.
+        if inner.applying.contains(&command_id.value) {
+            return Err(WorkerServiceError::Unavailable {
+                reason: "the command is still being applied".to_string(),
+            });
+        }
         let expected = {
             let entry = execution_entry(
                 &inner.executions,
@@ -559,14 +576,17 @@ where
         )?
         .execution
         .clone();
+        inner.applying.insert(command_id.value);
         drop(inner);
-        effect(&execution)?;
+        let applied = effect(&execution);
+        let mut inner = self.lock()?;
+        inner.applying.remove(&command_id.value);
+        applied?;
         let ack = bmux_cluster_plugin_api::cluster_types::WorkerMutationAck {
             execution_id: authority.execution_id.clone(),
             generation: authority.generation,
             applied: true,
         };
-        let mut inner = self.lock()?;
         {
             record_outcome(
                 &mut inner.command_outcomes,
@@ -1742,6 +1762,65 @@ mod tests {
             registry.get(&first.authority.execution_id).unwrap(),
             WorkerQueryResult::Found { .. }
         ));
+    }
+
+    /// The attach client retries an input whose reply it lost with the same command id; the
+    /// ingress issues each attempt a fresh lease. The worker applies it once and answers the
+    /// retry with the first outcome; the same id with other input is still a conflict.
+    #[test]
+    fn registry_input_retried_under_a_fresh_lease_is_applied_once() {
+        let registry =
+            WorkerRegistry::new("node:local", FakePaneRuntime::default(), AcceptSignature);
+        let mut lifecycle = authority(1, 1);
+        lifecycle.operation_class = WorkerOperationClass::Lifecycle;
+        let execution = registry
+            .launch(
+                &CommandId {
+                    value: uuid::Uuid::from_u128(51),
+                },
+                lifecycle,
+                &WorkerLaunchSpec {
+                    program: Some("sh".to_string()),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+                10,
+            )
+            .unwrap();
+        let mut first = execution.authority;
+        first.operation_class = WorkerOperationClass::Interactive;
+        first.lease_sequence = 2;
+        first.lease_id = uuid::Uuid::from_u128(52);
+        first.lease_issued_at_unix_ms = 20;
+        let command = CommandId {
+            value: uuid::Uuid::from_u128(53),
+        };
+        let applied = registry.input(&command, &first, b"typed\r", 11).unwrap();
+        let mut retry = first;
+        retry.lease_sequence = 3;
+        retry.lease_id = uuid::Uuid::from_u128(54);
+        retry.lease_issued_at_unix_ms = 21;
+        assert_eq!(
+            registry.input(&command, &retry, b"typed\r", 12).unwrap(),
+            applied
+        );
+        assert!(matches!(
+            registry.input(&command, &retry, b"other", 13),
+            Err(WorkerServiceError::CommandConflict)
+        ));
+        let mut other_principal = retry;
+        other_principal.principal_id = "principal:other".to_string();
+        assert!(matches!(
+            registry.input(&command, &other_principal, b"typed\r", 14),
+            Err(WorkerServiceError::CommandConflict)
+        ));
+        assert_eq!(
+            registry.runtime.calls.lock().unwrap().as_slice(),
+            ["launch", "input"]
+        );
     }
 
     #[test]

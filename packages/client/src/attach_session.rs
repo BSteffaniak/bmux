@@ -297,6 +297,30 @@ pub trait AttachSession: std::fmt::Debug + Send + 'static {
         &mut self,
         input: AttachProviderInput,
     ) -> AttachSessionFuture<'_, AttachProviderAck>;
+    /// Send several inputs, in order, that were ready together (keys typed or pasted while an
+    /// earlier send was in flight).
+    ///
+    /// A provider whose sends are costly delivers them as one; the default sends each in turn
+    /// and stops at the first that fails or is not accepted, returning that acknowledgement.
+    fn send_inputs(
+        &mut self,
+        inputs: Vec<AttachProviderInput>,
+    ) -> AttachSessionFuture<'_, AttachProviderAck> {
+        Box::pin(async move {
+            let mut last = AttachProviderAck {
+                command_id: None,
+                accepted: true,
+                message: None,
+            };
+            for input in inputs {
+                last = self.send_input(input).await?;
+                if !last.accepted {
+                    break;
+                }
+            }
+            Ok(last)
+        })
+    }
     fn update_viewport(
         &mut self,
         viewport: AttachProviderViewport,

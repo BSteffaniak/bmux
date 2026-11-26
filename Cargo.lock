@@ -4978,6 +4978,7 @@ dependencies = [
  "bmux_terminal_grid",
  "sha2 0.11.1",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

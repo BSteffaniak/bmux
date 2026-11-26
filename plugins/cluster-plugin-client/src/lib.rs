@@ -40,6 +40,17 @@ const CLUSTER_PROVIDER_ID: &str = "bmux.cluster";
 /// How long a new stream's worker has to push its first frame (it pushes one at once).
 const HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Waits before each retry of an input write that failed in a way that can pass; the last
+/// failure is returned once they are spent (about 6 s in all).
+const INPUT_RETRY_DELAYS: [std::time::Duration; 6] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_millis(800),
+    std::time::Duration::from_millis(1600),
+    std::time::Duration::from_millis(3200),
+];
+
 /// How long after a worker could not be observed (unreachable, or not yet running the execution),
 /// or the ingress's control subscription failed, the session tries again.
 const OBSERVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -658,6 +669,9 @@ struct ClusterAttachSession {
     workspace_id: uuid::Uuid,
     tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId,
     principal_id: String,
+    /// Scopes this attach's command ids: a later attach restarts its command sequence, and
+    /// workers remember the outcome of each command id they applied.
+    attach_nonce: uuid::Uuid,
     snapshot: Option<AttachProviderSnapshot>,
     view_revision: AttachViewRevision,
     control_revision: u64,
@@ -748,6 +762,7 @@ impl ClusterAttachSession {
             workspace_id,
             tab_id: layout.tab_id.clone(),
             principal_id,
+            attach_nonce: uuid::Uuid::new_v4(),
             snapshot: None,
             view_revision: AttachViewRevision::default(),
             control_revision: 0,
@@ -794,6 +809,77 @@ impl ClusterAttachSession {
         self.scene = snapshot.scene.clone();
         self.control_revision = layout.control_revision;
         self.tab_id = layout.tab_id.clone();
+    }
+
+    /// `payload` as the bytes the stream's program reads, encoded for the modes it set.
+    fn encode_input(
+        &self,
+        payload: bmux_client::AttachInputPayload,
+        stream_id: &AttachStreamId,
+    ) -> Result<Vec<u8>, AttachSessionError> {
+        // Input is encoded for the modes the program set, as the stream's screen has them.
+        let protocol = self
+            .replicas
+            .get(stream_id)
+            .filter(|replica| replica.hydrated())
+            .ok_or_else(|| {
+                provider_reason("stream terminal protocol state is unavailable".to_string())
+            })?
+            .grid
+            .protocol_state();
+        Ok(match payload {
+            bmux_client::AttachInputPayload::Bytes(data) => data,
+            bmux_client::AttachInputPayload::Key { stroke, enhanced } => {
+                encode_cluster_key(&stroke, enhanced, protocol)?
+            }
+            bmux_client::AttachInputPayload::Paste(data) => encode_cluster_paste(data, protocol),
+            bmux_client::AttachInputPayload::Mouse(mouse) => encode_cluster_mouse(mouse, protocol)?,
+        })
+    }
+
+    /// Writes `batch` to its worker through the ingress. The ingress checks that the execution
+    /// generation is still the pane's and fences the write with a fresh lease. A failure that
+    /// can pass (the worker briefly unreachable, a lease overtaken or expired, the reply lost)
+    /// is retried with the same command, which the worker applies at most once; any other
+    /// failure, or one that outlasts the retries, is returned: input is never dropped silently.
+    async fn deliver_input(&mut self, batch: InputBatch) -> Result<(), AttachSessionError> {
+        let execution_id = stream_execution_id(&batch.stream_id)?;
+        let command_id = command_id(&self.attach_nonce, batch.command_sequence, &batch.stream_id);
+        let workspace = self.workspace();
+        let mut retry_delays = INPUT_RETRY_DELAYS.iter();
+        loop {
+            let failure = match cluster_attach_command::client::input(
+                &mut self.client,
+                workspace.clone(),
+                command_id.clone(),
+                execution_id.clone(),
+                batch.generation,
+                self.principal_id.clone(),
+                batch.data.clone(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) if !input_error_is_transient(&error) => {
+                    return Err(provider_reason(format!("worker input failed: {error:?}")));
+                }
+                Ok(Err(error)) => format!("worker input failed: {error:?}"),
+                Err(error) => format!("worker input failed: {error}"),
+            };
+            let Some(delay) = retry_delays.next() else {
+                return Err(provider_reason(format!(
+                    "{failure} (after {} retries)",
+                    INPUT_RETRY_DELAYS.len()
+                )));
+            };
+            tracing::warn!(
+                stream = batch.stream_id.as_str(),
+                bytes = batch.data.len(),
+                retry_in_ms = delay.as_millis(),
+                "cluster attach input retry: {failure}"
+            );
+            tokio::time::sleep(*delay).await;
+        }
     }
 
     fn workspace(&self) -> bmux_cluster_plugin_api::cluster_types::WorkspaceId {
@@ -1370,69 +1456,30 @@ impl AttachSession for ClusterAttachSession {
         &mut self,
         input: AttachProviderInput,
     ) -> AttachSessionFuture<'_, AttachProviderAck> {
+        self.send_inputs(vec![input])
+    }
+
+    /// Inputs that were ready together go to each worker as one command: every command costs
+    /// a round trip through the ingress to the worker, so sending key by key falls behind
+    /// typing.
+    fn send_inputs(
+        &mut self,
+        inputs: Vec<AttachProviderInput>,
+    ) -> AttachSessionFuture<'_, AttachProviderAck> {
         Box::pin(async move {
-            let execution_id = stream_execution_id(&input.stream_id)?;
-            let view = cluster_control_state::client::read_linearizable(&mut self.client)
-                .await
-                .map_err(provider_error)?
-                .map_err(|error| {
-                    provider_reason(format!("control-state read failed: {error:?}"))
-                })?;
-            let pane = view
-                .panes
-                .iter()
-                .find(|pane| {
-                    pane.workspace_id.value == self.workspace_id
-                        && pane
-                            .execution
-                            .as_ref()
-                            .is_some_and(|assignment| assignment.execution_id == execution_id)
-                })
-                .ok_or_else(|| {
-                    provider_reason("stream no longer has an authoritative pane".to_string())
-                })?;
-            let assignment = pane.execution.as_ref().expect("checked assignment");
-            if assignment.generation != input.generation {
-                return Err(provider_reason(
-                    "input targets a stale execution generation".to_string(),
-                ));
+            let mut encoded = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let data = self.encode_input(input.payload, &input.stream_id)?;
+                encoded.push(EncodedInput {
+                    command_sequence: input.command_sequence,
+                    stream_id: input.stream_id,
+                    generation: input.generation,
+                    data,
+                });
             }
-            // Input is encoded for the modes the program set, as the stream's screen has them.
-            let protocol = self
-                .replicas
-                .get(&input.stream_id)
-                .filter(|replica| replica.hydrated())
-                .ok_or_else(|| {
-                    provider_reason("stream terminal protocol state is unavailable".to_string())
-                })?
-                .grid
-                .protocol_state();
-            let data = match input.payload {
-                bmux_client::AttachInputPayload::Bytes(data) => data,
-                bmux_client::AttachInputPayload::Key { stroke, enhanced } => {
-                    encode_cluster_key(&stroke, enhanced, protocol)?
-                }
-                bmux_client::AttachInputPayload::Paste(data) => {
-                    encode_cluster_paste(data, protocol)
-                }
-                bmux_client::AttachInputPayload::Mouse(mouse) => {
-                    encode_cluster_mouse(mouse, protocol)?
-                }
-            };
-            let command_id = command_id(input.command_sequence, &input.stream_id);
-            let workspace = self.workspace();
-            cluster_attach_command::client::input(
-                &mut self.client,
-                workspace,
-                command_id,
-                execution_id,
-                input.generation,
-                self.principal_id.clone(),
-                data,
-            )
-            .await
-            .map_err(provider_error)?
-            .map_err(|error| provider_reason(format!("worker input failed: {error:?}")))?;
+            for batch in input_batches(encoded) {
+                self.deliver_input(batch).await?;
+            }
             Ok(AttachProviderAck {
                 command_id: None,
                 accepted: true,
@@ -1483,7 +1530,11 @@ impl AttachSession for ClusterAttachSession {
                     continue;
                 }
                 let execution_id = stream_execution_id(&cursor.stream_id)?;
-                let resize_id = command_id(viewport.command_sequence, &cursor.stream_id);
+                let resize_id = command_id(
+                    &self.attach_nonce,
+                    viewport.command_sequence,
+                    &cursor.stream_id,
+                );
                 cluster_attach_command::client::resize(
                     &mut self.client,
                     bmux_cluster_plugin_api::cluster_types::AttachResizeRequest {
@@ -1519,6 +1570,9 @@ impl AttachSession for ClusterAttachSession {
         &mut self,
         action: AttachProviderAction,
     ) -> AttachSessionFuture<'_, AttachProviderAck> {
+        // The caller numbers its actions from one in every attach; the control plane remembers
+        // each command id it applied, so the ids it sees are scoped to this attach.
+        let scoped_id = format!("{}/{}", self.attach_nonce, action.command_id);
         if action.action == "focus" {
             let result = apply_local_focus_action(&self.scene, &action.arguments);
             return Box::pin(async move {
@@ -1551,7 +1605,7 @@ impl AttachSession for ClusterAttachSession {
                 });
             return Box::pin(async move {
                 let pane_id = pane_id?;
-                self.toggle_zoom(pane_id, &action.command_id).await?;
+                self.toggle_zoom(pane_id, &scoped_id).await?;
                 Ok(AttachProviderAck {
                     command_id: Some(action.command_id),
                     accepted: true,
@@ -1562,7 +1616,7 @@ impl AttachSession for ClusterAttachSession {
         if matches!(action.action.as_str(), "tab-next" | "tab-prev" | "tab-goto") {
             return Box::pin(async move {
                 let changed = self
-                    .select_tab(&action.action, &action.arguments, &action.command_id)
+                    .select_tab(&action.action, &action.arguments, &scoped_id)
                     .await?;
                 Ok(AttachProviderAck {
                     command_id: Some(action.command_id),
@@ -1575,7 +1629,7 @@ impl AttachSession for ClusterAttachSession {
             let command_uuid = action
                 .command_id
                 .parse::<uuid::Uuid>()
-                .unwrap_or_else(|_| command_id_from_text(&action.command_id));
+                .unwrap_or_else(|_| command_id_from_text(&scoped_id));
             let response = cluster_attach_command::client::action(
                 &mut self.client,
                 bmux_cluster_plugin_api::cluster_types::AttachActionRequest {
@@ -2304,6 +2358,61 @@ fn encode_cluster_mouse(
     .ok_or_else(|| provider_reason("mouse event is disabled by terminal protocol mode".to_string()))
 }
 
+/// One input, encoded for its stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedInput {
+    command_sequence: u64,
+    stream_id: AttachStreamId,
+    generation: u64,
+    data: Vec<u8>,
+}
+
+/// Consecutive inputs to one stream generation, written as one command named by the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputBatch {
+    command_sequence: u64,
+    stream_id: AttachStreamId,
+    generation: u64,
+    data: Vec<u8>,
+}
+
+/// `inputs` joined into batches in their order; a change of stream or generation starts the
+/// next batch.
+fn input_batches(inputs: Vec<EncodedInput>) -> Vec<InputBatch> {
+    let mut batches: Vec<InputBatch> = Vec::new();
+    for input in inputs {
+        match batches.last_mut() {
+            Some(batch)
+                if batch.stream_id == input.stream_id && batch.generation == input.generation =>
+            {
+                batch.data.extend_from_slice(&input.data);
+            }
+            _ => batches.push(InputBatch {
+                command_sequence: input.command_sequence,
+                stream_id: input.stream_id,
+                generation: input.generation,
+                data: input.data,
+            }),
+        }
+    }
+    batches
+}
+
+/// Whether an input write that failed with `error` may succeed when retried with the same
+/// command: the worker was unreachable, or the lease the ingress issued was overtaken by a
+/// newer one or expired before the worker saw it (a retry is issued a fresh lease).
+const fn input_error_is_transient(
+    error: &bmux_cluster_plugin_api::cluster_types::WorkerServiceError,
+) -> bool {
+    use bmux_cluster_plugin_api::cluster_types::WorkerServiceError;
+    matches!(
+        error,
+        WorkerServiceError::Unavailable { .. }
+            | WorkerServiceError::StaleTerm { .. }
+            | WorkerServiceError::LeaseExpired
+    )
+}
+
 fn action_stream_command_id(action_command_id: &str, stream_id: &AttachStreamId) -> uuid::Uuid {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
@@ -2329,12 +2438,14 @@ fn command_id_from_text(value: &str) -> uuid::Uuid {
 }
 
 fn command_id(
+    attach_nonce: &uuid::Uuid,
     sequence: u64,
     stream_id: &AttachStreamId,
 ) -> bmux_cluster_plugin_api::cluster_types::CommandId {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
-    digest.update(b"bmux.cluster.attach-command.v1\0");
+    digest.update(b"bmux.cluster.attach-command.v2\0");
+    digest.update(attach_nonce.as_bytes());
     digest.update(sequence.to_be_bytes());
     digest.update(stream_id.as_str().as_bytes());
     let bytes: [u8; 16] = digest.finalize()[..16]
@@ -2379,6 +2490,108 @@ mod tests {
         assert_eq!(initial_viewport(Some((132, 41))), (132, 41));
         assert_eq!(initial_viewport(Some((0, 41))), (80, 24));
         assert_eq!(initial_viewport(None), (80, 24));
+    }
+
+    fn encoded(sequence: u64, stream: &str, generation: u64, data: &[u8]) -> EncodedInput {
+        EncodedInput {
+            command_sequence: sequence,
+            stream_id: AttachStreamId::new(stream.to_string()).unwrap(),
+            generation,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn ready_inputs_join_per_stream_generation_in_order() {
+        let batches = input_batches(vec![
+            encoded(2, "execution:a", 1, b"ty"),
+            encoded(3, "execution:a", 1, b"ped"),
+            encoded(4, "execution:a", 1, b"\r"),
+            encoded(5, "execution:b", 1, b"x"),
+            encoded(6, "execution:a", 1, b"y"),
+            encoded(7, "execution:a", 2, b"z"),
+        ]);
+        let summary: Vec<(u64, &str, u64, &[u8])> = batches
+            .iter()
+            .map(|batch| {
+                (
+                    batch.command_sequence,
+                    batch.stream_id.as_str(),
+                    batch.generation,
+                    batch.data.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (2, "execution:a", 1, b"typed\r".as_slice()),
+                (5, "execution:b", 1, b"x".as_slice()),
+                (6, "execution:a", 1, b"y".as_slice()),
+                (7, "execution:a", 2, b"z".as_slice()),
+            ]
+        );
+        assert_eq!(input_batches(Vec::new()), [] as [InputBatch; 0]);
+    }
+
+    #[test]
+    fn input_is_retried_only_for_failures_that_can_pass() {
+        use bmux_cluster_plugin_api::cluster_types::{ExecutionId, WorkerServiceError};
+        for transient in [
+            WorkerServiceError::Unavailable {
+                reason: "worker unreachable".to_string(),
+            },
+            WorkerServiceError::StaleTerm {
+                expected_minimum: 2,
+                received: 1,
+            },
+            WorkerServiceError::LeaseExpired,
+        ] {
+            assert!(input_error_is_transient(&transient), "{transient:?}");
+        }
+        for permanent in [
+            WorkerServiceError::NotFound {
+                execution_id: ExecutionId {
+                    value: uuid::Uuid::nil(),
+                },
+            },
+            WorkerServiceError::CommandConflict,
+            WorkerServiceError::StaleGeneration {
+                expected: 2,
+                received: 1,
+            },
+            WorkerServiceError::AuthorityMismatch,
+            WorkerServiceError::InvalidRequest {
+                reason: "bad".to_string(),
+            },
+            WorkerServiceError::LocalRuntime {
+                reason: "pane closed".to_string(),
+            },
+        ] {
+            assert!(!input_error_is_transient(&permanent), "{permanent:?}");
+        }
+    }
+
+    /// Every attach numbers its commands from one, and workers remember the outcome of each
+    /// command id: a second attach to the same pane must not reuse the first one's ids, or its
+    /// input would be answered from that memory instead of being written.
+    #[test]
+    fn command_ids_are_scoped_to_one_attach() {
+        let stream = AttachStreamId::new("execution:a".to_string()).unwrap();
+        let first = uuid::Uuid::from_u128(1);
+        let second = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            command_id(&first, 2, &stream),
+            command_id(&first, 2, &stream)
+        );
+        assert_ne!(
+            command_id(&first, 2, &stream),
+            command_id(&first, 3, &stream)
+        );
+        assert_ne!(
+            command_id(&first, 2, &stream),
+            command_id(&second, 2, &stream)
+        );
     }
 
     #[test]

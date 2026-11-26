@@ -480,6 +480,124 @@ mod tests {
         assert!(error.to_string().contains("resume state did not match"));
     }
 
+    /// Records each provider send of input; detaches once the test's input has been read.
+    #[derive(Debug)]
+    struct BatchingSession {
+        sends: Arc<Mutex<Vec<Vec<AttachProviderInput>>>>,
+    }
+
+    impl AttachSession for BatchingSession {
+        fn initial_snapshot(&mut self) -> AttachSessionFuture<'_, AttachProviderSnapshot> {
+            Box::pin(async { Ok(synthetic_snapshot()) })
+        }
+
+        fn next_event(&mut self) -> AttachSessionFuture<'_, AttachProviderEvent> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(AttachProviderEvent::Detached)
+            })
+        }
+
+        fn send_input(
+            &mut self,
+            input: AttachProviderInput,
+        ) -> AttachSessionFuture<'_, AttachProviderAck> {
+            self.send_inputs(vec![input])
+        }
+
+        fn send_inputs(
+            &mut self,
+            inputs: Vec<AttachProviderInput>,
+        ) -> AttachSessionFuture<'_, AttachProviderAck> {
+            self.sends.lock().unwrap().push(inputs);
+            Box::pin(async {
+                Ok(AttachProviderAck {
+                    command_id: None,
+                    accepted: true,
+                    message: None,
+                })
+            })
+        }
+
+        fn update_viewport(
+            &mut self,
+            _viewport: AttachProviderViewport,
+        ) -> AttachSessionFuture<'_, AttachProviderAck> {
+            Box::pin(async {
+                Ok(AttachProviderAck {
+                    command_id: None,
+                    accepted: true,
+                    message: None,
+                })
+            })
+        }
+
+        fn execute_action(
+            &mut self,
+            _action: bmux_client::AttachProviderAction,
+        ) -> AttachSessionFuture<'_, AttachProviderAck> {
+            unreachable!("batching session receives no actions")
+        }
+
+        fn detach(&mut self) -> AttachSessionFuture<'_, AttachDetachOutcome> {
+            Box::pin(async { Ok(AttachDetachOutcome::Detached) })
+        }
+    }
+
+    /// Input that is ready together (a burst written at once, or keys typed while a send was
+    /// in flight) reaches the provider as one ordered send, so a provider whose sends are slow
+    /// keeps up with typing.
+    #[tokio::test]
+    async fn native_runner_sends_ready_input_to_the_provider_in_one_ordered_send() {
+        use bmux_terminal::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let (mut terminal, handle) = super::super::runtime::HeadlessAttachTerminal::new(80, 24);
+        for key in ['a', 'b', 'c'] {
+            handle
+                .send_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+        }
+        handle.send_event(Event::Paste("xy".to_string())).unwrap();
+        let outcome = super::super::runtime::run_native_attach_session_with_terminal(
+            Box::new(BatchingSession {
+                sends: Arc::clone(&sends),
+            }),
+            &mut terminal,
+        )
+        .await
+        .expect("run batching session");
+        assert_eq!(
+            outcome.exit_reason,
+            super::super::state::AttachExitReason::Detached
+        );
+        let sends = sends.lock().unwrap();
+        assert_eq!(sends.len(), 1, "one send for the ready input: {sends:?}");
+        let send = &sends[0];
+        assert_eq!(send.len(), 4);
+        assert!(
+            send.windows(2)
+                .all(|pair| pair[0].command_sequence < pair[1].command_sequence),
+            "inputs keep their order: {send:?}"
+        );
+        let keys: Vec<char> = send[..3]
+            .iter()
+            .map(|input| match &input.payload {
+                AttachInputPayload::Key { stroke, .. } => match stroke.key {
+                    bmux_keyboard::KeyCode::Char(key) => key,
+                    ref other => panic!("unexpected key {other:?}"),
+                },
+                other => panic!("unexpected payload {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, ['a', 'b', 'c']);
+        assert_eq!(send[3].payload, AttachInputPayload::Paste(b"xy".to_vec()));
+        drop(sends);
+        drop(handle);
+    }
+
     #[derive(Debug)]
     struct UnreachableConnector;
 

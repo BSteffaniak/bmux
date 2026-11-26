@@ -4823,30 +4823,47 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
                 }
             }
             event = terminal.next_event() => {
-                let Some(event) = event? else {
-                    break AttachRunOutcome {
-                        status_code: 0,
-                        exit_reason: AttachExitReason::Quit,
-                        resume: None,
-                        attached_session_id: None,
+                // Input already waiting behind this event (keys typed while the last send was
+                // in flight, or a burst written at once) goes to the provider in one send, so a
+                // slow provider round trip is paid per burst rather than per key.
+                let mut burst = ProviderInputBurst::default();
+                let mut next = event?;
+                let mut drained = 0_usize;
+                let exit = loop {
+                    let Some(event) = next else {
+                        break Some(AttachExitReason::Quit);
                     };
+                    command_sequence = command_sequence.saturating_add(1);
+                    if handle_native_provider_terminal_event(
+                        session.as_mut(),
+                        &continuity,
+                        &mut controls,
+                        &scene,
+                        &pane_buffers,
+                        &mut input_processor,
+                        focused_stream.as_ref(),
+                        command_sequence,
+                        keyboard_enhanced,
+                        &mut burst,
+                        event,
+                    ).await? {
+                        break Some(AttachExitReason::Detached);
+                    }
+                    drained += 1;
+                    if burst.provider_changed || drained >= MAX_PROVIDER_INPUT_BURST {
+                        break None;
+                    }
+                    match futures_util::FutureExt::now_or_never(terminal.next_event()) {
+                        Some(event) => next = event?,
+                        None => break None,
+                    }
                 };
-                command_sequence = command_sequence.saturating_add(1);
-                if handle_native_provider_terminal_event(
-                    session.as_mut(),
-                    &continuity,
-                    &mut controls,
-                    &scene,
-                    &pane_buffers,
-                    &mut input_processor,
-                    focused_stream.as_ref(),
-                    command_sequence,
-                    keyboard_enhanced,
-                    event,
-                ).await? {
+                // Everything typed before a detach or the end of input is still delivered.
+                flush_native_provider_input(session.as_mut(), &mut burst).await?;
+                if let Some(exit_reason) = exit {
                     break AttachRunOutcome {
                         status_code: 0,
-                        exit_reason: AttachExitReason::Detached,
+                        exit_reason,
                         resume: None,
                         attached_session_id: None,
                     };
@@ -5037,10 +5054,12 @@ async fn handle_native_provider_terminal_event(
     focused_stream: Option<&AttachStreamCursor>,
     command_sequence: u64,
     keyboard_enhanced: bool,
+    burst: &mut ProviderInputBurst,
     event: Event,
 ) -> Result<bool> {
     match event {
         Event::Resize(columns, rows) => {
+            settle_input_before_provider_change(session, burst).await?;
             let viewport = AttachProviderViewport {
                 command_sequence,
                 columns,
@@ -5058,15 +5077,14 @@ async fn handle_native_provider_terminal_event(
             ensure_provider_ack("viewport", &ack)?;
         }
         Event::Paste(text) => {
-            send_native_provider_input(
-                session,
+            queue_native_provider_input(
                 continuity,
                 controls,
                 focused_stream,
                 command_sequence,
                 AttachInputPayload::Paste(text.into_bytes()),
-            )
-            .await?;
+                burst,
+            )?;
         }
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let protocol = focused_provider_protocol(pane_buffers, focused_stream);
@@ -5083,15 +5101,14 @@ async fn handle_native_provider_terminal_event(
                                 enhanced: keyboard_enhanced,
                             },
                         );
-                        send_native_provider_input(
-                            session,
+                        queue_native_provider_input(
                             continuity,
                             controls,
                             focused_stream,
                             command_sequence,
                             payload,
-                        )
-                        .await?;
+                            burst,
+                        )?;
                     }
                     AttachEventAction::PluginCommand {
                         plugin_id,
@@ -5110,6 +5127,7 @@ async fn handle_native_provider_terminal_event(
                             &command_name,
                             &args,
                         )?;
+                        settle_input_before_provider_change(session, burst).await?;
                         execute_native_provider_action(session, controls, provider_action).await?;
                     }
                     AttachEventAction::Detach | AttachEventAction::Ui(RuntimeAction::Quit) => {
@@ -5148,13 +5166,13 @@ async fn handle_native_provider_terminal_event(
                         action: "focus".to_string(),
                         arguments: vec![pane_id.to_string()],
                     };
+                    settle_input_before_provider_change(session, burst).await?;
                     execute_native_provider_action(session, controls, provider_action).await?;
                 }
                 return Ok(false);
             }
             let (button, phase) = provider_mouse_event(mouse.kind);
-            send_native_provider_input(
-                session,
+            queue_native_provider_input(
                 continuity,
                 controls,
                 Some(&stream),
@@ -5166,8 +5184,8 @@ async fn handle_native_provider_terminal_event(
                     phase,
                     modifiers: provider_modifier_bits(mouse.modifiers),
                 }),
-            )
-            .await?;
+                burst,
+            )?;
         }
         Event::FocusGained | Event::FocusLost | Event::Key(_) => {}
     }
@@ -5283,13 +5301,27 @@ const fn provider_mouse_to_shared(mouse: MouseEvent) -> bmux_attach_pipeline::At
     }
 }
 
-async fn send_native_provider_input(
-    session: &mut dyn AttachSession,
+/// Most terminal events read into one provider send, so a long paste of key events
+/// still lets frames through between sends.
+const MAX_PROVIDER_INPUT_BURST: usize = 256;
+
+/// Input read from the terminal in one go, waiting to be sent to the provider together.
+#[derive(Debug, Default)]
+struct ProviderInputBurst {
+    pending: Vec<AttachProviderInput>,
+    /// A viewport change or action went to the provider: the focus or scene it brings is read
+    /// before any more input, so later keys reach the pane they were typed at.
+    provider_changed: bool,
+}
+
+/// Validates one input and queues it for the burst's send.
+fn queue_native_provider_input(
     continuity: &AttachContinuityValidator,
     controls: &mut AttachControlValidator,
     focused_stream: Option<&AttachStreamCursor>,
     command_sequence: u64,
     payload: AttachInputPayload,
+    burst: &mut ProviderInputBurst,
 ) -> Result<()> {
     let stream =
         focused_stream.ok_or_else(|| anyhow::anyhow!("attach provider has no focused stream"))?;
@@ -5302,8 +5334,32 @@ async fn send_native_provider_input(
     controls
         .validate_input(&input, continuity)
         .map_err(anyhow::Error::from)?;
+    burst.pending.push(input);
+    Ok(())
+}
+
+/// Sends the input queued so far ahead of a viewport change or action, and ends the burst.
+async fn settle_input_before_provider_change(
+    session: &mut dyn AttachSession,
+    burst: &mut ProviderInputBurst,
+) -> Result<()> {
+    flush_native_provider_input(session, burst).await?;
+    burst.provider_changed = true;
+    Ok(())
+}
+
+/// Sends the queued inputs, in order, as one provider send. A failed or refused send ends the
+/// attach with its error: input is never dropped silently.
+async fn flush_native_provider_input(
+    session: &mut dyn AttachSession,
+    burst: &mut ProviderInputBurst,
+) -> Result<()> {
+    if burst.pending.is_empty() {
+        return Ok(());
+    }
+    let inputs = std::mem::take(&mut burst.pending);
     let ack = session
-        .send_input(input)
+        .send_inputs(inputs)
         .await
         .map_err(anyhow::Error::from)?;
     ensure_provider_ack("input", &ack)
