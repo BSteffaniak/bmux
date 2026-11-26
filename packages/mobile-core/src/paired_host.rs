@@ -76,7 +76,8 @@ impl From<paired_hosts::PairedHost> for PairedHost {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Its link carries the pairing secret, so `Debug` leaves it out.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairingRequest {
     /// The `bmux-pair:` link `bmux remote pair` printed on the host.
     pub link: String,
@@ -84,6 +85,16 @@ pub struct PairingRequest {
     pub alias: Option<String>,
     /// The label the host owner sees for this device.
     pub device_name: String,
+}
+
+impl std::fmt::Debug for PairingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingRequest")
+            .field("link", &"[redacted]")
+            .field("alias", &self.alias)
+            .field("device_name", &self.device_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +352,18 @@ fn cancel(pairing: &Pairing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_shows_the_pairing_link() {
+        let request = PairingRequest {
+            link: "bmux-pair:secretsecret".into(),
+            alias: Some("desk".into()),
+            device_name: "phone".into(),
+        };
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("secretsecret"), "{shown}");
+        assert!(shown.contains("desk") && shown.contains("phone"));
+    }
 
     #[test]
     fn empty_store_lists_nothing_and_creates_no_state() {

@@ -61,6 +61,23 @@ mod tests {
     use super::{pane_runtime_commands, pane_runtime_state};
 
     #[test]
+    fn resolving_an_execution_is_input_not_observe() {
+        use super::pane_runtime_execution_v4::{ACCESS, OPERATION_ACCESS};
+        use bmux_plugin_sdk::RouteAccess;
+        let class = |operation: &str| {
+            OPERATION_ACCESS
+                .iter()
+                .find(|(name, _)| *name == operation)
+                .map(|(_, access)| *access)
+                .or(ACCESS)
+        };
+        // `resolve` can cancel or terminate an execution.
+        assert_eq!(class("resolve"), Some(RouteAccess::Input));
+        assert_eq!(class("status"), Some(RouteAccess::Observe));
+        assert_eq!(class("input-receipt"), Some(RouteAccess::Observe));
+    }
+
+    #[test]
     fn reusable_credentials_redact_debug_without_changing_serde() {
         use super::attach_runtime_commands::{AttachGrant, client::AttachOpenRequest};
         use super::pane_runtime_execution_v4::{TerminalExecutionRef, client::SendRequest};

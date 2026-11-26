@@ -40,8 +40,9 @@ impl PairedHost {
     }
 }
 
-/// One pairing request from a connecting device.
-#[derive(Clone, Debug)]
+/// One pairing request from a connecting device. Its link carries the
+/// pairing secret, so `Debug` leaves it out.
+#[derive(Clone)]
 pub struct PairRequest {
     /// The `bmux-pair:` link the host printed.
     pub link: String,
@@ -49,6 +50,16 @@ pub struct PairRequest {
     pub alias: Option<String>,
     /// The label the host owner sees for this device.
     pub device_name: String,
+}
+
+impl std::fmt::Debug for PairRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairRequest")
+            .field("link", &"[redacted]")
+            .field("alias", &self.alias)
+            .field("device_name", &self.device_name)
+            .finish()
+    }
 }
 
 /// The saved hosts of the default client profile under `paths.state_dir`.
@@ -205,4 +216,21 @@ pub fn check_link(link: &str) -> Result<()> {
 /// Fails with the alias rules.
 pub fn check_alias(alias: &str) -> Result<()> {
     valid_alias(alias)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_shows_the_pairing_link() {
+        let request = PairRequest {
+            link: "bmux-pair:secretsecret".into(),
+            alias: None,
+            device_name: "laptop".into(),
+        };
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("secretsecret"), "{shown}");
+        assert!(shown.contains("laptop"));
+    }
 }

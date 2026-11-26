@@ -314,7 +314,9 @@ interface pane-runtime-execution-v4 {
         -> result<terminal-input-receipt, terminal-recovery-error>;
     @access(observe) command input-receipt(execution: terminal-execution-ref, input_mutation_id: uuid)
         -> result<terminal-input-receipt, terminal-recovery-error>;
-    @access(observe) command resolve(execution: terminal-execution-ref, resolution_mutation_id: uuid,
+    // Resolving may cancel or terminate an execution: `input`, like the
+    // interface (the session policy's `pane.close` check also applies).
+    command resolve(execution: terminal-execution-ref, resolution_mutation_id: uuid,
         expected_revision: u64, action: terminal-resolution-action, input_mutation_id: uuid?, grace_ms: u32)
         -> result<terminal-resolution-receipt, terminal-recovery-error>;
     command capture-resume(cursor: terminal-capture-cursor, max_bytes: u32)
