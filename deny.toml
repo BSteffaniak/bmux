@@ -70,7 +70,6 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive dep, no direct replacement available" },
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained — transitive dep via syntect" },
     { id = "RUSTSEC-2021-0153", reason = "encoding unmaintained — transitive dep via hyperchad_router (mime_multipart)" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive dep, no action needed" },
@@ -78,6 +77,53 @@ ignore = [
     { id = "RUSTSEC-2023-0081", reason = "safemem unmaintained — transitive dep via hyperchad_router (mime_multipart, hyper 0.10)" },
     { id = "RUSTSEC-2021-0144", reason = "traitobject unmaintained — transitive dep via hyperchad_router (mime_multipart, hyper 0.10)" },
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained — transitive dep via syntect" },
+    # Triaged 2026-11-25 (remote-access phase 4). None of these has a semver-compatible fix
+    # (`cargo update` changes none of them); each fix needs an upstream release or a major
+    # bump of the crate that pulls it in. None is on the remote-access path (Iroh/noq/rustls
+    # 0.23, connections plugin, server, IPC).
+    # docs site only (hyperchad actix/html renderer, never shipped in bmux binaries):
+    { id = "RUSTSEC-2026-0443", reason = "actix-files 0.6 Windows short-name disclosure — docs site dev server via hyperchad_renderer_html_actix; fixed in 0.7.4, needs hyperchad upgrade" },
+    { id = "RUSTSEC-2026-0594", reason = "cookie 0.16 fork nonce reuse — via actix-web 4 (docs site); fixed in 0.18.3, actix-web 4.x still pins 0.16; docs site uses no private cookies" },
+    { id = "RUSTSEC-2021-0078", reason = "hyper 0.10 Content-Length parsing — via mime_multipart in hyperchad_router (docs site); fixed only in hyper 0.14+, needs hyperchad to drop mime_multipart" },
+    { id = "RUSTSEC-2021-0079", reason = "hyper 0.10 Transfer-Encoding overflow — via mime_multipart in hyperchad_router (docs site); fixed only in hyper 0.14+" },
+    { id = "RUSTSEC-2024-0421", reason = "idna 0.1 punycode — via url 1.7 / hyper 0.10 (docs site, hyperchad_router); fixed in idna 1.0" },
+    { id = "RUSTSEC-2020-0071", reason = "time 0.1 localtime segfault — via hyper 0.10 (docs site, hyperchad_router); fixed in time 0.2.23+" },
+    { id = "RUSTSEC-2026-0592", reason = "url 1.7 blob: origin stack overflow — via hyper 0.10 (docs site, hyperchad_router); fixed in url 2.5.9" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained — via serde_yaml 0.9 in hyperchad_renderer_html (docs site)" },
+    # h2 0.3: hyper 0.14 (aws-smithy legacy client, bcode bedrock provider) and actix-http 3:
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 empty DATA frames — via hyper 0.14 (aws-smithy-http-client legacy) and actix-http 3 (docs site); fixed only in h2 0.4.16, which needs hyper 1" },
+    # rustls 0.21 / webpki 0.101: aws-smithy-http-client's legacy hyper 0.14 TLS stack (bcode
+    # bedrock provider). bmux's own TLS (Iroh) is rustls 0.23.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 Debug exposes session secrets — aws-smithy-http-client legacy stack (bcode bedrock provider); fixed in 0.23.46, needs aws-smithy to drop its legacy rustls feature" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 ServerHello downgrade — aws-smithy-http-client legacy stack (bcode bedrock provider); fixed in 0.23.46" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101 URI name constraints — via rustls 0.21 (aws-smithy legacy stack); fixed in 0.103.12" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101 wildcard name constraints — via rustls 0.21 (aws-smithy legacy stack); fixed in 0.103.12" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101 CRL parsing panic — via rustls 0.21 (aws-smithy legacy stack); fixed in 0.103.13; no CRLs are configured" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 distrusted intermediates — via rustls 0.21 (aws-smithy legacy stack); fixed in 0.103.16" },
+    # Cryptography outside the remote path:
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack — via age 0.12 (ssh recipients) and jsonwebtoken in bcode crates; no fixed rsa release is usable by age 0.12 (fix in rsa 0.10); bmux remote access uses ed25519 keys only" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing variability — via elliptic-curve 0.13 / p256 (age, hpke, jsonwebtoken in bcode crates); fixed in 0.7.6, needs the RustCrypto 0.14 elliptic-curve stack" },
+    # Parsers of local, user-chosen files (not remote input):
+    { id = "RUSTSEC-2026-0187", reason = "lopdf 0.38 nested-object stack overflow — via pdf-extract in bcode_document_plugin (local PDFs); fixed in 0.42, needs a pdf-extract release" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30 bundled SQLite CVE — via rusqlite 0.32 in switchy_database (bcode local databases); fixed in 0.39, needs rusqlite/switchy upgrade" },
+    { id = "RUSTSEC-2026-0367", reason = "zip 8 SUID preservation on extract — via ruff_db (ruff_python_formatter, bcode shell plugin), which formats code and never extracts archives; fixed in zip 9" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8 symlink targets on extract — via ruff_db (no extraction); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8 permissions through symlinks on extract — via ruff_db (no extraction); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 8 abort on large symlink entry on extract — via ruff_db (no extraction); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 8 AES authentication — via ruff_db (no encrypted archives); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 8 extract outside destination — via ruff_db (no extraction); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0547", reason = "zip 8 legacy decoders preallocate declared size — via ruff_db (no archive input); fixed in zip 9" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 8 stream reader name mismatch — via ruff_db (no extraction); fixed in zip 9.0.5" },
+    # Unmaintained, no fixed release to move to:
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained — via askama_derive (uniffi_bindgen) and i18n-config (age); build-time config parsing only" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained — direct dep of bmux_tui_components_inputs and of switchy/moosicbox crates; no maintained drop-in yet" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained — via env_logger 0.10 (pretty_env_logger in switchy_async_cargo, a dev-dependency of the pane runtime plugin)" },
+    { id = "RUSTSEC-2026-0249", reason = "smartstring unmaintained — via swc_ecma_parser (hyperchad js bundler, bcode TypeScript stripping)" },
+    { id = "RUSTSEC-2026-0058", reason = "tokio-io unmaintained — via futures-util's compat feature (accesskit_unix in bterm, actix-cors in docs site)" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained — direct dep of bmux_recording_plugin and via ab_glyph/lopdf; font parsing of bundled fonts" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained — via zbus (atspi accessibility in bterm's native platform layer)" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained — via zbus / atspi-common (bterm accessibility)" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained — via zvariant (bterm accessibility)" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
