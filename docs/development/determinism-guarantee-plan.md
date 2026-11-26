@@ -421,8 +421,9 @@ exemption.
   no win32 input mode (`PtyOptions`), and with output captured or input fed it runs on pipes
   alone (`Behavior::console_on_all_streams_or_none`, `PtyChild::take_stderr`). The pty
   workload counts a process handle's drop as signalling its session there (it closes the
-  job). Native Windows moves onto the same module once CI validates `switchy_pty`'s native
-  side (the `dst-windows` branches).
+  job). Native Windows runs the same module: `switchy_pty`'s Windows backend gained jobs,
+  console options and console-less processes on pipes (non-blocking reads by peeking the
+  pipe), validated on Windows in CI before landing, and `conpty.rs` is gone.
 - **Real clock reads, counted.** `cargo sim NAME --clock-reads` runs NAME with
   `switchy_clock_probe` loaded (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`); simvar lists every real
   clock read made inside a run by its caller, and the nightly job fails on any not allowed.

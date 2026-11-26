@@ -156,9 +156,8 @@ Built on 2026-11-21:
   backends now check the leader's start identity first); host `ps` output
   reaching simulated process inspection; and the kernel's stale
   terminal-to-session link.
-- **Not yet:** `bmux_pty`'s own process API still has a separate Windows
-  implementation (`conpty.rs`) beside the Unix and simulated one, so
-  `cargo sim pty` draws only Unix personalities, and its conformance suite is
-  Unix only. Unifying it on `switchy_pty` and `behavior()` is the next step.
-  Files are still the host's (`switchy_fs` is a follow-up).
-
+- **Since done (2026-11-26):** `bmux_pty`'s process API runs on `switchy_pty`
+  on every system, following `behavior()`: `conpty.rs` and the pipes backend
+  are gone, `cargo sim pty` and `cargo sim local-terminal` draw Windows too,
+  and `tests/windows_personality.rs` checks the Windows behaviour in
+  simulation (`tests/windows.rs` natively on Windows).
