@@ -500,6 +500,130 @@ Release acceptance: desktop (Linux) and Mac on two different networks, covering 
 relay-only, a Wi-Fi switch, a host restart and revocation; native macOS CI green; the
 required checks from `AGENTS.md` all pass.
 
+## Phase 4: hardening
+
+Reviewed on `6d72f8c8` (security review, fuzzing, budgets, advisories). The two-network
+trial is still open.
+
+### Security review
+
+Checked, and found sound:
+
+- **Pairing secret.** 256 bits from the OS generator, single-use (the session ends on
+  approval), expires (default 10 minutes, at most 1 hour), proof compared in constant time
+  and bound to host key, device key, role and version. `Debug` of the link and secret is
+  redacted; the `begin-pairing` response field is `@secret`; the harness redacts links
+  from test failures.
+- **Pairing bounds.** One open session; 4 waiting requests; one request per device key; 5
+  failed proofs end the session; 8 pairing connections; 10 s each for the stream and the
+  hello; a waiting request is bounded by the session's expiry. Device names are sanitized
+  to `[A-Za-z0-9._-]{1,64}` before the owner sees them; the client's saved alias from the
+  host's name is sanitized and validated.
+- **Host key pinning.** The client dials the pinned key, so QUIC/TLS proves it; an alias
+  pinned to another key is never overwritten; a changed key is reported as such.
+- **Role enforcement.** Every BPDL interface with operations declares `@access` (checked
+  by script over all 20 BPDL files); the server denies unclassified routes and
+  `owner-local` on admitted streams whatever the authorizer says; kernel requests take a
+  fixed class from an exhaustive match; pipelines check every stage before the first runs;
+  `run_plugin` takes the named command's manifest class (templated payloads are denied).
+  Pairing admin, roles, saved hosts and the audit log are `owner-local`. Observe-class
+  commands that change state (`attach-set-viewport`, view selection) are gated again by
+  the session policy, where a view-only device maps to `observer`.
+- **Revocation.** Revoking closes the device's live connections through the trust-store
+  event (lagged subscribers re-validate every live device) and clears the role grant;
+  disabling hosting closes all; gate 3 covers both.
+- **Files.** `connections/` is 0700; host and device keys, `trust.redb` and known hosts are
+  0600, created with `O_NOFOLLOW`; key records are purpose-checked.
+- **Audit log.** Kinds, device key and name, role and a detail; no link, secret, proof or
+  phrase. Refusals are rate-limited (20 a minute); the log keeps 1000 entries.
+
+Fixed:
+
+- **Unbounded frame allocation (high).** `bmux_ipc` sized and zero-filled the read buffer
+  from the peer's 4-byte length before checking it, and lz4 sized its output from the
+  peer's size prefix: one frame claiming 4 GiB from any paired device, view-only included,
+  could take the host's server down. Lengths are now checked before allocating, lz4 and
+  zstd refuse oversized declared or produced output, and compressed frames decode with
+  the frame payload limit.
+- **Remote streams could exhaust the server (medium).** A paired device could open 100
+  streams per connection, each taking one of the server's 64 connection slots shared with
+  local clients, locking the owner out of their runtime. Each connection now gets 32
+  bidirectional streams (QUIC flow control: more waits), none unidirectional, and an 8 MiB
+  receive window; remote streams are capped at 40 in total, past which a stream is reset
+  (`busy`, close code 429).
+- **Pre-auth handshakes shared the session cap (medium).** Stalled handshakes counted
+  against the 64 live connections. Handshakes are now bounded apart: 16 in flight, 4 per
+  source address or relayed endpoint id, refused immediately past that.
+- **Pairing link in `Debug` (low).** `PairRequest` and the mobile `PairingRequest` printed
+  the link (the secret) in `Debug`; both redact it.
+- **Misclassed route (low).** `pane-runtime-execution-v4.resolve`, which can cancel or
+  terminate an execution, was `observe`; it is `input` (the `pane.close` policy check
+  already kept view-only devices out).
+
+Remains:
+
+- Any internet peer that knows the host's endpoint id can end an open pairing session
+  with five bad proofs (the owner sees it as expired). The 256-bit secret makes the
+  attempt bound unnecessary against guessing; rate-limiting failures instead of ending
+  the session would remove this lever. The ended reason should also say why.
+- A paired device can reconnect in a loop: each connection writes two audit entries and a
+  `last_seen` commit, so it can rotate older entries out of the 1000-entry log.
+  Rate-limiting connection events per device would bound this.
+- Calls a plugin makes while serving an admitted request are not re-classified; route
+  classes rely on each plugin not doing more on behalf of an observe route than reading.
+  Plugin command classes in manifests were spot-checked, not audited one by one.
+- The handshake bounds limit, but do not prevent, an unpaired peer occupying handshake
+  slots with many source addresses or relay identities.
+
+### Fuzzing
+
+Property tests (proptest, run by the normal `cargo nextest`):
+
+- `packages/ipc/tests/untrusted_frames.rs`: arbitrary bytes and mutated valid frames
+  (`Hello`, `Ping`, `EnableEventPush`, `InvokeService`) through every frame decoder,
+  compressed or not, and the stream reader, under a global allocator that records the
+  largest allocation: no panics, nothing above the frame limit, oversized headers refused
+  before the body is read, lz4 and zstd bombs refused.
+- `plugins/connections-plugin/src/pairing/fuzz_tests.rs`: arbitrary bytes and bodies on
+  the pairing stream, oversized lengths, mutated valid hellos (accepted only when version,
+  role and proof are untouched), arbitrary hello fields (never accepted without the
+  secret), sanitized names, and arbitrary or damaged pairing links.
+
+No cargo-fuzz target was added: the property tests cover the same decoders without a
+nightly toolchain.
+
+### Budgets
+
+`budget_pairing_attach_and_keystroke_round_trip` in `packages/cli/tests/remote_access.rs`
+times each phase apart from process and server startup, over a loopback paired connection
+through the counting UDP proxy. Measured on the development machine under load (three
+runs; the first without the proxy):
+
+| Phase | Budget (test ceiling) | Measured |
+| --- | --- | --- |
+| Pairing: link pasted to phrase shown (dial, handshake, proof) | 10 s | 67 ms, 1.5 s, 68 ms |
+| Pairing: owner approves to host saved | 10 s | 41 ms, 132 ms, 41 ms |
+| Attach: host saved to first frame | 15 s | 645 ms, 1.31 s, 621 ms |
+| Keystroke to echo, remote (median / max) | 1 s / 5 s | 10 ms / 15 ms |
+| Keystroke to echo, local attach of the same pane (median) | — | 9–10 ms |
+| Idle viewer, 10 s | 150 datagrams, 30 kB | 47–50 datagrams, 3.8–3.9 kB |
+| `seq 1 400000` (2.69 MB of output) | below the output volume | 610–615 kB on the wire |
+
+Keystroke to echo over loopback matches a local attach, within the 1 RTT plus server
+processing budget. Idle traffic is not zero bytes: about 5 datagrams (under 400 bytes) a
+second are QUIC keepalives and path probes; bmux sends no frames while idle. Output costs
+about a quarter of its volume on the wire.
+
+### Advisories
+
+`cargo deny check advisories` reported 36 advisories (26 vulnerabilities, 10
+unmaintained). None has a semver-compatible fix, so each has an ignore entry in
+`deny.toml` naming the crate that pulls it in, the fixed version and why it is acceptable
+for now. None is on the remote-access path: they come from the docs site's hyperchad and
+actix stack, aws-smithy's legacy hyper 0.14 TLS stack and other bcode crates (rustls 0.21,
+webpki 0.101, rsa, crypto-bigint, lopdf, SQLite, zip 8), and unmaintained crates with no
+replacement release. The check now passes.
+
 ## Open items
 
 - Whether to show the reconnecting overlay through the existing presentation layer or a
