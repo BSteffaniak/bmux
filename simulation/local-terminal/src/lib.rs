@@ -327,17 +327,23 @@ fn attach_event(attachment: u64) {
     );
 }
 
-/// Set up the run's kernel and telemetry.
-fn start_run() {
+/// The systems a run may be, drawn with equal chance.
+const PERSONALITIES: [Personality; 3] =
+    [Personality::Linux, Personality::MacOs, Personality::Windows];
+
+/// Set up the run's kernel and telemetry, as a system drawn from the seed; which one.
+fn start_run() -> Personality {
     switchy_time::simulator::set_step_multiplier(1);
     sim_support::watch_run();
+    let personality = PERSONALITIES[usize::try_from(draw(PERSONALITIES.len() as u64)).unwrap_or(0)];
     simulator::configure(Config {
-        personality: Personality::Linux,
+        personality,
         pid_reuse: 0.3,
         faults: Faults::default(),
     });
     simulator::install_default_programs();
     simulator::register_program("sh", shell);
+    personality
 }
 
 /// Say hello on `client` with a random size, checking invariant 1.
@@ -372,7 +378,7 @@ async fn handshake(client: &mut DuplexStream, attachment: u64, violations: &mut 
 ///
 /// * If the server task panics
 pub async fn run_workload() -> Result<(), Vec<String>> {
-    start_run();
+    let personality = start_run();
 
     let mut violations = Vec::new();
     let mut slot = None;
@@ -381,7 +387,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     let mut terminal: Option<String> = None;
     let attachments = 1 + draw(4);
     sim_support::shape(vec![
-        "personality:linux".into(),
+        format!("personality:{}", format!("{personality:?}").to_lowercase()),
         format!("attachments:{attachments}"),
     ]);
     let code = u8::try_from(draw(100)).unwrap_or(0);

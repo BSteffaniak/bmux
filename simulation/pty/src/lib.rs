@@ -25,12 +25,7 @@
 
 pub mod telemetry;
 
-use std::{
-    collections::BTreeSet,
-    fmt::Write as _,
-    io,
-    time::Duration,
-};
+use std::{collections::BTreeSet, fmt::Write as _, io, time::Duration};
 
 use bmux_pty::{PtyCommand, PtyEvent, PtyExit, PtySize};
 use sim_support::invariants::checked;
@@ -156,6 +151,10 @@ fn chance(stream: &Stream, p: f64) -> bool {
         .chance(p)
 }
 
+/// The systems a run may be, drawn with equal chance.
+const PERSONALITIES: [Personality; 3] =
+    [Personality::Linux, Personality::MacOs, Personality::Windows];
+
 /// The kernel configuration: from `SIMULATOR_PTY_*` when set, otherwise drawn from the seed.
 fn kernel_config() -> Config {
     let from_env = Config::from_env();
@@ -163,10 +162,12 @@ fn kernel_config() -> Config {
     // simulation-safe: a run input its replay command carries.
     let personality = if std::env::var("SIMULATOR_PTY_PERSONALITY").is_ok() {
         from_env.personality
-    } else if chance(&stream, 0.5) {
-        Personality::Linux
     } else {
-        Personality::MacOs
+        let index = stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .below(PERSONALITIES.len() as u64);
+        PERSONALITIES[usize::try_from(index).unwrap_or(0)]
     };
     // simulation-safe: a run input its replay command carries.
     let faults = if std::env::var("SIMULATOR_PTY_FAULTS").is_ok() {
@@ -728,6 +729,13 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
         check_group_ended(pid, serial, &violation);
     }
 
+    // Windows: dropping the process closes its job, which ends whatever is still in it.
+    if !bmux_pty::behavior().process_groups {
+        signal_self("job closed");
+    }
+    drop(control);
+    drop(process);
+
     let mut summary = lock(shared);
     summary.summary = summary
         .summary
@@ -737,15 +745,17 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
         .wrapping_add(u64::from(exit.code().unwrap_or(-1).cast_unsigned()) << 40);
 }
 
-/// 4. Shortly after a kill, nothing in the killed process's group is still running.
+/// 4. Shortly after a kill, nothing in the killed process's group (Windows: its job, the
+///    kernel's session) is still running.
 fn check_group_ended(pid: u32, serial: Option<u64>, violation: &impl Fn(Invariant, String)) {
     let Some(serial) = serial else {
         return;
     };
     checked(Invariant::GroupEnds);
+    let jobs = !bmux_pty::behavior().process_groups;
     thread::sleep(Duration::from_secs(1));
     let survivors: Vec<String> = sim_support::kernel::running()
-        .filter(|p| p.session_serial == serial && p.group == pid)
+        .filter(|p| p.session_serial == serial && (jobs || p.group == pid))
         .map(|p| format!("{} ({}, received {:?})", p.pid, p.program, p.signals))
         .collect();
     if !survivors.is_empty() {
