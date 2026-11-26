@@ -356,6 +356,11 @@ impl TerminalBackend for RemoteTerminalBackend {
                         {
                             Self::attach_auto_session(&mut client).await
                         }
+                        Err(error) if Self::is_session_not_found(&error) => {
+                            Err(MobileCoreError::TerminalBackendFailure(format!(
+                                "{SESSION_NOT_FOUND}: {error}"
+                            )))
+                        }
                         Err(error) => {
                             Err(MobileCoreError::TerminalBackendFailure(error.to_string()))
                         }
@@ -512,6 +517,15 @@ impl TerminalBackend for RemoteTerminalBackend {
             response_rx.await.unwrap_or(Ok(()))
         })
     }
+}
+
+/// How an open names a requested session the server does not have.
+pub(crate) const SESSION_NOT_FOUND: &str = "requested session not found";
+
+/// Whether `error` says the requested session does not exist (as opposed
+/// to the server being unreachable).
+pub(crate) fn is_session_gone_error(error: &MobileCoreError) -> bool {
+    matches!(error, MobileCoreError::TerminalBackendFailure(message) if message.starts_with(SESSION_NOT_FOUND))
 }
 
 fn set_session_terminated_reason(actor_state: &Arc<Mutex<SessionActorState>>, reason: String) {

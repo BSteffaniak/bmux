@@ -1445,7 +1445,7 @@ impl AttachSession for ClusterAttachSession {
                 if let Some(event) = self.pending_events.pop_front() {
                     return Ok(event);
                 }
-                if let Some(event) = self.next_change().await? {
+                if let Some(event) = recoverable_on_provider_failure(self.next_change().await)? {
                     return Ok(event);
                 }
             }
@@ -2468,6 +2468,26 @@ fn stream_execution_id(
     Ok(bmux_cluster_plugin_api::cluster_types::ExecutionId { value })
 }
 
+/// A failed connection (to the ingress or a worker) while waiting for the
+/// next change is a recoverable disconnect: the host reopens the provider and
+/// resumes from the view it validated. Continuity failures stay errors.
+fn recoverable_on_provider_failure(
+    next: Result<Option<bmux_client::AttachProviderEvent>, AttachSessionError>,
+) -> Result<Option<bmux_client::AttachProviderEvent>, AttachSessionError> {
+    match next {
+        Err(AttachSessionError::Provider { reason }) => Ok(Some(
+            bmux_client::AttachProviderEvent::Disconnected(bmux_client::AttachProviderDisconnect {
+                recoverable: true,
+                reason,
+                // The host resumes from what it validated.
+                resume: None,
+                retry_after_ms: None,
+            }),
+        )),
+        next => next,
+    }
+}
+
 fn provider_error(error: impl std::fmt::Display) -> AttachSessionError {
     provider_reason(error.to_string())
 }
@@ -2484,6 +2504,35 @@ pub fn attach_provider() -> Arc<dyn bmux_client::AttachProvider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lost_connection_is_a_recoverable_disconnect_not_an_error() {
+        let lost = super::recoverable_on_provider_failure(Err(super::provider_reason(
+            "ingress connection closed".to_string(),
+        )))
+        .unwrap();
+        assert!(matches!(
+            lost,
+            Some(bmux_client::AttachProviderEvent::Disconnected(
+                bmux_client::AttachProviderDisconnect {
+                    recoverable: true,
+                    resume: None,
+                    ..
+                }
+            ))
+        ));
+        assert!(
+            super::recoverable_on_provider_failure(Err(super::AttachSessionError::SequenceGap {
+                expected: 2,
+                actual: 4
+            }))
+            .is_err()
+        );
+        assert!(matches!(
+            super::recoverable_on_provider_failure(Ok(None)),
+            Ok(None)
+        ));
+    }
+
     use super::*;
     #[test]
     fn the_first_layout_uses_the_viewers_terminal_size() {

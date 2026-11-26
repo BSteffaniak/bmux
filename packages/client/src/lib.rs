@@ -7,6 +7,7 @@
 mod attach_provider;
 mod attach_session;
 mod connection_pool;
+pub mod reconnect;
 mod transport_connector;
 
 pub use attach_provider::{
@@ -54,8 +55,8 @@ use bmux_ipc::{
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{
-    TransportFailure as TypedTransportFailure, TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
-    TypedServiceClientError,
+    TransportFailure as TypedTransportFailure, TypedDispatchClient, TypedDispatchClientError,
+    TypedDispatchClientResult, TypedServiceClientError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -236,7 +237,9 @@ impl ClientError {
         let message = || format!("{context} typed dispatch failed: {error}");
         match error {
             TypedDispatchClientError::Transport { failure, .. } => match *failure {
-                TypedTransportFailure::Timeout { after } => Self::Timeout(after.unwrap_or_default()),
+                TypedTransportFailure::Timeout { after } => {
+                    Self::Timeout(after.unwrap_or_default())
+                }
                 TypedTransportFailure::ConnectionLost(kind) => {
                     Self::Transport(IpcTransportError::Io(std::io::Error::new(kind, message())))
                 }
@@ -2108,9 +2111,9 @@ mod tests {
 
     mod error_class {
         use super::super::{
-            ClientError, ErrorClass, ErrorCode, IpcTransportError, Request, TypedTransportFailure,
-            TypedDispatchClientError, TypedServiceClientError, map_client_error,
-            with_negotiated_deadline,
+            ClientError, ErrorClass, ErrorCode, IpcTransportError, Request,
+            TypedDispatchClientError, TypedServiceClientError, TypedTransportFailure,
+            map_client_error, with_negotiated_deadline,
         };
         use std::io::ErrorKind;
         use std::time::Duration;

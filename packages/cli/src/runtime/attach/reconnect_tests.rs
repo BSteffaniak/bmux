@@ -82,30 +82,10 @@ fn failing_then_ok(
 }
 
 #[test]
-fn attach_backoff_doubles_to_its_cap_within_its_jitter() {
-    let nominal = [300, 600, 1_200, 2_400, 4_800, 5_000, 5_000];
-    for seed in [0, 1, 42, u64::MAX] {
-        for (index, nominal) in nominal.into_iter().enumerate() {
-            let attempt = u32::try_from(index + 1).unwrap();
-            let delay = ReconnectBackoff::ATTACH.delay(attempt, seed).as_millis();
-            assert!(
-                (nominal * 8 / 10..=nominal * 12 / 10).contains(&delay),
-                "attempt {attempt}: {delay}ms is not within 20% of {nominal}ms"
-            );
-        }
-    }
-    // Different clients spread out.
-    let spread: std::collections::BTreeSet<_> = (0..16)
-        .map(|seed| ReconnectBackoff::ATTACH.delay(3, seed))
-        .collect();
-    assert!(spread.len() > 1);
-}
-
-#[test]
 fn a_connector_tries_for_at_least_two_minutes() {
     for seed in [0, 1, 42, u64::MAX] {
         let budget: Duration = (1..=CONNECTOR_RECONNECT_MAX_ATTEMPTS)
-            .map(|attempt| ReconnectBackoff::ATTACH.delay(attempt, seed))
+            .map(|attempt| ReconnectBackoff::INTERACTIVE.delay(attempt, seed))
             .sum();
         assert!(budget >= Duration::from_secs(120), "{budget:?}");
     }

@@ -18,66 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// How long to wait before each reconnect attempt: doubling from `base` up to
-/// `max`, spread by up to `jitter_permille` thousandths either way so clients
-/// that lost the same server do not all come back at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReconnectBackoff {
-    base: Duration,
-    max: Duration,
-    jitter_permille: u64,
-}
-
-impl ReconnectBackoff {
-    /// The attach client's in-place reconnect: 300ms doubling to 5s, ±20%.
-    pub const ATTACH: Self = Self {
-        base: Duration::from_millis(300),
-        max: Duration::from_secs(5),
-        jitter_permille: 200,
-    };
-
-    /// A schedule without jitter (tests time it exactly).
-    #[cfg(test)]
-    #[must_use]
-    pub const fn fixed(base: Duration, max: Duration) -> Self {
-        Self {
-            base,
-            max,
-            jitter_permille: 0,
-        }
-    }
-
-    /// The delay before attempt `attempt` (from 1); `seed` picks the jitter.
-    #[must_use]
-    pub fn delay(self, attempt: u32, seed: u64) -> Duration {
-        let exponent = attempt.saturating_sub(1).min(20);
-        let nominal = self.base.saturating_mul(1 << exponent).min(self.max);
-        if self.jitter_permille == 0 {
-            return nominal;
-        }
-        let spread = splitmix64(seed ^ u64::from(attempt)) % (2 * self.jitter_permille + 1);
-        let nominal_ms = u64::try_from(nominal.as_millis()).unwrap_or(u64::MAX);
-        Duration::from_millis(
-            nominal_ms.saturating_mul(1000 - self.jitter_permille + spread) / 1000,
-        )
-    }
-}
-
-const fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-/// A jitter seed that differs between processes and runs.
-#[must_use]
-pub fn jitter_seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
-    splitmix64(u64::from(nanos) ^ (u64::from(std::process::id()) << 32))
-}
+pub use bmux_client::reconnect::{ReconnectBackoff, jitter_seed};
 
 /// One reconnect attempt, as its connector sees it.
 #[derive(Clone, Copy, Debug)]
@@ -170,9 +111,9 @@ impl ReconnectPolicy {
     /// Attempts until the user quits, on the attach backoff.
     pub const UNTIL_QUIT: Self = Self {
         max_attempts: None,
-        backoff: ReconnectBackoff::ATTACH,
+        backoff: ReconnectBackoff::INTERACTIVE,
         first_delay: None,
-        gone_confirmations: 2,
+        gone_confirmations: bmux_client::reconnect::GONE_CONFIRMATIONS,
     };
 
     fn delay(&self, attempt: u32, seed: u64) -> Duration {

@@ -1,6 +1,7 @@
 use crate::error::{MobileCoreError, Result};
 use crate::paired_host::{PairedHost, PairedHostStore, PairingRequest, PairingState};
 use crate::remote_bridge::{BackendSessionHandle, RemoteTerminalBackend, TerminalBackend};
+use bmux_client::reconnect::{GONE_CONFIRMATIONS, ReconnectBackoff};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -153,6 +154,61 @@ struct TerminalSessionRuntime {
     first_output_seen: bool,
     pre_output_recovery_attempts: u8,
     opened_at_ms: u64,
+    /// Set while the stream is lost and being reopened.
+    reconnect: Option<TerminalReconnect>,
+}
+
+/// A lost terminal stream being reopened, to the same session, with the
+/// shared client backoff ([`ReconnectBackoff::INTERACTIVE`]).
+#[derive(Debug, Clone, Copy)]
+struct TerminalReconnect {
+    /// The attempt that runs next (from 1).
+    attempt: u32,
+    /// When it runs (epoch ms).
+    due_at_ms: u64,
+    /// Attempts in a row that found the session gone.
+    gone_answers: u32,
+    seed: u64,
+}
+
+impl TerminalReconnect {
+    fn first(now_ms: u64) -> Self {
+        let seed = bmux_client::reconnect::jitter_seed();
+        Self {
+            attempt: 1,
+            due_at_ms: now_ms.saturating_add(Self::delay_ms(1, seed)),
+            gone_answers: 0,
+            seed,
+        }
+    }
+
+    fn delay_ms(attempt: u32, seed: u64) -> u64 {
+        u64::try_from(
+            ReconnectBackoff::INTERACTIVE
+                .delay(attempt, seed)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// The attempt after a failed one.
+    fn next(self, now_ms: u64, gone: bool) -> Self {
+        let attempt = self.attempt.saturating_add(1);
+        Self {
+            attempt,
+            due_at_ms: now_ms.saturating_add(Self::delay_ms(attempt, self.seed)),
+            gone_answers: if gone {
+                self.gone_answers.saturating_add(1)
+            } else {
+                0
+            },
+            seed: self.seed,
+        }
+    }
+
+    const fn next_in_secs(self, now_ms: u64) -> u64 {
+        self.due_at_ms.saturating_sub(now_ms).div_ceil(1000)
+    }
 }
 
 /// Saved paired hosts, pairing, connections and terminal streams of one
@@ -383,6 +439,7 @@ impl ConnectionManager {
             first_output_seen: false,
             pre_output_recovery_attempts: 0,
             opened_at_ms: now_epoch_ms(),
+            reconnect: None,
         };
 
         runtime.push_diagnostic(
@@ -499,14 +556,20 @@ impl ConnectionManager {
                 .get_mut(&terminal_id)
                 .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
 
-            for _ in 0..max_chunks {
-                match runtime.chunks.pop_front() {
-                    Some(chunk) => output.push(chunk),
-                    None => break,
-                }
-            }
+            runtime.drain_chunks(&mut output, max_chunks);
             if output.len() >= max_chunks || runtime.state.status == TerminalSessionStatus::Closed {
                 return Ok(output);
+            }
+        }
+        if self.reconnecting(terminal_id) {
+            self.drive_reconnect(terminal_id);
+            if let Some(runtime) = self.terminals.get_mut(&terminal_id) {
+                runtime.drain_chunks(&mut output, max_chunks);
+                if runtime.reconnect.is_some()
+                    || runtime.state.status != TerminalSessionStatus::Open
+                {
+                    return Ok(output);
+                }
             }
         }
 
@@ -523,6 +586,12 @@ impl ConnectionManager {
                 Err(error) => {
                     if self.try_recover_pre_output_terminal_stream_drop(terminal_id, &error) {
                         continue;
+                    }
+                    if self.begin_reconnect(terminal_id, &error) {
+                        if let Some(runtime) = self.terminals.get_mut(&terminal_id) {
+                            runtime.drain_chunks(&mut output, max_chunks);
+                        }
+                        return Ok(output);
                     }
 
                     let runtime = self.terminals.get_mut(&terminal_id).ok_or_else(|| {
@@ -568,12 +637,7 @@ impl ConnectionManager {
                     );
                 }
                 runtime.push_chunk(TerminalChunkKind::Stdout, data, None);
-                while output.len() < max_chunks {
-                    match runtime.chunks.pop_front() {
-                        Some(chunk) => output.push(chunk),
-                        None => break,
-                    }
-                }
+                runtime.drain_chunks(&mut output, max_chunks);
             }
 
             return Ok(output);
@@ -598,6 +662,11 @@ impl ConnectionManager {
             );
             return Err(MobileCoreError::TerminalSessionClosed(
                 terminal_id.to_string(),
+            ));
+        }
+        if runtime.reconnect.is_some() {
+            return Err(MobileCoreError::TerminalBackendFailure(
+                "reconnecting to the server; input not delivered".to_string(),
             ));
         }
         if !bytes.is_empty() {
@@ -643,6 +712,11 @@ impl ConnectionManager {
             );
             return Err(MobileCoreError::TerminalSessionClosed(
                 terminal_id.to_string(),
+            ));
+        }
+        if runtime.reconnect.is_some() {
+            return Err(MobileCoreError::TerminalBackendFailure(
+                "reconnecting to the server; mouse event not delivered".to_string(),
             ));
         }
 
@@ -691,6 +765,11 @@ impl ConnectionManager {
                 TerminalStatusSeverity::Error,
             );
             return Err(error);
+        }
+        if runtime.reconnect.is_some() {
+            // The reopened stream starts at this size.
+            runtime.state.size = size;
+            return Ok(());
         }
         self.terminal_backend
             .resize(runtime.backend.id, size.rows, size.cols)
@@ -769,6 +848,139 @@ impl ConnectionManager {
         };
         let _ = self.disconnect(connection_id);
         self.terminal_state(terminal_id)
+    }
+
+    fn reconnecting(&self, terminal_id: Uuid) -> bool {
+        self.terminals
+            .get(&terminal_id)
+            .is_some_and(|runtime| runtime.reconnect.is_some())
+    }
+
+    fn set_connection_status(&mut self, connection_id: Uuid, status: ConnectionStatus) {
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            connection.status = status;
+        }
+    }
+
+    /// The stream of an open terminal was lost (`error`): keep the terminal
+    /// and reopen it to the same session with backoff, reporting
+    /// `Reconnecting`. Returns whether reconnecting started.
+    fn begin_reconnect(&mut self, terminal_id: Uuid, error: &MobileCoreError) -> bool {
+        if !is_early_stream_drop_error(error) {
+            return false;
+        }
+        let now = now_epoch_ms();
+        let Some(runtime) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        if runtime.state.status != TerminalSessionStatus::Open || runtime.reconnect.is_some() {
+            return false;
+        }
+        let reconnect = TerminalReconnect::first(now);
+        runtime.reconnect = Some(reconnect);
+        runtime.push_diagnostic(
+            "reconnect",
+            TerminalStatusSeverity::Warn,
+            Some("connection_lost"),
+            format!("terminal stream lost: {error}"),
+        );
+        runtime.push_status_chunk(
+            format!(
+                "connection lost — reconnecting (attempt 1, next in {}s)",
+                reconnect.next_in_secs(now)
+            ),
+            TerminalStatusSeverity::Warn,
+        );
+        let (old_backend, connection_id) = (runtime.backend.id, runtime.state.connection_id);
+        let _ = self.terminal_backend.close(old_backend);
+        self.set_connection_status(connection_id, ConnectionStatus::Reconnecting);
+        true
+    }
+
+    /// Run the reconnect attempt that is due, if one is.
+    fn drive_reconnect(&mut self, terminal_id: Uuid) {
+        let now = now_epoch_ms();
+        let Some(runtime) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let Some(reconnect) = runtime
+            .reconnect
+            .filter(|reconnect| now >= reconnect.due_at_ms)
+        else {
+            return;
+        };
+        let (host, session, size, connection_id) = (
+            runtime.state.host.clone(),
+            runtime.state.session.clone(),
+            runtime.state.size,
+            runtime.state.connection_id,
+        );
+        // The same session, asked for explicitly: a reopen never lands on
+        // another one.
+        let reopened = self
+            .terminal_backend
+            .open(&host, session, None, size.rows, size.cols);
+        let Some(runtime) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let status = match reopened {
+            Ok(backend) => {
+                runtime.backend = backend;
+                runtime.reconnect = None;
+                runtime.push_diagnostic(
+                    "reconnect",
+                    TerminalStatusSeverity::Info,
+                    Some("reconnected"),
+                    format!(
+                        "reopened the terminal stream on attempt {}",
+                        reconnect.attempt
+                    ),
+                );
+                runtime.push_status_chunk(
+                    "reconnected to server".to_string(),
+                    TerminalStatusSeverity::Info,
+                );
+                ConnectionStatus::Connected
+            }
+            Err(error) => {
+                let gone = crate::remote_bridge::is_session_gone_error(&error)
+                    || matches!(error, MobileCoreError::HostNotFound(_));
+                let next = reconnect.next(now, gone);
+                if next.gone_answers >= GONE_CONFIRMATIONS {
+                    runtime.reconnect = None;
+                    runtime.state.status = TerminalSessionStatus::Failed;
+                    runtime.push_diagnostic(
+                        "reconnect",
+                        TerminalStatusSeverity::Error,
+                        Some("session_gone"),
+                        format!("session no longer exists: {error}"),
+                    );
+                    runtime.push_status_chunk(
+                        "session no longer exists — terminal ended".to_string(),
+                        TerminalStatusSeverity::Error,
+                    );
+                    ConnectionStatus::Failed
+                } else {
+                    runtime.reconnect = Some(next);
+                    runtime.push_diagnostic(
+                        "reconnect",
+                        TerminalStatusSeverity::Warn,
+                        Some("reconnect_attempt_failed"),
+                        format!("reconnect attempt {} failed: {error}", reconnect.attempt),
+                    );
+                    runtime.push_status_chunk(
+                        format!(
+                            "connection lost — reconnecting (attempt {}, next in {}s)",
+                            next.attempt,
+                            next.next_in_secs(now)
+                        ),
+                        TerminalStatusSeverity::Warn,
+                    );
+                    ConnectionStatus::Reconnecting
+                }
+            }
+        };
+        self.set_connection_status(connection_id, status);
     }
 
     fn try_recover_pre_output_terminal_stream_drop(
@@ -884,6 +1096,16 @@ impl ConnectionManager {
 }
 
 impl TerminalSessionRuntime {
+    /// Move queued chunks into `output` until it holds `max_chunks`.
+    fn drain_chunks(&mut self, output: &mut Vec<TerminalChunk>, max_chunks: usize) {
+        while output.len() < max_chunks {
+            match self.chunks.pop_front() {
+                Some(chunk) => output.push(chunk),
+                None => break,
+            }
+        }
+    }
+
     fn push_chunk(
         &mut self,
         kind: TerminalChunkKind,
@@ -1383,6 +1605,202 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|event| event.code.as_deref() == Some("recovery_succeeded"))
+        );
+    }
+
+    /// A backend whose stream can be lost, and whose opens follow a script
+    /// (`Ok` once the script runs out).
+    #[derive(Default)]
+    struct LosingTerminalBackend {
+        opens: Mutex<VecDeque<Result<()>>>,
+        opened_sessions: Mutex<Vec<Option<String>>>,
+        lose_stream: Mutex<bool>,
+        session_id: Uuid,
+    }
+
+    impl TerminalBackend for LosingTerminalBackend {
+        fn probe(&self, _host: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(
+            &self,
+            _host: &str,
+            session: Option<String>,
+            _remembered_session: Option<String>,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<BackendSessionHandle> {
+            self.opened_sessions.lock().unwrap().push(session);
+            self.opens.lock().unwrap().pop_front().unwrap_or(Ok(()))?;
+            Ok(BackendSessionHandle {
+                id: Uuid::new_v4(),
+                session_id: self.session_id,
+                can_write: true,
+            })
+        }
+
+        fn poll_output(&self, _handle_id: Uuid, _max_bytes: usize) -> Result<Vec<u8>> {
+            if std::mem::take(&mut *self.lose_stream.lock().unwrap()) {
+                return Err(MobileCoreError::TerminalBackendFailure(
+                    "terminal session terminated: keepalive ping failed".to_string(),
+                ));
+            }
+            Ok(b"out".to_vec())
+        }
+
+        fn write_input(&self, _handle_id: Uuid, _bytes: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn mouse_event(&self, _handle_id: Uuid, _event: &TerminalMouseEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn resize(&self, _handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn close(&self, _handle_id: Uuid) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn losing_terminal(
+        opens: impl IntoIterator<Item = Result<()>>,
+    ) -> (
+        tempfile::TempDir,
+        ConnectionManager,
+        Arc<LosingTerminalBackend>,
+        TerminalSessionState,
+    ) {
+        let backend = Arc::new(LosingTerminalBackend {
+            session_id: Uuid::from_u128(7),
+            ..LosingTerminalBackend::default()
+        });
+        backend
+            .opens
+            .lock()
+            .unwrap()
+            .extend(std::iter::once(Ok(())).chain(opens));
+        let (root, mut manager) = manager(backend.clone());
+        let terminal = manager
+            .open_terminal(TerminalOpenRequest {
+                host: "desktop".to_string(),
+                session: None,
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+        // First output: past the pre-output recovery window.
+        manager.poll_terminal_output(terminal.id, 64).unwrap();
+        *backend.lose_stream.lock().unwrap() = true;
+        (root, manager, backend, terminal)
+    }
+
+    fn status_texts(chunks: &[TerminalChunk]) -> Vec<String> {
+        chunks
+            .iter()
+            .filter(|chunk| chunk.kind == TerminalChunkKind::Status)
+            .map(|chunk| String::from_utf8_lossy(&chunk.bytes).into_owned())
+            .collect()
+    }
+
+    /// Make the next reconnect attempt due now (the backoff is real time).
+    fn make_attempt_due(manager: &mut ConnectionManager, terminal_id: Uuid) {
+        manager
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .reconnect
+            .as_mut()
+            .expect("reconnecting")
+            .due_at_ms = 0;
+    }
+
+    #[test]
+    fn a_lost_stream_reconnects_to_the_same_session_with_backoff() {
+        let (_root, mut manager, backend, terminal) = losing_terminal([Err(
+            MobileCoreError::TerminalBackendFailure("connection refused".to_string()),
+        )]);
+        let connection =
+            |manager: &ConnectionManager| manager.connections[&terminal.connection_id].status;
+
+        let lost = manager.poll_terminal_output(terminal.id, 64).unwrap();
+        assert!(
+            status_texts(&lost)
+                .iter()
+                .any(|text| text.starts_with("connection lost — reconnecting (attempt 1")),
+            "{:?}",
+            status_texts(&lost)
+        );
+        assert_eq!(connection(&manager), ConnectionStatus::Reconnecting);
+        assert_eq!(
+            manager.terminal_state(terminal.id).unwrap().status,
+            TerminalSessionStatus::Open
+        );
+        // Not due yet: nothing runs, and input is refused without failing the terminal.
+        assert_eq!(manager.poll_terminal_output(terminal.id, 64).unwrap(), []);
+        assert!(manager.write_terminal_input(terminal.id, b"x").is_err());
+        assert_eq!(
+            manager.terminal_state(terminal.id).unwrap().status,
+            TerminalSessionStatus::Open
+        );
+
+        make_attempt_due(&mut manager, terminal.id);
+        let refused = manager.poll_terminal_output(terminal.id, 64).unwrap();
+        assert!(
+            status_texts(&refused)
+                .iter()
+                .any(|text| text.starts_with("connection lost — reconnecting (attempt 2")),
+            "{:?}",
+            status_texts(&refused)
+        );
+        assert_eq!(connection(&manager), ConnectionStatus::Reconnecting);
+
+        make_attempt_due(&mut manager, terminal.id);
+        let back = manager.poll_terminal_output(terminal.id, 64).unwrap();
+        assert!(status_texts(&back).contains(&"reconnected to server".to_string()));
+        assert!(back.iter().any(|chunk| chunk.bytes == b"out"));
+        assert_eq!(connection(&manager), ConnectionStatus::Connected);
+        manager.write_terminal_input(terminal.id, b"x").unwrap();
+        // Every reopen asked for the session the terminal was attached to.
+        let session = Some(Uuid::from_u128(7).to_string());
+        assert_eq!(
+            backend.opened_sessions.lock().unwrap()[1..],
+            [session.clone(), session]
+        );
+    }
+
+    #[test]
+    fn a_session_gone_on_two_attempts_in_a_row_ends_the_terminal() {
+        let gone = || {
+            Err(MobileCoreError::TerminalBackendFailure(format!(
+                "{}: not found",
+                crate::remote_bridge::SESSION_NOT_FOUND
+            )))
+        };
+        let (_root, mut manager, _backend, terminal) = losing_terminal([gone(), gone()]);
+        manager.poll_terminal_output(terminal.id, 64).unwrap();
+        make_attempt_due(&mut manager, terminal.id);
+        manager.poll_terminal_output(terminal.id, 64).unwrap();
+        // One answer is not proof.
+        assert_eq!(
+            manager.terminal_state(terminal.id).unwrap().status,
+            TerminalSessionStatus::Open
+        );
+        make_attempt_due(&mut manager, terminal.id);
+        let ended = manager.poll_terminal_output(terminal.id, 64).unwrap();
+        assert!(
+            status_texts(&ended).contains(&"session no longer exists — terminal ended".to_string())
+        );
+        assert_eq!(
+            manager.terminal_state(terminal.id).unwrap().status,
+            TerminalSessionStatus::Failed
+        );
+        assert_eq!(
+            manager.connections[&terminal.connection_id].status,
+            ConnectionStatus::Failed
         );
     }
 }
