@@ -26,6 +26,7 @@ mod identity;
 mod invoke;
 mod known_hosts;
 mod link;
+pub mod paired_hosts;
 mod pairing;
 mod roles;
 mod service;

@@ -4,7 +4,7 @@
 //! ```text
 //! device -> host  Hello { version, role, device_name, proof }
 //! host -> device  Pending { phrase }            (after the proof checks)
-//! host -> device  Approved { principal, host_name } | Refused { reason }
+//! host -> device  Approved { principal, host_name, role } | Refused { reason }
 //! ```
 //!
 //! The QUIC handshake already proves both keys: the device dials the host key
@@ -37,7 +37,13 @@ pub enum DeviceMessage {
 #[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "type")]
 pub enum HostMessage {
     Pending { phrase: String },
-    Approved { principal: Uuid, host_name: String },
+    /// `role` is the role the owner granted (the pairing session's), which
+    /// may differ from the one the device asked for.
+    Approved {
+        principal: Uuid,
+        host_name: String,
+        role: Role,
+    },
     Refused { reason: Refusal },
 }
 

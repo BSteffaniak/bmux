@@ -14,6 +14,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct Paired {
     pub principal: Uuid,
     pub host_name: String,
+    /// The role the owner granted.
+    pub role: Role,
 }
 
 /// Prove the link secret, show the phrase through `show_phrase`, and wait
@@ -75,9 +77,11 @@ pub async fn pair(
         HostMessage::Approved {
             principal,
             host_name,
+            role,
         } => Ok(Paired {
             principal,
             host_name,
+            role,
         }),
         HostMessage::Refused { reason } => bail!("pairing refused: {}", reason.describe()),
         HostMessage::Pending { .. } => bail!("unexpected pairing message"),

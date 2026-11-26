@@ -23,7 +23,11 @@ pub const MAX_WAITING: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Approved { principal: Uuid, host_name: String },
+    Approved {
+        principal: Uuid,
+        host_name: String,
+        role: Role,
+    },
     Refused(Refusal),
 }
 
@@ -375,12 +379,14 @@ mod tests {
         approval.resolve(Decision::Approved {
             principal,
             host_name: "h".into(),
+            role: Role::Full,
         });
         assert_eq!(
             submitted.decision.await.unwrap(),
             Decision::Approved {
                 principal,
-                host_name: "h".into()
+                host_name: "h".into(),
+                role: Role::Full,
             }
         );
         // Single use: ending after approval refuses any reuse of the secret.

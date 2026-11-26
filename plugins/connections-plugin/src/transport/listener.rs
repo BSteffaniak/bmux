@@ -459,9 +459,11 @@ async fn serve_pairing(
         Decision::Approved {
             principal,
             host_name,
+            role,
         } => HostMessage::Approved {
             principal,
             host_name,
+            role,
         },
         Decision::Refused(reason) => HostMessage::Refused { reason },
     };

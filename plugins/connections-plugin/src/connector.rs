@@ -33,9 +33,14 @@ impl SavedHostConnector {
             .join(format!("{CLIENT_PROFILE}.json"))
     }
 
+    /// Whether this client has a known-hosts record at all.
+    pub fn has_saved_hosts(&self) -> bool {
+        self.known_hosts_file().is_file()
+    }
+
     pub fn saved(&self, alias: &str) -> Result<Option<KnownHost>> {
         // Never create client state just to answer `supports`.
-        if !self.known_hosts_file().is_file() {
+        if !self.has_saved_hosts() {
             return Ok(None);
         }
         KnownHosts::open(&self.paths.state_dir, CLIENT_PROFILE)?.get(alias)
@@ -43,7 +48,7 @@ impl SavedHostConnector {
 
     /// Every saved host, without creating client state when there is none.
     pub fn saved_hosts(&self) -> Result<Vec<SavedHost>> {
-        if !self.known_hosts_file().is_file() {
+        if !self.has_saved_hosts() {
             return Ok(Vec::new());
         }
         Ok(KnownHosts::open(&self.paths.state_dir, CLIENT_PROFILE)?

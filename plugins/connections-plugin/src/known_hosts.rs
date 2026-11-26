@@ -2,6 +2,7 @@
 //! principal this device acts as on that host. One owner-only record per
 //! client profile at `state_dir/connections/known-hosts/<profile>.json`.
 use crate::storage::{self, RecordStore};
+use crate::trust::Role;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,6 +21,10 @@ pub struct KnownHost {
     pub relay: Option<String>,
     /// Principal the host issued to this device.
     pub principal: Uuid,
+    /// The role the host granted at pairing. The owner can change it later
+    /// (`bmux remote role`), so it is a label, never an authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
     /// `direct` or `relay`, from the last connection.
     pub last_path: Option<String>,
     pub last_runtime: Option<String>,
@@ -157,6 +162,7 @@ mod tests {
             addrs: vec!["127.0.0.1:1".parse().unwrap()],
             relay: None,
             principal: Uuid::new_v4(),
+            role: Some(Role::Full),
             last_path: None,
             last_runtime: None,
         }

@@ -4,11 +4,9 @@
 use super::{CLIENT_PROFILE, flag, option, positional, prompt};
 use crate::identity::DeviceKey;
 use crate::known_hosts::{KnownHost, KnownHosts, valid_alias};
-use crate::link::PairingLink;
-use crate::pairing::client::pair;
+use crate::paired_hosts::{PairRequest, PairedHosts};
 use crate::transport::manager::{ConnectionManager, HostRoute, refused};
 use crate::transport::path_of;
-use crate::trust::Role;
 use anyhow::{Context, Result, bail, ensure};
 use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
 use bmux_plugin_sdk::{CoreCliCommandRequest, NativeCommandContext};
@@ -164,57 +162,20 @@ async fn pair_interactively(
     if let Some(alias) = &alias {
         valid_alias(alias)?;
     }
-    let link = PairingLink::decode(
-        &super::blocking(|| prompt("Pairing link (input hidden): ", true)).await?,
-    )?;
-    let device = DeviceKey::load_or_create(&paths.state_dir, CLIENT_PROFILE)?;
-    let hosts = KnownHosts::open(&paths.state_dir, CLIENT_PROFILE)?;
-    let manager =
-        ConnectionManager::shared(device.secret(), &crate::connector::client_transport(paths)?);
-    let device_name = device_name.unwrap_or_else(crate::host::host_name);
-    let paired = pair(
-        &manager,
-        device.public(),
-        &link,
-        &device_name,
-        Role::Full,
-        |phrase| {
+    let link = super::blocking(|| prompt("Pairing link (input hidden): ", true)).await?;
+    let request = PairRequest {
+        link,
+        alias,
+        device_name: device_name.unwrap_or_else(crate::host::host_name),
+    };
+    let saved = PairedHosts::new(paths.clone())
+        .pair(request, |phrase| {
             println!("Verify on the host: {phrase}");
             println!("Waiting for the host owner to approve...");
-        },
-    )
-    .await?;
-    let saved = hosts.list()?;
-    let host_key = link.host_key.to_string();
-    let alias = alias.unwrap_or_else(|| {
-        let base = crate::pairing::protocol::sanitize_name(&paired.host_name);
-        let base = if valid_alias(&base).is_ok() {
-            base
-        } else {
-            "host".to_owned()
-        };
-        let free = |name: &str| saved.get(name).is_none_or(|host| host.host_key == host_key);
-        if free(&base) {
-            return base;
-        }
-        (2..1_000)
-            .map(|n| format!("{base}-{n}"))
-            .find(|name| free(name))
-            .unwrap_or(base)
-    });
-    hosts.insert(
-        &alias,
-        KnownHost {
-            host_key,
-            addrs: link.addrs,
-            relay: link.relay,
-            principal: paired.principal,
-            last_path: None,
-            last_runtime: None,
-        },
-    )?;
-    println!("Paired. Saved host: {alias}");
-    Ok(alias)
+        })
+        .await?;
+    println!("Paired. Saved host: {}", saved.alias);
+    Ok(saved.alias)
 }
 
 pub fn hosts(context: &NativeCommandContext) -> Result<i32> {
@@ -224,11 +185,12 @@ pub fn hosts(context: &NativeCommandContext) -> Result<i32> {
         println!("No saved hosts. Pair one with `bmux connect --pair`.");
         return Ok(0);
     }
-    println!("{:<20} {:<13} LAST PATH", "HOST", "HOST KEY");
+    println!("{:<20} {:<13} {:<10} LAST PATH", "HOST", "HOST KEY", "ROLE");
     for (alias, host) in hosts {
         println!(
-            "{alias:<20} {:<13} {}",
+            "{alias:<20} {:<13} {:<10} {}",
             &host.host_key[..host.host_key.len().min(12)],
+            host.role.map_or("-", crate::host::role_name),
             host.last_path.as_deref().unwrap_or("-")
         );
     }

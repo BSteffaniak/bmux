@@ -492,6 +492,7 @@ impl Host {
                 approval.resolve(Decision::Approved {
                     principal: device.principal,
                     host_name: host_name(),
+                    role: device.role,
                 });
                 // The secret is single-use.
                 self.sessions.end(session_id, Refusal::Expired);
