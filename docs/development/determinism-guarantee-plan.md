@@ -411,3 +411,21 @@ exemption.
 - **Found on the way.** `bmux_terminal_protocol`'s new `notification_output.rs` read the
   environment, which made every simulation's `--check` fail on master; it is client side and
   now exempt, as `pointer_output.rs` is.
+
+### Follow-ups, continued (2026-11-26)
+
+- **Windows in the pty simulations.** `bmux_pty`'s Unix and simulated module follows
+  `switchy_pty::behavior()` instead of the operating system, so `cargo sim pty` and
+  `cargo sim local-terminal` now draw Linux, macOS or Windows. Under Windows a process runs in
+  a kill-on-close job (`switchy_pty::PtyJob`), its console keeps its own cursor and asks for
+  no win32 input mode (`PtyOptions`), and with output captured or input fed it runs on pipes
+  alone (`Behavior::console_on_all_streams_or_none`, `PtyChild::take_stderr`). The pty
+  workload counts a process handle's drop as signalling its session there (it closes the
+  job). Native Windows moves onto the same module once CI validates `switchy_pty`'s native
+  side (the `dst-windows` branches).
+- **Real clock reads, counted.** `cargo sim NAME --clock-reads` runs NAME with
+  `switchy_clock_probe` loaded (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`); simvar lists every real
+  clock read made inside a run by its caller, and the nightly job fails on any not allowed.
+  The simulators' own reads (simvar timing a run, `switchy_thread` waiting for the OS to
+  spare a thread) and `foldhash` seeding its hashers (simulated maps are lookup-only) are
+  allowed. Nothing else read the clock in 60 runs of each simulation on macOS.
