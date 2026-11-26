@@ -87,13 +87,74 @@ impl AttachExitReason {
     }
 }
 
+/// When a link whose requests keep failing transiently (timing out) is
+/// presumed dead rather than slow: a property of the connection kind, chosen
+/// once when the attachment connects ([`Self::for_transport`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkLiveness {
+    /// The server shares this host: a link that stops answering is a slow
+    /// server, never a dead link (its loss shows as a transport failure).
+    #[default]
+    Patient,
+    /// A network path can die silently (no reset, no EOF; every request
+    /// just times out): a run of transient failures with no successful round
+    /// trip in between is presumed a lost connection, which reconnects in
+    /// place.
+    Presumed {
+        /// Transient failures in a row that mean the link is lost.
+        after_transient: u32,
+        /// Transient failures for this long, with no round trip completing
+        /// in between, mean the link is lost (however few there were).
+        stall_window: Duration,
+    },
+}
+
+impl LinkLiveness {
+    /// A connector-backed (remote) link: lost after three transient failures
+    /// in a row, or after transient failures for fifteen seconds (the remote
+    /// transport's own idle timeout, which already ends a path whose
+    /// keep-alives stop; this catches a stream that stalls on a live path).
+    pub const REMOTE: Self = Self::Presumed {
+        after_transient: 3,
+        stall_window: Duration::from_secs(15),
+    };
+
+    /// The liveness policy of a link to a local server (`local_transport`)
+    /// or through a transport connector.
+    #[must_use]
+    pub const fn for_transport(local_transport: bool) -> Self {
+        if local_transport {
+            Self::Patient
+        } else {
+            Self::REMOTE
+        }
+    }
+
+    /// Whether `in_a_row` transient failures over `failing_for` mean the
+    /// link is lost.
+    #[must_use]
+    pub fn presumes_lost(self, in_a_row: u32, failing_for: Duration) -> bool {
+        match self {
+            Self::Patient => false,
+            Self::Presumed {
+                after_transient,
+                stall_window,
+            } => in_a_row >= after_transient || failing_for >= stall_window,
+        }
+    }
+}
+
 /// How the attachment's server round trips have been going: the state the
 /// attach failure policy (`ipc_policy`) keeps between failures.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttachLinkHealth {
+    /// When transient failures mean the link is lost (the connection kind's).
+    pub liveness: LinkLiveness,
     /// Transient failures (timeouts, unavailable server) since the last
     /// successful round trip.
     pub consecutive_transient: u32,
+    /// When the first of [`Self::consecutive_transient`] happened.
+    pub transient_since: Option<Instant>,
     /// The view may not match the server: rehydrate it at the next
     /// opportunity.
     pub resync_pending: bool,
@@ -127,15 +188,38 @@ impl AttachLinkHealth {
     /// their own.
     pub const STALL_AFTER_REJECTED_RESYNCS: u32 = 5;
 
+    /// The health of a new connection whose liveness policy is `liveness`.
+    #[must_use]
+    pub fn new(liveness: LinkLiveness) -> Self {
+        Self {
+            liveness,
+            ..Self::default()
+        }
+    }
+
     /// A request completed: the server is answering again.
     pub const fn note_round_trip(&mut self) {
         self.consecutive_transient = 0;
+        self.transient_since = None;
     }
 
-    /// Record one transient failure; returns how many happened in a row.
-    pub const fn note_transient(&mut self) -> u32 {
+    /// Record one transient failure at `now`; returns how many happened in a
+    /// row.
+    pub fn note_transient(&mut self, now: Instant) -> u32 {
         self.consecutive_transient = self.consecutive_transient.saturating_add(1);
+        self.transient_since.get_or_insert(now);
         self.consecutive_transient
+    }
+
+    /// Whether the transient failures so far (as of `now`) mean the link is
+    /// lost, by its [`LinkLiveness`].
+    #[must_use]
+    pub fn presumed_lost(&self, now: Instant) -> bool {
+        let failing_for = self
+            .transient_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        self.liveness
+            .presumes_lost(self.consecutive_transient, failing_for)
     }
 
     #[must_use]
@@ -165,7 +249,7 @@ impl AttachLinkHealth {
         self.resync_not_before = None;
         self.resync_failures = 0;
         self.retarget_unconfirmed = false;
-        self.consecutive_transient = 0;
+        self.note_round_trip();
         self.consecutive_rejected_resyncs = 0;
         self.stalled = None;
     }

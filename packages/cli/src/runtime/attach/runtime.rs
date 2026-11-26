@@ -2518,6 +2518,10 @@ fn chunk_may_disable_mouse_protocol(bytes: &[u8]) -> bool {
 
 /// Read this client's input producer barriers and acknowledge new ones: the first pauses private
 /// input (fencing the terminal), and input resumes once none remain.
+///
+/// A poll the server refused (no barrier service) is ignored. One it never answered, or whose
+/// connection failed, goes to the failure policy: this periodic poll is what notices a link that
+/// went silent while the attachment is otherwise idle.
 async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
     client: &mut StreamingBmuxClient,
     terminal: &mut T,
@@ -2525,10 +2529,18 @@ async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
     attach_input_processor: &mut InputProcessor,
     keyboard_enhanced: bool,
 ) -> Result<()> {
-    let Ok(Ok(barriers)) =
-        attach_terminal_commands::client::input_producer_barriers_v2(client).await
-    else {
-        return Ok(());
+    let barriers = match attach_terminal_commands::client::input_producer_barriers_v2(client).await
+    {
+        Ok(Ok(barriers)) => barriers,
+        Ok(Err(_)) => return Ok(()),
+        Err(error) => {
+            let error = anyhow::Error::from(error);
+            return match super::ipc_policy::classify_attach_error(&error) {
+                super::ipc_policy::AttachIpcFailure::Transient
+                | super::ipc_policy::AttachIpcFailure::ConnectionLost => Err(error),
+                _ => Ok(()),
+            };
+        }
     };
     let current = barriers
         .iter()
@@ -6225,6 +6237,9 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     }
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
+    view_state.link = super::state::AttachLinkHealth::new(
+        super::state::LinkLiveness::for_transport(local_transport),
+    );
     // An embedder may supply its own scoped frontend host; otherwise this
     // attachment owns one, plus the frontend instances bound to it.
     let embedder_frontend_bindings = terminal.take_frontend_bindings();
@@ -9063,7 +9078,8 @@ fn resume_view_after_reconnect(
     view_state.last_attach_view_revision = None;
     // Registered again (or found unsupported) on the new connection.
     view_state.output_push = super::state::OutputPush::default();
-    view_state.link = super::state::AttachLinkHealth::default();
+    // Reconnected the same way: the same liveness policy.
+    view_state.link = super::state::AttachLinkHealth::new(view_state.link.liveness);
     view_state.link.request_resync();
     view_state.dirty.layout_needs_refresh = true;
     view_state

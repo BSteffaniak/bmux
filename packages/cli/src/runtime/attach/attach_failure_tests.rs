@@ -6,7 +6,7 @@ use super::super::ipc_policy::{
     AttachFailureDisposition, AttachIpcFailure, AttachOp, absorb_attach_failure,
     classify_attach_error, classify_attach_ipc_error,
 };
-use super::super::state::AttachLinkHealth;
+use super::super::state::{AttachLinkHealth, LinkLiveness};
 use super::*;
 use bmux_client::AttachOpenInfo;
 use bmux_ipc::transport::ErasedIpcStream;
@@ -328,6 +328,125 @@ fn the_degraded_banner_shows_while_the_server_is_unresponsive() {
     assert!(state.link.banner().is_some());
     state.link.resync_succeeded();
     assert_eq!(state.link.banner(), None);
+}
+
+// ── Link liveness: when timeouts mean the link is lost ─────────────────
+
+fn timeout() -> anyhow::Error {
+    anyhow::Error::from(ClientError::Timeout(Duration::from_secs(5)))
+}
+
+fn view_over(liveness: LinkLiveness) -> AttachViewState {
+    let mut state = view();
+    state.link = AttachLinkHealth::new(liveness);
+    state
+}
+
+fn presumed_after() -> u32 {
+    match LinkLiveness::REMOTE {
+        LinkLiveness::Presumed {
+            after_transient, ..
+        } => after_transient,
+        LinkLiveness::Patient => unreachable!("a remote link is presumed lost"),
+    }
+}
+
+#[test]
+fn the_connection_kind_chooses_the_liveness_policy() {
+    assert_eq!(LinkLiveness::for_transport(true), LinkLiveness::Patient);
+    assert_eq!(LinkLiveness::for_transport(false), LinkLiveness::REMOTE);
+    assert_eq!(AttachLinkHealth::default().liveness, LinkLiveness::Patient);
+}
+
+#[test]
+fn a_remote_link_whose_requests_keep_timing_out_is_presumed_lost() {
+    let mut state = view_over(LinkLiveness::REMOTE);
+    for _ in 1..presumed_after() {
+        assert!(matches!(
+            absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+            AttachFailureDisposition::Continue
+        ));
+    }
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resync, timeout()),
+        AttachFailureDisposition::Exit(AttachExitReason::ConnectionLost)
+    ));
+}
+
+#[test]
+fn a_local_link_whose_requests_keep_timing_out_stays_slow() {
+    let mut state = view_over(LinkLiveness::Patient);
+    for _ in 0..presumed_after() * 4 {
+        assert!(matches!(
+            absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+            AttachFailureDisposition::Continue
+        ));
+    }
+    assert!(state.link.unresponsive());
+    assert_eq!(
+        state.link.banner(),
+        Some(super::super::connection_banner::ConnectionBanner::Degraded)
+    );
+}
+
+#[test]
+fn a_round_trip_between_timeouts_restarts_the_count() {
+    let mut state = view_over(LinkLiveness::REMOTE);
+    for answered in [
+        AttachLinkHealth::note_round_trip as fn(&mut AttachLinkHealth),
+        AttachLinkHealth::resync_succeeded,
+    ] {
+        for _ in 1..presumed_after() {
+            assert!(matches!(
+                absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+                AttachFailureDisposition::Continue
+            ));
+        }
+        answered(&mut state.link);
+        assert_eq!(state.link.transient_since, None);
+    }
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Continue
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remote_link_failing_for_the_stall_window_is_presumed_lost() {
+    let LinkLiveness::Presumed { stall_window, .. } = LinkLiveness::REMOTE else {
+        unreachable!("a remote link is presumed lost");
+    };
+    let mut state = view_over(LinkLiveness::REMOTE);
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Continue
+    ));
+    // Short of the window, a second failure is still a slow server.
+    tokio::time::advance(stall_window.saturating_sub(Duration::from_millis(1))).await;
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Continue
+    ));
+    // A round trip ends the run of failures, and with it the window.
+    state.link.note_round_trip();
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Continue
+    ));
+    tokio::time::advance(stall_window).await;
+    assert!(matches!(
+        absorb_attach_failure(&mut state, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Exit(AttachExitReason::ConnectionLost)
+    ));
+
+    // A local link never is, however long its requests fail.
+    let mut local = view_over(LinkLiveness::Patient);
+    let _ = absorb_attach_failure(&mut local, AttachOp::Resize, timeout());
+    tokio::time::advance(stall_window * 10).await;
+    assert!(matches!(
+        absorb_attach_failure(&mut local, AttachOp::Resize, timeout()),
+        AttachFailureDisposition::Continue
+    ));
 }
 
 fn rejected_resync(state: &mut AttachViewState) {
@@ -949,10 +1068,12 @@ async fn native_provider_error_exits_still_restore_the_terminal() {
 /// A fake server for a whole attachment: it admits the client to one session
 /// and serves its layout and snapshot (one empty pane); anything else is
 /// answered "not found". It records the operations it served and hangs up
-/// when `kill` is notified.
+/// when `kill` is notified; while `silent`, it reads requests and never
+/// answers them (a network path that died without a reset).
 struct FakeAttachServer {
     operations: Arc<Mutex<Vec<String>>>,
     kill: Arc<tokio::sync::Notify>,
+    silent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether the fake server still has the session.
@@ -1102,10 +1223,24 @@ fn fake_reply(operation: &str, session: FakeSession) -> Response {
 impl FakeAttachServer {
     /// A client connected to a new fake server.
     async fn connect(session: FakeSession) -> (bmux_client::BmuxClient, Self) {
+        Self::connect_with_timeout(session, Duration::from_secs(2)).await
+    }
+
+    /// A client whose requests time out after `request_timeout`, connected
+    /// to a new fake server.
+    async fn connect_with_timeout(
+        session: FakeSession,
+        request_timeout: Duration,
+    ) -> (bmux_client::BmuxClient, Self) {
         let (client_stream, server_stream) = tokio::io::duplex(1 << 20);
         let operations = Arc::new(Mutex::new(Vec::new()));
         let kill = Arc::new(tokio::sync::Notify::new());
-        let (seen, killed) = (Arc::clone(&operations), Arc::clone(&kill));
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, killed, mute) = (
+            Arc::clone(&operations),
+            Arc::clone(&kill),
+            Arc::clone(&silent),
+        );
         tokio::spawn(async move {
             let mut stream = ErasedIpcStream::new(Box::new(server_stream));
             loop {
@@ -1116,6 +1251,9 @@ impl FakeAttachServer {
                         Err(_) => return,
                     },
                 };
+                if mute.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let request: bmux_ipc::Request = bmux_ipc::decode(&envelope.payload).unwrap();
                 let response = match request {
                     bmux_ipc::Request::Hello { contract, .. } => {
@@ -1157,13 +1295,20 @@ impl FakeAttachServer {
         });
         let client = bmux_client::BmuxClient::connect_with_bridge_stream(
             ErasedIpcStream::new(Box::new(client_stream)),
-            Duration::from_secs(2),
+            request_timeout,
             "attach-reconnect-test",
             Uuid::new_v4(),
         )
         .await
         .unwrap();
-        (client, Self { operations, kill })
+        (
+            client,
+            Self {
+                operations,
+                kill,
+                silent,
+            },
+        )
     }
 
     fn served(&self, operation: &str) -> usize {
@@ -1622,4 +1767,85 @@ async fn a_presentation_only_view_reconnects_in_place_with_the_banner_in_a_frame
         .unwrap()
         .expect("a clean exit");
     assert_eq!(outcome.exit_reason, AttachExitReason::Detached);
+}
+
+/// A transport connector for one fake server, so its client is
+/// connector-backed (remote) like a paired host's.
+struct FakeRemoteConnector(Mutex<Option<bmux_client::BmuxClient>>);
+
+impl std::fmt::Debug for FakeRemoteConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FakeRemoteConnector")
+    }
+}
+
+impl bmux_client::TransportConnector for FakeRemoteConnector {
+    fn supports(&self, target: &str) -> bool {
+        target == "fake-remote"
+    }
+
+    fn connect<'a>(
+        &'a self,
+        _target: &'a str,
+        _client_name: &'static str,
+    ) -> bmux_client::TransportConnectFuture<'a> {
+        let client = self.0.lock().unwrap().take();
+        Box::pin(async move {
+            client.ok_or_else(|| ClientError::Local("fake remote already connected".into()))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_link_that_goes_silent_reconnects_in_place() {
+    let (client, first) =
+        FakeAttachServer::connect_with_timeout(FakeSession::Present, Duration::from_millis(300))
+            .await;
+    let registry = Arc::new(bmux_client::TransportConnectorRegistry::new());
+    let _registration = registry.register(Arc::new(FakeRemoteConnector(Mutex::new(Some(client)))));
+    let client = registry
+        .connect("fake-remote", "attach-reconnect-test")
+        .await
+        .unwrap();
+    assert!(!client.is_local_transport());
+    let second = Arc::new(Mutex::new(None::<FakeAttachServer>));
+    let slots: ServerSlots = Arc::new(Mutex::new(VecDeque::from([Some((
+        FakeSession::Present,
+        Arc::clone(&second),
+    ))])));
+    let (terminal, handle) = HeadlessAttachTerminal::new(80, 24);
+    let reconnect = scripted_reconnect(Arc::clone(&slots));
+    let attach = tokio::spawn(async move {
+        let mut terminal = terminal;
+        run_session_attach_with_terminal_reconnecting(
+            client,
+            Some(&FAKE_SESSION.to_string()),
+            None,
+            false,
+            None,
+            &mut terminal,
+            Some(BmuxConfig::default()),
+            None,
+            None,
+            Some(reconnect),
+        )
+        .await
+    });
+    eventually("the first hydrate", || {
+        first.served("attach-snapshot-state") > 0
+    })
+    .await;
+    // The path dies silently: no reset, no EOF, every request times out.
+    first.silent.store(true, Ordering::SeqCst);
+    handle.send_event(Event::Resize(100, 30)).unwrap();
+    eventually("the rehydrate on a new connection", || {
+        second
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|server| server.served("attach-snapshot-state") > 0)
+    })
+    .await;
+    assert!(!attach.is_finished(), "the attach loop keeps running");
+    attach.abort();
 }

@@ -7,7 +7,9 @@
 //! - [`AttachIpcFailure::Gone`]: the attached runtime is gone; the attachment
 //!   ends as [`AttachExitReason::StreamClosed`].
 //! - [`AttachIpcFailure::Transient`]: the server is slow; the loop keeps
-//!   running, says so in the status line and resyncs the view.
+//!   running, says so in the status line and resyncs the view. On a link
+//!   whose [`super::state::LinkLiveness`] presumes it lost after enough of
+//!   them (a remote one), they become [`AttachIpcFailure::ConnectionLost`].
 //! - [`AttachIpcFailure::ConnectionLost`]: the attach loop stops as
 //!   [`AttachExitReason::ConnectionLost`]; an attachment that can reconnect
 //!   does so in place (see `reconnect`), otherwise it ends cleanly.
@@ -206,7 +208,14 @@ pub fn absorb_attach_failure(
         }
         AttachIpcFailure::Local => AttachFailureDisposition::Fatal(error),
         AttachIpcFailure::Transient => {
-            let in_a_row = view_state.link.note_transient();
+            // The runtime's clock, so a paused test clock drives the window.
+            let now = tokio::time::Instant::now().into_std();
+            let in_a_row = view_state.link.note_transient(now);
+            if view_state.link.presumed_lost(now) {
+                // A network path that died silently: reconnect in place.
+                tracing::warn!(op = op.label(), in_a_row, liveness = ?view_state.link.liveness, error = %format!("{error:#}"), "attach.failure.presumed_lost");
+                return AttachFailureDisposition::Exit(AttachExitReason::ConnectionLost);
+            }
             view_state.link.request_resync();
             let consequence = if op.drops_input() {
                 "input was not delivered"

@@ -154,7 +154,9 @@ An attachment never ends because a request failed. A banner on the top row
 says what is wrong until it is resolved:
 
 - "server not responding — retrying…": requests keep timing out; input still
-  goes to your panes.
+  goes to your panes. Over a paired remote host (`--target`), a network path
+  can die without a reset, so three timeouts in a row (or timeouts for 15
+  seconds) with no answer in between count as a lost connection instead.
 - "connection lost — reconnecting (attempt N, next in Xs)": the connection
   dropped. The last screen stays up and the client reconnects in place, with
   backoff, to the same session and tab, then redraws it. A bare `bmux` starts
