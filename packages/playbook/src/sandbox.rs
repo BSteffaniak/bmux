@@ -264,10 +264,13 @@ impl SandboxServer {
             client.stop_server().await?;
             Ok::<(), anyhow::Error>(())
         };
-        tokio::time::timeout(Duration::from_secs(10), cleanup).await??;
+        // Bounds only a hung server: retirement and shutdown finish on their
+        // own, however slowly a loaded machine runs them, and the server
+        // bounds its own exit (`server stop` waits at most 120 s by default).
+        tokio::time::timeout(SANDBOX_STOP_BOUND, cleanup).await??;
         if let ServerHandle::Foreground { child, .. } = &mut self.handle {
             anyhow::ensure!(
-                wait_for_child_exit(child, Duration::from_secs(3)).await?,
+                wait_for_child_exit(child, SANDBOX_STOP_BOUND).await?,
                 "sandbox child exit unconfirmed"
             );
         }
@@ -877,6 +880,16 @@ pub(crate) async fn wait_for_server_ready(
         }
     }
 }
+
+/// How long to wait for a sandbox server to become ready. Startup either
+/// finishes or the server exits (which readiness waits notice at once), so
+/// this bounds only a server that hangs, never how fast a loaded machine starts.
+pub(crate) const SANDBOX_STARTUP_BOUND: Duration = Duration::from_secs(120);
+
+/// How long sandbox teardown waits for the server to retire its sessions,
+/// stop and exit before reporting cleanup unconfirmed: the server's own
+/// owned-stop exit bound, so only a server that would never exit trips it.
+const SANDBOX_STOP_BOUND: Duration = Duration::from_secs(120);
 
 async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;

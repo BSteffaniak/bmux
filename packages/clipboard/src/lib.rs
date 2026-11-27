@@ -257,10 +257,22 @@ const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
     None
 }
 
+/// Selects the text copy backend. `command` copies through the platform's
+/// clipboard command (`pbcopy`; `wl-copy`, `xclip` or `xsel`; `clip`) instead of
+/// the native clipboard API: for a command on `PATH` that forwards the
+/// clipboard elsewhere, and for isolated environments (test fixtures) that must
+/// never write a real desktop clipboard.
+pub const BACKEND_ENV: &str = "BMUX_CLIPBOARD_BACKEND";
+
+fn native_copy_disabled() -> bool {
+    env::var_os(BACKEND_ENV).is_some_and(|backend| backend == "command")
+}
+
 /// Copy text to the system clipboard using a one-shot clipboard handle.
 ///
 /// Convenience wrapper that creates a [`Clipboard`] and copies `text` in
-/// a single call.
+/// a single call. With [`BACKEND_ENV`] set to `command`, only clipboard
+/// commands are tried.
 ///
 /// # Errors
 ///
@@ -269,7 +281,12 @@ const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
     let displays = ClipboardDisplays::detect();
     displays.check_read_available(env::consts::OS)?;
-    match native::copy_text(text) {
+    let native = if native_copy_disabled() {
+        Err(format!("native clipboard disabled by {BACKEND_ENV}=command"))
+    } else {
+        native::copy_text(text).map_err(|error| error.to_string())
+    };
+    match native {
         Ok(()) => Ok(()),
         Err(error) => copy_with_commands(
             clipboard_commands(env::consts::OS)
@@ -279,7 +296,7 @@ pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
                     displays.supports(env::consts::OS, command.program)
                         && command_exists(command.program)
                 }),
-            vec![error.to_string()],
+            vec![error],
             |command| run_copy_command(command, text),
         ),
     }

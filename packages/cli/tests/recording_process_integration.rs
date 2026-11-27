@@ -28,9 +28,10 @@ use std::time::{Duration, Instant};
 /// Bounds one CLI command's hang. Above [`PRODUCT_WAIT`], so a product-level
 /// wait reports its own timeout first.
 const COMMAND_HANG_GUARD: Duration = Duration::from_secs(180);
-/// The `--timeout` for product-level waits on an expected screen or exit: only
-/// a hang guard, never a budget the expected event must beat.
-const PRODUCT_WAIT: &str = "120s";
+/// The `--timeout` for product-level waits on an expected screen or exit: the
+/// longest the product accepts, as a hang guard, never a budget the expected
+/// event must beat.
+const PRODUCT_WAIT: &str = "30s";
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Bounds a wait for something that must eventually happen. Never a budget:
 /// reaching it means a hang, however loaded the machine.

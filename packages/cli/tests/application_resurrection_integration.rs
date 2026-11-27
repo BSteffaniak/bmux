@@ -277,11 +277,13 @@ async fn nested_round_trip(
     std::fs::write(
         server.root().join("home/.bashrc"),
         format!(
-            r#"if [[ -n ${{BMUX_ROOT_SHELL_PID:-}} && $BMUX_ROOT_SHELL_PID != $$ && -n ${{BMUX_SHELL_CALLBACK:-}} ]]; then
+            // First in PROMPT_COMMAND: the integration's DEBUG trap treats any
+            // command run after its own prompt hook as the user's next command.
+            r#"__fixture_ready() {{ printf '%s\n' "$$" >> '{0}'; }}
+PROMPT_COMMAND=(__fixture_ready)
+if [[ -n ${{BMUX_ROOT_SHELL_PID:-}} && $BMUX_ROOT_SHELL_PID != $$ && -n ${{BMUX_SHELL_CALLBACK:-}} ]]; then
   eval "$("$BMUX_SHELL_CALLBACK" __shell-integration bash)"
 fi
-__fixture_ready() {{ printf '%s\n' "$$" >> '{0}'; }}
-PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND;}}__fixture_ready"
 "#,
             shell_ready.display()
         ),

@@ -55,8 +55,7 @@ use super::types::{
     StepFailure, StepResult, StepStatus,
 };
 
-/// Default timeout for waiting for the sandbox server to start.
-const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVER_STARTUP_TIMEOUT: Duration = crate::sandbox::SANDBOX_STARTUP_BOUND;
 /// Max bytes to read from attach output per drain cycle.
 const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 

@@ -29,8 +29,7 @@ use super::sandbox::{SandboxServer, SandboxStartOptions};
 use super::screen::{ScreenDeltaEvent, ScreenDeltaFormat, ScreenInspector};
 use super::types::{PaneCapture, SnapshotCapture, Step};
 
-/// Default timeout for sandbox server startup.
-const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVER_STARTUP_TIMEOUT: Duration = crate::sandbox::SANDBOX_STARTUP_BOUND;
 /// Max bytes to drain per pane on output-available notifications.
 const INTERACTIVE_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 

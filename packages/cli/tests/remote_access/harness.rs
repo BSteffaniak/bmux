@@ -78,8 +78,13 @@ fn isolated_env(root: &Path, dirs: &Dirs) -> Vec<(OsString, Option<OsString>)> {
     ] {
         env.push((key.into(), Some(value.into_os_string())));
     }
-    // The clipboard: no display reaches the developer's own, and copies land in a file.
+    // The clipboard: no display or native pasteboard reaches the developer's own, and
+    // copies go through the platform's clipboard command, which lands them in a file.
     let bin = clipboard_capture(root);
+    env.push((
+        bmux_clipboard::BACKEND_ENV.into(),
+        Some("command".into()),
+    ));
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
         .expect("PATH with the clipboard capture");
@@ -92,8 +97,8 @@ fn isolated_env(root: &Path, dirs: &Dirs) -> Vec<(OsString, Option<OsString>)> {
     env
 }
 
-/// A Wayland display name no compositor serves: native clipboard writes fail and fall back
-/// to `wl-copy`, which [`clipboard_capture`] provides.
+/// A Wayland display name no compositor serves, so nothing reaches a real desktop even
+/// when a native clipboard would be tried.
 const NO_DISPLAY: &str = "bmux-test-no-display";
 
 /// Where copies made by processes under `root` land.
@@ -101,27 +106,30 @@ fn clipboard_file(root: &Path) -> PathBuf {
     root.join("clipboard.txt")
 }
 
-/// A directory holding a `wl-copy` that writes its input to [`clipboard_file`].
+/// A directory holding each platform's clipboard copy command (`wl-copy`, `pbcopy`), each
+/// writing its input to [`clipboard_file`].
 fn clipboard_capture(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
 
     let bin = root.join("clipboard-bin");
-    let program = bin.join("wl-copy");
-    if !program.exists() {
+    if !bin.exists() {
         private_dir(&bin);
         let target = clipboard_file(root);
-        std::fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\ncat > {}.tmp && mv {}.tmp {}\n",
-                shell_quote(&target),
-                shell_quote(&target),
-                shell_quote(&target)
-            ),
-        )
-        .expect("write the clipboard capture");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
-            .expect("make the clipboard capture executable");
+        for name in ["wl-copy", "pbcopy"] {
+            let program = bin.join(name);
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\ncat > {}.tmp && mv {}.tmp {}\n",
+                    shell_quote(&target),
+                    shell_quote(&target),
+                    shell_quote(&target)
+                ),
+            )
+            .expect("write the clipboard capture");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("make the clipboard capture executable");
+        }
     }
     bin
 }

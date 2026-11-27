@@ -17,7 +17,10 @@ struct Home {
 
 impl Home {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("bmux-drive-it-{}", uuid::Uuid::new_v4()));
+        // Short: the drive server's socket (`<root>/drive/<name>/sb/r/server.sock`)
+        // must fit a Unix socket address (104 bytes on macOS).
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let root = std::env::temp_dir().join(format!("bdi-{}", &id[..8]));
         for dir in ["config", "runtime", "data", "state", "logs", "drive"] {
             std::fs::create_dir_all(root.join(dir)).expect("create test directory");
             #[cfg(unix)]

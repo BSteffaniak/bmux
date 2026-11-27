@@ -250,6 +250,10 @@ impl InputAuthority {
 
     /// Recheck after acquiring the writer, and before every partial-write
     /// continuation. Never retry Interrupted or any other uncertain failure.
+    ///
+    /// Once every byte is written the input is delivered: a check after the
+    /// last write could only misreport delivered input as failed (the program
+    /// may already have read it and exited, ending the authority).
     pub(crate) fn write(&self, writer: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             self.check()?;
@@ -259,7 +263,6 @@ impl InputAuthority {
             }
             bytes = &bytes[written..];
         }
-        self.check()?;
         writer.flush()
     }
 }
@@ -344,6 +347,40 @@ mod tests {
         };
         assert!(authority.write(&mut writer, b"abc").is_err());
         assert_eq!(writer.output, b"a");
+    }
+
+    /// Input whose delivery ends the authority (a program that exits on the
+    /// Enter it was sent) was delivered: the write reports success.
+    #[test]
+    fn input_that_ends_its_authority_once_delivered_succeeds() {
+        struct ExitsOnInput {
+            allowed: Arc<AtomicBool>,
+            output: Vec<u8>,
+        }
+        impl Write for ExitsOnInput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                self.allowed.store(false, Ordering::SeqCst);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let allowed = Arc::new(AtomicBool::new(true));
+        let current = allowed.clone();
+        let authority = InputAuthority::new(move || {
+            current
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or("exited".into())
+        });
+        let mut writer = ExitsOnInput {
+            allowed,
+            output: Vec::new(),
+        };
+        authority.write(&mut writer, b"\r").unwrap();
+        assert_eq!(writer.output, b"\r");
     }
 
     #[test]

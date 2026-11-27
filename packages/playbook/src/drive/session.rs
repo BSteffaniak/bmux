@@ -27,7 +27,7 @@ use crate::types::{PluginConfig, SandboxEnvMode};
 const STATE_VERSION: u32 = 1;
 /// JSON terminal-grid snapshots, with pointer-shape state.
 const GRID_FORMAT_VERSION: u32 = 1;
-const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const SERVER_STARTUP_TIMEOUT: Duration = crate::sandbox::SANDBOX_STARTUP_BOUND;
 /// Largest ordered-capture read per request (the pane runtime's limit).
 const CAPTURE_READ_BYTES: u32 = 262_144;
 /// Most capture bytes any one command reads (lint rescans from the start).
