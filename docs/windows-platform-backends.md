@@ -30,8 +30,10 @@ helper process. `runtime/session_control.rs` is the platform-neutral owner;
 - The server holds the job handle for the pane's lifetime. If the server dies,
   even when killed outright, the kernel closes the handle and kill-on-close ends
   every process in the job. No crash records are needed on Windows.
-- With `sweep_on_exit = false`, kill-on-close is cleared once the shell exits
-  while jobs remain, so releasing the handle leaves them running.
+- With `sweep_on_exit = false`, jobs left when the shell exits stay in the job,
+  kill-on-close still set, while they hold the console: a server crash ends
+  them, as the recovery sweep does on Unix. Kill-on-close is cleared only when
+  the pane releases them, so releasing the handle leaves them running.
 
 The early ConPTY cursor reply (`native_process/conpty_startup.rs`) is unchanged.
 The console host is not in the job; the retired console is closed explicitly.

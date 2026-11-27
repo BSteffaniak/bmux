@@ -327,17 +327,21 @@ In the simulation itself:
 
 - Windows jobs now start with the spawn. This is held by the `Preparation`, as natively.
 
-### Open
+### Fixed since (2026-11-27)
 
 - **A Windows close hang with `sweep_on_exit` off.** A pane whose shell exited while leaving
-  a job attached to the console, after restarts, can fail to close: its capture threads wait
-  for console output that only ends once the console closes. The console is closed only after
-  its owner retires.
+  a job attached to the console could fail to close: its capture threads waited for console
+  output that only ends once the console closes, and the console closed only after its owner
+  retired. Two bugs, both behind `sweep=0`:
+  - Supervision ended as soon as the leader's waiter thread finished (its exit channel closed
+    right after reporting the exit), so the pane stopped serving the terminal its survivors
+    still held; on Windows nothing then closed the console. The pane now keeps serving until
+    they release the terminal or it is stopped.
+  - The survivors left their Windows job (kill-on-close cleared) the moment the leader exited,
+    so a server crash no longer ended them, and Windows keeps no records for recovery to sweep.
+    They now stay in the job until the pane lets them go, as Unix's recovery sweep ends them.
 
-  Replay: `SIMULATOR_SEED=3115520519799623519 SIMULATOR_EPOCH_OFFSET=79240133395435` on the
-  build of commit `145a0a38` (its profile is drawn from the seed; it was found before sweeping
-  was kept on by default). Profiles keep sweeping on by default until this is fixed, so CI
-  does not trip over it; `sweep=0` explores it.
+  Profiles draw `sweep=0` again (one run in four); both failures are regression seeds.
 
 ### Not done yet
 

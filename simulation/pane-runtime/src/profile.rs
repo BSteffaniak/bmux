@@ -344,13 +344,7 @@ impl Profile {
         }
         let mut profile = Self {
             programs,
-            // Kept on (the draw stays, so turning it back on shifts nothing): with it off, a
-            // Windows pane whose shell left an attached job can fail to close (an open finding
-            // of phase 18; see the plan). Force it off with `sweep=0` to explore that.
-            sweep: {
-                let _off = draw(4) == 0;
-                true
-            },
+            sweep: draw(4) != 0,
             drivers: 1 + draw(4),
             steps: 5 + draw(56),
             panes: 1 + usize::try_from(draw(5)).unwrap_or(0),

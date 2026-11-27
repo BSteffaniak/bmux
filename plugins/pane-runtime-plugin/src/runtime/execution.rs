@@ -243,7 +243,9 @@ impl ExecutionCapture {
     /// Settle the session after its leader was reaped: sweep what is left when
     /// `sweep` is set, then end and retire it. Without `sweep`, a session that
     /// still has members is left running and retired later by
-    /// [`Self::retire_released_session`] or swept by a forced stop.
+    /// [`Self::retire_released_session`] or swept by a forced stop. Until then
+    /// its members stay the server's: a Windows job keeps killing them on close,
+    /// so a crash ends them, as the recovery sweep does on Unix.
     pub(super) fn settle_after_leader_exit(&self, sweep: bool) {
         let Ok(session) = self.session.lock() else {
             self.record_cleanup_error("terminal session lock poisoned".into());
@@ -266,7 +268,6 @@ impl ExecutionCapture {
                 }
                 Ok(true) => {
                     tracing::debug!("terminal session members left running after leader exit");
-                    control.release_survivors();
                     return;
                 }
                 Err(error) => {
@@ -298,6 +299,9 @@ impl ExecutionCapture {
         }
         tracing::debug!("terminal released by left-running members; retiring session");
         self.terminal_session_ended.store(true, Ordering::SeqCst);
+        // They keep running once the pane lets them go: closing a Windows job
+        // would otherwise end them.
+        control.release_survivors();
         if let Err(error) = self.finish_owner_retirement(|| control.end_lifetime()) {
             self.record_cleanup_error(format!("terminal session release failed: {error}"));
         }

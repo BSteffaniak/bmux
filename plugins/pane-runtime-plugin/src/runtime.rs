@@ -8967,7 +8967,8 @@ impl SessionRuntimeManager {
                         stop_pane!();
                         break;
                     }
-                    child_exit = child_exit_rx.recv() => {
+                    // Once the owner exited its waiter is gone: the closed channel says nothing more.
+                    child_exit = child_exit_rx.recv(), if !owner_exited => {
                         match child_exit {
                             Some(ExecutionExitNotice::OwnerExited) => {
                                 if execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
