@@ -148,6 +148,9 @@ pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
     backend::sweep_unadopted(leader)
 }
 
+/// How often recovery tries one record before keeping it for a later activation.
+const RECOVERY_ATTEMPTS: usize = 3;
+
 /// Sweep every session a server that is gone recorded, then delete its record. Records of a
 /// server still running (this activation may be a command run beside it) are left alone.
 pub(crate) fn recover(records: &Path) {
@@ -161,7 +164,16 @@ pub(crate) fn recover(records: &Path) {
             let _ = switchy_fs::sync::remove_file(&path);
             continue;
         }
-        match backend::recover_record(&path) {
+        // A failed read (a transient I/O error) would leave the gone server's session running
+        // until some later activation recovers it: try the record again a few times first.
+        let mut recovery = backend::recover_record(&path);
+        for _ in 1..RECOVERY_ATTEMPTS {
+            if recovery.is_ok() {
+                break;
+            }
+            recovery = backend::recover_record(&path);
+        }
+        match recovery {
             Ok(crate::platform::RecordRecovery::Swept) => {
                 let _ = switchy_fs::sync::remove_file(&path);
             }
