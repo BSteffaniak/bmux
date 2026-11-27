@@ -18,6 +18,7 @@ pub enum Invariant {
     BystanderHarmless,
     ScreenFromInput,
     OutputDelivered,
+    ReplicaLevel,
 }
 
 impl sim_support::invariants::Invariant for Invariant {
@@ -36,6 +37,7 @@ impl sim_support::invariants::Invariant for Invariant {
         Self::BystanderHarmless,
         Self::ScreenFromInput,
         Self::OutputDelivered,
+        Self::ReplicaLevel,
     ];
 
     fn statement(self) -> &'static str {
@@ -54,6 +56,7 @@ impl sim_support::invariants::Invariant for Invariant {
             Self::BystanderHarmless => "a runtime activated beside the server kills nothing",
             Self::ScreenFromInput => "a pane's screen is what its input made it",
             Self::OutputDelivered => "a pane takes in what its terminal gave it, in order",
+            Self::ReplicaLevel => "a client's replica of a pane shows what the pane shows",
         }
     }
 }

@@ -267,6 +267,14 @@ listed under "Not done yet".
     server recovers.
 - **Wider workload (18.5, in part).** Splits (the facade now addresses each pane of a
   session), interrupts, shells told to `exit`, and `sweep_on_exit` off (`sweep=0`).
+  - Observing clients (2026-11-27): the `observe` action (draw epoch 3, so earlier fields
+    draw as before) takes a pane's frames as an unattached client does
+    (`observe_pane_frames`' path, `frames_for_panes`) and applies them to a replica of its
+    grid in the facade (`Panes::observe`), or, one time in four, stops observing, as a
+    client detaching does (its server-side replica is forgotten, so the next frame is a
+    reset). Invariant 15: a frame that does not apply, or a replica that, brought up to date
+    as the pane closes, shows other than the pane's grid. A mutation that drops every frame
+    after a replica's first is caught at once.
 - **Invariants (18.6).**
   - 8: each program's exit is acted on at most once.
   - 9: nothing is left once every pane closed: no open master, no stray process, no session
@@ -391,5 +399,6 @@ In the simulation itself:
 
 ### Not done yet
 
-- **Wider workload:** attach and detach with grid snapshots, program executions with exit
-  codes, snapshots and resurrection, managed scopes and reservations.
+- **Wider workload:** attaching proper (an attached client's frames and its attach snapshot,
+  where observing covers the frames), program executions with exit codes, snapshots and
+  resurrection, managed scopes and reservations.

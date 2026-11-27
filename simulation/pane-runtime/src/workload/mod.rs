@@ -381,6 +381,7 @@ impl Shared {
             Kind::Bystander => self.bystander(driver).await,
             Kind::Split => self.split(driver).await,
             Kind::Interrupt => self.interrupt(driver),
+            Kind::Observe => self.observe(driver),
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }

@@ -42,6 +42,9 @@
 //! 14. A pane takes in what its terminal gave it, in order: what its grid took in is, but for
 //!     the runtime's own notices, a prefix of every byte the terminal gave its master side (its
 //!     programs' output and its echoes).
+//! 15. A client's replica of a pane shows what the pane's grid shows: a client observing a
+//!     pane (as an unattached client does) applies every frame it is sent, and brought up to
+//!     date as the pane closes, its replica's screen is the pane's.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood

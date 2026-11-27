@@ -12,7 +12,7 @@
 //! or crashed while it starts.
 
 use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
-use bmux_session_models::SessionId;
+use bmux_session_models::{ClientId, SessionId};
 use uuid::Uuid;
 use switchy_thread::sync::{
     Arc, Mutex,
@@ -46,6 +46,15 @@ pub struct Panes {
     runtime: switchy_async::runtime::Runtime,
     /// Ends the task that drives the executor.
     stop: Arc<AtomicBool>,
+    /// Each observing client's replica of a pane, built from the frames it was sent (see
+    /// [`Panes::observe`]).
+    observers: Mutex<std::collections::BTreeMap<(Pane, u64), Replica>>,
+}
+
+/// A client's replica of a pane's grid, and where its frames left off.
+struct Replica {
+    grid: bmux_terminal_grid::TerminalGrid,
+    cursor: bmux_terminal_grid::ReplicaCursor,
 }
 
 /// What a server holds.
@@ -282,6 +291,7 @@ impl Panes {
             }),
             runtime,
             stop,
+            observers: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -452,6 +462,129 @@ impl Panes {
                 })
             })
             .flatten()
+    }
+
+    /// As client `client` observing `pane` without attaching does: take the frames the pane has
+    /// for it and apply them to its replica of the pane's grid (a new replica's first frame
+    /// is a reset). Returns whether the pane exists.
+    ///
+    /// # Errors
+    ///
+    /// * A frame that does not apply to the replica
+    pub fn observe(&self, pane: Pane, client: u64) -> Result<bool, String> {
+        let refs = lock(&self.server.manager)
+            .pane_data_refs_for_targets(&[(pane.session, pane.pane)]);
+        if refs.is_empty() {
+            return Ok(false);
+        }
+        let client_id = ClientId(Uuid::from_u128(u128::from(client)));
+        let mut observers = lock(&self.observers);
+        let replica = observers.entry((pane, client)).or_insert_with(|| Replica {
+            grid: bmux_terminal_grid::TerminalGrid::new(
+                1,
+                1,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .expect("a 1x1 grid"),
+            cursor: bmux_terminal_grid::ReplicaCursor::default(),
+        });
+        loop {
+            let (frames, pending) = super::frames_for_panes(&refs, client_id, usize::MAX)
+                .map_err(|error| format!("taking frames failed: {error:?}"))?;
+            for frame in frames {
+                replica
+                    .grid
+                    .apply_frame(&frame.encoded, &mut replica.cursor)
+                    .map_err(|error| format!("a frame did not apply: {error:?}"))?;
+            }
+            if !pending {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Client `client` stops observing `pane` (as a detaching client): the server forgets its
+    /// replica, so observing again starts over.
+    pub fn unobserve(&self, pane: Pane, client: u64) {
+        lock(&self.observers).remove(&(pane, client));
+        let refs = lock(&self.server.manager)
+            .pane_data_refs_for_targets(&[(pane.session, pane.pane)]);
+        let client_id = ClientId(Uuid::from_u128(u128::from(client)));
+        for pane in refs {
+            if let Ok(mut replicas) = pane.frame_replicas.lock() {
+                replicas.remove(&client_id);
+            }
+        }
+    }
+
+    /// Whether client `client`'s replica of `pane`, brought up to date, shows what the pane's
+    /// grid shows; `None` when it does not observe the pane. It stops observing.
+    ///
+    /// The pane may still take in output, so the grid is read (its revision and screen), then
+    /// the replica brought up to date: when the revision held still meanwhile, the replica
+    /// must show that screen.
+    #[must_use]
+    pub fn observed_level(&self, pane: Pane, client: u64) -> Option<Result<(), String>> {
+        if !lock(&self.observers).contains_key(&(pane, client)) {
+            return None;
+        }
+        let checked = self.level_once(pane, client);
+        self.unobserve(pane, client);
+        Some(checked)
+    }
+
+    fn level_once(&self, pane: Pane, client: u64) -> Result<(), String> {
+        let text = |rows: &[bmux_terminal_grid::RowSnapshot]| -> Vec<String> {
+            rows.iter()
+                .map(|row| {
+                    row.runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let grid_now = || {
+            self.server
+                .with_pane(pane, |handle| {
+                    handle
+                        .terminal_grid
+                        .lock()
+                        .map(|grid| {
+                            let grid = grid.grid();
+                            (grid.revision(), grid.height(), grid.snapshot(0, grid.height()).rows)
+                        })
+                        .map_err(|_| "the grid lock was poisoned".to_owned())
+                })
+                .ok_or_else(|| "the pane is gone".to_owned())?
+        };
+        let mut last = None;
+        for _ in 0..16 {
+            let (revision, height, rows) = grid_now()?;
+            self.observe(pane, client)?;
+            if grid_now()?.0 != revision {
+                continue;
+            }
+            let observers = lock(&self.observers);
+            let replica = &observers
+                .get(&(pane, client))
+                .ok_or("the replica is gone")?
+                .grid;
+            let shown = replica.snapshot(0, replica.height()).rows;
+            if (replica.height(), &shown) == (height, &rows) {
+                return Ok(());
+            }
+            last = Some(format!(
+                "the replica shows {:?} ({} rows), the grid {:?} ({height} rows)",
+                text(&shown),
+                replica.height(),
+                text(&rows),
+            ));
+            break;
+        }
+        Err(last.unwrap_or_else(|| "the grid never held still".to_owned()))
     }
 
     /// Bytes of output `pane` has taken in.

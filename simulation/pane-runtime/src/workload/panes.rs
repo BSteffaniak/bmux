@@ -262,6 +262,29 @@ impl Shared {
         }
     }
 
+    /// Observe a pane as a client does, checking invariant 15 as its frames apply, or (one
+    /// time in four) stop observing it, as a client detaching does.
+    pub(super) fn observe(&self, driver: u64) {
+        let (pane, panes) = {
+            let state = self.lock();
+            let Some(pane) = Self::pick(&state, driver) else {
+                return;
+            };
+            (pane, Arc::clone(&state.panes))
+        };
+        if draw(4) == 0 {
+            panes.unobserve(pane, OBSERVER);
+            return;
+        }
+        checked(Invariant::ReplicaLevel);
+        if let Err(problem) = panes.observe(pane, OBSERVER) {
+            self.violated(
+                Invariant::ReplicaLevel,
+                format!("observing a pane: {problem}"),
+            );
+        }
+    }
+
     /// Resize a pane, checking invariant 3.
     pub(super) async fn resize(&self, driver: u64) {
         let (pane, rows, cols, epoch, panes) = {
@@ -343,6 +366,51 @@ impl Shared {
         Board::closed(&format!("{pane:?}"));
     }
 
+    /// Invariants 13, 14 and 15, as `pane` (whose program was `opened`) closes: its screen,
+    /// what it took in, and an observing client's replica of it.
+    fn check_screen(&self, panes: &Panes, pane: Pane, opened: &Opened) {
+        let pid = opened.pid;
+        // 14. A pane takes in what its terminal gave it (its program's output and the terminal's
+        // echoes), in order.
+        if opened.programs == 1
+            && let (Some(terminal), Some(chunks)) = (&opened.terminal, panes.taken_in(pane))
+        {
+            checked(Invariant::OutputDelivered);
+            let given = simulator::terminal_output(terminal).unwrap_or_default();
+            // A console's own cursor query, which it opens with, the runtime answers as the
+            // pane starts and never shows.
+            let given = if switchy_pty::behavior().startup_cursor_query {
+                given.strip_prefix(b"\x1b[6n").unwrap_or(&given)
+            } else {
+                &given
+            };
+            if let Some(problem) = delivery_problem(given, &chunks) {
+                self.violated(
+                    Invariant::OutputDelivered,
+                    format!("pane process {pid} ({terminal}): {problem}"),
+                );
+            }
+        }
+        // 15. A client's replica of a pane shows what the pane's grid shows.
+        if let Some(level) = panes.observed_level(pane, OBSERVER) {
+            checked(Invariant::ReplicaLevel);
+            if let Err(difference) = level {
+                self.violated(
+                    Invariant::ReplicaLevel,
+                    format!("pane process {pid}: {difference}"),
+                );
+            }
+        }
+        // 13. A pane's screen is what its input made it.
+        checked(Invariant::ScreenFromInput);
+        if let Some(Err(difference)) = panes.screen_check(pane) {
+            self.violated(
+                Invariant::ScreenFromInput,
+                format!("pane process {pid}: {difference}"),
+            );
+        }
+    }
+
     /// Close `pane` (already out of the open set), checking invariants 2 and 4.
     pub(super) async fn close(&self, panes: &Panes, pane: Pane, opened: &Opened) {
         // 2. Every typed line reached the program, in order (unless it ended meanwhile).
@@ -380,35 +448,7 @@ impl Shared {
                 );
             }
         }
-        // 14. A pane takes in what its terminal gave it (its program's output and the terminal's
-        // echoes), in order.
-        if opened.programs == 1
-            && let (Some(terminal), Some(chunks)) = (&opened.terminal, panes.taken_in(pane))
-        {
-            checked(Invariant::OutputDelivered);
-            let given = simulator::terminal_output(terminal).unwrap_or_default();
-            // A console's own cursor query, which it opens with, the runtime answers as the
-            // pane starts and never shows.
-            let given = if switchy_pty::behavior().startup_cursor_query {
-                given.strip_prefix(b"\x1b[6n").unwrap_or(&given)
-            } else {
-                &given
-            };
-            if let Some(problem) = delivery_problem(given, &chunks) {
-                self.violated(
-                    Invariant::OutputDelivered,
-                    format!("pane process {pid} ({terminal}): {problem}"),
-                );
-            }
-        }
-        // 13. A pane's screen is what its input made it.
-        checked(Invariant::ScreenFromInput);
-        if let Some(Err(difference)) = panes.screen_check(pane) {
-            self.violated(
-                Invariant::ScreenFromInput,
-                format!("pane process {pid}: {difference}"),
-            );
-        }
+        self.check_screen(panes, pane, opened);
         // Its program leads its session (invariant 1), whose serial is the program's: it may
         // have exited (and been reaped), leaving jobs behind in it.
         let session = session_serial_of(opened.serial)
@@ -672,6 +712,9 @@ fn answered(pid: u32, lines: &[String]) -> bool {
         })
     })
 }
+
+/// The client the workload observes panes as.
+const OBSERVER: u64 = 1;
 
 /// The terminal the process of `serial` started on, while the kernel still has it.
 fn terminal_by_serial(serial: u64) -> Option<String> {
