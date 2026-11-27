@@ -308,6 +308,33 @@ impl Default for Profile {
 }
 
 impl Profile {
+    /// This profile without what makes a run's outcome hang on timing: one driver, no faults,
+    /// no crashes, restarts, interrupts, power losses or bystanders, and no programs that exit
+    /// at once (whether one ended before its pane adopted it is a race). What is left should
+    /// end the same on every system, which `--metamorphic` checks.
+    #[must_use]
+    pub fn calm(mut self) -> Self {
+        self.drivers = 1;
+        self.faults = FaultRates::default();
+        for (kind, weight) in Kind::ALL.iter().zip(self.weights.iter_mut()) {
+            if matches!(
+                kind,
+                Kind::Crash | Kind::Restart | Kind::Interrupt | Kind::PowerLoss | Kind::Bystander
+            ) {
+                *weight = 0;
+            }
+        }
+        for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs.iter_mut()) {
+            if matches!(kind, programs::Kind::Instant | programs::Kind::Orphaner) {
+                *weight = 0;
+            }
+        }
+        if self.programs.iter().all(|weight| *weight == 0) {
+            self.programs[0] = 1;
+        }
+        self
+    }
+
     /// Draw a profile with `draw(bound)`, which returns a number below `bound`.
     pub fn draw(draw: impl FnMut(u64) -> u64) -> Self {
         Self::draw_through(draw, LAST_EPOCH)

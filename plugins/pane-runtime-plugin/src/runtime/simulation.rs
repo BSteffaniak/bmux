@@ -303,6 +303,14 @@ impl Panes {
             .ok_or_else(|| anyhow::anyhow!("the server died"))?
     }
 
+    /// The serials of the session leaders whose left-running jobs the runtime released (with
+    /// `sweep_on_exit` off, once the pane's terminal reached end of file): they keep running,
+    /// whatever happens to the pane, as `docs/pane-execution.md` says.
+    #[must_use]
+    pub fn released_sessions(&self) -> Vec<u64> {
+        released().lock().map(|released| released.clone()).unwrap_or_default()
+    }
+
     /// The panes `pane`'s session has (with it).
     #[must_use]
     pub fn siblings(&self, pane: Pane) -> Vec<Pane> {
@@ -417,6 +425,35 @@ impl Panes {
             .unwrap_or(false)
     }
 
+    /// Whether `pane`'s grid shows what a replay of everything it took in shows (the grid's
+    /// record of its output and resizes): `None` when there is no such pane.
+    #[must_use]
+    pub fn screen_check(&self, pane: Pane) -> Option<Result<(), String>> {
+        self.server.with_pane(pane, |handle| {
+            handle
+                .terminal_grid
+                .lock()
+                .map_err(|_| "the grid lock was poisoned".to_owned())
+                .and_then(|grid| grid.check_record())
+        })
+    }
+
+    /// The chunks of output `pane`'s grid took in, in order: its programs' output as read, and
+    /// the runtime's own notices (which start `\r\n[bmux] `). `None` when there is no such pane.
+    #[must_use]
+    pub fn taken_in(&self, pane: Pane) -> Option<Vec<Vec<u8>>> {
+        self.server
+            .with_pane(pane, |handle| {
+                handle.terminal_grid.lock().ok().map(|grid| {
+                    grid.recorded_output()
+                        .into_iter()
+                        .map(<[u8]>::to_vec)
+                        .collect()
+                })
+            })
+            .flatten()
+    }
+
     /// Bytes of output `pane` has taken in.
     #[must_use]
     pub fn output_bytes(&self, pane: Pane) -> u64 {
@@ -478,5 +515,19 @@ impl Panes {
             }
         }
         panes
+    }
+}
+
+/// The run's record of released sessions (see [`Panes::released_sessions`]).
+struct ReleasedSessions;
+
+fn released() -> Arc<Mutex<Vec<u64>>> {
+    crate::run_shared::run_shared::<ReleasedSessions, _>(|| Mutex::new(Vec::new()))
+}
+
+/// Record that the runtime released the jobs of the session `leader` (a serial) led.
+pub(crate) fn record_release(leader: u64) {
+    if let Ok(mut released) = released().lock() {
+        released.push(leader);
     }
 }

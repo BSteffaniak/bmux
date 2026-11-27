@@ -302,6 +302,10 @@ impl ExecutionCapture {
         // They keep running once the pane lets them go: closing a Windows job
         // would otherwise end them.
         control.release_survivors();
+        #[cfg(feature = "simulator")]
+        if let Some(leader) = control.leader_serial() {
+            super::simulation::record_release(leader);
+        }
         if let Err(error) = self.finish_owner_retirement(|| control.end_lifetime()) {
             self.record_cleanup_error(format!("terminal session release failed: {error}"));
         }

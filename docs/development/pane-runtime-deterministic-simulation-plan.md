@@ -216,6 +216,7 @@ Phases 15.1–15.5 as built (2026-11-21):
   `cargo sim pane-runtime --tui` shows the scheduler, the invariants, a Panes
   tab and the kernel's processes, signals and terminal screens, with pausing,
   stepping, going back and breaking on failures.
-- **Not yet:** crash recovery and restart in the simulation (a detached host
-  writes no crash records), regression seeds for the new simulations, and
-  files on `switchy_fs`.
+- **Since landed:** crash recovery and restart in the simulation (the crash
+  model and power losses of the bug-hunting plan, phase 18), regression seeds
+  for every simulation (`sim_support::regression`), and files on `switchy_fs`
+  (56194039, 693b5b39).

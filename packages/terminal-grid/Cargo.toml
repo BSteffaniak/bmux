@@ -27,3 +27,6 @@ serde_json                = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
+# Streams record what they take in, so a simulation can check a grid against a replay
+# (`TerminalGridStream::check_record`).
+record = []

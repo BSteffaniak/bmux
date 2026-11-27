@@ -60,6 +60,18 @@ against its replay shows where they part when a seed does not replay;
 `PANE_RUNTIME_SIM_BACKTRACE_AT=N` adds where the stopping thread was at
 decision `N`.
 
+## Comparing systems
+
+`--metamorphic` runs each seed as Linux, macOS and Windows, each in a process of
+its own, with the profile calmed (one driver, no faults, crashes, restarts,
+interrupts, power losses or bystanders), and reports a seed whose runs ended
+differently, with each run's counts and replay command. See
+`src/metamorphic.rs`.
+
+```bash
+SIMULATOR_RUNS=300 cargo sim pane-runtime --metamorphic
+```
+
 ## Exploring scenarios
 
 `--explore` runs short scripted scenarios under every thread schedule within a

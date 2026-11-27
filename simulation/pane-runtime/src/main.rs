@@ -7,6 +7,8 @@
 //! (with either of the first two) steers runs toward shapes not seen yet; see
 //! `pane_runtime::guide`. `--explore <scenario|all> [--preemptions N]` runs short scripted
 //! scenarios under every schedule within a preemption bound; see `pane_runtime::explore`.
+//! `--metamorphic` runs each seed as Linux, macOS and Windows and compares how they end; see
+//! `pane_runtime::metamorphic`.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
@@ -17,6 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--explore") {
         return explore::main(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("--metamorphic") {
+        return pane_runtime::metamorphic::main().map(|code| {
+            if code != std::process::ExitCode::SUCCESS {
+                std::process::exit(1);
+            }
+        });
     }
     // Guided runs steer toward shapes not seen yet (see `pane_runtime::guide`).
     if let Some(at) = args.iter().position(|arg| arg == "--guided") {

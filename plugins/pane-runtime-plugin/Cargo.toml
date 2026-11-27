@@ -116,6 +116,7 @@ image-registry = [
 ]
 simulator = [
     "bmux_pty/simulator",
+    "bmux_terminal_grid/record",
     "dep:switchy_pty",
     "dep:switchy_simulation",
     "switchy_pty/simulator",

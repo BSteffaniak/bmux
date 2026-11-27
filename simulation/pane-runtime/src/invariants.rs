@@ -16,6 +16,8 @@ pub enum Invariant {
     EndedSaysSo,
     SiblingsAlone,
     BystanderHarmless,
+    ScreenFromInput,
+    OutputDelivered,
 }
 
 impl sim_support::invariants::Invariant for Invariant {
@@ -32,6 +34,8 @@ impl sim_support::invariants::Invariant for Invariant {
         Self::EndedSaysSo,
         Self::SiblingsAlone,
         Self::BystanderHarmless,
+        Self::ScreenFromInput,
+        Self::OutputDelivered,
     ];
 
     fn statement(self) -> &'static str {
@@ -48,6 +52,8 @@ impl sim_support::invariants::Invariant for Invariant {
             Self::EndedSaysSo => "a pane whose program ended says so",
             Self::SiblingsAlone => "closing a pane leaves its siblings alone",
             Self::BystanderHarmless => "a runtime activated beside the server kills nothing",
+            Self::ScreenFromInput => "a pane's screen is what its input made it",
+            Self::OutputDelivered => "a pane takes in what its terminal gave it, in order",
         }
     }
 }

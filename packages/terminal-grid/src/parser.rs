@@ -32,6 +32,28 @@ pub struct TerminalGridStream {
     /// The parser replacements are applied with, made at the first and reused while each ends
     /// between sequences.
     replayer: Option<Box<Parser>>,
+    /// Everything the stream took in since it was made (the `record` feature).
+    #[cfg(feature = "record")]
+    record: StreamRecord,
+}
+
+/// What a stream took in since it was made (the `record` feature, for simulations, which check
+/// a grid against a replay of its input): the grid and parser prefix it started from, then each
+/// chunk of output and each resize, in order.
+#[cfg(feature = "record")]
+#[derive(Debug, Clone)]
+struct StreamRecord {
+    start: TerminalGrid,
+    start_pending: Vec<u8>,
+    fed: Vec<Fed>,
+}
+
+/// One thing a recording stream took in.
+#[cfg(feature = "record")]
+#[derive(Debug, Clone)]
+enum Fed {
+    Output(Vec<u8>),
+    Resize(u16, u16),
 }
 
 impl TerminalGridStream {
@@ -49,6 +71,12 @@ impl TerminalGridStream {
     pub fn from_grid(grid: TerminalGrid) -> Self {
         Self {
             parser: Parser::new(),
+            #[cfg(feature = "record")]
+            record: StreamRecord {
+                start: grid.clone(),
+                start_pending: Vec::new(),
+                fed: Vec::new(),
+            },
             grid,
             pending_bytes: Vec::new(),
             previous_pending: Vec::new(),
@@ -79,8 +107,80 @@ impl TerminalGridStream {
                 .parser
                 .advance(&mut ParserRestore, &snapshot.pending_bytes);
             stream.pending_bytes.clone_from(&snapshot.pending_bytes);
+            #[cfg(feature = "record")]
+            stream
+                .record
+                .start_pending
+                .clone_from(&snapshot.pending_bytes);
         }
         Ok(stream)
+    }
+
+    /// The output chunks the stream took in since it was made, in order (the `record` feature).
+    #[cfg(feature = "record")]
+    #[must_use]
+    pub fn recorded_output(&self) -> Vec<&[u8]> {
+        self.record
+            .fed
+            .iter()
+            .filter_map(|fed| match fed {
+                Fed::Output(bytes) => Some(bytes.as_slice()),
+                Fed::Resize(..) => None,
+            })
+            .collect()
+    }
+
+    /// Check the grid against a replay of everything the stream took in (the `record`
+    /// feature): a fresh stream from the same start, fed the same output and resizes in the same
+    /// order, must show the same (revisions aside). A difference means something changed the
+    /// grid outside its input, or the input was not what it was fed. The replay applies no
+    /// sequence filters, so a stream fed through filters that change sequences replays
+    /// differently.
+    ///
+    /// # Errors
+    ///
+    /// * A description of the first difference
+    #[cfg(feature = "record")]
+    pub fn check_record(&self) -> Result<(), String> {
+        let mut replay = Self::from_grid(self.record.start.clone());
+        if !self.record.start_pending.is_empty() {
+            replay
+                .parser
+                .advance(&mut ParserRestore, &self.record.start_pending);
+            replay.pending_bytes.clone_from(&self.record.start_pending);
+        }
+        for fed in &self.record.fed {
+            match fed {
+                Fed::Output(bytes) => replay.process(bytes),
+                Fed::Resize(width, height) => replay
+                    .resize(*width, *height)
+                    .map_err(|error| format!("replaying a resize to {width}x{height}: {error}"))?,
+            }
+        }
+        let rows = self.grid.height();
+        let comparable = |stream: &Self| {
+            let mut snapshot = stream.snapshot(0, rows);
+            snapshot.revision = 0;
+            snapshot.content_revision = 0;
+            snapshot
+        };
+        let (actual, replayed) = (comparable(self), comparable(&replay));
+        if actual == replayed {
+            return Ok(());
+        }
+        let outputs = self
+            .record
+            .fed
+            .iter()
+            .filter(|fed| matches!(fed, Fed::Output(_)))
+            .count();
+        Err(format!(
+            "the grid differs from a replay of its {outputs} output chunks and {} resizes: \
+             shows {:?}, replay {:?}",
+            self.record.fed.len() - outputs,
+            screen_text(&actual),
+            screen_text(&replayed),
+        ))
     }
 
     /// Borrow the structured grid.
@@ -131,6 +231,8 @@ impl TerminalGridStream {
         if bytes.is_empty() {
             return;
         }
+        #[cfg(feature = "record")]
+        self.record.fed.push(Fed::Output(bytes.to_vec()));
         let revision = self.grid.revision();
         std::mem::swap(&mut self.pending_bytes, &mut self.previous_pending);
         let mut performer = GridPerformer {
@@ -191,7 +293,10 @@ impl TerminalGridStream {
     ///
     /// Returns an error if width or height is zero.
     pub fn resize(&mut self, width: u16, height: u16) -> Result<(), TerminalGridError> {
-        self.grid.resize(width, height)
+        self.grid.resize(width, height)?;
+        #[cfg(feature = "record")]
+        self.record.fed.push(Fed::Resize(width, height));
+        Ok(())
     }
 }
 
@@ -522,6 +627,23 @@ struct ObservedDcs {
     intermediate_len: usize,
     action: char,
     data: Vec<u8>,
+}
+
+/// The text of a snapshot's rows, a line each, for a difference report.
+#[cfg(feature = "record")]
+fn screen_text(snapshot: &crate::GridSnapshot) -> Vec<String> {
+    snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            row.runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
 }
 
 struct ParserRestore;
@@ -2516,5 +2638,33 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+}
+
+#[cfg(all(test, feature = "record"))]
+mod record_tests {
+    use super::TerminalGridStream;
+    use crate::GridLimits;
+
+    #[test]
+    fn a_grid_matches_the_replay_of_what_it_took_in() {
+        let mut stream = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        stream.process(b"hello \x1b[1mbold\x1b[0m\r\nsecond line");
+        stream.resize(10, 3).unwrap();
+        stream.process(b"\x1b[2Jthird");
+        // A chunk split inside an escape sequence replays the same.
+        stream.process(b"\x1b[3");
+        stream.process(b"1mred");
+        assert_eq!(stream.check_record(), Ok(()));
+    }
+
+    #[test]
+    fn a_change_outside_its_input_is_a_difference() {
+        let mut stream = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        stream.process(b"seen");
+        // As if something wrote to the grid without going through the stream.
+        stream.grid_mut().process(b" unseen");
+        let error = stream.check_record().unwrap_err();
+        assert!(error.contains("unseen"), "{error}");
     }
 }

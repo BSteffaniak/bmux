@@ -46,6 +46,8 @@ pub(super) struct Opened {
     /// Its program's id and serial (ids are reused; serials are not).
     pub(super) pid: u32,
     pub(super) serial: u64,
+    /// The terminal its first program started on (by its serial, while it ran), if known.
+    pub(super) terminal: Option<String>,
     /// Lines typed into its current program.
     pub(super) typed: Vec<String>,
     /// Programs it has started (one, plus one per restart begun).
@@ -117,6 +119,24 @@ impl Stats {
         .into_iter()
         .map(|(name, count)| format!("{name}:{}", bucket(count)))
         .collect()
+    }
+
+    /// The counts a metamorphic run compares across personalities, exactly. Not lines typed:
+    /// a pane takes input for as long as it serves its terminal, which outlasts its program
+    /// longer on Windows (whose output ends only with the console), though what is typed then
+    /// reaches nothing on any system.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "opened={} resized={} closed={} crashed={} restarted={} cancelled={} failed_opens={}",
+            self.opened,
+            self.resized,
+            self.closed,
+            self.crashed,
+            self.restarted,
+            self.cancelled,
+            self.failed_opens
+        )
     }
 
     /// Shape tags for what the run did.

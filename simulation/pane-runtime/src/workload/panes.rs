@@ -133,6 +133,7 @@ impl Shared {
             Opened {
                 pid,
                 serial,
+                terminal: terminal_by_serial(serial),
                 typed: Vec::new(),
                 programs: 1,
                 restarting: false,
@@ -233,6 +234,7 @@ impl Shared {
             Opened {
                 pid,
                 serial,
+                terminal: terminal_by_serial(serial),
                 typed: Vec::new(),
                 programs: 1,
                 restarting: false,
@@ -378,7 +380,39 @@ impl Shared {
                 );
             }
         }
-        let session = session_serial_of(opened.serial);
+        // 14. A pane takes in what its terminal gave it (its program's output and the terminal's
+        // echoes), in order.
+        if opened.programs == 1
+            && let (Some(terminal), Some(chunks)) = (&opened.terminal, panes.taken_in(pane))
+        {
+            checked(Invariant::OutputDelivered);
+            let given = simulator::terminal_output(terminal).unwrap_or_default();
+            // A console's own cursor query, which it opens with, the runtime answers as the
+            // pane starts and never shows.
+            let given = if switchy_pty::behavior().startup_cursor_query {
+                given.strip_prefix(b"\x1b[6n").unwrap_or(&given)
+            } else {
+                &given
+            };
+            if let Some(problem) = delivery_problem(given, &chunks) {
+                self.violated(
+                    Invariant::OutputDelivered,
+                    format!("pane process {pid} ({terminal}): {problem}"),
+                );
+            }
+        }
+        // 13. A pane's screen is what its input made it.
+        checked(Invariant::ScreenFromInput);
+        if let Some(Err(difference)) = panes.screen_check(pane) {
+            self.violated(
+                Invariant::ScreenFromInput,
+                format!("pane process {pid}: {difference}"),
+            );
+        }
+        // Its program leads its session (invariant 1), whose serial is the program's: it may
+        // have exited (and been reaped), leaving jobs behind in it.
+        let session = session_serial_of(opened.serial)
+            .or_else(|| (opened.serial != 0).then_some(opened.serial));
         // 11. Closing a pane leaves its siblings (its session's other panes) alone.
         let siblings = self.siblings_of(panes, pane);
         let signalled_before: usize = simulator::signal_log().len();
@@ -397,7 +431,10 @@ impl Shared {
                         format!("closing pane process {pid} failed to clean up: {error}"),
                     );
                 }
-                if let Some(session) = session {
+                // (Unless the runtime released them: then they outlive the pane by design.)
+                if let Some(session) =
+                    session.filter(|session| !panes.released_sessions().contains(session))
+                {
                     let ended = self.settle(|| running_in(&[session]).is_empty()).await;
                     if !ended {
                         self.violated(
@@ -634,4 +671,37 @@ fn answered(pid: u32, lines: &[String]) -> bool {
             true
         })
     })
+}
+
+/// The terminal the process of `serial` started on, while the kernel still has it.
+fn terminal_by_serial(serial: u64) -> Option<String> {
+    simulator::snapshot()
+        .processes
+        .into_iter()
+        .find(|process| process.serial == serial)
+        .and_then(|process| process.terminal)
+}
+
+/// What is wrong with a pane taking in `chunks` from a terminal that gave its master side
+/// `written` to read, if anything: each chunk is either the next part of it or one of the
+/// runtime's notices, so what the pane took in is a prefix of it (the rest may not have been
+/// read yet), notices aside.
+fn delivery_problem(written: &[u8], chunks: &[Vec<u8>]) -> Option<String> {
+    let mut at = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if written[at..].starts_with(chunk) {
+            at += chunk.len();
+        } else if !chunk.starts_with(b"\r\n[bmux] ") {
+            let next = &written[at..written.len().min(at + chunk.len().max(16))];
+            return Some(format!(
+                "chunk {index} of {} took in {:?} where the terminal gave {:?} next (at byte {at} \
+                 of {})",
+                chunks.len(),
+                String::from_utf8_lossy(chunk),
+                String::from_utf8_lossy(next),
+                written.len()
+            ));
+        }
+    }
+    None
 }

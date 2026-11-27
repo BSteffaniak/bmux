@@ -160,8 +160,7 @@ impl Shared {
         }
         // Everything running now that no outsider started belongs to the dead server.
         // (So do the daemons panes' programs detached, by design.)
-        let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
-        outsiders.extend(detached());
+        let outsiders = self.outsiders();
         let owned: Vec<u64> = simulator::snapshot()
             .processes
             .iter()
@@ -234,12 +233,33 @@ impl Shared {
         }
     }
 
+    /// The serials of running processes no server owns: those outsiders started, the daemons
+    /// panes' programs detached (by design), and the jobs the runtime released (left running
+    /// with `sweep_on_exit` off once their pane's terminal reached end of file, as documented).
+    fn outsiders(&self) -> Vec<u64> {
+        let (mut outsiders, panes) = {
+            let state = self.lock();
+            let witnesses: Vec<u64> = state.witnesses.iter().map(|w| w.serial).collect();
+            (witnesses, Arc::clone(&state.panes))
+        };
+        // Not under the state's lock: the record's own lock is a switch point.
+        let released = panes.released_sessions();
+        outsiders.extend(detached());
+        outsiders.extend(
+            simulator::snapshot()
+                .processes
+                .iter()
+                .filter(|p| released.contains(&p.session_serial))
+                .map(|p| p.serial),
+        );
+        outsiders
+    }
+
     /// Invariant 9: with every pane closed, nothing the runtime had is left: no terminal's
     /// master side open, no process running but those started outside it, no session record.
     pub(super) async fn check_nothing_leaks(&self) {
         checked(Invariant::NothingLeft);
-        let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
-        outsiders.extend(detached());
+        let outsiders = self.outsiders();
         let strays = || -> Vec<String> {
             simulator::snapshot()
                 .processes

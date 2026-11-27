@@ -232,8 +232,8 @@ found is described in the implementation notes below.
 
 ## Implementation notes
 
-Status (2026-11-22): 18.1–18.4, 18.7, 18.8 and 18.10 landed. 18.5 and 18.6 landed in part; what
-is missing is listed under "Not done yet".
+Status (2026-11-27): 18.1–18.4 and 18.6–18.10 landed. 18.5 landed in part; what is missing is
+listed under "Not done yet".
 
 ### What landed
 
@@ -267,13 +267,31 @@ is missing is listed under "Not done yet".
     server recovers.
 - **Wider workload (18.5, in part).** Splits (the facade now addresses each pane of a
   session), interrupts, shells told to `exit`, and `sweep_on_exit` off (`sweep=0`).
-- **Invariants (18.6, in part).**
+- **Invariants (18.6).**
   - 8: each program's exit is acted on at most once.
   - 9: nothing is left once every pane closed: no open master, no stray process, no session
     record.
   - 10: a pane whose program ended says so.
   - 11: closing a pane leaves its siblings alone.
+  - 13: a pane's screen is what its input made it. With the `record` feature (which the
+    plugin's `simulator` feature turns on), `bmux_terminal_grid`'s streams record the grid
+    they started from and every chunk and resize they took in; `check_record` replays that
+    into a fresh stream and compares the screens. Checked as each pane closes.
+  - 14: a pane takes in what its terminal gave it, in order: the chunks its grid took in are
+    consecutive parts of everything the terminal gave its master side (new in `switchy_pty`:
+    `terminal_output`, which has the echoes `terminal_written` lacks), but for the runtime's
+    own notices and, on Windows, the console's startup query the runtime answers.
+  - 4 now also covers a pane whose program already exited: its session is the program's
+    serial, not looked up among running processes. Jobs the runtime released (`sweep=0`, once
+    the terminal reached end of file) are excused from 4, 6 and 9, as documented in
+    `docs/pane-execution.md`; the plugin records each release for the simulation.
   - 5 now also fails an action that never finishes, naming the live threads.
+- **Metamorphic runs (18.6).** `--metamorphic` runs each seed as Linux, macOS and Windows,
+  each in a process of its own, with the profile calmed (`Profile::calm`: one driver, no
+  faults, crashes, restarts, interrupts, power losses or bystanders, no programs that exit at
+  once), and compares how many panes opened, resized, closed and failed to open, and whether
+  every run passed. Lines typed are not compared: a pane takes input for as long as it serves
+  its terminal, which outlasts its program longer on Windows. 300 seeds end alike.
 - **Scheduling and clock (18.7).** `SIMULATOR_SCHEDULE_STRATEGY=swarm` and
   `SIMULATOR_WEAK_MEMORY=swarm` (switchy_thread) are every simulation's defaults. Profiles draw
   the clock rate (1, 10 or 100 ms per step).
@@ -343,10 +361,21 @@ In the simulation itself:
 
   Profiles draw `sweep=0` again (one run in four); both failures are regression seeds.
 
+- **A Windows console closed under the lock callers take (bmux_pty).** The first nightly
+  fleets failed 1–2 runs in 5000 with drivers that never finished. When a process exited,
+  `bmux_pty`'s exit thread dropped the console while holding the control's lock; closing a
+  console waits until its output is read, and with a full event queue the reader waits for
+  the caller, who was waiting for the lock to resize. The console is now closed outside the
+  lock, and callers use it under the lock without keeping a clone.
+- **One failed read of a crash record left a dead server's session running.** Recovery kept a
+  record it could not read for a later activation; with file faults, the crashed server's
+  jobs ran on until then. Recovery now tries a record three times first.
+- **The simulation's own mistakes**, found by the metamorphic runs and the new invariants:
+  on macOS the hung-up terminal releases a shell's leftover jobs at once (documented), which
+  invariant 9 counted as leaks; and invariant 4 skipped panes whose program had already
+  exited.
+
 ### Not done yet
 
 - **Wider workload:** attach and detach with grid snapshots, program executions with exit
   codes, snapshots and resurrection, managed scopes and reservations.
-- **Grid consistency (18.6):** that what a pane's grid shows matches what its program wrote.
-- **Metamorphic runs (18.6):** the `--metamorphic` mode, one workload under three
-  personalities.

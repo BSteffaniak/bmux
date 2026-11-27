@@ -12,7 +12,8 @@
 //!
 //! 1. Exactly one `Exited` per process, last; nothing after it.
 //! 2. With `output_complete`, the terminal output and captured stdout delivered are exactly
-//!    what programs wrote, in order; otherwise they are a prefix of it.
+//!    what the terminal gave (programs' output and echoes of what was typed) and what programs
+//!    wrote, in order; otherwise they are a prefix of it.
 //! 3. The control handle reports the exit before (or as) `Exited` is delivered.
 //! 4. After a kill or a drop, nothing in the process group is left running.
 //! 5. An interrupt, kill or termination never reaches a session no driver signalled.
@@ -76,7 +77,7 @@ impl sim_support::invariants::Invariant for Invariant {
     fn statement(self) -> &'static str {
         match self {
             Self::OneExit => "exactly one Exited per process, last",
-            Self::Delivered => "output delivered is what programs wrote",
+            Self::Delivered => "output delivered is what the terminal and programs gave",
             Self::ControlKnowsExit => "the control handle knows the exit first",
             Self::GroupEnds => "a killed or dropped process's group ends",
             Self::SignalsContained => "ending signals reach only signalled sessions",
@@ -546,7 +547,6 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
         terminal: io.as_ref().and_then(|io| io.terminal.clone()),
         ..Observed::default()
     };
-    let mut typed = false;
     let mut killed = false;
     let mut output_stopped = false;
     let mut writer = None;
@@ -580,9 +580,8 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
                     let line: String = (0..=draw(&stream, 40))
                         .map(|_| char::from(b'a' + u8::try_from(draw(&stream, 26)).unwrap_or(0)))
                         .collect();
-                    if writer.write(format!("{line}\r")).is_ok() {
-                        typed = true;
-                    }
+                    // (Echoed, so the delivery check sees what was typed.)
+                    let _ = writer.write(format!("{line}\r"));
                 }
             }
             Action::Type => {}
@@ -705,8 +704,9 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
 
     // 2. What was delivered is what was written.
     if let Some(io) = io {
-        if !typed
-            && let Some(written) = io.terminal.as_deref().and_then(simulator::terminal_written)
+        // Everything the terminal gave its master side: the program's output and the echoes of
+        // what was typed.
+        if let Some(written) = io.terminal.as_deref().and_then(simulator::terminal_output)
             && let Some(problem) = check_stream(
                 "terminal output",
                 &observed.output,

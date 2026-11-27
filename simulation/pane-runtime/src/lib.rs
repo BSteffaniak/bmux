@@ -37,6 +37,11 @@
 //! 11. Closing a pane leaves its siblings (its session's other panes, from splits) alone.
 //! 12. A pane runtime activated on the server's runtime directory while it runs (as a command
 //!     run in a client does) kills nothing the server runs.
+//! 13. A pane's screen is what its input made it: its grid shows what a fresh grid shows after
+//!     the same output and resizes, in the same order (nothing changes it outside its input).
+//! 14. A pane takes in what its terminal gave it, in order: what its grid took in is, but for
+//!     the runtime's own notices, a prefix of every byte the terminal gave its master side (its
+//!     programs' output and its echoes).
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood
@@ -51,6 +56,7 @@
 pub mod explore;
 pub mod guide;
 pub mod invariants;
+pub mod metamorphic;
 pub mod profile;
 pub mod programs;
 pub mod telemetry;
@@ -169,6 +175,16 @@ pub(crate) fn host_var(name: &str) -> Option<String> {
 /// * If `PANE_RUNTIME_SIM_PROFILE` is not a profile
 #[must_use]
 pub fn run_profile() -> Profile {
+    let profile = chosen_profile();
+    if host_set(metamorphic::CALM) {
+        profile.calm()
+    } else {
+        profile
+    }
+}
+
+/// The profile before [`metamorphic::CALM`] calms it.
+fn chosen_profile() -> Profile {
     if let Some(text) = host_var("PANE_RUNTIME_SIM_PROFILE") {
         return text
             .parse()
@@ -327,6 +343,15 @@ pub async fn run(profile: Profile, scenario: Option<&explore::Scenario>) -> Resu
     }
     let (violations, stats) = shared.finish().await;
     drop(shared);
+    // A metamorphic run's summary, compared across personalities (see [`metamorphic`]).
+    if host_set(metamorphic::SUMMARY) {
+        println!(
+            "{} {} passed={}",
+            metamorphic::SUMMARY,
+            stats.summary(),
+            violations.is_empty()
+        );
+    }
     shape.extend(stats.tags());
     if let Some(profile) = &guided {
         let mut outcome = stats.outcome();
