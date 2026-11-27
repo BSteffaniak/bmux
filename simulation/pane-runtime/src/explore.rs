@@ -16,20 +16,21 @@
 //! the run's end (delay bounding: Emmi, Qadeer and Rakamarić, POPL 2011). With one delay that
 //! is one run per alternative at each choice point; with two, one per pair.
 //!
-//! It does not bound preemptions alone, as `switchy_thread::simulator::explore_runs` does:
-//! there, switching because the running thread blocked is free, so every free choice is
-//! branched on, and here they compound (a pane runtime's run has hundreds of choice points,
-//! many with several threads woken at once): not even every schedule without a preemption
-//! can be run. Nor can it prune: the simulated kernel and executor use the scheduler's public
-//! switch points, so it cannot tell independent operations apart. Every schedule with `k`
-//! preemptions and no other departure is within a bound of `k` delays.
+//! `switchy_thread::simulator::explore_runs` enumerates the schedules
+//! (`ExploreOptions::delays`, with its window opened by [`open_window`] once the setup is
+//! done). A preemption bound alone would not do: switching because the running thread blocked
+//! is free there, so every free choice is branched on, and here they compound (a pane
+//! runtime's run has hundreds of choice points, many with several threads woken at once): not
+//! even every schedule without a preemption can be run. Nor can it prune: the simulated kernel
+//! and executor use the scheduler's public switch points, so it cannot tell independent
+//! operations apart. Every schedule with `k` preemptions and no other departure is within a
+//! bound of `k` delays.
 //!
 //! Its runs are made here, not by simvar's harness: each is a fresh `switchy_thread` run
 //! (`run_with`, replaying its schedule) whose main thread drives the run's executor and clock
 //! as simvar's step loop does (a step: advance the clock one step, poll one task, then let the
-//! simulated threads run until idle). Each run's choice points are read through the
-//! scheduler's decision hook, and checked against the scheduler's own count and the schedule
-//! it followed, so a scenario that is not deterministic is reported, not explored wrongly.
+//! simulated threads run until idle). The exploration checks each run against the path it
+//! was to follow, so a scenario that is not deterministic is reported, not explored wrongly.
 //!
 //! A failing schedule is shrunk (`switchy_thread::simulator::shrink`, as simvar shrinks a
 //! fleet failure's) and printed with its replay command: `--explore <scenario> --workers N
@@ -37,16 +38,13 @@
 //! happened, or `SIMULATOR_SCHEDULE` instead of `--schedule`).
 
 use std::{
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Mutex, PoisonError},
     time::Instant,
 };
 
 use switchy_pty::simulator::Personality;
 use switchy_thread::simulator::{
-    Config, ExploredRun, Schedule, ThreadIndex, ThreadState, run_with, shrink,
+    Config, ExploreOptions, ExploredRun, Schedule, explore_runs, run_with, shrink,
 };
 
 use crate::{
@@ -264,63 +262,10 @@ fn drive(scenario: &'static Scenario) -> Result<(), Vec<String>> {
     result
 }
 
-/// Marks the part of a run where schedules branch: from the drivers' start (after the
-/// scenario's setup) to the run's end. Run-scoped; a `std` atomic, so reading it is no switch
-/// point.
-#[derive(Debug, Default)]
-pub struct Window(AtomicBool);
-
-/// Open the current run's exploration window: the scenario's setup is done.
+/// Open the current run's exploration window: the scenario's setup is done, and schedules
+/// branch from here to the run's end.
 pub fn open_window() {
-    switchy_simulation::state::<Window>().0.store(true, Ordering::SeqCst);
-}
-
-/// A choice point of a run: the threads that could run, the default pick, and whether it is in
-/// the exploration window.
-#[derive(Debug, Clone)]
-struct ChoicePoint {
-    runnable: Vec<ThreadIndex>,
-    default: ThreadIndex,
-    in_window: bool,
-}
-
-/// One run of `scenario` following `schedule`, with its choice points (seen through the
-/// scheduler's decision hook).
-fn traced_run(scenario: &'static Scenario, schedule: &Schedule) -> (ExploredRun, Vec<ChoicePoint>) {
-    let points: Arc<Mutex<Vec<ChoicePoint>>> = Arc::default();
-    let recorder = {
-        let points = Arc::clone(&points);
-        move || {
-            let window = switchy_simulation::state::<Window>();
-            switchy_thread::simulator::set_decision_hook(Some(Arc::new(
-                move |decision: &switchy_thread::simulator::Decision,
-                      snapshot: &dyn Fn() -> switchy_thread::simulator::SchedulerSnapshot| {
-                    let runnable: Vec<ThreadIndex> = snapshot()
-                        .threads
-                        .iter()
-                        .filter(|thread| thread.state == ThreadState::Runnable)
-                        .map(|thread| thread.index)
-                        .collect();
-                    if runnable.len() < 2 {
-                        return;
-                    }
-                    let default = if runnable.contains(&decision.from) {
-                        decision.from
-                    } else {
-                        runnable[0]
-                    };
-                    points.lock().unwrap_or_else(PoisonError::into_inner).push(ChoicePoint {
-                        runnable,
-                        default,
-                        in_window: window.0.load(Ordering::SeqCst),
-                    });
-                },
-            )));
-        }
-    };
-    let run = run_once_with(scenario, Config::explore(schedule.clone()), recorder);
-    let points = std::mem::take(&mut *points.lock().unwrap_or_else(PoisonError::into_inner));
-    (run, points)
+    switchy_thread::simulator::open_window();
 }
 
 /// What exploring one scenario under one worker count found.
@@ -356,61 +301,40 @@ pub fn explore(
         complete: false,
         failure: None,
     };
-    // Depth first: each schedule's children add one departure at a later choice point, so
-    // every schedule within the bound is made exactly once.
-    let mut pending = vec![Schedule::new()];
-    while let Some(schedule) = pending.pop() {
-        if max_runs.is_some_and(|max| summary.runs >= max) {
-            return Ok(summary);
-        }
-        let (run, points) = traced_run(scenario, &schedule);
+    let options = ExploreOptions {
+        max_runs,
+        ..ExploreOptions::delays(u32::try_from(delays).unwrap_or(u32::MAX)).window(true)
+    };
+    let exploration = explore_runs(&options, |config| {
+        let run = run_once(scenario, config);
         summary.runs += 1;
+        if summary.runs == 1
+            && let Some(trace) = &run.report.trace
+        {
+            summary.choice_points = (trace.choice_points(), trace.choice_points_in_window());
+        }
         if progress && summary.runs.is_multiple_of(100) {
             eprintln!(
-                "{} runs at {:.1}s ({} pending): {schedule}",
+                "{} runs at {:.1}s: {}",
                 summary.runs,
                 start.elapsed().as_secs_f64(),
-                pending.len()
+                run.report.schedule
             );
         }
-        if summary.runs == 1 {
-            summary.choice_points =
-                (points.len(), points.iter().filter(|point| point.in_window).count());
-        }
-        if let Some(message) = run.failure {
-            summary.failure = Some((run.report.schedule, message));
-            break;
-        }
-        let traced = run.report.trace.as_ref().map_or(0, switchy_thread::simulator::Trace::choice_points);
-        if run.report.schedule != schedule || traced != points.len() {
+        run
+    });
+    if let Some(failure) = exploration.failure {
+        // The exploration's own complaints (a run that left its path) start so; a run's
+        // failures are the workload's violations and panics.
+        if failure.message.starts_with("the run ") {
             return Err(format!(
-                "schedule {schedule} was not followed (the run took {}, with {} choice points \
-                 of {traced}): the scenario is not deterministic",
-                run.report.schedule,
-                points.len()
+                "schedule {}: {} (the scenario is not deterministic)",
+                failure.schedule, failure.message
             ));
         }
-        if schedule.choices.len() >= delays {
-            continue;
-        }
-        let after = schedule
-            .choices
-            .last()
-            .map_or(0, |&(point, _)| usize::try_from(point).unwrap_or(usize::MAX) + 1);
-        // Pushed in reverse, so earlier choice points are explored first.
-        for (index, point) in points.iter().enumerate().skip(after).rev() {
-            if !point.in_window {
-                continue;
-            }
-            for &thread in point.runnable.iter().rev() {
-                if thread == point.default {
-                    continue;
-                }
-                let mut child = schedule.clone();
-                child.choices.push((index as u64, thread));
-                pending.push(child);
-            }
-        }
+        summary.failure = Some((failure.schedule, failure.message));
+    } else if !exploration.complete {
+        return Ok(summary);
     }
     summary.complete = summary.failure.is_none();
     if let Some((schedule, message)) = summary.failure.take() {

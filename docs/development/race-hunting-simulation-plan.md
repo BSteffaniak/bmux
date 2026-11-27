@@ -416,8 +416,16 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
   replaying each schedule, driven as simvar's step loop drives a run. Each run's choice
   points are read through the decision hook, and checked against the scheduler's own count
   and the schedule it followed, so a nondeterministic scenario is reported, not explored
-  wrongly. Open in switchy_thread: delay bounding (or a window of choice points) in
-  `explore_runs`, and footprints from switchy_pty and switchy_async so sleep sets can prune.
+  wrongly.
+- **Delay bounding in switchy_thread (2026-11-27, MoosicBox `05d8df464`).**
+  `ExploreOptions::delays(k)` bounds any departure from the default (`Bound::Delays`), and
+  `ExploreOptions::window` confines departures to choice points after the run calls
+  `switchy_thread::simulator::open_window`. `--explore` now hands its runs to `explore_runs`
+  instead of enumerating schedules itself: on the same build, every scenario made the same
+  number of schedules both ways (for example 523, 1,063 and 7,459 for
+  `interrupt-during-startup` and `crash-during-open` at one and two delays). Sleep sets stay
+  with preemption bounds. Still open: footprints from switchy_pty and switchy_async so
+  sleep sets can prune.
 - **Measured** (on a 15-core laptop; with two delays, 12 explorations ran at once beside
   other builds, so those times are 3 to 4 times a run's unloaded cost, and the larger ones
   stopped at a 300,000-run cap):
