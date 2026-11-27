@@ -630,16 +630,21 @@ mod platform {
             self.capabilities
         }
 
-        fn master(&self) -> Option<Arc<PtyMaster>> {
+        /// Use the terminal's near side, if it is open, under its lock. Never a clone held past
+        /// it: the exit's thread must drop the last one, since closing a console waits until its
+        /// output is read, and the caller here may be what reads it.
+        fn with_master<R>(&self, f: impl FnOnce(&PtyMaster) -> R) -> Option<R> {
             self.master
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .clone()
+                .as_deref()
+                .map(f)
         }
 
         pub fn resize(&self, size: PtySize) -> io::Result<()> {
             // A closed console, or pipes: nothing to resize.
-            self.master().map_or(Ok(()), |master| master.resize(size))
+            self.with_master(|master| master.resize(size))
+                .unwrap_or(Ok(()))
         }
 
         pub fn interrupt(&self) -> io::Result<()> {
@@ -666,10 +671,9 @@ mod platform {
             if let Some(writer) = writer.as_ref() {
                 return Ok(writer.clone());
             }
-            let master = self
-                .master()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
-            let mut input = master.clone_writer()?;
+            let mut input = self
+                .with_master(PtyMaster::clone_writer)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))??;
             let (sender, queued) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
             spawn_named("bmux-pty-writer", move || {
                 for bytes in queued {
@@ -690,7 +694,7 @@ mod platform {
             // id, which names the group, cannot belong to another process yet. After the exit
             // with nothing holding the terminal there is nothing left to signal.
             if self.exited.load(Ordering::Acquire)
-                && !self.master().is_some_and(|master| master.has_peer())
+                && !self.with_master(PtyMaster::has_peer).unwrap_or(false)
             {
                 return Ok(());
             }
@@ -963,10 +967,13 @@ mod platform {
                 let exit = child.wait_unreaped().or_else(|_| child.wait());
                 *waiting.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
                 if let Some(console) = &console {
-                    console
+                    let closing = console
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .take();
+                    // Closed outside the lock: closing waits until the console's output is read,
+                    // and whoever reads it may be waiting for the lock (to resize, say).
+                    drop(closing);
                 }
                 exit.ok().map(|exit| PtyExit::from_child_exit(&exit))
             },

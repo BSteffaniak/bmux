@@ -12,3 +12,5 @@
 2258571551243736516  # bmux_pty: kill after reaping reached a process that reused the id
 2908671648205331351
 10903523760680128016
+17953013750010277518 64123881649443 SIMULATOR_PTY_PID_REUSE=1  # Windows: the exit thread closed a console under the lock resizing takes, waiting for output the resizing caller would read (found by the nightly fleet)
+4635352248865656617 51680961956030 SIMULATOR_PTY_FAULTS=0.1  # the same, with faults
