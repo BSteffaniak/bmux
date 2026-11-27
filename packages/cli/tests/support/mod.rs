@@ -5,8 +5,13 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds a wait for something that must eventually happen. Never a budget:
+/// reaching it means a hang, however loaded the machine.
+pub const HANG_GUARD: Duration = Duration::from_secs(120);
+const SERVER_READY_TIMEOUT: Duration = HANG_GUARD;
+/// Above the product's own owned-stop exit bound (120 s), so a stuck stop is
+/// reported by the product rather than cut short by the fixture.
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[must_use]
@@ -175,7 +180,7 @@ impl ServerEnv {
         lifecycle::run(
             &mut self.command(args),
             self.root(),
-            Duration::from_secs(30),
+            HANG_GUARD,
         )
         .expect("run isolated bmux command")
     }

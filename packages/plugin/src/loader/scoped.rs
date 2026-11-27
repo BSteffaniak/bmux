@@ -127,15 +127,14 @@ pub(super) struct BundledExecutableCache {
 #[derive(Debug)]
 struct BundledExecutableArtifact {
     // Private anonymous snapshot: no caller can mutate these retained bytes.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "held open for the lifetime of this observation; only tests read it back"
-        )
-    )]
+    // Held open for the lifetime of this observation.
     snapshot: std::fs::File,
-    identity: String,
+    /// The snapshot's SHA-256, computed when first needed: hashing a debug
+    /// executable (over a gigabyte) is the dominant cost of loading bundled
+    /// plugins, and only a manifest that pins its artifact identity needs it.
+    /// The snapshot fixes the bytes at observation, so the digest is the same
+    /// whenever it is computed.
+    identity: std::sync::OnceLock<std::result::Result<String, String>>,
 }
 impl BundledExecutableCache {
     fn observe(&self) -> Result<Arc<BundledExecutableArtifact>> {
@@ -174,24 +173,25 @@ impl BundledExecutableArtifact {
         let cloned = super::executable_identity::try_clone_snapshot(&input).ok();
         #[cfg(not(target_os = "macos"))]
         let cloned: Option<std::fs::File> = None;
-        let copying = cloned.is_none();
-        let mut snapshot = cloned.map_or_else(tempfile::tempfile, Ok)?;
-        let mut hash = Sha256::new();
-        let mut buffer = vec![0; 65536];
-        loop {
-            let count = if copying {
-                input.read(&mut buffer)?
-            } else {
-                snapshot.read(&mut buffer)?
-            };
-            if count == 0 {
-                break;
-            }
-            if copying {
+        let identity = std::sync::OnceLock::new();
+        let snapshot = if let Some(snapshot) = cloned {
+            snapshot
+        } else {
+            // Copying reads every byte anyway: hash them in the same pass.
+            let mut snapshot = tempfile::tempfile()?;
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0; 65536];
+            loop {
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
                 snapshot.write_all(&buffer[..count])?;
+                hash.update(&buffer[..count]);
             }
-            hash.update(&buffer[..count]);
-        }
+            let _ = identity.set(Ok(hex_digest(&hash.finalize())));
+            snapshot
+        };
         let after = input.metadata()?;
         if before.len() != after.len()
             || before.modified()? != after.modified()?
@@ -202,10 +202,32 @@ impl BundledExecutableArtifact {
         let mut permissions = snapshot.metadata()?.permissions();
         permissions.set_readonly(true);
         snapshot.set_permissions(permissions)?;
-        Ok(Self {
-            snapshot,
-            identity: hex_digest(&hash.finalize()),
-        })
+        Ok(Self { snapshot, identity })
+    }
+
+    /// The SHA-256 of the observed bytes.
+    fn identity(&self) -> Result<&str> {
+        self.identity
+            .get_or_init(|| {
+                use sha2::{Digest, Sha256};
+                use std::io::{Read, Seek};
+                // A separate handle on the same snapshot: its offset is shared,
+                // and only this initializer reads it.
+                let mut snapshot = self.snapshot.try_clone().map_err(|error| error.to_string())?;
+                snapshot.rewind().map_err(|error| error.to_string())?;
+                let mut hash = Sha256::new();
+                let mut buffer = vec![0; 1024 * 1024];
+                loop {
+                    let count = snapshot.read(&mut buffer).map_err(|error| error.to_string())?;
+                    if count == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..count]);
+                }
+                Ok(hex_digest(&hash.finalize()))
+            })
+            .as_deref()
+            .map_err(|error| failure(format!("bundled executable identity: {error}")))
     }
 }
 
@@ -472,7 +494,9 @@ impl DefinitionArtifact {
         let mut observed_identity = String::new();
         let mut artifact = if plugin.bundled_static {
             let executable = owner.observe()?;
-            observed_identity.push_str(&executable.identity);
+            if selected.pins_artifact_identity() {
+                observed_identity.push_str(executable.identity()?);
+            }
             let definition = match definition {
                 Some(definition) => definition,
                 None => crate::static_definition_registry::static_definition(
@@ -531,7 +555,11 @@ impl DefinitionArtifact {
             }
             artifact
         };
-        selected.validate_embedded_metadata(artifact.metadata(), &observed_identity)?;
+        if plugin.bundled_static && !selected.pins_artifact_identity() {
+            selected.validate_unpinned_embedded_metadata(artifact.metadata())?;
+        } else {
+            selected.validate_embedded_metadata(artifact.metadata(), &observed_identity)?;
+        }
         // Bare loads and static definitions have no private loaded-library proof.
         // Mint selection evidence only after all selected metadata checks pass.
         if matches!(&artifact.backend, ArtifactBackend::Dynamic(owner) if owner.artifact_copy.is_some())
@@ -4625,8 +4653,8 @@ mod tests {
         let rebuilt = new_owner
             .observe_with(|| BundledExecutableArtifact::capture(&path))
             .unwrap();
-        assert_ne!(first.identity, rebuilt.identity);
-        assert_eq!(first.identity.len(), 64);
+        assert_ne!(first.identity().unwrap(), rebuilt.identity().unwrap());
+        assert_eq!(first.identity().unwrap().len(), 64);
     }
 
     #[test]

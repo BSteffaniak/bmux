@@ -57,7 +57,7 @@ pub(crate) fn current_executable() -> std::io::Result<PathBuf> {
 ///
 /// # Errors
 /// When it cannot be read or is not a file.
-pub(crate) fn executable_sha256(path: &Path) -> Result<String, String> {
+fn executable_sha256(path: &Path) -> Result<String, String> {
     let metadata = switchy_fs::sync::metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() {
         return Err("executable is not a regular file".into());
@@ -106,6 +106,20 @@ pub(crate) fn retain_executable(
     switchy_fs::sync::set_permissions(&retained, Permissions::from_mode(0o500))
         .map_err(|error| error.to_string())?;
     Ok(retained)
+}
+
+/// Retain a copy of `source` as it is now under `directory` for `owner`, in the run's file
+/// system, and return the copy's path and digest, as the host's single-read retention does.
+///
+/// # Errors
+/// When the copy cannot be made.
+pub(crate) fn retain_executable_snapshot(
+    source: &Path,
+    directory: &Path,
+    owner: &str,
+) -> Result<(PathBuf, String), String> {
+    let hash = executable_sha256(source)?;
+    retain_executable(source, directory, owner, &hash).map(|path| (path, hash))
 }
 
 /// Make `directory` private to this user.

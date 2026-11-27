@@ -52,9 +52,14 @@ fn idle_duration() -> Duration {
     requested.max(OLD_LEASE * 3)
 }
 
-/// How long the reconnect gate keeps the path down: longer than QUIC's 30 s idle timeout,
-/// so the connection really drops rather than riding out the gap on retransmits.
-const BLACKHOLE: Duration = Duration::from_secs(45);
+/// The session transport's QUIC idle timeout (the connections plugin's
+/// `SESSION_IDLE_TIMEOUT`): a path silent this long is a lost connection.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the reconnect gate keeps the path down: well past the session transport's
+/// idle timeout, so the connection really drops rather than riding out the gap on
+/// retransmits.
+const BLACKHOLE: Duration = Duration::from_secs(25);
 
 /// A host with one session, `work`, its owner's local view, and a paired client.
 struct Paired {
@@ -1114,7 +1119,7 @@ fn fixture_local_relay_serves_plain_http_on_loopback() {
 #[test]
 fn fixture_idle_duration_outlasts_the_old_lease() {
     assert!(idle_duration() >= OLD_LEASE * 3);
-    assert!(BLACKHOLE > Duration::from_secs(30));
+    assert!(BLACKHOLE >= SESSION_IDLE_TIMEOUT + Duration::from_secs(10));
 }
 
 // ---------------------------------------------------------------------------------------

@@ -98,7 +98,7 @@ async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(120),
-            wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND)
+            wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_TIMEOUT, OWNED_STOP_EXIT_BOUND)
         )
         .await
         .is_err()
@@ -111,7 +111,7 @@ async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
     child.wait().await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND),
+        wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_TIMEOUT, OWNED_STOP_EXIT_BOUND),
     )
     .await
     .unwrap()
@@ -122,9 +122,12 @@ async fn cancelling_shutdown_observation_keeps_process_and_allows_rejoin() {
 #[tokio::test]
 async fn quiet_explicit_shutdown_waits_past_former_idle_deadline() {
     use std::process::Stdio;
+    // A quiet server outlives the idle deadline (scaled down from
+    // OWNED_STOP_TIMEOUT) and is still awaited until it exits within the bound.
+    let idle = std::time::Duration::from_millis(200);
     let root = tempfile::tempdir().unwrap();
     let mut child = tokio::process::Command::new("/bin/sleep")
-        .arg("31")
+        .arg("1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -132,14 +135,16 @@ async fn quiet_explicit_shutdown_waits_past_former_idle_deadline() {
         .unwrap();
     let process = ProcessObservation::open(child.id().unwrap()).unwrap();
     let path = root.path().join("shutdown-progress.json");
+    let started = std::time::Instant::now();
     let (observed, exited) = tokio::join!(
         tokio::time::timeout(
-            std::time::Duration::from_secs(35),
-            wait_for_shutdown_progress(&process, None, &path, OWNED_STOP_EXIT_BOUND)
+            std::time::Duration::from_secs(10),
+            wait_for_shutdown_progress(&process, None, &path, idle, OWNED_STOP_EXIT_BOUND)
         ),
         child.wait()
     );
     observed.unwrap().unwrap();
+    assert!(started.elapsed() > idle * 2);
     assert!(exited.unwrap().success());
 }
 
@@ -160,7 +165,13 @@ async fn stuck_server_exit_is_bounded_and_unsignalled() {
     let path = root.path().join("shutdown-progress.json");
     let started = std::time::Instant::now();
     let error =
-        wait_for_shutdown_progress(&process, None, &path, std::time::Duration::from_millis(200))
+        wait_for_shutdown_progress(
+            &process,
+            None,
+            &path,
+            OWNED_STOP_TIMEOUT,
+            std::time::Duration::from_millis(200),
+        )
             .await
             .unwrap_err()
             .to_string();

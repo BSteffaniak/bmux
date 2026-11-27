@@ -579,6 +579,7 @@ async fn run_server_stop_inner(connection_context: ConnectionContext<'_>) -> Res
         &ConfigPaths::default()
             .runtime_dir
             .join("shutdown-progress.json"),
+        OWNED_STOP_TIMEOUT,
         owned_stop_exit_bound(),
     )
     .await?;
@@ -592,6 +593,7 @@ async fn wait_for_shutdown_progress(
     process: &super::server_runtime::ProcessObservation,
     metadata: Option<&ServerRuntimeMetadata>,
     path: &std::path::Path,
+    idle: std::time::Duration,
     bound: std::time::Duration,
 ) -> Result<()> {
     use bmux_plugin_runtime::shutdown_progress::{ShutdownIdleTimer, ShutdownProgressSnapshot};
@@ -600,7 +602,7 @@ async fn wait_for_shutdown_progress(
     // forever. Keep validating provenance and monotonic observations; the CLI
     // notice timer never advances this state.
     let started = std::time::Instant::now();
-    let mut observations = ShutdownIdleTimer::new(started, OWNED_STOP_TIMEOUT);
+    let mut observations = ShutdownIdleTimer::new(started, idle);
     loop {
         if process.exited()? {
             return Ok(());

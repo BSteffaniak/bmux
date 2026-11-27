@@ -5,8 +5,35 @@ mod support;
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{self, client};
 use std::time::{Duration, Instant};
 
+/// Bounds a wait for something that must eventually happen. Never a budget:
+/// reaching it means a hang, however loaded the machine.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
+/// Wait until `count` distinct shells have shown a prompt (each appends its pid
+/// to `ready` at every prompt).
+async fn wait_for_shells(ready: &std::path::Path, count: usize, server: &support::ServerEnv) {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let shells = std::fs::read_to_string(ready).unwrap_or_default();
+        if shells
+            .lines()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= count
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{count} shells never reached their prompts; ready={shells:?}; server output: {}",
+            server.server_output()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_for(path: &std::path::Path, expected: &str, server: &support::ServerEnv) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         if std::fs::read_to_string(path).is_ok_and(|text| text.contains(expected)) {
             return;
@@ -23,7 +50,7 @@ async fn wait_for(path: &std::path::Path, expected: &str, server: &support::Serv
 }
 
 async fn wait_for_restores(path: &std::path::Path, count: usize, server: &support::ServerEnv) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         let text = std::fs::read_to_string(path).unwrap_or_default();
         if text.lines().filter(|line| *line == "committed").count() == count + 1 {
@@ -244,11 +271,32 @@ async fn nested_round_trip(
     server.isolate_shell_config();
     // Supported startup integration for shells without an inherited vendor
     // autoload directory. No user startup files are modified by the product.
-    std::fs::write(server.root().join("home/.bashrc"), r#"if [[ -n ${BMUX_ROOT_SHELL_PID:-} && $BMUX_ROOT_SHELL_PID != $$ && -n ${BMUX_SHELL_CALLBACK:-} ]]; then
+    // Every shell appends its pid here at each prompt: input is typed only once
+    // the expected shell is reading it, never after a guessed startup delay.
+    let shell_ready = server.root().join("shell-ready");
+    std::fs::write(
+        server.root().join("home/.bashrc"),
+        format!(
+            r#"if [[ -n ${{BMUX_ROOT_SHELL_PID:-}} && $BMUX_ROOT_SHELL_PID != $$ && -n ${{BMUX_SHELL_CALLBACK:-}} ]]; then
   eval "$("$BMUX_SHELL_CALLBACK" __shell-integration bash)"
 fi
-"#).unwrap();
-    let zsh_ready = server.root().join("zsh-ready");
+__fixture_ready() {{ printf '%s\n' "$$" >> '{0}'; }}
+PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND;}}__fixture_ready"
+"#,
+            shell_ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(server.root().join("home/.config/fish")).unwrap();
+    std::fs::write(
+        server.root().join("home/.config/fish/config.fish"),
+        format!(
+            "function __fixture_ready --on-event fish_prompt\n    echo $fish_pid >> '{}'\nend\n",
+            shell_ready.display()
+        ),
+    )
+    .unwrap();
+
     std::fs::write(
         server.root().join("home/.zshrc"),
         format!(
@@ -259,7 +307,7 @@ __fixture_ready() {{ print -r -- "$$" >> '{}' }}
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __fixture_ready
 "#,
-            zsh_ready.display()
+            shell_ready.display()
         ),
     )
     .unwrap();
@@ -293,16 +341,16 @@ if ack != {'revision': 1}:
 with open(sys.argv[1], 'a') as out: out.write('committed\n')
 while True: time.sleep(1)
 "#).unwrap();
-    let nu_ready = server.root().join("nushell-ready");
+
     std::fs::create_dir_all(server.root().join("home/.config/nushell")).unwrap();
     std::fs::write(
         server.root().join("home/.config/nushell/config.nu"),
-        format!("$env.config = ($env.config | upsert show_banner false | upsert hooks.pre_prompt [{{|| $'($nu.pid)(char newline)' | save --append '{}' }}])\n", nu_ready.display()),
+        format!("$env.config = ($env.config | upsert show_banner false | upsert hooks.pre_prompt [{{|| $'($nu.pid)(char newline)' | save --append '{}' }}])\n", shell_ready.display()),
     ).unwrap();
     server.start();
     let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock"));
     let mut connection =
-        bmux_client::BmuxClient::connect(&endpoint, Duration::from_secs(10), "resurrection-test")
+        bmux_client::BmuxClient::connect(&endpoint, HANG_GUARD, "resurrection-test")
             .await
             .unwrap();
     let session = client::new_session_with_runtime(&mut connection, Some("recovery".into()))
@@ -334,10 +382,10 @@ while True: time.sleep(1)
         .unwrap()
         .unwrap();
         let pane = panes.panes[0].id;
-        // Wait for shell startup before injecting a command through the public input service.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let mut nu_count = usize::from(shell_program.ends_with("/nu"));
-        for nested_shell in nested {
+        // Type into each shell only once it shows its prompt: the root shell,
+        // then every nested one in turn.
+        wait_for_shells(&shell_ready, 1, &server).await;
+        for (index, nested_shell) in nested.iter().enumerate() {
             client::pane_direct_input(
                 &mut connection,
                 session.session_id,
@@ -347,40 +395,7 @@ while True: time.sleep(1)
             .await
             .unwrap()
             .unwrap();
-            if *nested_shell == "zsh" {
-                let deadline = Instant::now() + Duration::from_secs(15);
-                while std::fs::read_to_string(&zsh_ready)
-                    .unwrap_or_default()
-                    .is_empty()
-                {
-                    assert!(
-                        Instant::now() < deadline,
-                        "nested Zsh did not reach its prompt"
-                    );
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            } else if *nested_shell == "nu" {
-                nu_count += 1;
-                let deadline = Instant::now() + Duration::from_secs(15);
-                loop {
-                    let ready = std::fs::read_to_string(&nu_ready).unwrap_or_default();
-                    if ready
-                        .lines()
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        >= nu_count
-                    {
-                        break;
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "nested Nushell did not reach its prompt; ready={ready:?}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            wait_for_shells(&shell_ready, index + 2, &server).await;
         }
         client::pane_direct_input(
             &mut connection,
@@ -450,7 +465,7 @@ while True: time.sleep(1)
     if shell {
         // Application selection commits over a different socket from shell
         // metadata. Do not snapshot until both authorities observed the launch.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + HANG_GUARD;
         loop {
             let panes = bmux_pane_runtime_plugin_api::pane_runtime_state::client::list_panes(
                 &mut connection,
@@ -503,7 +518,7 @@ while True: time.sleep(1)
         }
         let mut connection = bmux_client::BmuxClient::connect(
             &endpoint,
-            Duration::from_secs(10),
+            HANG_GUARD,
             "resurrection-layout-test",
         )
         .await
@@ -558,7 +573,7 @@ async fn manual_launch_after_restore(
     use bmux_pane_runtime_plugin_api::attach_runtime_commands::{self, client as attach};
     use bmux_pane_runtime_plugin_api::pane_runtime_state::client as state;
     let mut connection =
-        bmux_client::BmuxClient::connect(endpoint, Duration::from_secs(10), "manual-launch-test")
+        bmux_client::BmuxClient::connect(endpoint, HANG_GUARD, "manual-launch-test")
             .await
             .unwrap();
     let grant = attach::attach_session(
@@ -586,7 +601,7 @@ async fn manual_launch_after_restore(
         .await
         .unwrap()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         let panes = state::list_panes(&mut connection, Some(session))
             .await

@@ -994,6 +994,40 @@ impl SelectedPluginCandidate {
         observed_artifact_identity: &str,
     ) -> Result<()> {
         self.validate_artifact_identity(observed_artifact_identity)?;
+        self.validate_embedded_declaration(metadata)
+    }
+
+    /// Whether the selected manifest pins its artifact's SHA-256 identity, which
+    /// the loader must then observe and pass to [`Self::validate_embedded_metadata`].
+    #[must_use]
+    pub const fn pins_artifact_identity(&self) -> bool {
+        self.candidate.plugin.manifest.artifact_sha256.is_some()
+    }
+
+    /// Validate metadata returned by the selected artifact against its manifest,
+    /// as [`Self::validate_embedded_metadata`] does, for an artifact whose identity
+    /// is not pinned (see [`Self::pins_artifact_identity`]): a digest would only be
+    /// checked for its form.
+    ///
+    /// # Errors
+    /// Returns an error for missing embedded declarations or any identity
+    /// mismatch, or when the manifest pins an artifact identity.
+    pub fn validate_unpinned_embedded_metadata(
+        &self,
+        metadata: &bmux_plugin_sdk::definition::PluginMetadata,
+    ) -> Result<()> {
+        if self.pins_artifact_identity() {
+            return Err(candidate_error(
+                "selected plugin pins an artifact identity the loader must observe",
+            ));
+        }
+        self.validate_embedded_declaration(metadata)
+    }
+
+    fn validate_embedded_declaration(
+        &self,
+        metadata: &bmux_plugin_sdk::definition::PluginMetadata,
+    ) -> Result<()> {
         let expected = &self.candidate.plugin.manifest;
         let embedded = metadata
             .manifest_toml

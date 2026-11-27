@@ -54,14 +54,30 @@ impl Inspection {
         let bundle = root.join("bundle");
         std::fs::create_dir(&bundle).unwrap();
         let frontend = bundle.join("bterm");
-        std::fs::copy(env!("CARGO_BIN_EXE_bterm"), &frontend).unwrap();
+        // A hard link presents the real frontend bytes at a bundle path while
+        // sharing one file (and one page cache) across concurrently running
+        // tests; copying the multi-gigabyte debug executable per test thrashed
+        // memory. Fall back to a copy across filesystems.
+        if std::fs::hard_link(env!("CARGO_BIN_EXE_bterm"), &frontend).is_err() {
+            std::fs::copy(env!("CARGO_BIN_EXE_bterm"), &frontend).unwrap();
+        }
         let companion = bundle.join("bmux");
         std::fs::write(&companion, b"inspection-only companion artifact").unwrap();
         use sha2::{Digest as _, Sha256};
         let digest = |path: &Path| {
             use std::fmt::Write as _;
+            let mut hasher = Sha256::new();
+            let mut file = std::fs::File::open(path).unwrap();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let read = std::io::Read::read(&mut file, &mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
             let mut output = String::new();
-            for byte in Sha256::digest(std::fs::read(path).unwrap()) {
+            for byte in hasher.finalize() {
                 write!(&mut output, "{byte:02x}").unwrap();
             }
             output
@@ -145,8 +161,18 @@ impl Drop for Inspection {
 enum Entry {
     Directory,
     File(Vec<u8>),
+    /// Large files (the hard-linked frontend executable) are fingerprinted by
+    /// length, modification time and inode instead of being read whole: any
+    /// write or replacement changes the fingerprint.
+    LargeFile {
+        len: u64,
+        modified: std::time::SystemTime,
+        inode: u64,
+    },
     Symlink(PathBuf),
 }
+
+const SNAPSHOT_CONTENT_LIMIT: u64 = 1024 * 1024;
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
     fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Entry>) {
@@ -164,7 +190,20 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
                     metadata.is_file(),
                     "inspection created a special file: {path:?}"
                 );
-                entries.insert(key, Entry::File(std::fs::read(&path).unwrap()));
+                let entry = if metadata.len() > SNAPSHOT_CONTENT_LIMIT {
+                    #[cfg(unix)]
+                    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+                    #[cfg(not(unix))]
+                    let inode = 0;
+                    Entry::LargeFile {
+                        len: metadata.len(),
+                        modified: metadata.modified().unwrap(),
+                        inode,
+                    }
+                } else {
+                    Entry::File(std::fs::read(&path).unwrap())
+                };
+                entries.insert(key, entry);
             }
         }
     }

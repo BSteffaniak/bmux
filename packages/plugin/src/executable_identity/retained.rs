@@ -22,20 +22,11 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
         if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("invalid executable SHA-256 identity".into());
         }
-        if !root.is_absolute() {
-            return Err("executable image root must be absolute".into());
-        }
-        // Hash owner names rather than interpreting arbitrary plugin IDs as paths.
-        let directory = root.join(hex(&Sha256::digest(owner.as_bytes())));
-        private_directory(root)?;
-        private_directory(&directory)?;
-        let directory = directory
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
+        let owner_directory = owner_directory(root, owner)?;
         let filename = source
             .file_name()
             .ok_or("executable image has no filename")?;
-        let directory = directory.join(expected);
+        let directory = owner_directory.join(expected);
         private_directory(&directory)?;
         let destination = directory.join(filename);
         match std::fs::symlink_metadata(&destination) {
@@ -49,36 +40,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
         let (mut input, _) = open_verified_executable(source)?;
         let mut staging = stage(&mut input, &directory)?;
         verify_file(staging.as_file_mut(), expected)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            staging
-                .as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o500))
-                .map_err(|error| error.to_string())?;
-        }
-        staging
-            .as_file()
-            .sync_all()
-            .map_err(|error| error.to_string())?;
-        // The rename keeps the staged inode verified above; only an image
-        // published concurrently by someone else still needs checking.
-        let published = match staging.persist_noclobber(&destination) {
-            Ok(_) => true,
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A concurrent publisher won. Never overwrite even a corrupt image.
-                false
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        #[cfg(unix)]
-        File::open(&directory)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        if !published {
-            verify(&destination, expected)?;
-        }
-        Ok(destination)
+        publish(staging, &directory, &destination, expected)
     })();
     result.map_err(|error: String| {
         format!(
@@ -87,6 +49,110 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             root.display()
         )
     })
+}
+
+/// Retain a private copy of the executable `source` as it is now, under the
+/// digest of the copied bytes, and return the image and that digest.
+///
+/// Equivalent to hashing `source` and then calling [`retain`] with its digest,
+/// but reads the executable once: the copy is staged first and its own bytes
+/// name it. A source modified or replaced while it is copied is rejected rather
+/// than retained torn.
+///
+/// # Errors
+/// Rejects unsafe directories, invalid executable files, and sources that
+/// change while they are copied.
+pub fn retain_snapshot(source: &Path, root: &Path, owner: &str) -> Result<(PathBuf, String), String> {
+    let result = (|| {
+        let owner_directory = owner_directory(root, owner)?;
+        let filename = source
+            .file_name()
+            .ok_or("executable image has no filename")?;
+        let (mut input, opened) = open_verified_executable(source)?;
+        let mut staging = stage(&mut input, &owner_directory)?;
+        let after = input.metadata().map_err(|error| error.to_string())?;
+        let unchanged = after.len() == opened.len() && after.modified().ok() == opened.modified().ok();
+        #[cfg(unix)]
+        let unchanged = unchanged && {
+            use std::os::unix::fs::MetadataExt as _;
+            after.ctime() == opened.ctime() && after.ctime_nsec() == opened.ctime_nsec()
+        };
+        if !unchanged {
+            return Err("executable modified while it was retained".into());
+        }
+        let digest = file_digest(staging.as_file_mut())?;
+        let directory = owner_directory.join(&digest);
+        private_directory(&directory)?;
+        let destination = directory.join(filename);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                verify(&destination, &digest)?;
+                return Ok((destination, digest));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        publish(staging, &directory, &destination, &digest).map(|path| (path, digest))
+    })();
+    result.map_err(|error: String| {
+        format!(
+            "retain executable {} in {}: {error}",
+            source.display(),
+            root.display()
+        )
+    })
+}
+
+/// The private, canonical directory holding `owner`'s images under `root`.
+fn owner_directory(root: &Path, owner: &str) -> Result<PathBuf, String> {
+    if !root.is_absolute() {
+        return Err("executable image root must be absolute".into());
+    }
+    // Hash owner names rather than interpreting arbitrary plugin IDs as paths.
+    let directory = root.join(hex(&Sha256::digest(owner.as_bytes())));
+    private_directory(root)?;
+    private_directory(&directory)?;
+    directory.canonicalize().map_err(|error| error.to_string())
+}
+
+/// Publish a verified staged image at `destination` (in `directory`), never
+/// overwriting an image someone else published first.
+fn publish(
+    staging: tempfile::NamedTempFile,
+    directory: &Path,
+    destination: &Path,
+    expected: &str,
+) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        staging
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .map_err(|error| error.to_string())?;
+    }
+    staging
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    // The rename keeps the staged inode verified above; only an image
+    // published concurrently by someone else still needs checking.
+    let published = match staging.persist_noclobber(destination) {
+        Ok(_) => true,
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A concurrent publisher won. Never overwrite even a corrupt image.
+            false
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    if !published {
+        verify(destination, expected)?;
+    }
+    Ok(destination.to_path_buf())
 }
 
 /// Stage a private copy of the opened source, never a hard link to mutable
@@ -190,9 +256,17 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn verify_file(file: &mut File, expected: &str) -> Result<(), String> {
+    if file_digest(file)? != expected {
+        return Err("executable image checksum mismatch".into());
+    }
+    Ok(())
+}
+
+/// The SHA-256 digest of all of `file`'s bytes.
+fn file_digest(file: &mut File) -> Result<String, String> {
     file.rewind().map_err(|error| error.to_string())?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
         if count == 0 {
@@ -200,8 +274,5 @@ fn verify_file(file: &mut File, expected: &str) -> Result<(), String> {
         }
         digest.update(&buffer[..count]);
     }
-    if hex(&digest.finalize()) != expected {
-        return Err("executable image checksum mismatch".into());
-    }
-    Ok(())
+    Ok(hex(&digest.finalize()))
 }

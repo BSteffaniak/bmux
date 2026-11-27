@@ -100,6 +100,7 @@ pub use loader::scoped::{
 };
 pub use loader::{
     LoadedPlugin, NativePluginLoader, executable_sha256, load_process_plugin, retain_executable,
+    retain_executable_snapshot,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestExtension,

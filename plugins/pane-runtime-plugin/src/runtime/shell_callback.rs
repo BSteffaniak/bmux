@@ -52,13 +52,21 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     } else {
         crate::readiness::running_executable_sha256()
     };
-    let hash = match attested {
-        Some(hash) => hash,
-        None => crate::platform::files::executable_sha256(&source).map_err(anyhow::Error::msg)?,
+    // Otherwise the copy is named by its own bytes: one read of a possibly
+    // very large executable instead of hashing it and then verifying the copy.
+    let (path, hash) = match attested {
+        Some(hash) => (
+            crate::platform::files::retain_executable(&source, &directory, "shell-callback", &hash)
+                .map_err(anyhow::Error::msg)?,
+            hash,
+        ),
+        None => crate::platform::files::retain_executable_snapshot(
+            &source,
+            &directory,
+            "shell-callback",
+        )
+        .map_err(anyhow::Error::msg)?,
     };
-    let path =
-        crate::platform::files::retain_executable(&source, &directory, "shell-callback", &hash)
-            .map_err(anyhow::Error::msg)?;
     // Images outlive this manager: nested shells and recovery can still need
     // them. Pruning is deliberately not part of pane teardown.
     let identity = crate::platform::files::file_identity(&path);

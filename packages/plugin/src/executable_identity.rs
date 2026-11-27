@@ -8,7 +8,7 @@ use std::path::Path;
 #[path = "executable_identity/retained.rs"]
 mod retained;
 
-pub use retained::retain as retain_executable;
+pub use retained::{retain as retain_executable, retain_snapshot as retain_executable_snapshot};
 
 /// An anonymous copy-on-write snapshot of the opened file, never a hard link.
 #[cfg(target_os = "macos")]

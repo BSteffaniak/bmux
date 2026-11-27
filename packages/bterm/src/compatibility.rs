@@ -223,11 +223,16 @@ impl VerifiedCompanion {
                 _ => {}
             }
         }
-        let (_, frontend_artifact) = frontend.context("bundle has no frontend artifact")?;
+        let (frontend_path, frontend_artifact) =
+            frontend.context("bundle has no frontend artifact")?;
         // An explicitly located bundle must contain this frontend's bytes, not
         // merely an arbitrary executable paired with a matching manifest hash.
+        // Running from the bundle's own frontend, the artifact just verified is
+        // that file: hashing it a second time (a debug frontend exceeds a
+        // gigabyte) proves nothing more, as neither read pins the file.
         ensure!(
-            file_sha256(running_frontend)? == frontend_artifact.sha256,
+            running_frontend.canonicalize().ok().as_ref() == Some(&frontend_path)
+                || file_sha256(running_frontend)? == frontend_artifact.sha256,
             "bundle frontend does not match the running frontend executable"
         );
         let (verified_path, sha256) = companion.context("bundle has no companion artifact")?;

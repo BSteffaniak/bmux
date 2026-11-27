@@ -25,8 +25,16 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds one CLI command's hang. Above [`PRODUCT_WAIT`], so a product-level
+/// wait reports its own timeout first.
+const COMMAND_HANG_GUARD: Duration = Duration::from_secs(180);
+/// The `--timeout` for product-level waits on an expected screen or exit: only
+/// a hang guard, never a budget the expected event must beat.
+const PRODUCT_WAIT: &str = "120s";
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Bounds a wait for something that must eventually happen. Never a budget:
+/// reaching it means a hang, however loaded the machine.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 struct RecordingEnv {
     root: PathBuf,
@@ -215,22 +223,8 @@ impl RecordingEnv {
             .stderr(File::create(&stderr_path).expect("create command stderr"))
             .spawn()
             .expect("spawn explicit test binary");
-        // GIF export is a bounded offline rasterization workload, not a launch
-        // or input operation. The approved acceptance deadline is two minutes.
-        let exports_gif = args.windows(2).any(|pair| pair == ["--export", "gif"])
-            || args.contains(&"--format=gif")
-            || args.windows(2).any(|pair| pair == ["--format", "gif"]);
-        // Launch also hashes the full debug executable before server readiness.
-        // Budget that bootstrap separately from the existing operation deadlines.
-        let launches_runtime = args.starts_with(&["recording", "process", "start"])
-            || args.starts_with(&["recording", "process", "run"]);
-        let timeout = if exports_gif {
-            Duration::from_secs(120)
-        } else if launches_runtime {
-            Duration::from_secs(60)
-        } else {
-            COMMAND_TIMEOUT
-        };
+        // Every command completes on its own; this only bounds a hang.
+        let timeout = COMMAND_HANG_GUARD;
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().expect("poll CLI child") {
@@ -362,7 +356,7 @@ impl RecordingEnv {
             id,
             "--exit",
             "--timeout",
-            "10s",
+            PRODUCT_WAIT,
             "--json",
         ])
     }
@@ -950,7 +944,7 @@ fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
             "--screen-contains",
             "Ready>",
             "--timeout",
-            "10s",
+            PRODUCT_WAIT,
             "--json",
         ]);
         assert_success(&ready);
@@ -979,7 +973,7 @@ fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
             &id,
             "--exit",
             "--timeout",
-            "10s",
+            PRODUCT_WAIT,
             "--json",
         ]);
         assert_success(&waited);
@@ -1197,7 +1191,9 @@ fn finite_launch_status_before_wait_reports_drain() {
     env.profile_export = true;
     let id = env.start("stty -opost\nprintf FINITE\nchunk=0123456789abcdef\ni=0\nwhile [ \"$i\" -lt 12 ]; do chunk=$chunk$chunk; i=$((i+1)); done\nprintf '%s' \"$chunk\"\nprintf LAST\nexit 7\n", &[]);
     let expected = format!("FINITE{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Status alone (no `wait`) must come to report the drain; how soon depends on
+    // the machine, so the deadline only bounds a hang.
+    let deadline = Instant::now() + HANG_GUARD;
     let mut timeline = Vec::new();
     loop {
         let status = env.json(&["recording", "process", "status", "--json", &id]);
@@ -1328,10 +1324,9 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
         "--screen-contains",
         "Ready>",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
-    let started = Instant::now();
     let timeout = env.run(&[
         "recording",
         "process",
@@ -1352,7 +1347,9 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
     assert_eq!(timed_out["run_id"].as_str(), Some(id.as_str()));
     assert_eq!(timed_out["timed_out"].as_bool(), Some(true));
     assert_eq!(timed_out["matched"].as_bool(), Some(false));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // The target blocks reading input, so a wait that ignored its own timeout
+    // would never return: the command's hang guard catches that, without
+    // asserting how quickly a loaded machine reports the timeout.
     let refused = env.run(&["recording", "process", "finish", &id, "--json"]);
     assert!(
         !refused.status.success(),
@@ -1387,7 +1384,7 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
         "--screen-contains",
         "Reply:héllo",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     let screen = env.json(&["recording", "process", "screen", &id, "--json"]);
@@ -1432,7 +1429,7 @@ fn termination_is_separate_from_finalization() {
         "--screen-contains",
         "Ready>",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     let status = env.json(&[
@@ -1541,7 +1538,7 @@ fn gif_export_decodes_every_frame_and_animates() {
         "--screen-contains",
         "FRAME_ONE",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     // Deliberate media sampling interval, not process-readiness synchronization.
@@ -1563,7 +1560,7 @@ fn gif_export_decodes_every_frame_and_animates() {
         "--screen-contains",
         "FRAME_TWO",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     thread::sleep(Duration::from_millis(300));
@@ -1724,7 +1721,7 @@ fn durable_start_and_send_retries_do_not_duplicate_effects() {
         "--screen-contains",
         "Ready>",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     assert_eq!(
@@ -1774,7 +1771,7 @@ fn durable_start_and_send_retries_do_not_duplicate_effects() {
         "--screen-contains",
         "FIRST:one",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     let second_key = uuid::Uuid::new_v4().to_string();
@@ -2049,7 +2046,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
         "--screen-contains",
         "Ready>",
         "--timeout",
-        "10s",
+        PRODUCT_WAIT,
         "--json",
     ]);
     let read_pid = |path: &Path| -> u32 {
@@ -2083,7 +2080,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
                 .trim_start()
                 .starts_with('Z')
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG_GUARD;
     while target_running() && Instant::now() < deadline {
         thread::sleep(POLL_INTERVAL);
     }

@@ -3,7 +3,7 @@ use std::path::Path;
 use switchy_fs::sync::{File, OpenOptions, Permissions};
 
 pub(crate) use super::native::{
-    current_executable, executable_sha256, process_id, retain_executable,
+    current_executable, process_id, retain_executable, retain_executable_snapshot,
 };
 
 /// `path`'s identity: device, inode, size, mode, and modification and status-change times

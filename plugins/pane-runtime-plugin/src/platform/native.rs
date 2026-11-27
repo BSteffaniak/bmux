@@ -14,14 +14,6 @@ pub(crate) fn current_executable() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-/// The SHA-256 digest of the executable at `path`.
-///
-/// # Errors
-/// When it cannot be opened or read as an executable.
-pub(crate) fn executable_sha256(path: &Path) -> Result<String, String> {
-    bmux_plugin::executable_sha256(path)
-}
-
 /// Retain a verified copy of the executable `source` (whose digest is `hash`) under
 /// `directory` for `owner`, and return the copy's path.
 ///
@@ -34,6 +26,19 @@ pub(crate) fn retain_executable(
     hash: &str,
 ) -> Result<PathBuf, String> {
     bmux_plugin::retain_executable(source, directory, owner, hash)
+}
+
+/// Retain a verified copy of the executable `source` as it is now under `directory` for
+/// `owner`, reading it once, and return the copy's path and digest.
+///
+/// # Errors
+/// When the copy cannot be made, or `source` changes while it is copied.
+pub(crate) fn retain_executable_snapshot(
+    source: &Path,
+    directory: &Path,
+    owner: &str,
+) -> Result<(PathBuf, String), String> {
+    bmux_plugin::retain_executable_snapshot(source, directory, owner)
 }
 
 pub(crate) fn path_is_usable_program(path: &Path) -> bool {

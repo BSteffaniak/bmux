@@ -11,50 +11,6 @@ slow-timeout = { period = "60s", terminate-after = 15, grace-period = "10s" }
 # Keep nextest's default detection window; do not hide leaks with a longer timeout.
 leak-timeout = { period = "100ms", result = "fail" }
 
-# Recorded-process tests launch isolated servers and rasterize animated evidence.
-# Bound their aggregate host load without relaxing per-command deadlines.
-[test-groups.recorded-processes]
-max-threads = 1
-
-[[profile.default.overrides]]
-filter = 'binary(recording_process_integration) | binary(interactive_recording_integration)'
-test-group = 'recorded-processes'
-# Each test owns a server and a font-rasterization workload; reserve the
-# scheduler's CPU budget rather than competing with the rest of the suite.
-threads-required = "num-cpus"
-
-# Pane-runtime PTY fixtures also spawn real controlling-terminal owners with
-# bounded startup deadlines; do not flood the host with concurrent helpers.
-[[profile.default.overrides]]
-filter = 'package(bmux_pane_runtime_plugin)'
-threads-required = "num-cpus"
-
-# Playbook fixtures also boot isolated plugin-loaded servers. Reserve host
-# capacity so parallel sandbox startups do not exhaust their fixed deadlines.
-[[profile.default.overrides]]
-filter = 'binary(playbook_integration)'
-threads-required = "num-cpus"
-
-# Application-resurrection fixtures boot a full plugin-loaded server, restart
-# it, and drive nested shells through it. Run concurrently, their servers miss
-# fixed readiness deadlines, so reserve host capacity like the fixtures above.
-[[profile.default.overrides]]
-filter = 'binary(application_resurrection_integration) | binary(group_move_integration)'
-threads-required = "num-cpus"
-
-# Mutual-authentication fixtures run multiple real servers and Raft voters.
-# Reserve host capacity just as for PTY fixtures; libtest serializes these in
-# the integration binary, while nextest runs each test in a separate process.
-[[profile.default.overrides]]
-filter = 'binary(cluster_peer_auth_transport_integration)'
-threads-required = "num-cpus"
-
-# Remote-access gates each boot a host server plus several client terminals and
-# Iroh endpoints (some with a relay or UDP proxy); run them one at a time.
-[[profile.default.overrides]]
-filter = 'binary(remote_access)'
-threads-required = "num-cpus"
-
 # Every test sees a short, canonical, private TMPDIR, independent of the
 # host's temporary directory (symlinked on macOS, long under `nix develop`).
 # See scripts/nextest-test-tmpdir.sh.
@@ -65,3 +21,9 @@ command = { command-line = "scripts/nextest-test-tmpdir.sh", relative-to = "work
 platform = 'cfg(unix)'
 filter = 'all()'
 setup = 'test-tmpdir'
+
+[profile.audit]
+fail-fast = false
+
+[profile.audit.junit]
+path = "junit.xml"

@@ -3,7 +3,9 @@ pub mod scoped;
 
 #[path = "executable_identity.rs"]
 mod executable_identity;
-pub use executable_identity::{executable_sha256, retain_executable};
+pub use executable_identity::{
+    executable_sha256, retain_executable, retain_executable_snapshot,
+};
 
 use crate::{
     CapabilityProvider, PluginDeclaration, PluginEntrypoint, PluginRegistry, RegisteredPlugin,
