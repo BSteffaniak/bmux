@@ -1617,7 +1617,7 @@ impl LoadedExecution {
         policy: PluginConcurrencyConfig,
     ) -> Result<u64> {
         reject_executable_context(native.host_kernel_bridge.is_some())?;
-        let _control = self.control()?;
+        let _control = self.activation_control()?;
         self.ensure_capacity()?;
         self.ensure_activation_port_negotiated()?;
         let activation = self.scope.begin_activation(policy).map_err(scope_error)?;
@@ -1744,23 +1744,39 @@ impl LoadedExecution {
         for call in calls {
             self.cancel(call)?;
         }
-        drain_activation(&activation, bmux_plugin_runtime::teardown_deadline()).await?;
-        let calls = self
-            .state
-            .lock()
-            .map_err(|_| failure("execution state poisoned"))?
-            .calls
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for call in calls {
-            if !matches!(&*call.state.lock().map_err(|_| failure("operation state poisoned"))?,
-                CallState::Ready(outcome) if call.lifecycle.is_some() && !matches!(outcome, NativeOutcome::Unit))
-            {
+        let deadline = bmux_plugin_runtime::teardown_deadline();
+        drain_activation(&activation, deadline).await?;
+        // Drained work has finished, but a caller may not have collected its
+        // outcome yet (its observer runs on another, possibly busy, thread): wait
+        // for it within the teardown bound. Only retained lifecycle failure
+        // outcomes may remain.
+        loop {
+            let calls = self
+                .state
+                .lock()
+                .map_err(|_| failure("execution state poisoned"))?
+                .calls
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut outstanding = false;
+            for call in calls {
+                if !matches!(&*call.state.lock().map_err(|_| failure("operation state poisoned"))?,
+                    CallState::Ready(outcome) if call.lifecycle.is_some() && !matches!(outcome, NativeOutcome::Unit))
+                {
+                    outstanding = true;
+                    break;
+                }
+            }
+            if !outstanding {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
                 return Err(failure(
                     "acknowledge outstanding outcomes before deactivation",
                 ));
             }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         // The native adapter requires its terminal activation operation to be
         // acknowledged before cleanup can start. Keep the host-owned failure
@@ -2300,6 +2316,30 @@ impl LoadedExecution {
             return Err(failure(
                 "ordinary operation admission in progress; lifecycle not admitted",
             ));
+        }
+        Ok(guard)
+    }
+
+    /// Lifecycle control for activation. Once claimed, control refuses every new
+    /// ordinary admission, so only admissions already starting an operation remain;
+    /// each is held only for that synchronous start on another thread, so wait
+    /// (bounded by the teardown timeout) for them to leave instead of refusing the
+    /// activation. A provider's services become reachable before its activation,
+    /// and a caller racing that window (an activated plugin's background task) must
+    /// not fail the server's startup.
+    fn activation_control(&self) -> Result<ControlGuard<'_>> {
+        self.control
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| failure("execution lifecycle control busy; operation not admitted"))?;
+        let guard = ControlGuard(&self.control);
+        let deadline = std::time::Instant::now() + bmux_plugin_runtime::teardown_timeout();
+        while self.operation_admissions.load(Ordering::SeqCst) != 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(failure(
+                    "ordinary operation admission in progress; lifecycle not admitted",
+                ));
+            }
+            std::thread::yield_now();
         }
         Ok(guard)
     }
