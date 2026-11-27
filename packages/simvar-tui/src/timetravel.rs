@@ -159,10 +159,13 @@ impl TimeTravel {
     }
 
     /// Note where the shown replay stopped on its own (at a breakpoint, a failure), so that is
-    /// where it is: returns whether it had.
+    /// where it is, and stop playing: returns whether it had. Playing moves a decision at a
+    /// time, so such a stop may fall on the target.
     pub fn adopt_stop(&mut self) -> bool {
         let (mode, at) = self.cursor.control.status();
-        if matches!(mode, ReplayMode::Pause) && at != self.cursor.target {
+        if matches!(mode, ReplayMode::Pause)
+            && (at != self.cursor.target || (self.playing.is_some() && self.cursor.control.broke()))
+        {
             self.cursor.target = at;
             self.playing = None;
             return true;
@@ -378,6 +381,29 @@ mod tests {
         travel.seek(&controller, 41);
         assert_eq!(controller.replays.lock().unwrap().len(), before + 1);
         assert!(!travel.ended);
+    }
+
+    #[test]
+    fn playing_stops_at_a_breakpoint() {
+        let controller = FakeController::default();
+        let mut travel = TimeTravel::start(&controller, 1, 0, 0, Some(100));
+        controller.settle();
+        travel
+            .cursor
+            .control
+            .add_breakpoint(simvar_observer::Breakpoint::Decision(3));
+        travel.set_playing(Some(1));
+        for _ in 0..10 {
+            travel.adopt_stop();
+            travel.frame(&controller);
+            controller.settle();
+        }
+        assert_eq!(travel.playing, None);
+        assert_eq!(travel.position(), 3);
+        assert_eq!(
+            travel.cursor.control.hit().as_deref(),
+            Some("break at decision 3")
+        );
     }
 
     #[test]

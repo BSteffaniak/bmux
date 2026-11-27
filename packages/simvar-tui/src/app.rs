@@ -133,6 +133,8 @@ pub enum Action {
     BreakDecision(u64),
     BreakEvent(String),
     BreakFailure,
+    /// Pause where the named predicate first holds.
+    BreakWhen(String),
     ClearBreaks,
     Dismiss(u64),
 }
@@ -213,6 +215,7 @@ impl Action {
             "break" => match parts.next()? {
                 "failure" => Self::BreakFailure,
                 "clear" => Self::ClearBreaks,
+                "when" => Self::BreakWhen(parts.next()?.to_owned()),
                 _ => return None,
             },
             _ => return None,
@@ -1160,6 +1163,13 @@ impl App {
             Action::Quit => self.quit = true,
             Action::BreakDecision(decision) => self.break_at(Breakpoint::Decision(decision)),
             Action::BreakFailure => self.break_at(Breakpoint::Failure),
+            Action::BreakWhen(name) => {
+                if simvar_observer::predicates().iter().any(|p| p.name == name) {
+                    self.break_at(Breakpoint::When(name));
+                } else {
+                    self.say(&format!("no predicate `{name}`"));
+                }
+            }
             Action::BreakEvent(kind) => {
                 let on = !self.interest.breaks_on(&kind);
                 self.interest.set_break(&kind, on);
@@ -1458,6 +1468,15 @@ impl App {
                 ),
                 item("Break on failures", "", Action::BreakFailure),
                 item("Clear breakpoints", "", Action::ClearBreaks),
+            ]);
+            for predicate in simvar_observer::predicates() {
+                items.push(item(
+                    &format!("Break when {}", predicate.description),
+                    "",
+                    Action::BreakWhen(predicate.name.to_owned()),
+                ));
+            }
+            items.extend([
                 item("Overview", "", Action::Page(Page::Overview)),
                 item("Threads", "", Action::Page(Page::Threads)),
                 item("Invariants", "", Action::Page(Page::Invariants)),
@@ -1535,7 +1554,7 @@ fn fuzzy(query: &str, text: &str) -> Option<usize> {
 }
 
 /// A typed palette command: `goto N`, `back N`, `forward N`, `break N`, `break fail`,
-/// `break EVENT`, `parallel N`, `open SEED`.
+/// `break when PREDICATE`, `break EVENT`, `parallel N`, `open SEED`.
 fn parse_command(query: &str) -> Option<Action> {
     let mut words = query.split_whitespace();
     let verb = words.next()?;
@@ -1547,6 +1566,7 @@ fn parse_command(query: &str) -> Option<Action> {
         ("forward" | "f", _) => Action::Step(i64::try_from(number.unwrap_or(1)).ok()?),
         ("break", Some("fail" | "failure" | "failures")) => Action::BreakFailure,
         ("break", Some("clear")) => Action::ClearBreaks,
+        ("break", Some("when")) => Action::BreakWhen(words.next()?.to_owned()),
         ("break", Some(kind)) => number.map_or_else(
             || Action::BreakEvent(kind.to_owned()),
             Action::BreakDecision,

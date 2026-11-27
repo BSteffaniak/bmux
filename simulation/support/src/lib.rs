@@ -1123,6 +1123,7 @@ pub fn main<B: simvar::SimBootstrap + Send + 'static>(
     if args.first().map(String::as_str) == Some("--regression") {
         return regression(name, regression_seeds);
     }
+    bmux_simvar_tui::register_predicates(kernel::PREDICATES);
     scheduling_defaults();
     let results = match args.first().map(String::as_str) {
         None => simvar::run_simulation(bootstrap)?,

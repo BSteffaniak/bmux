@@ -57,7 +57,9 @@ Going back in time replays the run's seed in the simulation's process. A few
 replays are kept parked at keyframes along the run, so going anywhere costs
 at most one keyframe's worth of decisions (`timetravel`). The fleet keeps
 running meanwhile. Breakpoints: `b` (the next decision), or commands such as
-`break 1200`, `break fail` and `break crash` (pause at that kind of event).
+`break 1200`, `break fail`, `break crash` (pause at that kind of event) and
+`break when zombie` (pause where a predicate the simulation registered first
+holds; the palette lists them). Playing stops at breakpoints too.
 
 ## Everywhere
 

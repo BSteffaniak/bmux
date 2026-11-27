@@ -2256,7 +2256,7 @@ fn palette(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
             theme.accent().add_modifier(Modifier::BOLD),
         )),
         Some(one(span(
-            " goto N · back N · break N|fail|EVENT · parallel N ",
+            " goto N · back N · break N|fail|when P|EVENT · parallel N ",
             theme.muted(),
         ))),
         rect,

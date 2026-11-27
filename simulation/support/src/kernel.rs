@@ -3,6 +3,65 @@
 
 use switchy_pty::simulator::{self, ProcessSnapshot, ProcessState};
 
+/// Conditions over the kernel's state that a dashboard breakpoint can wait for
+/// (`break when NAME`), registered by [`crate::main`] for every simulation.
+pub const PREDICATES: &[bmux_simvar_tui::Predicate] = &[
+    bmux_simvar_tui::Predicate {
+        name: "zombie",
+        description: "a process exited and is not reaped",
+        holds: || {
+            simulator::snapshot()
+                .processes
+                .iter()
+                .any(|p| matches!(p.state, ProcessState::Zombie(_)))
+        },
+    },
+    bmux_simvar_tui::Predicate {
+        name: "orphan",
+        description: "a process runs on after its session's leader exited",
+        holds: || {
+            let processes = simulator::snapshot().processes;
+            processes.iter().any(|p| {
+                p.state == ProcessState::Running
+                    && p.serial != p.session_serial
+                    && !processes.iter().any(|leader| {
+                        leader.serial == p.session_serial && leader.state == ProcessState::Running
+                    })
+            })
+        },
+    },
+    bmux_simvar_tui::Predicate {
+        name: "hung-up",
+        description: "a terminal hung up while a process still holds it",
+        holds: || {
+            simulator::snapshot()
+                .terminals
+                .iter()
+                .any(|t| t.hung_up && t.slave_holders > 0)
+        },
+    },
+    bmux_simvar_tui::Predicate {
+        name: "master-closed",
+        description: "a terminal's master side closed while a process holds it",
+        holds: || {
+            simulator::snapshot()
+                .terminals
+                .iter()
+                .any(|t| t.master_handles == 0 && t.slave_holders > 0)
+        },
+    },
+    bmux_simvar_tui::Predicate {
+        name: "backlog",
+        description: "a terminal has 1 KiB or more of output unread",
+        holds: || {
+            simulator::snapshot()
+                .terminals
+                .iter()
+                .any(|t| t.output_buffered >= 1024)
+        },
+    },
+];
+
 /// The processes running now, in the kernel's order.
 pub fn running() -> impl Iterator<Item = ProcessSnapshot> {
     simulator::snapshot()

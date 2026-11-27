@@ -43,8 +43,8 @@ use bmux_tui::terminal::Terminal;
 use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 use bmux_tui::text::Line;
 pub use simvar_observer::{
-    Breakpoint, ReplayControl, ReplayMode, RunId, RunKind, SchedulerView, SimEvent, SimObserver,
-    Verification,
+    Breakpoint, Predicate, ReplayControl, ReplayMode, RunId, RunKind, SchedulerView, SimEvent,
+    SimObserver, Verification, predicates, register_predicates,
 };
 
 pub use app::App;
