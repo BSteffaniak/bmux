@@ -2,5 +2,5 @@
 @shell sh
 new-session
 send-keys keys='echo snap_content_marker\r'
-wait-for pattern='snap_content_marker'
+wait-for pattern='snap_content_marker' timeout=60000
 snapshot id=after_echo

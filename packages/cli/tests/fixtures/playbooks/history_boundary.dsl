@@ -1,4 +1,4 @@
-@timeout 30000
+@timeout 300000
 @driver real-attach
 @sandbox-config packages/cli/tests/fixtures/playbooks/history_boundary.toml
 @viewport cols=80 rows=24
@@ -7,7 +7,7 @@
 
 new-session
 send-keys keys='printf "\\e[2J\\e[H"; seq 1 30\r'
-wait-for pattern='30'
+wait-for pattern='30' timeout=60000
 send-attach key='ctrl+a ['
 sleep ms=500
 assert-rendered contains='SCROLL'

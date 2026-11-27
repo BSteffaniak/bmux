@@ -48,6 +48,30 @@ fn failure(details: impl Into<String>) -> PluginError {
     }
 }
 
+/// Release an invocation scope allocated for an operation that never started.
+///
+/// An operation refused after its scope was allocated (a closing activation,
+/// exhausted capacity, a closed callback parent) never takes the scope over: an
+/// unreleased one stays an unfinished child of the activation, which then can
+/// never finish cleanup. Finish succeeds only when nothing owns the scope; a
+/// scope that uncertain foreign work may own remains retained and is reported.
+fn abandon_unstarted(
+    invocation: &bmux_plugin_runtime::InvocationScope,
+    error: PluginError,
+) -> PluginError {
+    if let Err(cleanup) = invocation.close() {
+        return failure(format!(
+            "operation admission failed: {error}; scope close failed: {cleanup}"
+        ));
+    }
+    if let Err(cleanup) = invocation.finish() {
+        return failure(format!(
+            "operation admission failed: {error}; scope cleanup retained: {cleanup}"
+        ));
+    }
+    error
+}
+
 fn observation_ack_error(id: u64, outcome: &NativeOutcome, error: &PluginError) -> PluginError {
     match outcome {
         NativeOutcome::Error { code, message } => failure(format!(
@@ -832,14 +856,20 @@ impl ProductionPlugin {
             Backend::Process(plugin) => plugin.dispatch_event(event),
             Backend::Scoped(execution) => {
                 let invocation = execution.begin_invocation_scope()?;
-                let binding = execution
-                    .bind_root_callback(invocation, bmux_plugin_sdk::ServiceCancellation::new())?;
-                let id = execution.begin_with_callback_dispatch(
-                    NativeOperation::Event(event.clone()),
-                    binding,
-                    None,
-                    None,
-                )?;
+                let started = execution
+                    .bind_root_callback(
+                        invocation.clone(),
+                        bmux_plugin_sdk::ServiceCancellation::new(),
+                    )
+                    .and_then(|binding| {
+                        execution.begin_with_callback_dispatch(
+                            NativeOperation::Event(event.clone()),
+                            binding,
+                            None,
+                            None,
+                        )
+                    });
+                let id = started.map_err(|error| abandon_unstarted(&invocation, error))?;
                 match Self::observe_sync(execution, id)? {
                     NativeOutcome::Unit => Ok(Some(0)),
                     _ => Err(failure("unexpected event outcome")),
@@ -983,13 +1013,14 @@ impl ProductionPlugin {
                     bmux_plugin_sdk::ServiceCancellation::new,
                     crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::cancellation,
                 );
-                let invocation = execution.begin_invocation_scope()?;
                 let runtime = host_runtime(execution)?;
+                let invocation = execution.begin_invocation_scope()?;
                 let binding = if let Some(parent) = callback_parent {
-                    execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
+                    execution.bind_child_callback(&parent, invocation.clone(), cancellation)
                 } else {
-                    execution.bind_root_callback(invocation.clone(), cancellation)?
-                };
+                    execution.bind_root_callback(invocation.clone(), cancellation)
+                }
+                .map_err(|error| abandon_unstarted(&invocation, error))?;
                 let kernel = self
                     .kernel_grant
                     .as_ref()
@@ -1014,18 +1045,7 @@ impl ProductionPlugin {
                     Some(dispatch),
                     kernel,
                 );
-                let id = match started {
-                    Ok(id) => id,
-                    Err(error) => {
-                        invocation
-                            .close()
-                            .map_err(|cleanup| failure(cleanup.to_string()))?;
-                        // Finish succeeds only when no accepted operation owns
-                        // this scope; uncertain foreign work remains retained.
-                        let _ = invocation.finish();
-                        return Err(error);
-                    }
-                };
+                let id = started.map_err(|error| abandon_unstarted(&invocation, error))?;
                 match Self::observe_sync(execution, id)? {
                     NativeOutcome::Command(outcome) => Ok((
                         outcome.exit_code,
@@ -1075,10 +1095,6 @@ impl ProductionPlugin {
             kernel_granted = self.kernel_grant.is_some(),
             "scoped authenticated provider dispatch"
         );
-        let invocation = execution.begin_invocation_scope().map_err(|error| failure(format!(
-            "selected provider invocation allocation failed: provider={} interface={} operation={} error={error}",
-            self.declaration.id.as_str(), context.request.service.interface_id, context.request.operation,
-        )))?;
         let cancellation = authority.cancellation();
         let callback_parent = authority.callback_parent()?;
         let kernel_authority = self.kernel_grant.as_ref().map(|_| authority.clone());
@@ -1095,16 +1111,21 @@ impl ProductionPlugin {
         let mut context = context.clone();
         context.host_kernel_bridge = None;
         context.host_service_port = None;
+        let invocation = execution.begin_invocation_scope().map_err(|error| failure(format!(
+            "selected provider invocation allocation failed: provider={} interface={} operation={} error={error}",
+            self.declaration.id.as_str(), context.request.service.interface_id, context.request.operation,
+        )))?;
         let binding = if let Some(parent) = callback_parent {
             execution.bind_child_callback_with(
                 &parent,
                 invocation.clone(),
                 cancellation,
                 reentry,
-            )?
+            )
         } else {
-            execution.bind_root_callback(invocation.clone(), cancellation)?
-        };
+            execution.bind_root_callback(invocation.clone(), cancellation)
+        }
+        .map_err(|error| abandon_unstarted(&invocation, error))?;
         // Kernel requests made inside the author entry carry that entry as
         // their call-chain parent, like the entered host route below.
         let kernel = self
@@ -1124,24 +1145,7 @@ impl ProductionPlugin {
             Some(host),
             kernel,
         );
-        let id = match started {
-            Ok(id) => id,
-            Err(error) => {
-                // Only unused scopes can finish here. If foreign start may
-                // already own work, failed finish retains cleanup authority.
-                invocation.close().map_err(|cleanup| {
-                    failure(format!(
-                        "operation admission failed: {error}; scope close failed: {cleanup}"
-                    ))
-                })?;
-                invocation.finish().map_err(|cleanup| {
-                    failure(format!(
-                        "operation admission failed: {error}; scope cleanup retained: {cleanup}"
-                    ))
-                })?;
-                return Err(error);
-            }
-        };
+        let id = started.map_err(|error| abandon_unstarted(&invocation, error))?;
         match Self::observe_sync(execution, id)? {
             NativeOutcome::Service(response) => Ok(response),
             _ => Err(failure("unexpected authenticated service outcome")),

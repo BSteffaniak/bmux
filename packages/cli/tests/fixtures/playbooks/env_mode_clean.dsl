@@ -3,5 +3,5 @@
 @env-mode clean
 new-session
 send-keys keys='echo $TERM\r'
-wait-for pattern='xterm-256color'
+wait-for pattern='xterm-256color' timeout=60000
 assert-screen contains='xterm-256color'

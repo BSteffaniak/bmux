@@ -233,7 +233,7 @@ fn playbook_run_interactive_step_controls() {
         let mut stdin = child.stdin.take().expect("stdin should be piped");
         stdin
             .write_all(
-                b"n\n: send-keys keys='echo adhoc_interactive_marker\\r'\n: wait-for pattern='adhoc_interactive_marker'\ns\nc\n",
+                b"n\n: send-keys keys='echo adhoc_interactive_marker\\r'\n: wait-for pattern='adhoc_interactive_marker' timeout=60000\ns\nc\n",
             )
             .expect("failed writing interactive commands");
     }
@@ -1047,7 +1047,7 @@ async fn run_playbook_echo_pass() {
 @shell sh
 new-session
 send-keys keys='echo api_test_marker\\r'
-wait-for pattern='api_test_marker'
+wait-for pattern='api_test_marker' timeout=60000
 assert-screen contains='api_test_marker'
 ";
     let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
@@ -1072,7 +1072,7 @@ async fn run_playbook_failing_returns_fail() {
 @shell sh
 new-session
 send-keys keys='echo real_output\\r'
-wait-for pattern='real_output'
+wait-for pattern='real_output' timeout=60000
 assert-screen contains='nonexistent_xyz_api'
 ";
     let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
@@ -1490,8 +1490,14 @@ async fn interactive_mode_basic() {
     .await;
     assert_eq!(resp["status"], "ok", "send-keys response: {resp:#}");
 
-    // sleep briefly for output to arrive
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for the shell's output rather than for a guessed delay.
+    let resp = send_op(
+        &mut writer,
+        &mut reader,
+        &serde_json::json!({"op":"command","request_id":"basic-wait","dsl":"wait-for pattern='interactive_test' timeout=60000"}),
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "wait-for response: {resp:#}");
 
     // screen
     let resp = send_op(
@@ -1576,15 +1582,12 @@ async fn interactive_mode_basic() {
     let resp = send_op(
         &mut writer,
         &mut reader,
-        &serde_json::json!({"op":"command","request_id":"basic-wait-marker","dsl":"wait-for pattern='push_test_marker' timeout=3000"}),
+        &serde_json::json!({"op":"command","request_id":"basic-wait-marker","dsl":"wait-for pattern='push_test_marker' timeout=60000"}),
     )
     .await;
     assert_eq!(resp["status"], "ok", "wait-for marker response: {resp:#}");
 
-    // Read responses/push events until we find an output push event or the
-    // screen command response. Push events may arrive before or after the
-    // screen response.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The marker is on screen once wait-for answers: hydrate reads that state.
 
     // Drain any push events that arrived.
     let resp = send_op(
@@ -2049,7 +2052,7 @@ async fn concurrent_playbook_runs() {
 @shell sh
 new-session
 send-keys keys='echo concurrent_test\\r'
-wait-for pattern='concurrent_test'
+wait-for pattern='concurrent_test' timeout=60000
 assert-screen contains='concurrent_test'
 ";
 

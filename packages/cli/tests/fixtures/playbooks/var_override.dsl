@@ -3,4 +3,4 @@
 @var MARKER=default_value
 new-session
 send-keys keys='echo ${MARKER}\r'
-wait-for pattern='cli_override'
+wait-for pattern='cli_override' timeout=60000

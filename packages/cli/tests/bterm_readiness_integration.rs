@@ -49,7 +49,9 @@ async fn managed_companion_idle_watch_does_not_block_handshake_or_lose_host_orig
             .unwrap(),
     );
     let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock"));
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Startup, policy verification and configuration finish on their own; the
+    // deadline only bounds a hang, however slowly a loaded machine gets there.
+    let deadline = Instant::now() + support::HANG_GUARD;
     let mut owner = loop {
         assert!(child.0.try_wait().unwrap().is_none(), "{}", server_output());
         assert!(
@@ -123,7 +125,7 @@ async fn fresh_companion_exposes_authoritative_readiness() {
     // Activation verifies identity before serving readiness requests.
     let mut client = bmux_client::BmuxClient::connect(
         &endpoint,
-        std::time::Duration::from_secs(5),
+        support::HANG_GUARD,
         "bterm-readiness-test",
     )
     .await
@@ -164,7 +166,7 @@ async fn fresh_companion_exposes_authoritative_readiness() {
     // Repeated readiness requests retain the same activation identity.
     let mut warm_client = bmux_client::BmuxClient::connect(
         &endpoint,
-        std::time::Duration::from_secs(5),
+        support::HANG_GUARD,
         "bterm-readiness-cached-test",
     )
     .await

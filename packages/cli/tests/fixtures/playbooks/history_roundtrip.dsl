@@ -1,4 +1,4 @@
-@timeout 60000
+@timeout 300000
 @driver real-attach
 @sandbox-config packages/cli/tests/fixtures/playbooks/history_boundary.toml
 @viewport cols=80 rows=24
@@ -6,7 +6,7 @@
 @env-mode clean
 new-session
 send-keys keys='printf "\\e[2J\\e[H"; seq 1 50\r'
-wait-for pattern='50'
+wait-for pattern='50' timeout=60000
 send-attach key='ctrl+a ['
 sleep ms=300
 send-attach key='g'

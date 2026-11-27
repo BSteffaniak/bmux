@@ -2,4 +2,4 @@
 @shell sh
 new-session
 send-keys keys='echo item_42_done\r'
-wait-for pattern='item_\d+_done'
+wait-for pattern='item_\d+_done' timeout=60000

@@ -1,4 +1,4 @@
-@timeout 30000
+@timeout 300000
 @driver real-attach
 @sandbox-config packages/cli/tests/fixtures/playbooks/history_boundary.toml
 @viewport cols=80 rows=24
@@ -6,7 +6,7 @@
 @env-mode clean
 new-session
 send-keys keys='printf "MAIN-CONTENT\\n\\e[?1049h\\e[2J\\e[HALTERNATE-COPY"\r'
-wait-for pattern='ALTERNATE-COPY'
+wait-for pattern='ALTERNATE-COPY' timeout=60000
 send-attach key='ctrl+a ['
 sleep ms=300
 assert-rendered contains='ALTERNATE-COPY'

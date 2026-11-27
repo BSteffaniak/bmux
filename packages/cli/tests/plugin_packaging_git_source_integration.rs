@@ -29,6 +29,10 @@ fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
         .env("GIT_AUTHOR_EMAIL", "bmux-test@example.invalid")
         .env("GIT_COMMITTER_NAME", "bmux-test")
         .env("GIT_COMMITTER_EMAIL", "bmux-test@example.invalid")
+        // Fixed dates: the same tree always makes the same commit, so Cargo reuses
+        // what it built from an unchanged snapshot instead of rebuilding the SDK.
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
         .output()
         .expect("run git");
     support::assert_success(&output, &format!("git {}", args.join(" ")));
@@ -38,6 +42,11 @@ fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
 /// Snapshot the working tree (tracked and untracked, honoring ignores) into a
 /// fresh repository on branch `master`.
 fn snapshot_repository(workspace: &Path, repo: &Path) {
+    match std::fs::remove_dir_all(repo) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("clear previous snapshot repo: {error}"),
+    }
     std::fs::create_dir_all(repo).expect("create snapshot repo");
     let listing = git(
         workspace,
@@ -154,7 +163,19 @@ fn a_plugin_pinned_to_git_bmux_packages_itself() {
                 .expect("target dir"),
         )
         .expect("scratch dir");
-    let repo = scratch.path().join("bmux");
+    // A stable location (with deterministic commits): the git source Cargo resolves
+    // is identical whenever the working tree is, so its build is reused. One run at
+    // a time owns it.
+    let packaging = target_dir.parent().expect("packaging dir");
+    std::fs::create_dir_all(packaging).expect("create packaging dir");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(packaging.join("git-source.lock"))
+        .expect("open git-source lock");
+    lock.lock().expect("lock git-source snapshot");
+    let repo = packaging.join("git-source-repo/bmux");
     let consumer = scratch.path().join("consumer");
     let receipt = scratch.path().join("receipt");
     snapshot_repository(&workspace, &repo);

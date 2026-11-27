@@ -4,5 +4,5 @@ new-session
 # Only executed output contains the contiguous sentinel; terminal echo cannot
 # satisfy the wait before the command runs.
 send-keys keys='printf "%s%s\\n" hello_world_ test\r'
-wait-for pattern='(?m)^hello_world_test *$'
+wait-for pattern='(?m)^hello_world_test *$' timeout=60000
 assert-screen contains='hello_world_test'

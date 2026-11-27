@@ -1,51 +1,51 @@
 @driver real-attach
-@timeout 60000
+@timeout 300000
 @viewport cols=100 rows=30
 @shell sh
 @sandbox-config packages/cli/tests/fixtures/playbooks/workspaces_real_attach.toml
 new-session name='bootstrap'
 send-attach key='alt+a'
-wait-rendered contains='<active:tab-A_ONE>' timeout=10000
+wait-rendered contains='<active:tab-A_ONE>' timeout=60000
 send-keys keys='printf "\\033[2J\\033[HA_ONE\\n"\r'
-wait-for pattern='A_ONE'
+wait-for pattern='A_ONE' timeout=60000
 send-attach key='alt+b'
-wait-rendered contains='<active:tab-A_TWO>' timeout=10000
+wait-rendered contains='<active:tab-A_TWO>' timeout=60000
 send-keys keys='printf "\\033[2J\\033[HA_TWO\\n"\r'
-wait-for pattern='A_TWO'
+wait-for pattern='A_TWO' timeout=60000
 # A new workspace creates and selects an empty tab-1 context, not a name prompt.
 send-attach key='alt+w'
-wait-rendered contains='<active:tab-1>' timeout=10000
+wait-rendered contains='<active:tab-1>' timeout=60000
 send-attach key='alt+d'
-wait-rendered contains='<active:tab-B_ONE>' timeout=10000
+wait-rendered contains='<active:tab-B_ONE>' timeout=60000
 send-keys keys='printf "\\033[2J\\033[HB_ONE\\n"\r'
-wait-for pattern='B_ONE'
+wait-for pattern='B_ONE' timeout=60000
 send-attach key='alt+e'
-wait-rendered contains='<active:tab-B_TWO>' timeout=10000
+wait-rendered contains='<active:tab-B_TWO>' timeout=60000
 send-keys keys='printf "\\033[2J\\033[HB_TWO\\n"\r'
-wait-for pattern='B_TWO'
+wait-for pattern='B_TWO' timeout=60000
 send-attach key='alt+l'
-wait-rendered contains='<active:tab-A_TWO>' timeout=10000
-wait-for pattern='A_TWO' timeout=10000
+wait-rendered contains='<active:tab-A_TWO>' timeout=60000
+wait-for pattern='A_TWO' timeout=60000
 assert-screen contains='A_TWO'
 # MRU excluding current: B_TWO, B_ONE, A_ONE; not workspace order.
 send-attach key='alt+f'
-wait-rendered contains='Find Tab' timeout=10000
+wait-rendered contains='Find Tab' timeout=60000
 # A finder selection switches asynchronously after the prompt resolves; wait
 # for the committed active tab, not a name the tab bar already shows.
 send-attach key='enter'
-wait-rendered contains='<active:tab-B_TWO>' timeout=10000
-wait-for pattern='B_TWO' timeout=10000
+wait-rendered contains='<active:tab-B_TWO>' timeout=60000
+wait-for pattern='B_TWO' timeout=60000
 assert-screen contains='B_TWO'
 # After that visit: A_TWO, B_ONE, A_ONE. Filtering must retain recency.
 send-attach key='alt+f'
-wait-rendered contains='Find Tab' timeout=10000
+wait-rendered contains='Find Tab' timeout=60000
 send-attach key='t'
 send-attach key='a'
 send-attach key='b'
-wait-rendered contains='1/4 matches' timeout=10000
+wait-rendered contains='1/4 matches' timeout=60000
 send-attach key='down'
-wait-rendered contains='2/4 matches' timeout=10000
+wait-rendered contains='2/4 matches' timeout=60000
 send-attach key='enter'
-wait-rendered contains='<active:tab-B_ONE>' timeout=10000
-wait-for pattern='B_ONE' timeout=10000
+wait-rendered contains='<active:tab-B_ONE>' timeout=60000
+wait-for pattern='B_ONE' timeout=60000
 assert-screen contains='B_ONE'

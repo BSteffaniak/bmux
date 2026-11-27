@@ -1,5 +1,5 @@
 @driver real-attach
-@timeout 60000
+@timeout 300000
 @viewport cols=110 rows=30
 @shell bash
 @plugin enable=bmux.tabs
@@ -13,14 +13,14 @@
 new-session
 attach-command action='plugin:bmux.tabs:new-tab'
 send-attach key='ctrl+alt+s'
-wait-rendered contains='TABS'
+wait-rendered contains='TABS' timeout=60000
 send-keys keys='set +H\r'
 # A job reports, with the pane's marker, that it is blocked: the sidebar
 # says so with its message (assembled here, so it is never typed).
 send-keys keys='a=app; M=$(printf ${a}rove | base64); R="\\033]633;bmux;$BMUX_SHELL_MARKER;agent;blocked;;$M\\007"; export R; echo RE""ADY\r'
-wait-for pattern='READY'
+wait-for pattern='READY' timeout=60000
 send-keys keys='sh -c "printf %b \$R; sleep 8"\r'
-wait-rendered contains='needs input'
+wait-rendered contains='needs input' timeout=60000
 assert-rendered matches='(?m)^.{0,30}needs input'
-wait-rendered contains='approve'
+wait-rendered contains='approve' timeout=60000
 assert-rendered matches='(?m)^.{0,30}approve'

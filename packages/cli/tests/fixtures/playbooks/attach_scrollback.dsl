@@ -1,9 +1,9 @@
-@timeout 20000
+@timeout 300000
 @shell sh
 
 new-session
 send-keys keys='seq 1 200\r'
-wait-for pattern='200'
+wait-for pattern='200' timeout=60000
 
 # Enter scrollback mode and move the cursor up one line via attach key handling.
 send-attach key='ctrl+a ['

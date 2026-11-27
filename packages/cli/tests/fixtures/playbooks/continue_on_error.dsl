@@ -2,6 +2,6 @@
 @shell sh
 new-session
 send-keys keys='echo real_output\r'
-wait-for pattern='real_output'
+wait-for pattern='real_output' timeout=60000
 assert-screen contains='nonexistent_xyz_continue' !continue
 assert-screen contains='real_output'

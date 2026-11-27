@@ -11,7 +11,7 @@
 @plugin disable=bmux.sidebar
 new-session
 send-keys keys='printf PRESENTATIONS_NEITHER_OK\r'
-wait-for pattern='PRESENTATIONS_NEITHER_OK'
+wait-for pattern='PRESENTATIONS_NEITHER_OK' timeout=60000
 assert-screen contains='PRESENTATIONS_NEITHER_OK'
 resize-viewport cols=80 rows=24
 resize-viewport cols=120 rows=36

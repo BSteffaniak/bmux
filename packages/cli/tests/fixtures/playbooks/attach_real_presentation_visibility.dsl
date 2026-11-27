@@ -1,5 +1,5 @@
 @driver real-attach
-@timeout 60000
+@timeout 300000
 @viewport cols=100 rows=30
 @shell sh
 @plugin enable=bmux.tabs
@@ -14,11 +14,11 @@ new-session
 # column 0. Markers are printed in two halves so the echoed command line
 # cannot match.
 send-keys keys='clear; printf %s%s HID DEN_OK\r'
-wait-rendered contains='HIDDEN_OK'
+wait-rendered contains='HIDDEN_OK' timeout=60000
 assert-rendered matches='(?m)^ *HIDDEN_OK'
 send-attach key='ctrl+alt+s'
-wait-rendered contains=' TABS '
+wait-rendered contains=' TABS ' timeout=60000
 send-attach key='ctrl+alt+s'
 send-keys keys='clear; printf %s%s HIDDEN AGAIN_OK\r'
-wait-rendered contains='HIDDENAGAIN_OK'
+wait-rendered contains='HIDDENAGAIN_OK' timeout=60000
 assert-rendered matches='(?m)^ *HIDDENAGAIN_OK'

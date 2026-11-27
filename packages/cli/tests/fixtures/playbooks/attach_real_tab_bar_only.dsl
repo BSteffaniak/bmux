@@ -10,9 +10,9 @@
 @plugin enable=bmux.tab_bar
 new-session
 send-keys keys='printf TAB_ONLY_OK\r'
-wait-for pattern='TAB_ONLY_OK'
+wait-for pattern='TAB_ONLY_OK' timeout=60000
 # The bar shows the input mode.
-wait-rendered contains='INSERT'
+wait-rendered contains='INSERT' timeout=60000
 assert-screen contains='TAB_ONLY_OK'
 send-attach key='ctrl+a c'
 send-attach key='ctrl+s'

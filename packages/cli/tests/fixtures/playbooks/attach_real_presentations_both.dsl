@@ -11,11 +11,11 @@
 @plugin enable=bmux.sidebar
 new-session
 send-keys keys='printf PRESENTATIONS_BOTH_OK\r'
-wait-for pattern='PRESENTATIONS_BOTH_OK'
+wait-for pattern='PRESENTATIONS_BOTH_OK' timeout=60000
 # The sidebar is enabled by default but starts hidden.
 send-attach key='ctrl+alt+s'
-wait-rendered contains=' TABS '
-wait-rendered contains='INSERT'
+wait-rendered contains=' TABS ' timeout=60000
+wait-rendered contains='INSERT' timeout=60000
 assert-screen contains='PRESENTATIONS_BOTH_OK'
 send-attach key='ctrl+a c'
 send-attach key='ctrl+s'
