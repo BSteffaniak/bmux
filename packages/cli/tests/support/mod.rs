@@ -1,4 +1,5 @@
 mod lifecycle;
+mod stable_executable;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -16,7 +17,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[must_use]
 pub fn bmux_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
+    stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux"))
 }
 
 /// Short root for isolated process trees: `/tmp` unless `BMUX_TEST_TMP_ROOT` names
@@ -73,6 +74,63 @@ impl Drop for TempDirGuard {
             eprintln!("failed removing fixture {}: {error}", self.path.display());
         }
     }
+}
+
+/// The private shell-callback image root shared by fixture servers (see
+/// [`ServerEnv::share_shell_callback_images`]). Images of earlier builds are removed
+/// once per test process: each pins its executable's old bytes on disk.
+#[allow(dead_code)] // This shared fixture module is compiled separately by each integration target.
+fn shared_shell_callback_images() -> &'static Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        #[cfg(unix)]
+        let user = {
+            // SAFETY: geteuid only reads the effective user identity.
+            unsafe { libc::geteuid() }
+        };
+        #[cfg(not(unix))]
+        let user = 0;
+        let root = test_tmp_root().join(format!("bmux-shell-images-{user}"));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create shared shell-callback image root: {error}"),
+        }
+        let root = root
+            .canonicalize()
+            .expect("canonical shell-callback image root");
+        let built = std::fs::metadata(bmux_binary())
+            .and_then(|metadata| metadata.modified())
+            .expect("bmux binary modification time");
+        let stale = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|created| created < built)
+        };
+        // Images live at <root>/<owner digest (64 hex)>/<image digest>/bmux; the
+        // servers' per-pane shell startup files share the root.
+        for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_name().len() == 64 {
+                for image in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                    if stale(&image.path()) {
+                        let _ = std::fs::remove_dir_all(image.path());
+                    }
+                }
+            } else if stale(&path) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+        root
+    })
 }
 
 #[derive(Debug)]
@@ -144,6 +202,26 @@ impl ServerEnv {
         self.command_with_binary(&bmux_binary(), args)
     }
 
+    /// Retain the server's shell-callback image (the bmux executable nested shells
+    /// run) in one directory shared by every fixture server, instead of a fresh copy
+    /// per server.
+    ///
+    /// macOS assesses an executable the first time it runs from a new path, which for
+    /// a debug bmux (over a gigabyte) takes seconds: a nested shell's first prompt
+    /// waited on it for each new server. Images are content-addressed and published
+    /// without clobbering, so concurrent servers share one safely. Opt in only where
+    /// nested shells run the callback: a server finding an existing image verifies
+    /// it, which costs a read of the executable.
+    #[allow(dead_code)] // This shared fixture module is compiled separately by each integration target.
+    pub fn share_shell_callback_images(&mut self) {
+        let shared = shared_shell_callback_images();
+        let runtime = self.state_dir.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("create state runtime directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(shared, runtime.join("shell-integration"))
+            .expect("link the shared shell-callback image root");
+    }
+
     #[allow(dead_code)] // This shared fixture module is compiled separately by each integration target.
     pub fn isolate_shell_config(&mut self) {
         let home = self.root().join("home");
@@ -177,12 +255,8 @@ impl ServerEnv {
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
-        lifecycle::run(
-            &mut self.command(args),
-            self.root(),
-            HANG_GUARD,
-        )
-        .expect("run isolated bmux command")
+        lifecycle::run(&mut self.command(args), self.root(), HANG_GUARD)
+            .expect("run isolated bmux command")
     }
 
     fn retire(&mut self) -> std::io::Result<()> {

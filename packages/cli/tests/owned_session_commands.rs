@@ -1,6 +1,8 @@
 //! Exercise the public spellings against an isolated, deliberately stopped runtime.
 #![cfg(feature = "bundled-plugin-sessions")]
 
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 #[test]
 fn offline_commands_route_to_sessions_without_starting_a_server() {
     use std::process::{Command, Stdio};
@@ -34,7 +36,7 @@ fn offline_commands_route_to_sessions_without_starting_a_server() {
             "server is not running",
         ),
     ] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bmux"));
+        let mut cmd = Command::new(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
         cmd.env_clear()
             .current_dir(&root)
             .env("HOME", &root)

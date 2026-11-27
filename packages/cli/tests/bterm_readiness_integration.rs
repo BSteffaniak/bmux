@@ -123,13 +123,10 @@ async fn fresh_companion_exposes_authoritative_readiness() {
     server.start();
     let endpoint = bmux_ipc::IpcEndpoint::UnixSocket(server.runtime_dir.join("server.sock"));
     // Activation verifies identity before serving readiness requests.
-    let mut client = bmux_client::BmuxClient::connect(
-        &endpoint,
-        support::HANG_GUARD,
-        "bterm-readiness-test",
-    )
-    .await
-    .unwrap();
+    let mut client =
+        bmux_client::BmuxClient::connect(&endpoint, support::HANG_GUARD, "bterm-readiness-test")
+            .await
+            .unwrap();
     client.require_service_contracts().unwrap();
     let readiness =
         bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(

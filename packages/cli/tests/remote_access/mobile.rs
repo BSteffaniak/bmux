@@ -64,7 +64,11 @@ fn mobile_core_pairs_with_a_host_and_attaches_a_terminal() {
     let waiting = wait_pairing(&manager, &started, |state| {
         state.status != PairingStatus::Connecting
     });
-    assert_eq!(waiting.status, PairingStatus::AwaitingApproval, "{waiting:?}");
+    assert_eq!(
+        waiting.status,
+        PairingStatus::AwaitingApproval,
+        "{waiting:?}"
+    );
     let host_phrase = owner.expect(
         "Compare this phrase on the other device: ([0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4})",
         STEP,

@@ -1,6 +1,8 @@
 //! A standalone command must not acquire server identity or ingress authority.
 #![cfg(feature = "bundled-plugin-connections")]
 
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use std::process::Command;
 
 #[test]
@@ -9,7 +11,7 @@ fn revoke_without_device_on_a_fresh_install_reports_usage_not_lifecycle_failure(
     let root = root.path().canonicalize().unwrap();
     let config = root.join("config.toml");
     std::fs::write(&config, "[plugins]\ndisabled = []\n").unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bmux"));
+    let mut command = Command::new(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
     command
         .current_dir(&root)
         .env_clear()

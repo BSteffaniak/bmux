@@ -12,6 +12,8 @@
 // fixture launches servers and/or rasterizes evidence. Keep deadlines strict.
 #[path = "support/recording_cleanup.rs"]
 mod recording_cleanup;
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use recording_cleanup::cleanup_short_tmp;
 #[path = "support/generated_manifest.rs"]
 mod generated_manifest;
@@ -504,7 +506,7 @@ fn acceptance_binary() -> PathBuf {
     let root = std::env::var_os("BMUX_RECORDING_TEST_INSTALL_ROOT");
     match (selected, root) {
         (None, None) => {
-            let binary = PathBuf::from(env!("CARGO_BIN_EXE_bmux"));
+            let binary = stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux"));
             assert!(binary.is_absolute(), "Cargo must supply an absolute binary");
             binary
         }

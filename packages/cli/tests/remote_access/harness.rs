@@ -81,10 +81,7 @@ fn isolated_env(root: &Path, dirs: &Dirs) -> Vec<(OsString, Option<OsString>)> {
     // The clipboard: no display or native pasteboard reaches the developer's own, and
     // copies go through the platform's clipboard command, which lands them in a file.
     let bin = clipboard_capture(root);
-    env.push((
-        bmux_clipboard::BACKEND_ENV.into(),
-        Some("command".into()),
-    ));
+    env.push((bmux_clipboard::BACKEND_ENV.into(), Some("command".into())));
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
         .expect("PATH with the clipboard capture");

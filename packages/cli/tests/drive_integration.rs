@@ -3,6 +3,8 @@
 //! linted when it exits, and its recorded script replayed at two sizes.
 #![cfg(all(unix, feature = "bundled-plugin-playbook"))]
 
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -34,7 +36,7 @@ impl Home {
     }
 
     fn drive(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_bmux"))
+        Command::new(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")))
             .arg("drive")
             .args(args)
             .current_dir(&self.root)

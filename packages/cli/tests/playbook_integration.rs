@@ -9,6 +9,8 @@
 //!   directly (lower-level checks).
 #![cfg(feature = "bundled-plugin-playbook")]
 
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,7 +18,7 @@ use std::process::Stdio;
 
 /// Path to the built `bmux` binary.
 fn bmux_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
+    stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux"))
 }
 
 /// Path to the fixtures directory.
@@ -1051,7 +1053,7 @@ wait-for pattern='api_test_marker' timeout=60000
 assert-screen contains='api_test_marker'
 ";
     let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
-    playbook.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+    playbook.config.binary = Some(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
 
     let result = bmux_cli::playbook::run(playbook, false).await.unwrap();
     assert!(result.pass, "playbook should pass: {:?}", result.error);
@@ -1076,7 +1078,7 @@ wait-for pattern='real_output' timeout=60000
 assert-screen contains='nonexistent_xyz_api'
 ";
     let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
-    playbook.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+    playbook.config.binary = Some(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
 
     let result = bmux_cli::playbook::run(playbook, false).await.unwrap();
     assert!(!result.pass, "playbook should fail");
@@ -2058,12 +2060,12 @@ assert-screen contains='concurrent_test'
 
     let run1 = async {
         let (mut pb, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
-        pb.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+        pb.config.binary = Some(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
         bmux_cli::playbook::run(pb, false).await.unwrap()
     };
     let run2 = async {
         let (mut pb, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
-        pb.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+        pb.config.binary = Some(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
         bmux_cli::playbook::run(pb, false).await.unwrap()
     };
 

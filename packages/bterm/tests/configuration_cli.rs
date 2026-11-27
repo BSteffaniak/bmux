@@ -17,54 +17,56 @@ struct Inspection {
     root: PathBuf,
 }
 
-impl Inspection {
-    fn new() -> Self {
-        #[cfg(unix)]
-        let temporary = std::env::var_os("BMUX_TEST_TMP_ROOT")
-            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-            .canonicalize()
-            .unwrap();
-        #[cfg(not(unix))]
-        let temporary = std::env::temp_dir().canonicalize().unwrap();
-        let root = loop {
-            let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let candidate = temporary.join(format!("btc-{}-{id}", std::process::id()));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => break candidate.canonicalize().unwrap(),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("create private inspection root: {error}"),
+/// The bundle every inspection runs: the real frontend (managed inspection
+/// verifies the same bundle identities as startup) beside an inspection-only
+/// companion artifact and their manifest, never launching any companion.
+///
+/// One bundle per frontend build, at a stable path shared by every test: macOS
+/// assesses an executable the first time it runs from a new path (seconds for a
+/// debug frontend over a gigabyte), so a fresh bundle per test paid that every
+/// time. A hard link presents the frontend's bytes without copying them.
+/// Inspections only read it; each test still owns its private roots.
+fn shared_bundle() -> &'static Path {
+    static BUNDLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        let source = Path::new(env!("CARGO_BIN_EXE_bterm"));
+        let metadata = std::fs::metadata(source).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Size and modification time identify the build: Cargo re-links the
+        // uplifted executable (a new inode) on every invocation.
+        let len = metadata.len();
+        let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let name = format!("bterm-inspection-bundle-{len}-{modified}");
+        let bundle = parent.join(&name);
+        if bundle.join(bterm::compatibility::BUNDLE_MANIFEST).exists() {
+            return bundle.canonicalize().unwrap();
+        }
+        // Bundles of earlier builds pin their frontend's old bytes on disk.
+        for entry in std::fs::read_dir(parent).unwrap().flatten() {
+            let other = entry.file_name();
+            let other = other.to_string_lossy();
+            if other.starts_with("bterm-inspection-bundle-") && other != name {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        for name in ["h", "c", "d", "s", "r", "t", "k", "w"] {
-            let path = root.join(name);
-            std::fs::create_dir(&path).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
+        let staging = tempfile::Builder::new()
+            .prefix(".bterm-inspection-bundle-")
+            .tempdir_in(parent)
+            .unwrap()
+            .keep();
+        let frontend = staging.join("bterm");
+        if std::fs::hard_link(source, &frontend).is_err() {
+            std::fs::copy(source, &frontend).unwrap();
         }
-        // Managed inspection verifies the same bundle identities as startup;
-        // provide real frontend bytes without launching any companion process.
-        let bundle = root.join("bundle");
-        std::fs::create_dir(&bundle).unwrap();
-        let frontend = bundle.join("bterm");
-        // A hard link presents the real frontend bytes at a bundle path while
-        // sharing one file (and one page cache) across concurrently running
-        // tests; copying the multi-gigabyte debug executable per test thrashed
-        // memory. Fall back to a copy across filesystems.
-        if std::fs::hard_link(env!("CARGO_BIN_EXE_bterm"), &frontend).is_err() {
-            std::fs::copy(env!("CARGO_BIN_EXE_bterm"), &frontend).unwrap();
-        }
-        let companion = bundle.join("bmux");
+        let companion = staging.join("bmux");
         std::fs::write(&companion, b"inspection-only companion artifact").unwrap();
-        use sha2::{Digest as _, Sha256};
         let digest = |path: &Path| {
+            use sha2::{Digest as _, Sha256};
             use std::fmt::Write as _;
             let mut hasher = Sha256::new();
             let mut file = std::fs::File::open(path).unwrap();
@@ -100,10 +102,50 @@ impl Inspection {
             ],
         };
         std::fs::write(
-            bundle.join(bterm::compatibility::BUNDLE_MANIFEST),
+            staging.join(bterm::compatibility::BUNDLE_MANIFEST),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
+        // Concurrent tests may publish the same bundle; the first one wins.
+        if std::fs::rename(&staging, &bundle).is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        bundle.canonicalize().unwrap()
+    })
+}
+
+impl Inspection {
+    fn new() -> Self {
+        #[cfg(unix)]
+        let temporary = std::env::var_os("BMUX_TEST_TMP_ROOT")
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+            .canonicalize()
+            .unwrap();
+        #[cfg(not(unix))]
+        let temporary = std::env::temp_dir().canonicalize().unwrap();
+        let root = loop {
+            let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = temporary.join(format!("btc-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate.canonicalize().unwrap(),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private inspection root: {error}"),
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in ["h", "c", "d", "s", "r", "t", "k", "w"] {
+            let path = root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
         Self { root }
     }
 
@@ -115,7 +157,7 @@ impl Inspection {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(self.root.join("bundle/bterm"));
+        let mut command = Command::new(shared_bundle().join("bterm"));
         command.env_clear().current_dir(self.root.join("w"));
         for (name, directory) in [
             ("HOME", "h"),
@@ -161,18 +203,8 @@ impl Drop for Inspection {
 enum Entry {
     Directory,
     File(Vec<u8>),
-    /// Large files (the hard-linked frontend executable) are fingerprinted by
-    /// length, modification time and inode instead of being read whole: any
-    /// write or replacement changes the fingerprint.
-    LargeFile {
-        len: u64,
-        modified: std::time::SystemTime,
-        inode: u64,
-    },
     Symlink(PathBuf),
 }
-
-const SNAPSHOT_CONTENT_LIMIT: u64 = 1024 * 1024;
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
     fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Entry>) {
@@ -190,20 +222,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
                     metadata.is_file(),
                     "inspection created a special file: {path:?}"
                 );
-                let entry = if metadata.len() > SNAPSHOT_CONTENT_LIMIT {
-                    #[cfg(unix)]
-                    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
-                    #[cfg(not(unix))]
-                    let inode = 0;
-                    Entry::LargeFile {
-                        len: metadata.len(),
-                        modified: metadata.modified().unwrap(),
-                        inode,
-                    }
-                } else {
-                    Entry::File(std::fs::read(&path).unwrap())
-                };
-                entries.insert(key, entry);
+                entries.insert(key, Entry::File(std::fs::read(&path).unwrap()));
             }
         }
     }

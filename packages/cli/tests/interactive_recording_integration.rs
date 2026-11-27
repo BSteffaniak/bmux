@@ -4,6 +4,8 @@
 
 #[path = "support/recording_cleanup.rs"]
 mod recording_cleanup;
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 
 use serde_json::Value;
 use serial_test::serial;
@@ -81,7 +83,7 @@ impl Fixture {
             std::env::var_os("BMUX_RECORDING_TEST_BINARY"),
             std::env::var_os("BMUX_RECORDING_TEST_INSTALL_ROOT"),
         ) {
-            (None, None) => PathBuf::from(env!("CARGO_BIN_EXE_bmux")),
+            (None, None) => stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")),
             (Some(binary), Some(installation)) => {
                 let installation = PathBuf::from(installation)
                     .canonicalize()

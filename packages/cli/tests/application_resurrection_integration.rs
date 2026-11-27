@@ -136,7 +136,7 @@ fn shipped_executable_serves_private_shell_callback_modes() {
         ("zsh", "__shell-invocation"),
         ("fish", "__shell-invocation"),
     ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bmux"))
+        let output = std::process::Command::new(support::bmux_binary())
             .args(["__shell-integration", kind])
             .env_remove("APPLICATION_RESURRECTION_HOST")
             .output()
@@ -147,7 +147,7 @@ fn shipped_executable_serves_private_shell_callback_modes() {
             "{kind} integration unavailable from shipped executable: {output:?}"
         );
     }
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bmux"))
+    let output = std::process::Command::new(support::bmux_binary())
         .args(["__shell-invocation", "prompt", "/bin/sh", "1", "", "/"])
         .env_remove("APPLICATION_RESURRECTION_HOST")
         .output()
@@ -269,6 +269,7 @@ async fn nested_round_trip(
 ) {
     let mut server = support::ServerEnv::new("application-resurrection");
     server.isolate_shell_config();
+    server.share_shell_callback_images();
     // Supported startup integration for shells without an inherited vendor
     // autoload directory. No user startup files are modified by the product.
     // Every shell appends its pid here at each prompt: input is typed only once
@@ -518,13 +519,10 @@ while True: time.sleep(1)
         for result in &results {
             wait_for_restores(result, restart, &server).await;
         }
-        let mut connection = bmux_client::BmuxClient::connect(
-            &endpoint,
-            HANG_GUARD,
-            "resurrection-layout-test",
-        )
-        .await
-        .unwrap();
+        let mut connection =
+            bmux_client::BmuxClient::connect(&endpoint, HANG_GUARD, "resurrection-layout-test")
+                .await
+                .unwrap();
         assert_eq!(
             layout_root(&mut connection, session.session_id).await,
             before_layout,

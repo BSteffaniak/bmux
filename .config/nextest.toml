@@ -11,6 +11,29 @@ slow-timeout = { period = "60s", terminate-after = 15, grace-period = "10s" }
 # Keep nextest's default detection window; do not hide leaks with a longer timeout.
 leak-timeout = { period = "100ms", result = "fail" }
 
+# Start the longest tests first so the suite's wall time is not the longest
+# test started late. Tests that compile plugins (dylib packaging, a git-sourced
+# SDK, trybuild) or run multi-node/restart scenarios come first; the remaining
+# end-to-end binaries, which spawn servers and shells, next; the thousands of
+# short unit tests fill the remaining slots around them.
+[[profile.default.overrides]]
+filter = """
+binary(both_modes) | binary(author_api_dylib_integration)
+| binary(native_plugin_identity_integration)
+| binary(plugin_packaging_git_source_integration)
+| binary(compile_tests)
+| (binary(cluster_peer_auth_transport_integration) & test(three_paired_voters))
+| (binary(recording_process_integration) & test(immediate_exit_and_startup_burst))
+"""
+priority = 100
+
+[[profile.default.overrides]]
+filter = """
+(package(bmux_cli) & kind(test)) | binary(configuration_cli)
+| (package(bmux_terminal_grid) & test(printing_ascii_runs_matches_printing_each_character))
+"""
+priority = 50
+
 # Every test sees a short, canonical, private TMPDIR, independent of the
 # host's temporary directory (symlinked on macOS, long under `nix develop`).
 # See scripts/nextest-test-tmpdir.sh.

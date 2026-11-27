@@ -2,8 +2,11 @@
 #![cfg(target_os = "linux")]
 use std::process::Command;
 
+#[path = "../../cli/tests/support/stable_executable.rs"]
+mod stable_executable;
+
 fn command(root: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bterm"));
+    let mut command = Command::new(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bterm")));
     command
         .env_clear()
         .env("HOME", root)

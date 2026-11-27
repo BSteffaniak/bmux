@@ -1,13 +1,15 @@
 //! Stdin belongs to the command caller, even under a plugin-owned nested path.
 #![cfg(feature = "bundled-plugin-playbook")]
 
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
 fn offline_validate_reads_caller_stdin_without_a_server() {
     let root = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bmux"));
+    let mut command = Command::new(stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux")));
     for (key, directory) in [
         ("BMUX_CONFIG_DIR", "config"),
         ("BMUX_RUNTIME_DIR", "runtime"),

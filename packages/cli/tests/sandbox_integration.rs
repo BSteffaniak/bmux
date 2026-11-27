@@ -1,3 +1,5 @@
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 fn bmux_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
+    stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux"))
 }
 
 fn workspace_root() -> PathBuf {

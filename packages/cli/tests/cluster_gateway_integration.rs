@@ -1,10 +1,12 @@
+#[path = "support/stable_executable.rs"]
+mod stable_executable;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bmux_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
+    stable_executable::cargo_bin(env!("CARGO_BIN_EXE_bmux"))
 }
 
 struct TempDirGuard {
