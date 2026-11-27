@@ -379,8 +379,15 @@ Built on 2026-11-21:
     observes and replays it in a fresh process; the failure's page shows the first
     observation where they part, with the text around it, rather than an aligned
     view of two whole traces.
-  - Predicates for breakpoints are event kinds (`break crash`), not arbitrary
-    state predicates.
+  - Breakpoints on state predicates (2026-11-27): a simulation registers named
+    predicates (`simvar_observer::register_predicates`), plain functions over
+    the run's state checked at each decision while such a breakpoint is set;
+    `break when NAME` (or the palette's "Break when ..." items) sets one.
+    `sim_support` registers the kernel's for every simulation: `zombie`,
+    `orphan`, `hung-up`, `master-closed` and `backlog`. Event kinds
+    (`break crash`) stay too. Playing a run (a decision at a time) used to run
+    through every breakpoint, since reaching the target was checked first; it
+    now stops at them.
   - Dividers are dragged through the dashboard's own drag handles (the fleet's
     columns, the run overview's rows), not `panel_group`. Where they are left is
     saved with the findings (`layout.splits`) and restored next session.

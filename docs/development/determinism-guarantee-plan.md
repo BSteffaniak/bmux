@@ -192,9 +192,11 @@ exemption.
 
 ## Open questions
 
-- Is the digest's cost acceptable on every run? Content hashes of the final file tree are
-  cheap, and terminal output is hashed incrementally. If needed, process verification can
-  cover only a sample.
+- **Answered (2026-11-27): the digest's cost is negligible on every run.** Recording it on
+  every run (`SIMULATOR_DIGEST_OUT` set, no replays) against not at all, 3000 runs each, three
+  times, on a 15-core laptop: pane runtime 8.0–8.5s either way (on: 8.1s on average, off:
+  8.2s), pty 8.6–8.8s (on: 8.75s, off: 8.68s), all within run-to-run noise. Runs still record
+  only when something compares them, since nothing reads the others' digests.
 - How do we handle macro-generated code `syn` cannot see? Proc macros the graph uses go on the
   audit list. `macro_rules!` bodies are scanned as token streams.
 - **Decided: scope.** 20.2 checks the simulated dependency graph only. All of bmux follows
