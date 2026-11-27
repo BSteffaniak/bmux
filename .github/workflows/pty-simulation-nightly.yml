@@ -83,6 +83,32 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/findings
 
+  # The same calm runs as Linux, macOS and Windows should end alike at the pane level
+  # (`cargo sim pane-runtime --metamorphic`; see simulation/pane-runtime/src/metamorphic.rs).
+  metamorphic:
+    name: Metamorphic (pane runtime under three personalities)
+    runs-on: ubuntu-latest
+    needs: [rust-version]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+
+      - name: Compare
+        shell: bash
+        run: |
+          SIMULATOR_RUNS=1000 cargo sim pane-runtime --metamorphic | tee "$RUNNER_TEMP/metamorphic.log"
+
+      - name: Upload the log of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metamorphic
+          path: ${{ runner.temp }}/metamorphic.log
+
   # Local crates marked `runs = false` are not scanned by `cargo sim NAME --check`, and external
   # crates audited `not-run` are not read, on their word that simulations never run them.
   # Coverage-instrumented fleets check that word: any line of such a crate that runs fails the
