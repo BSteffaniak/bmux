@@ -44,9 +44,3 @@ command = { command-line = "scripts/nextest-test-tmpdir.sh", relative-to = "work
 platform = 'cfg(unix)'
 filter = 'all()'
 setup = 'test-tmpdir'
-
-[profile.audit]
-fail-fast = false
-
-[profile.audit.junit]
-path = "junit.xml"

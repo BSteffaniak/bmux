@@ -257,8 +257,9 @@ const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
     None
 }
 
-/// Selects the text copy backend. `command` copies through the platform's
-/// clipboard command (`pbcopy`; `wl-copy`, `xclip` or `xsel`; `clip`) instead of
+/// Selects the text copy backend.
+///
+/// `command` copies through the platform's clipboard command (`pbcopy`; `wl-copy`, `xclip` or `xsel`; `clip`) instead of
 /// the native clipboard API: for a command on `PATH` that forwards the
 /// clipboard elsewhere, and for isolated environments (test fixtures) that must
 /// never write a real desktop clipboard.
