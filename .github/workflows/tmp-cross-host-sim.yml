@@ -1,0 +1,66 @@
+name: TMP cross-host simulation
+on:
+  push:
+    branches:
+      - tmp/cross-host-sim
+jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+  # The simulations behave the same on any host: each runs natively on Linux, macOS and
+  # Windows (regression seeds and a short verified fleet), and the same seeds' runs record the
+  # same digests everywhere (compared below).
+  cross-host:
+    name: Cross-host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [rust-version]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+      - name: Regression seeds and a verified fleet
+        shell: bash
+        run: |
+          for simulation in pty pane-runtime local-terminal; do
+            cargo sim "$simulation" --regression
+            SIMULATOR_RUNS=200 SIMULATOR_VERIFY_DETERMINISM=process cargo sim "$simulation"
+          done
+      - name: Record digests of fixed seeds
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          for simulation in pty pane-runtime local-terminal; do
+            for seed in $(seq 1 25); do
+              SIMULATOR_RUNS=1 SIMULATOR_SEED="$seed" SIMULATOR_EPOCH_OFFSET=1000000000 \
+                SIMULATOR_DIGEST_OUT="$RUNNER_TEMP/digests/$simulation-$seed.txt" \
+                cargo sim "$simulation" > /dev/null
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.os }}
+          path: ${{ runner.temp }}/digests
+  cross-host-compare:
+    name: Cross-host digests match
+    runs-on: ubuntu-latest
+    needs: [cross-host]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+      - name: Compare
+        shell: bash
+        run: |
+          status=0
+          for os in macos-latest windows-latest; do
+            if ! diff -r digests-ubuntu-latest "digests-$os"; then
+              echo "::error::runs on $os recorded other digests than on ubuntu-latest"
+              status=1
+            fi
+          done
+          exit "$status"
