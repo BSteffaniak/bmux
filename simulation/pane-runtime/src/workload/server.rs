@@ -123,6 +123,30 @@ impl Shared {
         drop(paused);
     }
 
+    /// Close every terminal the dead server still held, as the operating system does, whatever
+    /// its threads' unwinding dropped: a thread killed inside a destructor (releasing a lock, say)
+    /// unwinds from it, and Rust then leaks the value its function was returning
+    /// (rust-lang/rust#47949), such as a pane's waiter work taken from its slot. The outsiders'
+    /// terminals are theirs (and after a power loss, nothing is).
+    fn close_dead_terminals(&self, power_loss: bool) {
+        let witnesses: Vec<String> = if power_loss {
+            Vec::new()
+        } else {
+            self.lock()
+                .witnesses
+                .iter()
+                .map(|w| w.terminal.clone())
+                .collect()
+        };
+        let held: Vec<String> = simulator::snapshot()
+            .terminals
+            .into_iter()
+            .filter(|t| t.master_handles > 0 && !witnesses.contains(&t.name))
+            .map(|t| t.name)
+            .collect();
+        simulator::close_masters(&held);
+    }
+
     /// Crash the server, start processes it never owned, then start a new server on the same
     /// runtime directory, checking invariant 6.
     pub(super) async fn crash(&self, driver: u64, power_loss: bool) {
@@ -147,6 +171,7 @@ impl Shared {
         // Die: every task and thread of the server stops where it is.
         panes.crash();
         drop(panes);
+        self.close_dead_terminals(power_loss);
         let filesystem = switchy_fs::simulator::current_filesystem();
         if power_loss {
             // Every process dies, and the disk keeps what was made durable and a random part

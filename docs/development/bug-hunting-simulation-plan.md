@@ -378,24 +378,20 @@ In the simulation itself:
 - **One failed read of a crash record left a dead server's session running.** Recovery kept a
   record it could not read for a later activation; with file faults, the crashed server's
   jobs ran on until then. Recovery now tries a record three times first.
+- **A crash could leave a pane's terminal open (macOS, about 1 run in 3000): the simulated
+  crash's mistake.** A crash killed a starting pane's waiter thread just as it released the
+  lock on its work, after taking it. A killed thread unwinds from its switch point, here
+  inside the guard's destructor, and Rust then leaks the value the enclosing function was
+  returning (rust-lang/rust#47949): the waiter's work, holding the pane's execution and its
+  terminal. A dead process's handles do not depend on its destructors, so a crash now closes
+  every terminal the dead server still held, as the operating system does
+  (`switchy_pty::simulator::close_masters`, which now also closes a terminal that already
+  hung up, as a macOS terminal does when its leader exits). Found by holding each execution
+  in a tracking pointer recording where it was cloned; a regression seed.
 - **The simulation's own mistakes**, found by the metamorphic runs and the new invariants:
   on macOS the hung-up terminal releases a shell's leftover jobs at once (documented), which
   invariant 9 counted as leaks; and invariant 4 skipped panes whose program had already
   exited.
-
-### Open
-
-- **A crash can leave a pane's terminal open (macOS, about 1 run in 3000).** After several
-  crashes, a pane whose program exited at once was still being started when its server
-  crashed: one execution of the dead server stays alive (a single strong reference, its
-  master set, never retired), so its terminal's master side stays open and its program is
-  never reaped, and invariant 9 fails at the end. The same seed fails on the build before the
-  phase-18 fixes of 2026-11-27, so it is older than them. Only the simulated crash can show
-  it (a real crashed server's handles close with its process), but the owner is unknown, and
-  a reference cycle would leak in a live server too.
-
-  Replay: `SIMULATOR_SEED=3097087903332360765 SIMULATOR_EPOCH_OFFSET=5120828589703
-  SIMULATOR_PTY_PERSONALITY=macos` on the build of commit `d6c6f5c6`.
 
 ### Not done yet
 
