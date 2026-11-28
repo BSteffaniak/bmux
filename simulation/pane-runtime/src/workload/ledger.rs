@@ -99,6 +99,8 @@ pub(super) struct State {
     pub(super) executions: BTreeMap<u128, Launch>,
     /// Mutation ids handed out so far.
     pub(super) mutations: u64,
+    /// The panes the last snapshot recorded, once one was taken.
+    pub(super) persisted: Option<Vec<Pane>>,
 }
 
 /// A program execution the workload launched (see `executions.rs`).

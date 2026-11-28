@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bmux_pane_runtime_plugin::simulation::Panes;
+use bmux_pane_runtime_plugin::simulation::{Execution, Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;
 use sim_support::{
     invariants::checked,
@@ -17,7 +17,7 @@ use switchy_pty::simulator::{self, ProcessState};
 
 use super::{
     Shared, draw, event,
-    ledger::{State, Witness},
+    ledger::{Opened, State, Witness},
 };
 use crate::{invariants::Invariant, telemetry::Board};
 
@@ -193,36 +193,22 @@ impl Shared {
             .map(|p| p.session_serial)
             .collect();
         // Processes started while the crashed sessions linger (their ids may be reused).
-        let mut witnesses = Vec::new();
-        for _ in 0..=draw(2) {
-            let Ok(pair) = switchy_pty::PtyPair::open(switchy_pty::PtySize::new(80, 24)) else {
-                continue;
-            };
-            let Ok(child) = pair
-                .slave
-                .spawn(switchy_pty::SpawnCommand::new("sleep").arg("3600000"))
-            else {
-                continue;
-            };
-            let terminal = simulator::process_io(child.id())
-                .and_then(|io| io.terminal)
-                .unwrap_or_default();
-            if let Some(serial) = simulator::serial_of(child.id()) {
-                witnesses.push(Witness {
-                    serial,
-                    terminal,
-                    _child: child,
-                    _pair: pair,
-                });
-            }
-        }
+        let witnesses = start_witnesses();
         let fresh = Arc::new(super::server(&self.profile, &self.records));
+        // Restored as it activates, before it serves anything.
+        let restored = self.resurrect(&fresh).await;
         let outside: Vec<u64> = {
             let mut state = self.lock();
             for pane in state.open.keys() {
                 Board::closed(&format!("{pane:?}"));
             }
             state.open.clear();
+            for (pane, opened) in restored {
+                // A new incarnation of the pane: its exits so far were the old one's.
+                state.exits.remove(&pane);
+                state.order.push(pane);
+                state.open.insert(pane, opened);
+            }
             state.opening = 0;
             state.panes = fresh;
             paused.resume(&mut state);
@@ -256,6 +242,123 @@ impl Shared {
             }
         }
         self.check_orphaned_executions().await;
+    }
+
+    /// Persist the server's panes, as the snapshot orchestration does from time to time.
+    pub(super) fn persist(&self, driver: u64) {
+        let panes = Arc::clone(&self.lock().panes);
+        // (A failing disk may keep it from being written: then the last one stands.)
+        if let Ok(persisted) = panes.persist(&self.snapshot) {
+            event(
+                "snapshot",
+                format!("d{driver}: the server persisted {} panes", persisted.len()),
+                Tone::Info,
+            );
+            self.lock().persisted = Some(persisted);
+        }
+    }
+
+    /// After a crash, have the new server `panes` restore the panes the last snapshot recorded,
+    /// checking invariant 19; returns those running, to be taken on as open panes.
+    async fn resurrect(&self, panes: &Panes) -> Vec<(Pane, Opened)> {
+        let (persisted, executions, shells) = {
+            let state = self.lock();
+            let executions: Vec<Pane> = state
+                .executions
+                .values()
+                .filter_map(|launch| launch.execution.as_ref().map(Execution::pane))
+                .collect();
+            (state.persisted.clone(), executions, state.order.clone())
+        };
+        let Some(persisted) = persisted else {
+            return Vec::new();
+        };
+        // 19. A crashed server's successor restores the panes the last snapshot recorded, or,
+        // when it recorded a program execution's (whose process authority died with the
+        // server), refuses the whole snapshot, launching nothing. (A failing disk may keep it
+        // from reading the snapshot.)
+        checked(Invariant::Resurrection);
+        let refused = persisted.iter().any(|pane| executions.contains(pane));
+        let restored = match panes.resurrect(&self.snapshot).await {
+            Ok(_) if refused => {
+                self.violated(
+                    Invariant::Resurrection,
+                    "a snapshot recording a program execution was restored",
+                );
+                return Vec::new();
+            }
+            // Refused for an execution's pane (perhaps one whose launch was still under way, so
+            // the workload never learned its pane), never a shell's.
+            Err(problem) if problem.contains("nonresumable") => {
+                let named = problem.split_whitespace().nth(1);
+                if named.is_none_or(|id| shells.iter().any(|pane| pane.has_id(id))) {
+                    self.violated(
+                        Invariant::Resurrection,
+                        format!("restoring the last snapshot was refused for a shell: {problem}"),
+                    );
+                }
+                return Vec::new();
+            }
+            Ok(restored) => restored,
+            Err(problem) => {
+                if self.profile.faults.file == 0 {
+                    self.violated(
+                        Invariant::Resurrection,
+                        format!("restoring the last snapshot failed: {problem}"),
+                    );
+                }
+                return Vec::new();
+            }
+        };
+        let got: Vec<Pane> = restored.iter().map(|(pane, _)| *pane).collect();
+        if got != persisted {
+            self.violated(
+                Invariant::Resurrection,
+                format!("the snapshot recorded panes {persisted:?}, but {got:?} were restored"),
+            );
+        }
+        event(
+            "resurrect",
+            format!("the new server restored {} panes", restored.len()),
+            Tone::Info,
+        );
+        let mut running = Vec::new();
+        for (pane, started) in restored {
+            let pid = match started {
+                Restarted::Running(pid) => pid,
+                // Its program failed to start (a fault): the pane says so; close it.
+                Restarted::Failed => {
+                    let _ = panes.close(pane).await;
+                    continue;
+                }
+                // Recorded and restored, yet the new server does not have it.
+                Restarted::Gone => {
+                    self.violated(
+                        Invariant::Resurrection,
+                        format!("the snapshot's pane {pane:?} is not on the restored server"),
+                    );
+                    continue;
+                }
+            };
+            let serial = panes
+                .program_serial(pane)
+                .or_else(|| simulator::serial_of(pid))
+                .unwrap_or(0);
+            running.push((
+                pane,
+                Opened {
+                    pid,
+                    serial,
+                    terminal: super::panes::terminal_by_serial(serial),
+                    typed: Vec::new(),
+                    programs: 1,
+                    restarting: false,
+                    resizes: 0,
+                    touched: 0,
+                },
+            ));
+        }
+        running
     }
 
     /// The serials of running processes no server owns: those outsiders started, the daemons
@@ -341,4 +444,33 @@ impl Shared {
             );
         }
     }
+}
+
+/// Start processes outside the pane runtime, each on a terminal of its own (as a crashed
+/// server's sessions linger, so their ids may be reused).
+fn start_witnesses() -> Vec<Witness> {
+    let mut witnesses = Vec::new();
+    for _ in 0..=draw(2) {
+        let Ok(pair) = switchy_pty::PtyPair::open(switchy_pty::PtySize::new(80, 24)) else {
+            continue;
+        };
+        let Ok(child) = pair
+            .slave
+            .spawn(switchy_pty::SpawnCommand::new("sleep").arg("3600000"))
+        else {
+            continue;
+        };
+        let terminal = simulator::process_io(child.id())
+            .and_then(|io| io.terminal)
+            .unwrap_or_default();
+        if let Some(serial) = simulator::serial_of(child.id()) {
+            witnesses.push(Witness {
+                serial,
+                terminal,
+                _child: child,
+                _pair: pair,
+            });
+        }
+    }
+    witnesses
 }

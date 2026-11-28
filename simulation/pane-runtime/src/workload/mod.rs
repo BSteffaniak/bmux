@@ -133,6 +133,8 @@ pub struct Shared {
     profile: Profile,
     /// The runtime directory's session records, which outlive a crashed server.
     records: PathBuf,
+    /// Where the `snapshot` action persists the server's panes (beside the records).
+    snapshot: PathBuf,
     /// Bumped when the server crashes; actions under way watch it. (Not a `tokio` watch:
     /// with several receivers, it wakes them in an order drawn from `tokio`'s own per-thread
     /// generator, which no seed decides.)
@@ -202,8 +204,10 @@ impl Shared {
                 targets: BTreeMap::new(),
                 executions: BTreeMap::new(),
                 mutations: 0,
+                persisted: None,
             }),
             profile,
+            snapshot: records.with_extension("snapshot.json"),
             records,
             generation: AtomicU64::new(0),
             exclusive: tokio::sync::Mutex::new(()),
@@ -395,6 +399,7 @@ impl Shared {
             Kind::Observe => self.observe(driver),
             Kind::Attach => self.attach(driver),
             Kind::Execute => self.execute().await,
+            Kind::Snapshot => self.persist(driver),
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }

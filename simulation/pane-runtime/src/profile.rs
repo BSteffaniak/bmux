@@ -49,11 +49,14 @@ pub enum Kind {
     /// Run a program through the execution service as its clients do (reserve, launch,
     /// retry, reconcile, retire).
     Execute,
+    /// Persist the server's panes as the snapshot orchestration does (a crash's successor
+    /// restores them).
+    Snapshot,
 }
 
 impl Kind {
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -68,6 +71,7 @@ impl Kind {
         Self::Observe,
         Self::Attach,
         Self::Execute,
+        Self::Snapshot,
     ];
 
     /// Whether it takes the server to itself: drivers pause, and it waits for every action
@@ -85,6 +89,7 @@ impl Kind {
             Self::Observe => 3,
             Self::Attach => 4,
             Self::Execute => 5,
+            Self::Snapshot => 6,
             _ => 0,
         }
     }
@@ -123,6 +128,7 @@ impl Kind {
             Self::Observe => "observe",
             Self::Attach => "attach",
             Self::Execute => "execute",
+            Self::Snapshot => "snapshot",
         }
     }
 }
@@ -164,7 +170,7 @@ pub struct FaultRates {
 /// with, 1 the thread-spawn and wall-clock faults, 2 the bystander. A field added once profiles
 /// are in use belongs to a new epoch, drawn after every earlier one, so every earlier field (and
 /// so every regression seed's profile) draws as before it existed.
-const LAST_EPOCH: u8 = 5;
+const LAST_EPOCH: u8 = 6;
 
 /// The draw epoch of [`Profile::managed`].
 const MANAGED_EPOCH: u8 = 5;
@@ -320,7 +326,7 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0, 0, 0],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()

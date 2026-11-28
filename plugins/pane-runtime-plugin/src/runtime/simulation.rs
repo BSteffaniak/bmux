@@ -66,6 +66,8 @@ struct Server {
     manager: Arc<Mutex<SessionRuntimeManager>>,
     host: PaneRuntimeHost,
     exits: Mutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
+    /// The sessions its panes belong to (the sessions plugin's part).
+    sessions: Arc<Sessions>,
 }
 
 /// One pane: a session's (each session starts with one; splits add more).
@@ -73,6 +75,14 @@ struct Server {
 pub struct Pane {
     session: SessionId,
     pane: Uuid,
+}
+
+impl Pane {
+    /// Whether `id` is this pane's id (as the runtime's messages write it).
+    #[must_use]
+    pub fn has_id(&self, id: &str) -> bool {
+        self.pane.to_string() == id
+    }
 }
 
 /// How closing a pane went.
@@ -224,7 +234,12 @@ impl Server {
         let mut prepared = prepared?;
         prepared.wait_until_ready().await?;
         let mut manager = lock(&self.manager);
-        manager.commit_fresh_runtime(session_id, &mut prepared, || Ok(()))?;
+        manager.commit_fresh_runtime(session_id, &mut prepared, || {
+            bmux_session_state::SessionManagerWriter::insert_session(
+                &*self.sessions,
+                bmux_session_models::Session::with_id(session_id, None),
+            )
+        })?;
         let pane = manager
             .runtimes
             .get(&session_id)
@@ -277,7 +292,12 @@ impl Server {
                 manager.close_pane(pane.session, Some(PaneSelector::ById(pane.pane)))?;
                 (execution, None)
             } else {
-                (execution, Some(manager.remove_runtime(pane.session)?))
+                let removed = manager.remove_runtime(pane.session)?;
+                let _ = bmux_session_state::SessionManagerWriter::remove_session(
+                    &*self.sessions,
+                    pane.session,
+                );
+                (execution, Some(removed))
             }
         };
         let Some(removed) = removed else {
@@ -346,7 +366,8 @@ impl Panes {
         }
         let runtime = switchy_async::runtime::Runtime::new();
         let manager = Arc::new(Mutex::new(manager));
-        register_execution_service(&host, &manager, &runtime, records);
+        let sessions = Arc::new(Sessions::default());
+        register_execution_service(&host, &manager, &runtime, records, &sessions);
         let stop = Arc::new(AtomicBool::new(false));
         let (pumped, stopped) = (runtime.clone(), Arc::clone(&stop));
         // On the current (the run's) executor, not the server's: it is the server's processor.
@@ -361,6 +382,7 @@ impl Panes {
                 manager,
                 host,
                 exits: Mutex::new(exits),
+                sessions,
             }),
             runtime,
             stop,
@@ -838,6 +860,54 @@ impl Panes {
         .await
     }
 
+    /// Persist the runtime's panes to `path` (durably), as the snapshot orchestration does with
+    /// the pane runtime's part of its snapshot. Returns the panes it recorded.
+    ///
+    /// # Errors
+    ///
+    /// * If the snapshot cannot be built or written
+    pub fn persist(&self, path: &std::path::Path) -> Result<Vec<Pane>, String> {
+        crate::snapshot::persist_to(&self.server.host, path)
+            .map(|sessions| flatten_panes(&sessions))
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Restore the panes [`Self::persist`] recorded at `path` (if any), as a server starting
+    /// from a snapshot does, and wait until each one's program runs or fails to start.
+    ///
+    /// # Errors
+    ///
+    /// * If the snapshot cannot be read or restored, or the server died meanwhile
+    pub async fn resurrect(&self, path: &std::path::Path) -> Result<Vec<(Pane, Restarted)>, String> {
+        let path = path.to_path_buf();
+        let restored = self
+            .on_server(move |server| {
+                Box::pin(async move {
+                    let sessions = Arc::clone(&server.sessions);
+                    crate::snapshot::restore_from(&server.host, &path, |session| {
+                        let _ = bmux_session_state::SessionManagerWriter::insert_session(
+                            &*sessions,
+                            bmux_session_models::Session::with_id(SessionId(session), None),
+                        );
+                    })
+                    .map_err(|error| format!("{error:#}"))
+                })
+            })
+            .await
+            .ok_or_else(|| "the server died".to_owned())??;
+        let mut started = Vec::new();
+        for pane in flatten_panes(&restored) {
+            let program = pane.pane;
+            let server = Arc::clone(&self.server);
+            let state = self
+                .on_server(move |_| Box::pin(async move { server.started(pane, program).await }))
+                .await
+                .unwrap_or(Restarted::Gone);
+            started.push((pane, state));
+        }
+        Ok(started)
+    }
+
     /// Bytes of output `pane` has taken in.
     #[must_use]
     pub fn output_bytes(&self, pane: Pane) -> u64 {
@@ -911,6 +981,7 @@ fn register_execution_service(
     manager: &Arc<Mutex<SessionRuntimeManager>>,
     runtime: &switchy_async::runtime::Runtime,
     records: Option<&std::path::Path>,
+    sessions: &Arc<Sessions>,
 ) {
     let pane_inputs = Arc::clone(&lock(manager).pane_input_index);
     host.states()
@@ -923,7 +994,14 @@ fn register_execution_service(
     host.states()
         // simulation-safe: core's state registry type, written only at registration
         .register(&Arc::new(std::sync::RwLock::new(
-            bmux_session_state::SessionManagerHandle::new(Sessions::default()),
+            bmux_session_state::SessionManagerHandle::from_arc(Arc::clone(sessions) as _),
+        )));
+    host.states()
+        // simulation-safe: core's state registry type, written only at registration
+        .register(&Arc::new(std::sync::RwLock::new(
+            bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
+                super::ServerSessionRuntimeAdapter::new(Arc::clone(manager)),
+            ),
         )));
     if let Some(domain) = records.and_then(std::path::Path::parent) {
         let domain = domain.join("executions");
@@ -945,7 +1023,10 @@ struct Sessions(Mutex<std::collections::BTreeMap<SessionId, bmux_session_models:
 
 impl bmux_session_state::SessionManagerReader for Sessions {
     fn list_sessions(&self) -> Vec<bmux_session_models::SessionInfo> {
-        Vec::new()
+        lock(&self.0)
+            .values()
+            .map(bmux_session_models::SessionInfo::from)
+            .collect()
     }
     fn get_session(&self, session_id: SessionId) -> Option<bmux_session_models::Session> {
         lock(&self.0).get(&session_id).cloned()
@@ -987,6 +1068,19 @@ impl bmux_session_state::SessionManagerWriter for Sessions {
 /// The managed execution target [`Panes::recovering_managed`] serves, and its identity.
 const MANAGED_TARGET: &str = "5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e";
 const MANAGED_IDENTITY: &str = r#"{"simulation":"pane-runtime"}"#;
+
+/// The panes of each session in `sessions` (session id, pane ids).
+fn flatten_panes(sessions: &[(Uuid, Vec<Uuid>)]) -> Vec<Pane> {
+    sessions
+        .iter()
+        .flat_map(|(session, panes)| {
+            panes.iter().map(|pane| Pane {
+                session: SessionId(*session),
+                pane: *pane,
+            })
+        })
+        .collect()
+}
 
 /// The client id [`Panes::attach`] attaches client `client` as (apart from observers').
 fn attaching_client(client: u64) -> ClientId {

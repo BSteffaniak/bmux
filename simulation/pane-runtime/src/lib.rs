@@ -55,6 +55,10 @@
 //!     launched as still running.
 //! 18. A program execution's reported exit code is its program's: the runtime's status and the
 //!     reconciled launch receipt both say the code `exit CODE` exited with.
+//! 19. A crashed server's successor restores the panes the last snapshot recorded: with the
+//!     `snapshot` action persisting the pane runtime's part of a server snapshot, a server
+//!     started after a crash (or a power cut) restores exactly those panes, each running a new
+//!     program.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood

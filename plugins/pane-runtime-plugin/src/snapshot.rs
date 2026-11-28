@@ -580,6 +580,62 @@ fn decode_pane_runtime_snapshot(
     })
 }
 
+/// Persist the pane runtime's snapshot payload to `path`, durably, as the snapshot
+/// orchestration does (for a simulated server). Returns each session's panes it recorded.
+///
+/// # Errors
+///
+/// * If the payload cannot be built or written
+#[cfg(feature = "simulator")]
+pub(crate) fn persist_to(
+    host: &crate::runtime::PaneRuntimeHost,
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<(Uuid, Vec<Uuid>)>> {
+    let payload = build_pane_runtime_payload(host)?;
+    crate::atomic_state::commit(path, &payload)?;
+    Ok(payload_panes(&payload))
+}
+
+/// Restore the payload [`persist_to`] wrote to `path` (nothing when there is none), after
+/// `insert_session` made each of its sessions (the sessions plugin's part). Returns each
+/// session's panes it restored.
+///
+/// # Errors
+///
+/// * If the payload cannot be read, decoded or restored
+#[cfg(feature = "simulator")]
+pub(crate) fn restore_from(
+    host: &crate::runtime::PaneRuntimeHost,
+    path: &std::path::Path,
+    insert_session: impl Fn(Uuid),
+) -> anyhow::Result<Vec<(Uuid, Vec<Uuid>)>> {
+    let bytes = match switchy_fs::sync::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let payload: PaneRuntimeSnapshotV1 = serde_json::from_slice(&bytes)?;
+    for entry in &payload.sessions {
+        insert_session(entry.session_id);
+    }
+    apply_pane_runtime_payload(host, &payload)?;
+    Ok(payload_panes(&payload))
+}
+
+#[cfg(feature = "simulator")]
+fn payload_panes(payload: &PaneRuntimeSnapshotV1) -> Vec<(Uuid, Vec<Uuid>)> {
+    payload
+        .sessions
+        .iter()
+        .map(|entry| {
+            (
+                entry.session_id,
+                entry.panes.iter().map(|pane| pane.id).collect(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

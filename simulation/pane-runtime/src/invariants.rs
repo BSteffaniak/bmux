@@ -22,6 +22,7 @@ pub enum Invariant {
     AttachSnapshot,
     Reservations,
     ExitCode,
+    Resurrection,
 }
 
 impl sim_support::invariants::Invariant for Invariant {
@@ -44,6 +45,7 @@ impl sim_support::invariants::Invariant for Invariant {
         Self::AttachSnapshot,
         Self::Reservations,
         Self::ExitCode,
+        Self::Resurrection,
     ];
 
     fn statement(self) -> &'static str {
@@ -66,6 +68,7 @@ impl sim_support::invariants::Invariant for Invariant {
             Self::AttachSnapshot => "an attach snapshot shows a state the pane passed through",
             Self::Reservations => "a mutation's reservation names one execution; a crash's retire",
             Self::ExitCode => "an execution's reported exit code is its program's",
+            Self::Resurrection => "a crash's successor restores the panes last persisted",
         }
     }
 }

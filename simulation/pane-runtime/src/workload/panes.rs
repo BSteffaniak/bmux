@@ -745,7 +745,7 @@ const OBSERVER: u64 = 1;
 const ATTACHER: u64 = 1;
 
 /// The terminal the process of `serial` started on, while the kernel still has it.
-fn terminal_by_serial(serial: u64) -> Option<String> {
+pub(super) fn terminal_by_serial(serial: u64) -> Option<String> {
     simulator::snapshot()
         .processes
         .into_iter()
