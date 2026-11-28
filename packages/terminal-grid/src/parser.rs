@@ -142,29 +142,15 @@ impl TerminalGridStream {
     /// * A description of the first difference
     #[cfg(feature = "record")]
     pub fn check_record(&self) -> Result<(), String> {
-        let mut replay = Self::from_grid(self.record.start.clone());
-        if !self.record.start_pending.is_empty() {
-            replay
-                .parser
-                .advance(&mut ParserRestore, &self.record.start_pending);
-            replay.pending_bytes.clone_from(&self.record.start_pending);
-        }
+        let mut replay = self.replay_start();
         for fed in &self.record.fed {
-            match fed {
-                Fed::Output(bytes) => replay.process(bytes),
-                Fed::Resize(width, height) => replay
-                    .resize(*width, *height)
-                    .map_err(|error| format!("replaying a resize to {width}x{height}: {error}"))?,
-            }
+            replay.replay_one(fed)?;
         }
         let rows = self.grid.height();
-        let comparable = |stream: &Self| {
-            let mut snapshot = stream.snapshot(0, rows);
-            snapshot.revision = 0;
-            snapshot.content_revision = 0;
-            snapshot
-        };
-        let (actual, replayed) = (comparable(self), comparable(&replay));
+        let (actual, replayed) = (
+            comparable(self.snapshot(0, rows)),
+            comparable(replay.snapshot(0, rows)),
+        );
         if actual == replayed {
             return Ok(());
         }
@@ -181,6 +167,85 @@ impl TerminalGridStream {
             screen_text(&actual),
             screen_text(&replayed),
         ))
+    }
+
+    /// Check that `snapshot` (as [`Self::snapshot`] took it with `rows`) shows a state this
+    /// stream passed through: the one it was in once it had taken in `offset` bytes of output,
+    /// or after one of the resizes it took in right after them (the `record` feature).
+    ///
+    /// # Errors
+    ///
+    /// * A description of what differs, or why no such state exists
+    #[cfg(feature = "record")]
+    pub fn check_passed_through(
+        &self,
+        snapshot: &crate::GridSnapshot,
+        rows: usize,
+        offset: u64,
+    ) -> Result<(), String> {
+        let wanted = comparable(snapshot.clone());
+        let mut replay = self.replay_start();
+        let mut taken = 0_u64;
+        let mut fed = self.record.fed.iter().peekable();
+        while taken < offset {
+            let Some(next) = fed.next() else {
+                return Err(format!(
+                    "the snapshot is at output byte {offset}, past the {taken} the stream took in"
+                ));
+            };
+            if let Fed::Output(bytes) = next {
+                taken += bytes.len() as u64;
+            }
+            replay.replay_one(next)?;
+        }
+        if taken != offset {
+            return Err(format!(
+                "the snapshot is at output byte {offset}, inside a chunk the stream took in whole \
+                 (it ends at {taken})"
+            ));
+        }
+        loop {
+            let replayed = comparable(replay.snapshot(0, rows));
+            if replayed == wanted {
+                return Ok(());
+            }
+            match fed.next() {
+                Some(resize @ Fed::Resize(..)) => replay.replay_one(resize)?,
+                _ => {
+                    return Err(format!(
+                        "the snapshot at output byte {offset} shows {:?}, but the stream showed \
+                         {:?} then",
+                        screen_text(&wanted),
+                        screen_text(&replayed),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// A stream in the state this one started from (the `record` feature).
+    #[cfg(feature = "record")]
+    fn replay_start(&self) -> Self {
+        let mut replay = Self::from_grid(self.record.start.clone());
+        if !self.record.start_pending.is_empty() {
+            replay
+                .parser
+                .advance(&mut ParserRestore, &self.record.start_pending);
+            replay.pending_bytes.clone_from(&self.record.start_pending);
+        }
+        replay
+    }
+
+    /// Take in one thing a recording stream took in (the `record` feature).
+    #[cfg(feature = "record")]
+    fn replay_one(&mut self, fed: &Fed) -> Result<(), String> {
+        match fed {
+            Fed::Output(bytes) => self.process(bytes),
+            Fed::Resize(width, height) => self
+                .resize(*width, *height)
+                .map_err(|error| format!("replaying a resize to {width}x{height}: {error}"))?,
+        }
+        Ok(())
     }
 
     /// Borrow the structured grid.
@@ -627,6 +692,14 @@ struct ObservedDcs {
     intermediate_len: usize,
     action: char,
     data: Vec<u8>,
+}
+
+/// `snapshot` without what differs between equal screens (its revisions).
+#[cfg(feature = "record")]
+fn comparable(mut snapshot: crate::GridSnapshot) -> crate::GridSnapshot {
+    snapshot.revision = 0;
+    snapshot.content_revision = 0;
+    snapshot
 }
 
 /// The text of a snapshot's rows, a line each, for a difference report.
@@ -2666,5 +2739,26 @@ mod record_tests {
         stream.grid_mut().process(b" unseen");
         let error = stream.check_record().unwrap_err();
         assert!(error.contains("unseen"), "{error}");
+    }
+
+    #[test]
+    fn a_snapshot_shows_a_state_the_stream_passed_through() {
+        let mut stream = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        stream.process(b"first");
+        let early = stream.snapshot(0, 4);
+        stream.resize(12, 3).unwrap();
+        let resized = stream.snapshot(0, 3);
+        stream.process(b"\r\nsecond");
+        let late = stream.snapshot(0, 3);
+        assert_eq!(stream.check_passed_through(&early, 4, 5), Ok(()));
+        // After the resizes right after its output.
+        assert_eq!(stream.check_passed_through(&resized, 3, 5), Ok(()));
+        assert_eq!(stream.check_passed_through(&late, 3, 13), Ok(()));
+        // Paired with another offset, a snapshot shows a state the stream never was in.
+        let error = stream.check_passed_through(&late, 3, 5).unwrap_err();
+        assert!(error.contains("second"), "{error}");
+        // An offset inside a chunk, or past the stream's output, names no state.
+        assert!(stream.check_passed_through(&early, 4, 3).is_err());
+        assert!(stream.check_passed_through(&late, 3, 99).is_err());
     }
 }

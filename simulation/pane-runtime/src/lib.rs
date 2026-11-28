@@ -45,6 +45,10 @@
 //! 15. A client's replica of a pane shows what the pane's grid shows: a client observing a
 //!     pane (as an unattached client does) applies every frame it is sent, and brought up to
 //!     date as the pane closes, its replica's screen is the pane's.
+//! 16. An attach snapshot shows a state the pane passed through: a client attaching to a pane's
+//!     session gets a snapshot of the pane's grid, naming the output offset it leaves off at,
+//!     and a fresh grid fed the pane's first that many bytes (and the resizes right after them)
+//!     shows the same.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood

@@ -286,6 +286,31 @@ impl Shared {
     }
 
     /// Resize a pane, checking invariant 3.
+    /// Attach to a pane's session as a client does and take an attach snapshot of the pane
+    /// (again, when attached: as a client does on a layout change), or, one time in four,
+    /// detach. Checks invariant 16.
+    pub(super) fn attach(&self, driver: u64) {
+        let (pane, panes) = {
+            let state = self.lock();
+            let Some(pane) = Self::pick(&state, driver) else {
+                return;
+            };
+            (pane, Arc::clone(&state.panes))
+        };
+        if draw(4) == 0 {
+            panes.detach(pane, ATTACHER);
+            return;
+        }
+        // 16. An attach snapshot shows a state the pane's grid passed through.
+        checked(Invariant::AttachSnapshot);
+        if let Err(problem) = panes.attach(pane, ATTACHER) {
+            self.violated(
+                Invariant::AttachSnapshot,
+                format!("attaching to a pane: {problem}"),
+            );
+        }
+    }
+
     pub(super) async fn resize(&self, driver: u64) {
         let (pane, rows, cols, epoch, panes) = {
             let mut state = self.lock();
@@ -715,6 +740,9 @@ fn answered(pid: u32, lines: &[String]) -> bool {
 
 /// The client the workload observes panes as.
 const OBSERVER: u64 = 1;
+
+/// The client that attaches to panes.
+const ATTACHER: u64 = 1;
 
 /// The terminal the process of `serial` started on, while the kernel still has it.
 fn terminal_by_serial(serial: u64) -> Option<String> {

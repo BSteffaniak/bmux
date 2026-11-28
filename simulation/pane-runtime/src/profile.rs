@@ -43,11 +43,14 @@ pub enum Kind {
     /// Observe a pane as a client does (its frames, applied to a replica of its grid), or
     /// stop observing it.
     Observe,
+    /// Attach to a pane's session as a client does and take a snapshot of the pane's grid, or
+    /// detach.
+    Attach,
 }
 
 impl Kind {
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -60,6 +63,7 @@ impl Kind {
         Self::Interrupt,
         Self::Bystander,
         Self::Observe,
+        Self::Attach,
     ];
 
     /// Whether it takes the server to itself: drivers pause, and it waits for every action
@@ -75,6 +79,7 @@ impl Kind {
         match self {
             Self::Bystander => 2,
             Self::Observe => 3,
+            Self::Attach => 4,
             _ => 0,
         }
     }
@@ -111,6 +116,7 @@ impl Kind {
             Self::Interrupt => "interrupt",
             Self::Bystander => "bystander",
             Self::Observe => "observe",
+            Self::Attach => "attach",
         }
     }
 }
@@ -152,7 +158,7 @@ pub struct FaultRates {
 /// with, 1 the thread-spawn and wall-clock faults, 2 the bystander. A field added once profiles
 /// are in use belongs to a new epoch, drawn after every earlier one, so every earlier field (and
 /// so every regression seed's profile) draws as before it existed.
-const LAST_EPOCH: u8 = 3;
+const LAST_EPOCH: u8 = 4;
 
 /// How a rate fault is drawn.
 #[derive(Clone, Copy)]
@@ -302,7 +308,7 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()

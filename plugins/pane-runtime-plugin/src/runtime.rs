@@ -1912,6 +1912,78 @@ fn acknowledge_grid_snapshots(
     Ok(())
 }
 
+/// Each of `panes`' grids as a snapshot for `client_id`'s attach, up to `max_rows_per_pane`
+/// rows each, acknowledging the client's output up to where each snapshot leaves off (see
+/// `attach_grid_snapshot_state`).
+fn grid_snapshots_for_panes(
+    panes: Vec<PaneAttachDataRef>,
+    client_id: ClientId,
+    max_rows_per_pane: usize,
+) -> Result<bmux_pane_runtime_state::AttachGridSnapshotState, SessionRuntimeError> {
+    let mut snapshots = Vec::new();
+    let mut remaining = RESPONSE_OUTPUT_BUDGET;
+    let mut cursor_updates = Vec::new();
+    let mut wire = REPLY_WIRE_BUDGET;
+    let mut seen = BTreeSet::new();
+    let mut omitted = false;
+    for pane in panes {
+        if !seen.insert(pane.pane_id) {
+            continue;
+        }
+        let grid = pane
+            .terminal_grid
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        // Panes that no longer fit the shared reply budget are omitted, as
+        // missing panes are: callers hydrate what is returned and leave the
+        // rest to live state, instead of losing every pane to one large one.
+        // Admit selected aggregate source text before projection clones it.
+        if !grid
+            .grid()
+            .snapshot_text_fits(0, max_rows_per_pane, remaining)
+        {
+            omitted = true;
+            warn_grid_snapshot_omitted(pane.pane_id, remaining);
+            continue;
+        }
+        let Some(snapshot) = grid.try_snapshot(0, max_rows_per_pane, remaining) else {
+            omitted = true;
+            warn_grid_snapshot_omitted(pane.pane_id, remaining);
+            continue;
+        };
+        let stream_end = pane
+            .output_buffer
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .end_offset();
+        drop(grid);
+        let encoded = match encode_grid_window(&snapshot, &mut wire) {
+            Ok(encoded) => encoded,
+            Err(SessionRuntimeError::ResponseBudgetExceeded) => {
+                omitted = true;
+                warn_grid_snapshot_omitted(pane.pane_id, wire);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        // Encoded output coexists with later projections.
+        remaining = remaining.saturating_sub(encoded.len());
+        cursor_updates.push((pane.pane_id, Arc::clone(&pane.output_buffer), stream_end));
+        snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
+            pane_id: pane.pane_id,
+            stream_end,
+            encoded,
+        });
+    }
+    // Nothing fit: report the budget instead of an empty success that is
+    // indistinguishable from every requested pane being absent.
+    if snapshots.is_empty() && omitted {
+        return Err(SessionRuntimeError::ResponseBudgetExceeded);
+    }
+    acknowledge_grid_snapshots(client_id, &mut cursor_updates)?;
+    Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
+}
+
 fn warn_grid_snapshot_omitted(pane_id: Uuid, remaining: usize) {
     tracing::warn!(
         %pane_id,
@@ -12441,68 +12513,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
-        let mut snapshots = Vec::new();
-        let mut remaining = RESPONSE_OUTPUT_BUDGET;
-        let mut cursor_updates = Vec::new();
-        let mut wire = REPLY_WIRE_BUDGET;
-        let mut seen = BTreeSet::new();
-        let mut omitted = false;
-        for pane in panes {
-            if !seen.insert(pane.pane_id) {
-                continue;
-            }
-            let grid = pane
-                .terminal_grid
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?;
-            // Panes that no longer fit the shared reply budget are omitted, as
-            // missing panes are: callers hydrate what is returned and leave the
-            // rest to live state, instead of losing every pane to one large one.
-            // Admit selected aggregate source text before projection clones it.
-            if !grid
-                .grid()
-                .snapshot_text_fits(0, max_rows_per_pane, remaining)
-            {
-                omitted = true;
-                warn_grid_snapshot_omitted(pane.pane_id, remaining);
-                continue;
-            }
-            let Some(snapshot) = grid.try_snapshot(0, max_rows_per_pane, remaining) else {
-                omitted = true;
-                warn_grid_snapshot_omitted(pane.pane_id, remaining);
-                continue;
-            };
-            let stream_end = pane
-                .output_buffer
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?
-                .end_offset();
-            drop(grid);
-            let encoded = match encode_grid_window(&snapshot, &mut wire) {
-                Ok(encoded) => encoded,
-                Err(SessionRuntimeError::ResponseBudgetExceeded) => {
-                    omitted = true;
-                    warn_grid_snapshot_omitted(pane.pane_id, wire);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            // Encoded output coexists with later projections.
-            remaining = remaining.saturating_sub(encoded.len());
-            cursor_updates.push((pane.pane_id, Arc::clone(&pane.output_buffer), stream_end));
-            snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
-                pane_id: pane.pane_id,
-                stream_end,
-                encoded,
-            });
-        }
-        // Nothing fit: report the budget instead of an empty success that is
-        // indistinguishable from every requested pane being absent.
-        if snapshots.is_empty() && omitted {
-            return Err(SessionRuntimeError::ResponseBudgetExceeded);
-        }
-        acknowledge_grid_snapshots(client_id, &mut cursor_updates)?;
-        Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
+        grid_snapshots_for_panes(panes, client_id, max_rows_per_pane)
     }
 
     fn attach_grid_window_state(

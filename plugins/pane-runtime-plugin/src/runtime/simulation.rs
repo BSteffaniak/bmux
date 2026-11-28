@@ -587,6 +587,66 @@ impl Panes {
         Err(last.unwrap_or_else(|| "the grid never held still".to_owned()))
     }
 
+    /// Client `client` attaches to `pane`'s session (once) and takes an attach snapshot of
+    /// `pane`'s grid, as an attaching client does (and again on a layout change), hydrating a
+    /// grid from it as `bmux attach` does. Returns whether the pane was there.
+    ///
+    /// # Errors
+    ///
+    /// * The snapshot shows a state the pane's grid never passed through, by the output offset
+    ///   it names, or attaching failed otherwise
+    pub fn attach(&self, pane: Pane, client: u64) -> Result<bool, String> {
+        let client_id = attaching_client(client);
+        let refs = {
+            let mut manager = lock(&self.server.manager);
+            let Some(runtime) = manager.runtimes.get(&pane.session) else {
+                return Ok(false);
+            };
+            if !runtime.panes.contains_key(&pane.pane) {
+                return Ok(false);
+            }
+            if !runtime.attached_clients.contains(&client_id) {
+                manager
+                    .begin_attach(pane.session, client_id)
+                    .map_err(|error| format!("attaching failed: {error:?}"))?;
+            }
+            manager
+                .attach_pane_data_refs_for_session_panes(pane.session, client_id, &[pane.pane])
+                .map_err(|error| format!("resolving the attached pane failed: {error:?}"))?
+        };
+        let rows = usize::from(u16::MAX);
+        let state = match super::grid_snapshots_for_panes(refs, client_id, rows) {
+            Ok(state) => state,
+            // Over the reply budget, a client gets no snapshot: it shows live state instead.
+            Err(super::SessionRuntimeError::ResponseBudgetExceeded) => return Ok(true),
+            Err(error) => return Err(format!("taking an attach snapshot failed: {error:?}")),
+        };
+        for captured in state.snapshots {
+            let snapshot: bmux_terminal_grid::GridSnapshot =
+                serde_json::from_slice(&captured.encoded)
+                    .map_err(|error| format!("an attach snapshot did not decode: {error}"))?;
+            bmux_terminal_grid::TerminalGridStream::from_snapshot(
+                &snapshot,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .map_err(|error| format!("an attach snapshot did not hydrate: {error}"))?;
+            let checked = self.server.with_pane(pane, |handle| {
+                handle
+                    .terminal_grid
+                    .lock()
+                    .map_err(|_| "the grid lock was poisoned".to_owned())?
+                    .check_passed_through(&snapshot, rows, captured.stream_end)
+            });
+            checked.unwrap_or(Ok(()))?;
+        }
+        Ok(true)
+    }
+
+    /// Client `client` detaches from `pane`'s session (as [`Self::attach`] attached it).
+    pub fn detach(&self, pane: Pane, client: u64) {
+        lock(&self.server.manager).end_attach(pane.session, attaching_client(client));
+    }
+
     /// Bytes of output `pane` has taken in.
     #[must_use]
     pub fn output_bytes(&self, pane: Pane) -> u64 {
@@ -649,6 +709,11 @@ impl Panes {
         }
         panes
     }
+}
+
+/// The client id [`Panes::attach`] attaches client `client` as (apart from observers').
+fn attaching_client(client: u64) -> ClientId {
+    ClientId(Uuid::from_u128((1 << 64) | u128::from(client)))
 }
 
 /// The run's record of released sessions (see [`Panes::released_sessions`]).
