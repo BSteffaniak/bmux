@@ -23,6 +23,12 @@ pub(crate) fn create(path: &Path) -> std::io::Result<switchy_fs::sync::File> {
         .open(path)
 }
 
+/// Make the entries of directory `directory` durable: nothing to do, since Windows journals
+/// directory entries itself (NTFS metadata) and has no directory flush.
+pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Atomically replace `path` with `temporary`.
 ///
 /// Readers may hold the previous state open (std opens files with delete

@@ -49,6 +49,12 @@
 //!     session gets a snapshot of the pane's grid, naming the output offset it leaves off at,
 //!     and a fresh grid fed the pane's first that many bytes (and the resizes right after them)
 //!     shows the same.
+//! 17. A program execution's reservation names one execution: a client retrying a mutation id
+//!     gets the same execution (and launching it again starts nothing new), two mutation ids
+//!     never share one, and after a crash the new server never reports one the dead server
+//!     launched as still running.
+//! 18. A program execution's reported exit code is its program's: the runtime's status and the
+//!     reconciled launch receipt both say the code `exit CODE` exited with.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood
@@ -332,6 +338,13 @@ pub async fn run(profile: Profile, scenario: Option<&explore::Scenario>) -> Resu
         switchy_time::Instant::now() + BUDGET * u32::try_from(profile.clock).unwrap_or(1);
     // In the run's simulated file system, which outlives a crashed server like a disk.
     let records = switchy_fs::tempdir().expect("a directory for session records");
+    // A server's runtime directory was made long before, and outlives a power cut: make it
+    // and its parents durable (the run's file system starts with nothing durable).
+    let mut durable = Some(records.path());
+    while let Some(directory) = durable {
+        let _ = switchy_fs::sync::sync_directory(directory);
+        durable = directory.parent();
+    }
     let drivers = profile.drivers;
     let guided = guide::tracking().then(|| profile.clone());
     let shared = Shared::new(profile, records.path().to_path_buf());

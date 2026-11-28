@@ -20,6 +20,8 @@ pub enum Invariant {
     OutputDelivered,
     ReplicaLevel,
     AttachSnapshot,
+    Reservations,
+    ExitCode,
 }
 
 impl sim_support::invariants::Invariant for Invariant {
@@ -40,6 +42,8 @@ impl sim_support::invariants::Invariant for Invariant {
         Self::OutputDelivered,
         Self::ReplicaLevel,
         Self::AttachSnapshot,
+        Self::Reservations,
+        Self::ExitCode,
     ];
 
     fn statement(self) -> &'static str {
@@ -60,6 +64,8 @@ impl sim_support::invariants::Invariant for Invariant {
             Self::OutputDelivered => "a pane takes in what its terminal gave it, in order",
             Self::ReplicaLevel => "a client's replica of a pane shows what the pane shows",
             Self::AttachSnapshot => "an attach snapshot shows a state the pane passed through",
+            Self::Reservations => "a mutation's reservation names one execution; a crash's retire",
+            Self::ExitCode => "an execution's reported exit code is its program's",
         }
     }
 }

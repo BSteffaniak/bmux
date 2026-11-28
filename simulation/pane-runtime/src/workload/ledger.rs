@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use bmux_pane_runtime_plugin::simulation::{Pane, Panes};
+use bmux_pane_runtime_plugin::simulation::{Execution, Pane, Panes};
 
 use super::Step;
 
@@ -95,6 +95,22 @@ pub(super) struct State {
     pub(super) scripts: Option<Vec<std::collections::VecDeque<Step>>>,
     /// The step each scripted driver is taking.
     pub(super) targets: BTreeMap<u64, Step>,
+    /// Program executions launched, by their mutation id.
+    pub(super) executions: BTreeMap<u128, Launch>,
+    /// Mutation ids handed out so far.
+    pub(super) mutations: u64,
+}
+
+/// A program execution the workload launched (see `executions.rs`).
+pub(super) struct Launch {
+    /// Its program's exit code.
+    pub(super) code: u8,
+    /// The execution its reservation names, once launched.
+    pub(super) execution: Option<Execution>,
+    /// The server generation that first launched it.
+    pub(super) generation: u64,
+    /// Whether it was finished (or found orphaned by a crash).
+    pub(super) settled: bool,
 }
 
 impl Stats {

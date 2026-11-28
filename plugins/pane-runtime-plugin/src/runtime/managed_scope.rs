@@ -46,6 +46,24 @@ fn validate(identity: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Select the managed target `target` with `identity` (as [`activate`] does from a launch's
+/// markers), for a simulated activation.
+#[cfg(feature = "simulator")]
+pub(crate) fn select(
+    host: &crate::runtime::PaneRuntimeHost,
+    identity: &str,
+    target: &str,
+) -> Result<(), String> {
+    let scope = validate(identity, target).map(|()| {
+        Some(Scope {
+            target: target.to_owned(),
+            identity: identity.to_owned(),
+        })
+    });
+    let _ = host.managed_scope().0.set(scope.clone());
+    scope.map(|_| ())
+}
+
 pub(crate) fn selected(host: &crate::runtime::PaneRuntimeHost) -> Result<Option<Scope>, String> {
     host.managed_scope().0.get().map_or(Ok(None), Clone::clone)
 }

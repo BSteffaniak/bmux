@@ -5,6 +5,25 @@ use std::path::{Path, PathBuf};
 
 use crate::platform::files::atomic;
 
+/// Create directory `path` and any missing parents, making each one created durable in its
+/// parent (as [`commit`] makes a file durable): a directory lost to a power cut takes every file
+/// committed in it along.
+pub(crate) fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = Some(path);
+    while let Some(directory) = current.filter(|directory| !switchy_fs::exists(directory)) {
+        missing.push(directory);
+        current = directory.parent();
+    }
+    switchy_fs::sync::create_dir_all(path)?;
+    for directory in missing.iter().rev() {
+        if let Some(parent) = directory.parent() {
+            atomic::sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn commit(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     let parent = path

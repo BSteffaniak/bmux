@@ -20,6 +20,10 @@ use switchy_thread::sync::{
 };
 use tokio::sync::mpsc;
 
+use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
+    TerminalExecutionRef as ExecutionRef, TerminalProgramOptions,
+};
+
 use super::{
     PaneExitEvent, PanePaddingConfig, PaneRuntimeCommand, PaneRuntimeHandle, PaneRuntimeHost,
     SessionRuntimeManager, protocol_profile_for_term, shutdown_runtime_handle,
@@ -59,7 +63,7 @@ struct Replica {
 
 /// What a server holds.
 struct Server {
-    manager: Mutex<SessionRuntimeManager>,
+    manager: Arc<Mutex<SessionRuntimeManager>>,
     host: PaneRuntimeHost,
     exits: Mutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
 }
@@ -78,6 +82,61 @@ pub struct Closed {
     pub drained: bool,
     /// Cleaning up its process or terminal failed: the first error, if so.
     pub cleanup_error: Option<String>,
+}
+
+/// A program execution the execution service launched (see [`Panes::execute`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Execution(ExecutionRef);
+
+impl Execution {
+    /// Its pane.
+    #[must_use]
+    pub const fn pane(&self) -> Pane {
+        Pane {
+            session: SessionId(self.0.session_id),
+            pane: self.0.pane_id,
+        }
+    }
+}
+
+/// What a launch receipt says (see [`Panes::execute`] and [`Panes::reconcile`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    /// The execution its reservation names.
+    pub execution: Execution,
+    /// Its launch's phase (`Reserved`, `Running`, `Exited`, `Retired`, ...).
+    pub phase: String,
+    /// The program's exit code, once recorded.
+    pub exit_code: Option<u32>,
+    /// The signal that ended it, once recorded.
+    pub exit_signal: Option<String>,
+    /// What went wrong, if anything.
+    pub error: Option<String>,
+}
+
+impl Receipt {
+    fn of(receipt: &bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalLaunchReceipt) -> Self {
+        Self {
+            execution: Execution(receipt.reservation.execution.clone()),
+            phase: format!("{:?}", receipt.phase),
+            exit_code: receipt.exit_code,
+            exit_signal: receipt.exit_signal.clone(),
+            error: receipt.error.clone(),
+        }
+    }
+}
+
+/// How a running execution stands (see [`Panes::execution_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionStatus {
+    /// Its terminal session ended, with its output drained.
+    pub ended: bool,
+    /// The program's exit code, when it exited (not killed by a signal).
+    pub exit_code: Option<u32>,
+    /// The signal that ended it.
+    pub signal: Option<String>,
+    /// What went wrong, if anything.
+    pub error: Option<String>,
 }
 
 /// How restarting a pane went.
@@ -246,7 +305,7 @@ impl Panes {
     /// kernel, by its base name).
     #[must_use]
     pub fn new(shell: &str) -> Self {
-        Self::build(shell, None)
+        Self::build(shell, None, false)
     }
 
     /// As [`Self::new`], recording each pane's session under `records` (as an activation
@@ -254,12 +313,24 @@ impl Panes {
     /// recorded there.
     #[must_use]
     pub fn recovering(shell: &str, records: &std::path::Path) -> Self {
-        Self::build(shell, Some(records))
+        Self::build(shell, Some(records), false)
     }
 
-    fn build(shell: &str, records: Option<&std::path::Path>) -> Self {
+    /// As [`Self::recovering`], activated as a managed companion of one execution target (as a
+    /// launch with `BMUX_MANAGED_TARGET_ID` and `BMUX_MANAGED_TARGET_IDENTITY` is): its
+    /// executions' store is that target's, which one writer holds at a time.
+    #[must_use]
+    pub fn recovering_managed(shell: &str, records: &std::path::Path) -> Self {
+        Self::build(shell, Some(records), true)
+    }
+
+    fn build(shell: &str, records: Option<&std::path::Path>, managed: bool) -> Self {
         let (exit_tx, exits) = mpsc::unbounded_channel();
         let host = PaneRuntimeHost::detached();
+        if managed {
+            super::managed_scope::select(&host, MANAGED_IDENTITY, MANAGED_TARGET)
+                .expect("the simulation's managed target is valid");
+        }
         let manager = SessionRuntimeManager::new(
             host.clone(),
             shell.into(),
@@ -274,6 +345,8 @@ impl Panes {
             host.sessions().install_records(records.to_path_buf());
         }
         let runtime = switchy_async::runtime::Runtime::new();
+        let manager = Arc::new(Mutex::new(manager));
+        register_execution_service(&host, &manager, &runtime, records);
         let stop = Arc::new(AtomicBool::new(false));
         let (pumped, stopped) = (runtime.clone(), Arc::clone(&stop));
         // On the current (the run's) executor, not the server's: it is the server's processor.
@@ -285,7 +358,7 @@ impl Panes {
         }));
         Self {
             server: Arc::new(Server {
-                manager: Mutex::new(manager),
+                manager,
                 host,
                 exits: Mutex::new(exits),
             }),
@@ -647,6 +720,124 @@ impl Panes {
         lock(&self.server.manager).end_attach(pane.session, attaching_client(client));
     }
 
+    /// Run `work` on a thread of the server's that no executor runs on, as a service request
+    /// is (the execution service drives the server's executor from it).
+    ///
+    /// # Errors
+    ///
+    /// * The server crashed meanwhile (its threads die with it)
+    async fn on_request_thread<R: Send + Unpin + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<R, String> + Send + 'static,
+    ) -> Result<R, String> {
+        // A thread started from one of the server's belongs to the server.
+        self.runtime
+            .spawn_blocking(move || {
+                // Starting a thread may fail (the thread-spawn fault), as a service's can.
+                switchy_thread::thread::Builder::new()
+                    .name("request".into())
+                    .spawn(work)
+                    .map_err(|error| format!("starting a request thread failed: {error}"))?
+                    .join()
+                    .map_err(|_| "the server went".to_owned())?
+            })
+            .await
+            .map_err(|error| format!("the server went: {error}"))?
+    }
+
+    /// Reserve running `program` with `args` under the mutation id `mutation`, then launch
+    /// that reservation, as a client of the execution service does (a client retrying with the
+    /// same id gets the same reservation, and launching it again starts nothing new). The work
+    /// runs on one of the server's threads, as a service request's does.
+    ///
+    /// # Errors
+    ///
+    /// * What the execution service refused, or the server crashed meanwhile
+    pub async fn execute(
+        &self,
+        mutation: u128,
+        program: &str,
+        args: Vec<String>,
+        (rows, cols): (u16, u16),
+    ) -> Result<Receipt, String> {
+        let host = self.server.host.clone();
+        let options = TerminalProgramOptions {
+            program: program.to_owned(),
+            args,
+            cwd: None,
+            env: Default::default(),
+            cols,
+            rows,
+        };
+        self.on_request_thread(move || {
+                let reservation = super::reservations::reserve(
+                    &host,
+                    Uuid::from_u128(mutation),
+                    options,
+                    |_| Ok(()),
+                )
+                .map_err(|error| format!("reserving failed: {error:?}"))?;
+                super::reservations::launch(&host, &reservation, |_| Ok(()))
+                    .map(|receipt| Receipt::of(&receipt))
+                    .map_err(|error| format!("launching failed: {error:?}"))
+            })
+        .await
+    }
+
+    /// How `execution` stands now; `None` once the runtime no longer knows it.
+    #[must_use]
+    pub fn execution_status(&self, execution: &Execution) -> Option<ExecutionStatus> {
+        super::execution::status(&self.server.host, &execution.0)
+            .ok()
+            .map(|status| ExecutionStatus {
+                ended: status.terminal_session_ended && status.output_drained,
+                exit_code: status.exit_code,
+                signal: status.signal,
+                error: status.error,
+            })
+    }
+
+    /// Reconcile `execution`'s launch receipt with the runtime, as a client does after an
+    /// outage (it records the exit of one that ended), returning what it says.
+    ///
+    /// # Errors
+    ///
+    /// * What the execution service refused, or the server crashed meanwhile
+    pub async fn reconcile(&self, execution: &Execution) -> Result<Receipt, String> {
+        let host = self.server.host.clone();
+        let reference = execution.0.clone();
+        self.on_request_thread(move || {
+                super::reservations::reconcile(&host, &reference)
+                    .map(|reconciled| Receipt::of(&reconciled.launch))
+                    .map_err(|error| format!("reconciling failed: {error:?}"))
+            })
+        .await
+    }
+
+    /// Retire `execution`, which ended (reconciled to its last revision), as a client done
+    /// with it does.
+    ///
+    /// # Errors
+    ///
+    /// * What the execution service refused, or the server crashed meanwhile
+    pub async fn retire(&self, execution: &Execution) -> Result<(), String> {
+        let host = self.server.host.clone();
+        let reference = execution.0.clone();
+        self.on_request_thread(move || {
+                let reconciled = super::reservations::reconcile(&host, &reference)
+                    .map_err(|error| format!("reconciling failed: {error:?}"))?;
+                super::reservations::retire(
+                    &host,
+                    &reference,
+                    crate::ids::new_uuid(),
+                    reconciled.launch.revision,
+                )
+                .map(|_| ())
+                .map_err(|error| format!("retiring failed: {error:?}"))
+            })
+        .await
+    }
+
     /// Bytes of output `pane` has taken in.
     #[must_use]
     pub fn output_bytes(&self, pane: Pane) -> u64 {
@@ -710,6 +901,92 @@ impl Panes {
         panes
     }
 }
+
+/// Register what the execution service finds through the host, as an activation does: the
+/// runtime its work runs on, the session manager its sessions join, and (with a runtime
+/// directory) its reservation store, in `executions` beside `records`, retiring what a
+/// crashed predecessor left launched.
+fn register_execution_service(
+    host: &PaneRuntimeHost,
+    manager: &Arc<Mutex<SessionRuntimeManager>>,
+    runtime: &switchy_async::runtime::Runtime,
+    records: Option<&std::path::Path>,
+) {
+    let pane_inputs = Arc::clone(&lock(manager).pane_input_index);
+    host.states()
+        // simulation-safe: core's state registry type, written only at registration
+        .register(&Arc::new(std::sync::RwLock::new(super::SpawnRuntimeHandle(
+            Arc::clone(manager),
+            runtime.handle(),
+            pane_inputs,
+        ))));
+    host.states()
+        // simulation-safe: core's state registry type, written only at registration
+        .register(&Arc::new(std::sync::RwLock::new(
+            bmux_session_state::SessionManagerHandle::new(Sessions::default()),
+        )));
+    if let Some(domain) = records.and_then(std::path::Path::parent) {
+        let domain = domain.join("executions");
+        // A server's state directory, made before its first activation, survives a power cut.
+        if crate::atomic_state::create_dir_all_durable(&domain).is_ok() {
+            let mut durable = Some(domain.as_path());
+            while let Some(directory) = durable {
+                let _ = switchy_fs::sync::sync_directory(directory);
+                durable = directory.parent();
+            }
+            super::reservations::activate_at(host, &domain);
+        }
+    }
+}
+
+/// The sessions programs' executions join (the sessions plugin's part).
+#[derive(Default)]
+struct Sessions(Mutex<std::collections::BTreeMap<SessionId, bmux_session_models::Session>>);
+
+impl bmux_session_state::SessionManagerReader for Sessions {
+    fn list_sessions(&self) -> Vec<bmux_session_models::SessionInfo> {
+        Vec::new()
+    }
+    fn get_session(&self, session_id: SessionId) -> Option<bmux_session_models::Session> {
+        lock(&self.0).get(&session_id).cloned()
+    }
+    fn contains(&self, session_id: SessionId) -> bool {
+        lock(&self.0).contains_key(&session_id)
+    }
+}
+
+impl bmux_session_state::SessionManagerWriter for Sessions {
+    fn create_session(&self, name: Option<String>) -> anyhow::Result<SessionId> {
+        let session = bmux_session_models::Session::with_id(
+            SessionId(crate::ids::new_uuid()),
+            name,
+        );
+        let id = session.id;
+        lock(&self.0).insert(id, session);
+        Ok(id)
+    }
+    fn insert_session(&self, session: bmux_session_models::Session) -> anyhow::Result<()> {
+        lock(&self.0).insert(session.id, session);
+        Ok(())
+    }
+    fn rename_session(&self, _session_id: SessionId, _name: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+        lock(&self.0).remove(&session_id);
+        Ok(())
+    }
+    fn add_client(&self, _session_id: SessionId, _client_id: ClientId) {}
+    fn remove_client(&self, _session_id: SessionId, _client_id: &ClientId) {}
+    fn snapshot(&self) -> bmux_session_state::SessionManagerSnapshot {
+        bmux_session_state::SessionManagerSnapshot::default()
+    }
+    fn restore_snapshot(&self, _snapshot: bmux_session_state::SessionManagerSnapshot) {}
+}
+
+/// The managed execution target [`Panes::recovering_managed`] serves, and its identity.
+const MANAGED_TARGET: &str = "5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e5d1e6a7e";
+const MANAGED_IDENTITY: &str = r#"{"simulation":"pane-runtime"}"#;
 
 /// The client id [`Panes::attach`] attaches client `client` as (apart from observers').
 fn attaching_client(client: u64) -> ClientId {

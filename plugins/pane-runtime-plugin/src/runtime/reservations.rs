@@ -28,11 +28,16 @@ pub(crate) fn activate(
     host: &crate::runtime::PaneRuntimeHost,
     context: &bmux_plugin_sdk::NativeLifecycleContext,
 ) {
-    let opened = open_activation_store(
+    activate_at(
         host,
         &PathBuf::from(&context.connection.state_dir).join("pane-executions-v4"),
-    )
-    .map_err(|error| format!("{error:?}"));
+    );
+}
+
+/// Open the activation's store in `domain` (as [`activate`] does in the server's state
+/// directory), retiring what a previous server left launched.
+pub(crate) fn activate_at(host: &crate::runtime::PaneRuntimeHost, domain: &Path) {
+    let opened = open_activation_store(host, domain).map_err(|error| format!("{error:?}"));
     if let Ok(store) = &opened
         && let Err(error) = store.retire_orphans()
     {
@@ -403,7 +408,8 @@ impl ReservationStore {
         // Reject symlinks in this owned component. Ancestors above the domain
         // may be platform aliases and are not ownership evidence.
         validate_authority_directory(root)?;
-        switchy_fs::sync::create_dir_all(root).map_err(failed)?;
+        // Durably: a store whose directory a power cut loses forgets every launch it admitted.
+        crate::atomic_state::create_dir_all_durable(root).map_err(failed)?;
         crate::platform::files::restrict_directory(root).map_err(failed)?;
         Ok(Self {
             root: root.to_path_buf(),

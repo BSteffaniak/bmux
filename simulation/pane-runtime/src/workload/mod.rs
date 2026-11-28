@@ -38,6 +38,7 @@ use crate::{
     telemetry::Board,
 };
 
+mod executions;
 mod ledger;
 mod panes;
 mod server;
@@ -108,6 +109,18 @@ impl Step {
     }
 }
 
+/// A server (a pane runtime activated with the runtime directory whose session records are
+/// `records`), as `profile` sets one up.
+fn server(profile: &Profile, records: &std::path::Path) -> Panes {
+    let panes = if profile.managed {
+        Panes::recovering_managed(SHELL, records)
+    } else {
+        Panes::recovering(SHELL, records)
+    };
+    panes.set_sweep_on_exit(profile.sweep);
+    panes
+}
+
 fn random_size() -> (u16, u16) {
     let rows = u16::try_from(5 + draw(60)).unwrap_or(24);
     let cols = u16::try_from(20 + draw(200)).unwrap_or(80);
@@ -174,11 +187,7 @@ impl Shared {
         let settle = SETTLE * u32::try_from(profile.clock).unwrap_or(1);
         Arc::new(Self {
             state: Mutex::new(State {
-                panes: {
-                    let panes = Arc::new(Panes::recovering(SHELL, &records));
-                    panes.set_sweep_on_exit(profile.sweep);
-                    panes
-                },
+                panes: Arc::new(server(&profile, &records)),
                 open: BTreeMap::new(),
                 opening: 0,
                 steps_left: profile.steps,
@@ -191,6 +200,8 @@ impl Shared {
                 order: Vec::new(),
                 scripts: None,
                 targets: BTreeMap::new(),
+                executions: BTreeMap::new(),
+                mutations: 0,
             }),
             profile,
             records,
@@ -383,6 +394,7 @@ impl Shared {
             Kind::Interrupt => self.interrupt(driver),
             Kind::Observe => self.observe(driver),
             Kind::Attach => self.attach(driver),
+            Kind::Execute => self.execute().await,
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }
@@ -409,6 +421,7 @@ impl Shared {
     /// Close every pane, end every process, and check invariant 5's threads. Returns the
     /// violations found, and the run's shape tags.
     pub async fn finish(&self) -> (Vec<String>, Stats) {
+        self.settle_executions().await;
         loop {
             let next = {
                 let mut state = self.lock();

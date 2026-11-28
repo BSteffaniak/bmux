@@ -74,4 +74,10 @@ pub(crate) mod atomic {
         switchy_fs::sync::rename(temporary, path)?;
         switchy_fs::sync::sync_directory(parent)
     }
+
+    /// Make the entries of directory `directory` durable (a file or directory created or
+    /// renamed in it).
+    pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
+        switchy_fs::sync::sync_directory(directory)
+    }
 }

@@ -46,11 +46,14 @@ pub enum Kind {
     /// Attach to a pane's session as a client does and take a snapshot of the pane's grid, or
     /// detach.
     Attach,
+    /// Run a program through the execution service as its clients do (reserve, launch,
+    /// retry, reconcile, retire).
+    Execute,
 }
 
 impl Kind {
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -64,6 +67,7 @@ impl Kind {
         Self::Bystander,
         Self::Observe,
         Self::Attach,
+        Self::Execute,
     ];
 
     /// Whether it takes the server to itself: drivers pause, and it waits for every action
@@ -80,6 +84,7 @@ impl Kind {
             Self::Bystander => 2,
             Self::Observe => 3,
             Self::Attach => 4,
+            Self::Execute => 5,
             _ => 0,
         }
     }
@@ -117,6 +122,7 @@ impl Kind {
             Self::Bystander => "bystander",
             Self::Observe => "observe",
             Self::Attach => "attach",
+            Self::Execute => "execute",
         }
     }
 }
@@ -158,7 +164,10 @@ pub struct FaultRates {
 /// with, 1 the thread-spawn and wall-clock faults, 2 the bystander. A field added once profiles
 /// are in use belongs to a new epoch, drawn after every earlier one, so every earlier field (and
 /// so every regression seed's profile) draws as before it existed.
-const LAST_EPOCH: u8 = 4;
+const LAST_EPOCH: u8 = 5;
+
+/// The draw epoch of [`Profile::managed`].
+const MANAGED_EPOCH: u8 = 5;
 
 /// How a rate fault is drawn.
 #[derive(Clone, Copy)]
@@ -295,6 +304,9 @@ pub struct Profile {
     pub faults: FaultRates,
     /// Whether panes' programs' leftover jobs are swept when the program exits.
     pub sweep: bool,
+    /// Whether the server runs as a managed companion of one execution target (its
+    /// executions' store is the target's, held by one writer at a time).
+    pub managed: bool,
     /// Each program's weight among those panes run (0 for never), in
     /// [`programs::Kind::ALL`]'s order.
     pub programs: [u64; programs::Kind::ALL.len()],
@@ -308,13 +320,14 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0, 0],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0, 0, 0, 0, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()
             },
             programs: [1, 0, 0, 0, 0, 0, 0, 0, 0],
             sweep: true,
+            managed: false,
         }
     }
 }
@@ -384,6 +397,7 @@ impl Profile {
         let mut profile = Self {
             programs,
             sweep: draw(4) != 0,
+            managed: false,
             drivers: 1 + draw(4),
             steps: 5 + draw(56),
             panes: 1 + usize::try_from(draw(5)).unwrap_or(0),
@@ -398,6 +412,9 @@ impl Profile {
             for kind in Kind::ALL.into_iter().filter(|kind| kind.epoch() == epoch) {
                 let weight = kind.draw_weight(&mut draw);
                 profile.set_weight(kind, weight);
+            }
+            if epoch == MANAGED_EPOCH {
+                profile.managed = draw(2) == 0;
             }
         }
         profile
@@ -489,6 +506,7 @@ impl fmt::Display for Profile {
         }
         write!(f, " fsfault={}", self.faults.file)?;
         write!(f, " sweep={}", u8::from(self.sweep))?;
+        write!(f, " managed={}", u8::from(self.managed))?;
         for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs) {
             write!(f, " p.{}={weight}", kind.name())?;
         }
@@ -532,6 +550,7 @@ impl std::str::FromStr for Profile {
                 }
                 "fsfault" => faults.file = number()?,
                 "sweep" => profile.sweep = number()? != 0,
+                "managed" => profile.managed = number()? != 0,
                 other if other.starts_with("p.") => {
                     let index = programs::Kind::ALL
                         .iter()
@@ -623,6 +642,9 @@ mod tests {
         }
         for kind in Kind::ALL.into_iter().filter(|kind| kind.epoch() >= epoch) {
             profile.set_weight(kind, 0);
+        }
+        if epoch <= MANAGED_EPOCH {
+            profile.managed = false;
         }
         profile
     }

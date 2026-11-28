@@ -16,7 +16,7 @@ use sim_support::{
 use switchy_pty::simulator::{self, ProcessState};
 
 use super::{
-    SHELL, Shared, draw, event,
+    Shared, draw, event,
     ledger::{State, Witness},
 };
 use crate::{invariants::Invariant, telemetry::Board};
@@ -95,7 +95,7 @@ impl Shared {
             .filter(|serial| running_process(*serial).is_some())
             .collect();
         let before = simulator::signal_log().len();
-        let bystander = Panes::recovering(SHELL, &self.records);
+        let bystander = super::server(&self.profile, &self.records);
         bystander.shut_down();
         drop(bystander);
         // 12. It killed none of them (the kill fault aside).
@@ -216,8 +216,7 @@ impl Shared {
                 });
             }
         }
-        let fresh = Arc::new(Panes::recovering(SHELL, &self.records));
-        fresh.set_sweep_on_exit(self.profile.sweep);
+        let fresh = Arc::new(super::server(&self.profile, &self.records));
         let outside: Vec<u64> = {
             let mut state = self.lock();
             for pane in state.open.keys() {
@@ -256,6 +255,7 @@ impl Shared {
                 );
             }
         }
+        self.check_orphaned_executions().await;
     }
 
     /// The serials of running processes no server owns: those outsiders started, the daemons
