@@ -30,11 +30,11 @@ use bmux_frontend_runtime::input::{
 };
 use uuid::Uuid;
 
-const LIMIT: Duration = Duration::from_secs(15);
+const LIMIT: Duration = support::HANG_GUARD;
 /// Daemon startup and attach convergence deadline. Generous because a loaded
 /// host can take far longer to boot a plugin-loaded debug server.
 const STARTUP: Duration = Duration::from_secs(120);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = support::HANG_GUARD;
 
 struct OwnedDaemon {
     env: support::ServerEnv,

@@ -21,7 +21,7 @@ use bmux_frontend_runtime::input::{
     InputEvent, KeyEvent, KeyPhase, LogicalKey, Modifiers, PhysicalKey,
 };
 
-const LIMIT: Duration = Duration::from_secs(15);
+const LIMIT: Duration = support::HANG_GUARD;
 /// Daemon startup and attach convergence deadline. Generous because a loaded
 /// host can take far longer to boot a plugin-loaded debug server; behaviour
 /// assertions below keep their own short settle windows.

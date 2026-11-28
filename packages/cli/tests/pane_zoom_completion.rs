@@ -32,7 +32,7 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_state::client as state,
 };
 
-const LIMIT: Duration = Duration::from_secs(15);
+const LIMIT: Duration = support::HANG_GUARD;
 
 struct OwnedDaemon {
     env: support::ServerEnv,

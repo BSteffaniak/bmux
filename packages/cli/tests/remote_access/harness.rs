@@ -21,8 +21,9 @@ use crate::support::{ServerEnv, assert_success, bmux_binary, combined_output};
 /// Terminal size used by every viewer, so screens of different clients compare cell for cell.
 pub const COLS: u16 = 100;
 pub const ROWS: u16 = 30;
-/// Deadline for one interactive step (a prompt, a screen change, a pairing transition).
-pub const STEP: Duration = Duration::from_secs(30);
+/// Deadline for one interactive step (a prompt, a screen change, a pairing transition):
+/// each step finishes on its own, so this only bounds a hang.
+pub const STEP: Duration = crate::support::HANG_GUARD;
 /// How long an assertion that something does NOT happen keeps watching.
 pub const QUIET: Duration = Duration::from_secs(4);
 /// The pane shell's prompt: seeing it means an attach has drawn the pane.

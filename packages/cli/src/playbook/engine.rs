@@ -1020,6 +1020,11 @@ mod tests {
     use super::*;
     use bmux_playbook::subst::RuntimeVars;
 
+    /// Bounds a wait for something that must eventually happen (a server start,
+    /// an acknowledgement, captured output). Never a budget: reaching it means a
+    /// hang, however loaded the machine.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
     #[test]
     fn selected_host_retains_configuration_and_all_roots() {
         let paths = ConfigPaths::new(
@@ -1070,7 +1075,7 @@ mod tests {
         let target = Uuid::new_v4();
         let action = "plugin:bmux.finder:show";
         assert_eq!(runtime.prefix_chord(), "ctrl+b");
-        let send = runtime.send_action(action.into(), Instant::now() + Duration::from_secs(5));
+        let send = runtime.send_action(action.into(), Instant::now() + HANG_GUARD);
         tokio::pin!(send);
         assert!(matches!(
             futures_util::poll!(&mut send),
@@ -1122,7 +1127,7 @@ mod tests {
     async fn chord_submission_waits_for_initial_attachment() {
         let (mut terminal, runtime) = acknowledged_test_runtime();
         let target = Uuid::new_v4();
-        let send = runtime.send_chord("a", Instant::now() + Duration::from_secs(5));
+        let send = runtime.send_chord("a", Instant::now() + HANG_GUARD);
         tokio::pin!(send);
         assert!(matches!(
             futures_util::poll!(&mut send),
@@ -1149,7 +1154,7 @@ mod tests {
         terminal.set_attached_session_id(first);
         let send = runtime.send_event(
             TermEvent::Paste("first".into()),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + HANG_GUARD,
         );
         tokio::pin!(send);
         assert!(matches!(
@@ -1172,7 +1177,7 @@ mod tests {
 
         let second = runtime.send_event(
             TermEvent::Paste("second".into()),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + HANG_GUARD,
         );
         tokio::pin!(second);
         assert!(matches!(
@@ -1213,7 +1218,7 @@ mod tests {
         let (mut terminal, runtime) = acknowledged_test_runtime();
         let send = runtime.send_event(
             TermEvent::Paste("lost".into()),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + HANG_GUARD,
         );
         tokio::pin!(send);
         assert!(matches!(
@@ -1272,7 +1277,7 @@ mod tests {
             shell: Some("sh"),
             input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
-            startup_timeout: Duration::from_secs(15),
+            startup_timeout: HANG_GUARD,
             env: &BTreeMap::new(),
             env_mode: super::super::types::SandboxEnvMode::Clean,
             binary: Some(&binary),
@@ -1323,7 +1328,7 @@ mod tests {
             shell: Some("sh"),
             input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
-            startup_timeout: Duration::from_secs(15),
+            startup_timeout: HANG_GUARD,
             env: &BTreeMap::new(),
             env_mode: super::super::types::SandboxEnvMode::Clean,
             binary: Some(&binary),
@@ -1362,12 +1367,12 @@ mod tests {
             control.attach_input(session, b"\r".to_vec()).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
             for runtime in [&first, &second] {
-                runtime.send_chord("ctrl+a [", Instant::now() + Duration::from_secs(5)).await?;
+                runtime.send_chord("ctrl+a [", Instant::now() + HANG_GUARD).await?;
             }
             wait_for_scrollback_mode(&first, &second, true).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
             for runtime in [&first, &second] {
-                runtime.send_chord("Escape", Instant::now() + Duration::from_secs(5)).await?;
+                runtime.send_chord("Escape", Instant::now() + HANG_GUARD).await?;
             }
             wait_for_scrollback_mode(&first, &second, false).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
@@ -1393,7 +1398,7 @@ mod tests {
             shell: Some("sh"),
             input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
-            startup_timeout: Duration::from_secs(15),
+            startup_timeout: HANG_GUARD,
             env: &BTreeMap::new(),
             env_mode: super::super::types::SandboxEnvMode::Clean,
             binary: Some(&binary),
@@ -1419,7 +1424,7 @@ mod tests {
                         .to_vec(),
                 )
                 .await?;
-            let capture = tokio::time::timeout(Duration::from_secs(10), async {
+            let capture = tokio::time::timeout(HANG_GUARD, async {
                 loop {
                     let capture =
                         api::client::attach_history_capture_v1(&mut client, session, pane)
@@ -1487,7 +1492,7 @@ mod tests {
             shell: Some("sh"),
             input_profile: None,
             plugin_config: &crate::playbook::types::PluginConfig::default(),
-            startup_timeout: std::time::Duration::from_secs(15),
+            startup_timeout: HANG_GUARD,
             env: &std::collections::BTreeMap::new(),
             env_mode: crate::playbook::types::SandboxEnvMode::Clean,
             binary: Some(&binary),
@@ -1505,7 +1510,7 @@ mod tests {
             client.open_attach_stream_info(&grant).await?;
             let pane = client.attach_layout(session).await?.panes[0].id;
             client.attach_input(session, b"printf '\\033[2J\\033[H'; printf '%050d' 0; printf '\\033Pq\"1;1;1;6#1;2;100;0;0~\\033\\\\MARK'; i=0; while [ $i -lt 60 ]; do printf '\\r\\nROW'; i=$((i+1)); done\r".to_vec()).await?;
-            let capture = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let capture = tokio::time::timeout(HANG_GUARD, async {
                 loop {
                     let capture = api::client::attach_history_capture_v1(&mut client, session, pane).await?
                         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
@@ -1730,7 +1735,7 @@ mod tests {
         second: &RealAttachPlaybookRuntime,
         active: bool,
     ) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while first.terminal.scrollback_active() != active
                 || second.terminal.scrollback_active() != active
             {
@@ -1747,7 +1752,7 @@ mod tests {
         marker: &str,
         size: (u16, u16),
     ) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG_GUARD;
         loop {
             ensure!(
                 !first.task.is_finished() && !second.task.is_finished(),

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const READY_TIMEOUT: Duration = support::HANG_GUARD;
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(100);
 

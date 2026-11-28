@@ -59,11 +59,13 @@ pub async fn blocking<T: Send + 'static>(
 /// `secret`, terminal echo is off while reading (the value never reaches argv,
 /// shell history or the screen).
 pub fn prompt(label: &str, secret: bool) -> Result<String> {
-    eprint!("{label}");
-    std::io::stderr().flush()?;
+    // Hide echo before asking: input typed or pasted as soon as the prompt
+    // appears must never be echoed by the terminal.
     let guard = (secret && std::io::stdin().is_terminal())
         .then(echo::Echo::hide)
         .transpose()?;
+    eprint!("{label}");
+    std::io::stderr().flush()?;
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()

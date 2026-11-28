@@ -24,7 +24,7 @@ use std::{
 
 static NATIVE_RUNTIME: Mutex<()> = Mutex::new(());
 
-const DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = support::HANG_GUARD;
 const WORKLOAD: &str = r#"#!/bin/sh
 exec 2> "$0.stderr"
 printf 'started pid=%s argv0=%s cwd=%s\n' "$$" "$0" "$PWD" > "$0.progress"

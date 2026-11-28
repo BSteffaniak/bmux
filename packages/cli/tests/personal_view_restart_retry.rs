@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// Daemon readiness and convergence deadline. Generous because a loaded host
 /// can take far longer to boot a plugin-loaded debug server.
 const STARTUP: Duration = Duration::from_secs(120);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = support::HANG_GUARD;
 
 /// One isolated daemon that is stopped, killed and started again over the
 /// same configuration, data and state directories.

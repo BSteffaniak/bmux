@@ -21,7 +21,7 @@ use bmux_scene_protocol::scene_protocol::{DecorationScene, Rect};
 use bmux_theme_plugin::{theme_control_v1 as theme, theme_state};
 use uuid::Uuid;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = support::HANG_GUARD;
 const EVENT_WINDOW: Duration = Duration::from_millis(250);
 
 async fn connect(server: &support::ServerEnv) -> StreamingBmuxClient {
@@ -96,13 +96,57 @@ struct PresentationEvents {
 // An absolute deadline prevents unrelated public events from extending a negative assertion.
 /// The scenes pushed are rebuilt from the deltas the view pushes, on `held` (the last scene this
 /// connection was pushed).
+/// Every delivery within [`EVENT_WINDOW`]: for checks that nothing (else) arrives.
 async fn events(
     client: &mut StreamingBmuxClient,
     held: &mut Option<DecorationScene>,
 ) -> PresentationEvents {
-    let deadline = tokio::time::Instant::now() + EVENT_WINDOW;
+    collect(
+        client,
+        held,
+        tokio::time::Instant::now() + EVENT_WINDOW,
+        |_| false,
+    )
+    .await
+}
+
+/// Deliveries until `arrived` holds for them, and then any that follow within
+/// [`EVENT_WINDOW`] (as [`events`] would have collected): an expected delivery is
+/// awaited, not expected within a window a loaded machine can miss. The deadline
+/// only bounds a hang.
+async fn events_until(
+    client: &mut StreamingBmuxClient,
+    held: &mut Option<DecorationScene>,
+    arrived: impl Fn(&PresentationEvents) -> bool,
+) -> PresentationEvents {
+    let mut result = collect(
+        client,
+        held,
+        tokio::time::Instant::now() + support::HANG_GUARD,
+        &arrived,
+    )
+    .await;
+    assert!(
+        arrived(&result),
+        "expected delivery never arrived: {result:?}"
+    );
+    let trailing = events(client, held).await;
+    result.scenes.extend(trailing.scenes);
+    result.appearances.extend(trailing.appearances);
+    result
+}
+
+async fn collect(
+    client: &mut StreamingBmuxClient,
+    held: &mut Option<DecorationScene>,
+    deadline: tokio::time::Instant,
+    done: impl Fn(&PresentationEvents) -> bool,
+) -> PresentationEvents {
     let mut result = PresentationEvents::default();
     loop {
+        if done(&result) {
+            return result;
+        }
         match tokio::time::timeout_at(deadline, client.event_receiver().recv()).await {
             Ok(Some(ServerEvent::PluginBusEvent { kind, payload })) if kind == DELTA_KIND => {
                 let delta: DecorationSceneDelta =
@@ -303,8 +347,24 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     // Publish BEFORE event push: hydration must come from the real recipient retention table.
     a.enable_event_push().await.expect("enable A push");
     b.enable_event_push().await.expect("enable B push");
-    hydrated(&events(&mut a, &mut held_a).await, &a_scene, &a_appearance);
-    hydrated(&events(&mut b, &mut held_b).await, &b_scene, &b_appearance);
+    hydrated(
+        &events_until(&mut a, &mut held_a, |events| {
+            events.scenes.last() == Some(&a_scene)
+                && events.appearances.last() == Some(&a_appearance)
+        })
+        .await,
+        &a_scene,
+        &a_appearance,
+    );
+    hydrated(
+        &events_until(&mut b, &mut held_b, |events| {
+            events.scenes.last() == Some(&b_scene)
+                && events.appearances.last() == Some(&b_appearance)
+        })
+        .await,
+        &b_scene,
+        &b_appearance,
+    );
 
     // Read/no-op operations must not repaint either connection.
     assert_eq!(current(&mut a).await, a_selected);
@@ -335,9 +395,13 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     .await
     .expect("preview dispatch")
     .expect("preview preset");
-    let preview_events = events(&mut a, &mut held_a).await;
-    assert_eq!(preview_events.appearances.last(), Some(&b_appearance));
     let preview_scene = view::scene(&mut a).await.expect("preview owner scene");
+    let preview_events = events_until(&mut a, &mut held_a, |events| {
+        events.appearances.last() == Some(&b_appearance)
+            && events.scenes.last() == Some(&preview_scene)
+    })
+    .await;
+    assert_eq!(preview_events.appearances.last(), Some(&b_appearance));
     assert_eq!(preview_events.scenes.last(), Some(&preview_scene));
     assert_eq!(preview_scene.surfaces[&pane].rect.w, 20);
     assert_ne!(
@@ -349,9 +413,13 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
         .await
         .expect("cancel dispatch")
         .expect("cancel owner preview");
-    let restored = events(&mut a, &mut held_a).await;
-    assert_eq!(restored.appearances.last(), Some(&a_appearance));
     let restored_scene = view::scene(&mut a).await.expect("restored owner scene");
+    let restored = events_until(&mut a, &mut held_a, |events| {
+        events.appearances.last() == Some(&a_appearance)
+            && events.scenes.last() == Some(&restored_scene)
+    })
+    .await;
+    assert_eq!(restored.appearances.last(), Some(&a_appearance));
     assert_eq!(restored.scenes.last(), Some(&restored_scene));
     assert_eq!(
         restored_scene.surfaces[&pane].paint_commands, a_scene.surfaces[&pane].paint_commands,
@@ -370,7 +438,11 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     assert!(changed.revision > a_scene.revision);
     assert_eq!(changed.surfaces[&pane].rect.w, 24);
     assert_eq!(
-        events(&mut a, &mut held_a).await.scenes.last(),
+        events_until(&mut a, &mut held_a, |events| events.scenes.last()
+            == Some(&changed))
+        .await
+        .scenes
+        .last(),
         Some(&changed)
     );
     quiet(&events(&mut b, &mut held_b).await);
@@ -427,7 +499,11 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
         .await
         .expect("enable fresh owner push");
     hydrated(
-        &events(&mut c, &mut held_c).await,
+        &events_until(&mut c, &mut held_c, |events| {
+            events.scenes.last() == Some(&c_scene)
+                && events.appearances.last() == Some(&baseline_appearance)
+        })
+        .await,
         &c_scene,
         &baseline_appearance,
     );
